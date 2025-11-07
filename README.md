@@ -72,13 +72,17 @@ _✨ ai groupmate ✨_
 | 配置项 | 必填 | 默认值 | 说明 |
 |:-----:|:----:|:----:|:----:|
 | bot_name | 是 | 无 | bot 名 |
-| deepseek_bearer_token | 是 | 无 | deepseek api 密钥（bearer后面的）  |
-| siliconflow_bearer_token | 是 | 无 | siliconflow api 密钥（bearer后面的）  |
 | reply_probability | 否 | 0.04 | 群内发言概率 |
 | personality_setting | 否 | 无 | 自定义人设 |
 | milvus_uri | 否 | 无 | milvus 地址 |
 | milvus_user | 否 | 无| milvus 用户名 |
 | milvus_password | 否 | 无 | milvus 密码 |
+| tavily_api_key | 否 | 无 | tavily api 密钥 |
+| openai_base_url | 否 | 无| openai 请求地址 |
+| openai_token | 否 | 无 | openai token |
+| openai_model | 否 | 无 | openai 模型名 |
+| vlm_ollama_base_url | 否 | 无| vlm 地址 |
+| vlm_model | 否 | 无 | vlm 模型名 |
 
 ## 🎉 使用
 
