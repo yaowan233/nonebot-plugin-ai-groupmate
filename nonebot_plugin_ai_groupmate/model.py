@@ -4,6 +4,7 @@ from typing import Optional
 from nonebot_plugin_orm import Model
 from sqlalchemy import String, Boolean
 from sqlalchemy.orm import Mapped, mapped_column
+from pydantic import BaseModel
 
 
 class MediaStorage(Model):
@@ -18,6 +19,16 @@ class MediaStorage(Model):
     vectorized: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
 
 
+class MediaStorageSchema(BaseModel):
+    media_id: int
+    file_hash: str
+    file_path: str
+    created_at: datetime
+    references: int
+    description: str
+    vectorized: bool
+
+
 class ChatHistory(Model):
     msg_id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     session_id: Mapped[str] = mapped_column(index=True)
@@ -28,3 +39,17 @@ class ChatHistory(Model):
     user_name: Mapped[str]
     media_id: Mapped[Optional[int]]  # 媒体消息专用
     vectorized: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+
+class ChatHistorySchema(BaseModel):
+    msg_id: int
+    session_id: str
+    user_id: str
+    content_type: str
+    content: str
+    created_at: datetime
+    user_name: str
+    media_id: Optional[int] = None
+    vectorized: Optional[bool] = False
+
+    class Config:
+        from_attributes = True  # ✅ 允许从 ORM 对象创建

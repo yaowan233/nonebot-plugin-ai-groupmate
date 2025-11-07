@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import hashlib
 import traceback
@@ -10,13 +11,15 @@ import io
 from nonebot_plugin_orm import AsyncSession
 from sqlalchemy import Select, Update
 
-
 from nonebot import logger, get_plugin_config
-from .model import ChatHistory
+from tqdm import tqdm
+
+from .model import ChatHistory, ChatHistorySchema
 from .milvus import MilvusOP
 from .config import Config
 
 plugin_config = get_plugin_config(Config)
+
 
 def generate_file_hash(file_data: bytes) -> str:
     sha256 = hashlib.sha256()
@@ -25,7 +28,7 @@ def generate_file_hash(file_data: bytes) -> str:
 
 
 def check_and_compress_image_bytes(
-    image_bytes, max_size_mb=2, quality_start=95, image_format="JPEG"
+        image_bytes, max_size_mb=2, quality_start=95, image_format="JPEG"
 ):
     """
     检查bytes格式的图片大小，如果大于指定大小则压缩
@@ -121,11 +124,11 @@ def bytes_to_base64(bytes_data):
 
 
 async def split_chat_into_context_groups(
-    db_session: AsyncSession,
-    session_id: str,
-    max_time_gap: timedelta = timedelta(hours=1),
-    max_token_count: int = 1000,
-    max_messages: int = 50,
+        db_session: AsyncSession,
+        session_id: str,
+        max_time_gap: timedelta = timedelta(hours=1),
+        max_token_count: int = 700,
+        max_messages: int = 50,
 ) -> List[List[ChatHistory]]:
     """
     将一个会话内的聊天记录智能切分为多个上下文组
@@ -149,6 +152,9 @@ async def split_chat_into_context_groups(
     )
 
     all_messages = (await db_session.execute(query)).scalars().all()
+    # ✅ 转成 Pydantic 模型（一次性完全脱离数据库）
+    all_messages = [ChatHistorySchema.model_validate(m) for m in all_messages]
+
 
     if not all_messages:
         return []
@@ -168,8 +174,8 @@ async def split_chat_into_context_groups(
 
         # 条件1: 时间间隔过大
         if (
-            last_message_time
-            and (message.created_at - last_message_time) > max_time_gap
+                last_message_time
+                and (message.created_at - last_message_time) > max_time_gap
         ):
             start_new_group = True
 
@@ -214,10 +220,12 @@ def estimate_token_count(text: str) -> int:
 
 
 async def process_and_vectorize_session_chats(
-    db_session: AsyncSession,
-    session_id: str,
-    max_time_gap: timedelta = timedelta(hours=1),
-    max_token_count: int = 1000,
+        db_session: AsyncSession,
+        session_id: str,
+        max_time_gap: timedelta = timedelta(hours=1),
+        max_token_count: int = 1000,
+        chunk_size: int = 100,
+        commit_interval: int = 500,
 ) -> Optional[Dict]:
     """
     处理并向量化一个会话内的聊天记录，按上下文智能切分
@@ -227,7 +235,8 @@ async def process_and_vectorize_session_chats(
         session_id: 会话ID
         max_time_gap: 时间间隔切分标准
         max_token_count: token数量切分标准
-        max_workers: 并行向量化线程数
+        chunk_size: 每批次向量化的数量
+        commit_interval: 数据库提交间隔（消息数）
     """
     # 1. 获取并切分会话
     context_groups = await split_chat_into_context_groups(
@@ -240,37 +249,194 @@ async def process_and_vectorize_session_chats(
     if not context_groups:
         return None
 
-    # 2. 处理每个上下文组
     processed_groups = 0
+    failed_groups = 0
+    total_groups = len(context_groups)
 
-    for group in context_groups:
-        # 3. 为每个组创建合并上下文
-        context_text, msg_ids = combine_messages_into_context(group)
+    # 2. 分块处理，避免一次性处理过多数据
+    for i in tqdm(range(0, total_groups, chunk_size), desc="向量化处理"):
+        chunk = context_groups[i:i + chunk_size]
 
-        # 4. 向量化合并后的上下文
+        # 准备当前批次的数据
+        batch_contexts = []
+        batch_msg_ids = []
+
+        for group in chunk:
+            context_text, msg_ids = await combine_messages_into_context_async(group)
+            batch_contexts.append(context_text)
+            batch_msg_ids.extend(msg_ids)
+
+        if not batch_contexts:
+            continue
+
+        # 3. 批量插入向量到 Milvus（带重试）
         try:
-            # 向量化上下文
-            MilvusOP.insert(context_text, session_id)
-
-            # 6. 更新消息向量化状态
-            for msg_id in msg_ids:
-                await mark_message_as_vectorized(db_session, msg_id)
-
-            processed_groups += 1
-
+            await insert_vectors_with_retry(batch_contexts, session_id)
         except Exception as e:
             logger.error(
-                f"向量化会话组失败 {session_id}: {str(e)}\n{traceback.format_exc()}"
+                f"批量向量化失败 (chunk {i}-{i + chunk_size}): {str(e)}\n{traceback.format_exc()}"
             )
+            failed_groups += len(chunk)
+            continue
 
-    # 提交所有更改
-    await db_session.commit()
+        # 4. 分批更新数据库状态，避免单次更新过多
+        try:
+            await update_messages_in_batches(
+                db_session,
+                batch_msg_ids,
+                commit_interval
+            )
+            processed_groups += len(chunk)
+        except Exception as e:
+            logger.error(
+                f"批量更新数据库失败 (chunk {i}-{i + chunk_size}): {str(e)}\n{traceback.format_exc()}"
+            )
+            failed_groups += len(chunk)
+            # 发生错误时回滚当前事务
+            await db_session.rollback()
+
+    # 5. 最终提交
+    try:
+        await db_session.commit()
+    except Exception as e:
+        logger.error(f"最终提交失败: {str(e)}")
+        await db_session.rollback()
 
     return {
         "session_id": session_id,
         "processed_groups": processed_groups,
-        "total_groups": len(context_groups),
+        "failed_groups": failed_groups,
+        "total_groups": total_groups,
+        "success_rate": f"{processed_groups / total_groups * 100:.2f}%" if total_groups > 0 else "0%"
     }
+
+
+async def combine_messages_into_context_async(
+        messages: list[ChatHistory]
+) -> Tuple[str, List[str]]:
+    """
+    异步版本：将消息列表组合成上下文文本
+
+    关键：所有数据库对象的属性访问都在异步上下文中完成
+    """
+    context_parts = []
+    msg_ids = []
+
+    for msg in messages:
+        # 在异步上下文中访问所有属性
+        # 确保所有关系和延迟加载的字段都已加载
+        msg_id = msg.msg_id
+        sender_name = msg.sender_name if hasattr(msg, 'sender_name') else "Unknown"
+        content = msg.content
+        created_at = msg.created_at
+
+        # 格式化时间（现在所有数据都已加载到内存）
+        time_str = created_at.strftime("%Y-%m-%d %H:%M:%S")
+
+        # 组合消息
+        context_parts.append(f"[{time_str}] {sender_name}: {content}")
+        msg_ids.append(msg_id)
+
+    return "\n".join(context_parts), msg_ids
+
+
+# 如果你需要保留原来的同步版本用于其他地方
+def combine_messages_into_context(messages: List) -> Tuple[str, List[str]]:
+    """
+    同步版本：仅用于已经完全加载的对象
+
+    警告：确保传入的 messages 对象已经预加载了所有需要的字段
+    """
+    context_parts = []
+    msg_ids = []
+
+    for msg in messages:
+        # 使用 __dict__ 直接访问，避免触发延迟加载
+        msg_data = msg.__dict__
+
+        msg_id = msg_data.get('id')
+        sender_name = msg_data.get('sender_name', 'Unknown')
+        content = msg_data.get('content', '')
+        created_at = msg_data.get('created_at')
+
+        if created_at:
+            time_str = created_at.strftime("%Y-%m-%d %H:%M:%S")
+        else:
+            time_str = "Unknown Time"
+
+        context_parts.append(f"[{time_str}] {sender_name}: {content}")
+        msg_ids.append(msg_id)
+
+    return "\n".join(context_parts), msg_ids
+
+
+async def insert_vectors_with_retry(
+        contexts: List[str],
+        session_id: str,
+        max_retries: int = 3
+) -> None:
+    """
+    带重试机制的向量插入
+    """
+    for attempt in range(max_retries):
+        try:
+            # 如果 MilvusOP.batch_insert 是同步的，需要在线程池中执行
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(
+                None,
+                MilvusOP.batch_insert,
+                contexts,
+                session_id
+            )
+            return
+        except Exception as e:
+            if attempt == max_retries - 1:
+                raise
+            logger.warning(
+                f"向量插入失败 (尝试 {attempt + 1}/{max_retries}): {str(e)}"
+            )
+            await asyncio.sleep(2 ** attempt)
+
+
+async def update_messages_in_batches(
+        db_session: AsyncSession,
+        msg_ids: List[str],
+        batch_size: int = 500
+) -> None:
+    """
+    分批更新消息状态
+    """
+    total_updated = 0
+
+    for i in range(0, len(msg_ids), batch_size):
+        batch_ids = msg_ids[i:i + batch_size]
+
+        try:
+            await mark_messages_as_vectorized_batch(db_session, batch_ids)
+            await db_session.commit()
+            total_updated += len(batch_ids)
+            logger.debug(f"已更新 {total_updated}/{len(msg_ids)} 条消息")
+
+        except Exception as e:
+            logger.error(f"更新批次失败: {str(e)}")
+            await db_session.rollback()
+            await update_messages_one_by_one(db_session, batch_ids)
+
+
+async def update_messages_one_by_one(
+        db_session: AsyncSession,
+        msg_ids: List[str]
+) -> None:
+    """
+    逐条更新（降级方案）
+    """
+    for msg_id in msg_ids:
+        try:
+            await mark_messages_as_vectorized_batch(db_session, [msg_id])
+            await db_session.commit()
+        except Exception as e:
+            logger.error(f"更新单条消息失败 {msg_id}: {str(e)}")
+            await db_session.rollback()
 
 
 def combine_messages_into_context(messages: List[ChatHistory]) -> Tuple[str, List[int]]:
@@ -303,3 +469,17 @@ async def mark_message_as_vectorized(db_session: AsyncSession, msg_id: int):
     await db_session.execute(
         Update(ChatHistory).where(ChatHistory.msg_id == msg_id).values(vectorized=True)
     )
+
+
+async def mark_messages_as_vectorized_batch(db_session: AsyncSession, msg_ids: list[int]):
+    """批量更新消息向量化状态"""
+    if not msg_ids:
+        return
+
+    # 使用SQLAlchemy的批量更新
+    await db_session.execute(
+        Update(ChatHistory)
+        .where(ChatHistory.msg_id.in_(msg_ids))
+        .values(vectorized=True)
+    )
+    await db_session.commit()
