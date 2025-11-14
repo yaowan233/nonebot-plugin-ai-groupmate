@@ -206,22 +206,19 @@ def create_send_meme_tool(db_session, session_id: str):
             # 读取图片数据
             pic_data = pic_path.read_bytes()
             description = pic.description
-
+            # 发送图片
+            res = await UniMessage.image(raw=pic_data).send()
             # 记录发送历史
             chat_history = ChatHistory(
                 session_id=session_id,
                 user_id=plugin_config.bot_name,
                 content_type="bot",
-                content=f"发送了图片，图片描述是: {description}",
+                content=f"id:{res.msg_ids[-1]['message_id']}\n发送了图片，图片描述是: {description}",
                 user_name=plugin_config.bot_name,
             )
             db_session.add(chat_history)
+            logger.info(f"id:{res.msg_ids}\n" + f"发送表情包: {description}")
             await db_session.commit()
-
-            # 发送图片
-            await UniMessage.image(raw=pic_data).send()
-
-            logger.info(f"成功发送表情包: {description}")
             return f"已成功发送表情包: {description}"
 
         except Exception as e:

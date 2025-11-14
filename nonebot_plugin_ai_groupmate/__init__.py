@@ -227,7 +227,7 @@ async def process_image_message(
                 session_id=session.scene.id,
                 user_id=session.user.id,
                 content_type=content_type,
-                content=existing_media.description,
+                content=content + existing_media.description,
                 user_name=user_name,
                 media_id=existing_media.media_id,
             )
@@ -268,14 +268,6 @@ async def handle_reply_logic(
         last_msg = [ChatHistorySchema.model_validate(m) for m in last_msg]
         last_msg = last_msg[::-1]
 
-        # 构建上下文用于搜索相似消息
-        # context, _ = combine_messages_into_context(last_msg)
-        # search_context, _ = combine_messages_into_context(last_msg[-5:])
-        #
-        # # 搜索相似的历史对话
-        # _, similar_msgs = await milvus_async.search([search_context])
-        # contexts = [similar_msgs] if similar_msgs else []
-
         # 使用Agent决定回复策略
         logger.info("开始调用Agent决策...")
         strategy = await choice_response_strategy(db_session, session.scene.id, last_msg, "")
@@ -283,86 +275,27 @@ async def handle_reply_logic(
         logger.info(f"Agent决策结果: {strategy}")
 
         # 检查是否需要回复
-        if not strategy.text and not strategy.image_desc:
+        if not strategy.text:
             logger.info("Agent决定不回复")
             return
 
         # 处理文本回复
         if strategy.text:
             text = strategy.text
+            res = await record.send(text)
+            logger.info(f"发送文本回复: {text}")
             chat_history = ChatHistory(
                 session_id=session.scene.id,
                 user_id=bot_name,
                 content_type="bot",
-                content=text,
+                content= f"id:{res['message_id']}\n" +text,
                 user_name=bot_name,
             )
             db_session.add(chat_history)
             await db_session.commit()
-
-            res = await record.send(text)
-            logger.info(f"发送文本回复: {res}")
     except Exception as e:
         logger.error(f"回复逻辑执行失败: {e}")
         await db_session.rollback()
-
-
-async def send_meme_image(
-        db_session,
-        image_desc: str,
-        session_id: str,
-        bot_name: str,
-):
-    """发送表情包图片"""
-    try:
-        # 从向量数据库搜索匹配的表情包
-        pic_ids = await milvus_async.search_media([image_desc])
-
-        if not pic_ids:
-            logger.warning(f"未找到匹配的表情包: {image_desc}")
-            return
-
-        # 随机选择一个
-        pic_id = random.choice(pic_ids)
-
-        # 从数据库获取图片信息
-        pic = (
-            await db_session.execute(
-                Select(MediaStorage).where(MediaStorage.media_id == pic_id)
-            )
-        ).scalar()
-
-        if not pic:
-            logger.warning(f"图片记录不存在: {pic_id}")
-            return
-
-        pic_path = pic_dir / pic.file_path
-
-        if not pic_path.exists():
-            logger.warning(f"图片文件不存在: {pic_path}")
-            return
-
-        # 读取图片并发送
-        pic_data = pic_path.read_bytes()
-
-        # 记录发送历史
-        chat_history = ChatHistory(
-            session_id=session_id,
-            user_id=bot_name,
-            content_type="bot",
-            content=f"发送了图片，图片描述是: {pic.description}",
-            user_name=bot_name,
-        )
-        db_session.add(chat_history)
-        logger.info(f"发送表情包: {pic.description}")
-        await db_session.commit()
-
-        await UniMessage.image(raw=pic_data).send()
-
-    except Exception as e:
-        logger.error(f"发送表情包失败: {e}")
-        await db_session.rollback()
-
 
 
 def _build_wordcloud_image(words: str) -> BytesIO:
