@@ -326,7 +326,7 @@ async def combine_messages_into_context_async(
         # 在异步上下文中访问所有属性
         # 确保所有关系和延迟加载的字段都已加载
         msg_id = msg.msg_id
-        sender_name = msg.sender_name if hasattr(msg, 'sender_name') else "Unknown"
+        sender_name = msg.user_name
         content = msg.content
         created_at = msg.created_at
 
