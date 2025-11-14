@@ -213,6 +213,8 @@ class MilvusOperator:
         texts = MilvusOP.query_ids([i["id"] for i in res[0]], collection_name=collection_name)
         text_list = [i["text"] for i in texts]
         results = self.bge_rf(text[0], text_list)
+        if not results:
+            return None, None
         # 找到最佳结果在原始列表中的索引
         best_text = results[0].text
         best_index = text_list.index(best_text)

@@ -80,7 +80,6 @@ async def search_history_context(query: str, runtime: ToolRuntime[Context]) -> s
         _, similar_msgs = await milvus_async.search([query], search_filter=f'session_id == "{runtime.context.session_id}"')
         return similar_msgs if similar_msgs else "未找到相关历史记录"
     except Exception as e:
-        traceback.print_exc()
         logger.error(f"历史搜索失败: {e}")
         return "历史搜索失败"
 
@@ -206,13 +205,14 @@ def create_send_meme_tool(db_session, session_id: str):
 
             # 读取图片数据
             pic_data = pic_path.read_bytes()
+            description = pic.description
 
             # 记录发送历史
             chat_history = ChatHistory(
                 session_id=session_id,
                 user_id=plugin_config.bot_name,
                 content_type="bot",
-                content=f"发送了图片，图片描述是: {pic.description}",
+                content=f"发送了图片，图片描述是: {description}",
                 user_name=plugin_config.bot_name,
             )
             db_session.add(chat_history)
@@ -221,8 +221,8 @@ def create_send_meme_tool(db_session, session_id: str):
             # 发送图片
             await UniMessage.image(raw=pic_data).send()
 
-            logger.info(f"成功发送表情包: {pic.description}")
-            return f"已成功发送表情包: {pic.description}"
+            logger.info(f"成功发送表情包: {description}")
+            return f"已成功发送表情包: {description}"
 
         except Exception as e:
             logger.error(f"发送表情包失败: {e}")
