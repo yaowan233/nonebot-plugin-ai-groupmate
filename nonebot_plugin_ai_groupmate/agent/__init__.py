@@ -80,6 +80,7 @@ async def search_history_context(query: str, runtime: ToolRuntime[Context]) -> s
         _, similar_msgs = await milvus_async.search([query], search_filter=f'session_id == "{runtime.context.session_id}"')
         return similar_msgs if similar_msgs else "未找到相关历史记录"
     except Exception as e:
+        traceback.print_exc()
         logger.error(f"历史搜索失败: {e}")
         return "历史搜索失败"
 
@@ -121,7 +122,7 @@ def create_search_meme_tool(db_session):
             for pic_id in pic_ids[:5]:  # 只返回前5张，避免信息过多
                 pic = (
                     await db_session.execute(
-                        Select(MediaStorage).where(MediaStorage.media_id == pic_id)
+                        Select(MediaStorage).where(MediaStorage.media_id == int(pic_id))
                     )
                 ).scalar()
 
@@ -182,14 +183,14 @@ def create_send_meme_tool(db_session, session_id: str):
         try:
             selected_pic_id = None
             if pic_id:
-                selected_pic_id = pic_id
+                selected_pic_id = int(pic_id)
                 logger.info(f"使用指定的图片ID: {pic_id}")
 
 
             # 从数据库获取图片信息
             pic = (
                 await db_session.execute(
-                    Select(MediaStorage).where(MediaStorage.media_id == selected_pic_id)
+                    Select(MediaStorage).where(MediaStorage.media_id == int(selected_pic_id))
                 )
             ).scalar()
 
@@ -424,7 +425,7 @@ if __name__ == '__main__':
     model = ChatOpenAI(
         model=plugin_config.openai_model,
         api_key=plugin_config.openai_token,
-        base_url=plugin_config.openai_base_url,
+        base_url=plugin_config.base_url,
         temperature=0.7,
     )
     agent = create_agent(model, tools=tools, response_format=ToolStrategy(ResponseMessage))
