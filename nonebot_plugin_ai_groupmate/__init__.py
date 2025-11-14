@@ -16,7 +16,7 @@ from wordcloud import WordCloud
 from PIL import Image as PILImage
 require("nonebot_plugin_alconna")
 require("nonebot_plugin_orm")
-from nonebot_plugin_alconna import Image, Text, image_fetch, UniMessage
+from nonebot_plugin_alconna import Image, image_fetch, UniMessage
 from nonebot_plugin_orm import async_scoped_session, get_session
 from nonebot_plugin_alconna.uniseg import UniMsg
 from nonebot_plugin_uninfo import Uninfo
@@ -52,9 +52,6 @@ with open(Path(__file__).parent / "stop_words.txt", "r", encoding="utf-8") as f:
 
 async def check_group_permission(event: GroupMessageEvent):
     # 检查是否为群聊
-    # if event.self_id == 1784933404 and event.group_id not in (758450633, 730139506, 247833096, 684532130, 646960504, 931213301, 735113523, 680242010, 1020145437, 673263142, 686681834, 280079266):
-    #     logger.info("不在指定群聊中")
-    #     return False
     return True
 
 
@@ -76,8 +73,26 @@ async def handle_message(
 ):
     """处理消息的主函数"""
     bot_name = plugin_config.bot_name
-    texts = msg.include(Text)
     imgs = msg.include(Image)
+    content = f"id: {msg.get_message_id(event)}\n"
+    to_me = False
+    is_text = False
+    if event.is_tome():
+        to_me = True
+        content += f"@{plugin_config.bot_name} "
+    for i in msg:
+        if i.type == "at":
+            qq = i.target
+            res = await bot.get_group_member_info(group_id=session.scene.id, user_id=qq, no_cache=False)
+            name = res["nickname"]
+            content += "@" + name + " "
+            is_text = True
+        if i.type == "reply":
+            content += "回复id:" + i.id
+        if i.type == "text":
+            content += i.text
+            is_text = True
+
 
     # 构建用户名（包含昵称和职位）
     user_name = session.user.name
@@ -89,17 +104,12 @@ async def handle_message(
         user_name = f"管理员-{user_name}"
 
     # ========== 步骤1: 处理文本消息（快速） ==========
-    for text_msg in texts:
-        if event.is_tome():
-            text_msg.text = f"@{bot_name} {text_msg.text}"
-        if not text_msg.text:
-            continue
-
+    if is_text:
         chat_history = ChatHistory(
             session_id=session.scene.id,
             user_id=session.user.id,
             content_type="text",
-            content=text_msg.text,
+            content=content,
             user_name=user_name,
         )
         db_session.add(chat_history)
@@ -115,14 +125,19 @@ async def handle_message(
     for img in imgs:
         await process_image_message(
             db_session, img, event, bot, state,
-            session, user_name
+            session, user_name, f"id: {msg.get_message_id(event)}\n"
         )
 
     # ========== 步骤3: 决定是否回复 ==========
-    should_reply = event.is_tome() or (random.random() < plugin_config.reply_probability)
+    if msg.extract_plain_text().strip().startswith(plugin_config.bot_name):
+        to_me = True
+    should_reply = to_me or (random.random() < plugin_config.reply_probability)
     if not event.get_plaintext() and not imgs:
         should_reply = False
-
+    if event.get_plaintext().startswith(("!", "！", "/", "#", "?", "\\")):
+        should_reply = False
+    if not event.get_plaintext() and not event.is_tome():
+        should_reply = False
     if should_reply:
         await handle_reply_logic(db_session, session, bot_name, event)
 
@@ -137,6 +152,7 @@ async def process_image_message(
         state: T_State,
         session: Uninfo,
         user_name: str,
+        content: str,
 ):
     """处理单张图片消息"""
     try:
@@ -190,7 +206,7 @@ async def process_image_message(
                 session_id=session.scene.id,
                 user_id=session.user.id,
                 content_type=content_type,
-                content=image_description,
+                content=content + image_description,
                 user_name=user_name,
                 media_id=existing_media.media_id,
             )
@@ -298,7 +314,6 @@ async def handle_reply_logic(
                 db_session, strategy.image_desc,
                 session.scene.id, bot_name
             )
-
     except Exception as e:
         logger.error(f"回复逻辑执行失败: {e}")
         await db_session.rollback()
@@ -351,9 +366,9 @@ async def send_meme_image(
             user_name=bot_name,
         )
         db_session.add(chat_history)
+        logger.info(f"发送表情包: {pic.description}")
         await db_session.commit()
 
-        logger.info(f"发送表情包: {pic.description}")
         await UniMessage.image(raw=pic_data).send()
 
     except Exception as e:
