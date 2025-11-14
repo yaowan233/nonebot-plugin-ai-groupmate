@@ -47,7 +47,7 @@ pic_dir = plugin_data_dir / "pics"
 pic_dir.mkdir(parents=True, exist_ok=True)
 plugin_config = get_plugin_config(Config)
 with open(Path(__file__).parent / "stop_words.txt", "r", encoding="utf-8") as f:
-    stop_words = f.read().splitlines()
+    stop_words = f.read().splitlines() + ["id"]
 
 
 async def check_group_permission(event: GroupMessageEvent):
@@ -178,8 +178,6 @@ async def process_image_message(
             )
         ).scalar()
 
-        image_description = None
-
         if existing_media:
             # 已存在，直接使用描述
             image_description = existing_media.description
@@ -249,9 +247,6 @@ async def handle_reply_logic(
 ):
     """处理回复逻辑"""
     try:
-        # 如果是@机器人，稍微延迟一下显得更自然
-        if event.is_tome():
-            await asyncio.sleep(random.uniform(1, 3))
 
         # 获取最近1小时内的消息历史
         cutoff_time = datetime.datetime.now() - datetime.timedelta(hours=1)
@@ -283,7 +278,7 @@ async def handle_reply_logic(
 
         # 使用Agent决定回复策略
         logger.info("开始调用Agent决策...")
-        strategy = await choice_response_strategy([], last_msg, "")
+        strategy = await choice_response_strategy(db_session, session.scene.id, last_msg, "")
 
         logger.info(f"Agent决策结果: {strategy}")
 
@@ -305,15 +300,8 @@ async def handle_reply_logic(
             db_session.add(chat_history)
             await db_session.commit()
 
-            await record.send(text)
-            logger.info(f"发送文本回复: {text}")
-
-        # 处理图片回复（表情包）
-        if strategy.image_desc:
-            await send_meme_image(
-                db_session, strategy.image_desc,
-                session.scene.id, bot_name
-            )
+            res = await record.send(text)
+            logger.info(f"发送文本回复: {res}")
     except Exception as e:
         logger.error(f"回复逻辑执行失败: {e}")
         await db_session.rollback()
