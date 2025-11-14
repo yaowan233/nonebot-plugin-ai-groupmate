@@ -76,7 +76,7 @@ def check_and_compress_image_bytes(
             if compressed_size <= max_size_bytes:
                 break
 
-            quality -= 5
+            quality -= 15
 
         # 如果压缩后的图像仍然大于目标大小，可以考虑调整图像尺寸
         if compressed_size > max_size_bytes:
