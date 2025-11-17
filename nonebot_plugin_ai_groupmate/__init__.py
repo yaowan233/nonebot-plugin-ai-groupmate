@@ -446,9 +446,9 @@ async def clear_cache_pic():
         records_to_delete = []
         for media in medias:
             try:
-                file_path = pic_dir / media.file_path
+                file_path = Path(pic_dir / media.file_path)
                 # use pathlib unlink with missing_ok=True to avoid raising if missing
-                await asyncio.to_thread(Path.unlink, file_path, True)
+                await asyncio.to_thread(file_path.unlink, True)
                 records_to_delete.append(media)
                 logger.debug(f"删除文件: {file_path}")
             except Exception as e:
