@@ -197,6 +197,8 @@ async def process_image_message(
                 db_session.add(media_storage)
                 await db_session.flush()  # 确保获取media_id
                 existing_media = media_storage
+            else:
+                file_path.unlink()
 
         # 添加聊天历史记录
         if existing_media and image_description:
