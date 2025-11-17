@@ -262,7 +262,7 @@ async def process_and_vectorize_session_chats(
         batch_msg_ids = []
 
         for group in chunk:
-            context_text, msg_ids = await combine_messages_into_context_async(group)
+            context_text, msg_ids = combine_messages_into_context(group)
             batch_contexts.append(context_text)
             batch_msg_ids.extend(msg_ids)
 
@@ -311,19 +311,13 @@ async def process_and_vectorize_session_chats(
     }
 
 
-async def combine_messages_into_context_async(
+def combine_messages_into_context(
         messages: list[ChatHistory]
 ) -> Tuple[str, List[str]]:
-    """
-    异步版本：将消息列表组合成上下文文本
-
-    关键：所有数据库对象的属性访问都在异步上下文中完成
-    """
     context_parts = []
     msg_ids = []
 
     for msg in messages:
-        # 在异步上下文中访问所有属性
         # 确保所有关系和延迟加载的字段都已加载
         msg_id = msg.msg_id
         sender_name = msg.user_name
@@ -334,36 +328,6 @@ async def combine_messages_into_context_async(
         time_str = created_at.strftime("%Y-%m-%d %H:%M:%S")
 
         # 组合消息
-        context_parts.append(f"[{time_str}] {sender_name}: {content}")
-        msg_ids.append(msg_id)
-
-    return "\n".join(context_parts), msg_ids
-
-
-# 如果你需要保留原来的同步版本用于其他地方
-def combine_messages_into_context(messages: List) -> Tuple[str, List[str]]:
-    """
-    同步版本：仅用于已经完全加载的对象
-
-    警告：确保传入的 messages 对象已经预加载了所有需要的字段
-    """
-    context_parts = []
-    msg_ids = []
-
-    for msg in messages:
-        # 使用 __dict__ 直接访问，避免触发延迟加载
-        msg_data = msg.__dict__
-
-        msg_id = msg_data.get('id')
-        sender_name = msg_data.get('sender_name', 'Unknown')
-        content = msg_data.get('content', '')
-        created_at = msg_data.get('created_at')
-
-        if created_at:
-            time_str = created_at.strftime("%Y-%m-%d %H:%M:%S")
-        else:
-            time_str = "Unknown Time"
-
         context_parts.append(f"[{time_str}] {sender_name}: {content}")
         msg_ids.append(msg_id)
 
@@ -437,29 +401,6 @@ async def update_messages_one_by_one(
         except Exception as e:
             logger.error(f"更新单条消息失败 {msg_id}: {str(e)}")
             await db_session.rollback()
-
-
-def combine_messages_into_context(messages: List[ChatHistory]) -> Tuple[str, List[int]]:
-    """
-    将消息组合成一个上下文文本，并返回消息ID列表
-    """
-    combined_text = ""
-    msg_ids = []
-
-    for msg in messages:
-        time = msg.created_at.strftime("%Y-%m-%d %H:%M:%S")
-        combined_text += f"[{time}] "
-        if msg.content_type == "text":
-            combined_text += f"{msg.user_name}: {msg.content}\n"
-        elif msg.content_type == "image":
-            combined_text += (
-                f"{msg.user_name} 发送了一张图片\n该图片的描述为: {msg.content}\n"
-            )
-        elif msg.content_type == "bot":
-            combined_text += f"[{plugin_config.bot_name}](你自己)发言: {msg.content}\n"
-        msg_ids.append(msg.msg_id)
-
-    return combined_text.strip(), msg_ids
 
 
 async def mark_message_as_vectorized(db_session: AsyncSession, msg_id: int):

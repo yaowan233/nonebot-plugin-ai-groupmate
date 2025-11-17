@@ -30,7 +30,6 @@ from .utils import (
     generate_file_hash,
     check_and_compress_image_bytes,
     bytes_to_base64,
-    combine_messages_into_context,
     process_and_vectorize_session_chats,
 )
 from .vlm import image_vl
