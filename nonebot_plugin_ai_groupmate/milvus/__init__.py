@@ -1,7 +1,9 @@
 import asyncio
-import threading
+import os
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
 import time
-from queue import Queue
 from typing import Optional
 
 import torch
@@ -13,6 +15,7 @@ from pymilvus import (
     FunctionType,
     AnnSearchRequest,
     WeightedRanker,
+    AsyncMilvusClient
 )
 from pymilvus.model.hybrid import BGEM3EmbeddingFunction
 from pymilvus.model.reranker import BGERerankFunction
@@ -20,10 +23,16 @@ from transformers import AutoModel
 
 from ..config import Config
 
+
 class MilvusOperator:
     def __init__(
-        self, uri: str = "http://localhost:19530", user: str = "", password: str = ""
+            self, uri: str = "http://localhost:19530", user: str = "", password: str = ""
     ):
+        self.uri = uri
+        self.user = user
+        self.password = password
+        self.embed_semaphore = asyncio.Semaphore(1)
+        self.rerank_semaphore = asyncio.Semaphore(1)
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.ef = BGEM3EmbeddingFunction(
             model_name="BAAI/bge-m3",  # Specify the model name
@@ -37,6 +46,7 @@ class MilvusOperator:
         # Put model in evaluation mode
         self.clip_model.eval()
         self.client = MilvusClient(uri, user, password)
+        self.async_client = None
         self.ranker = WeightedRanker(0.8, 0.3)
         if not self.client.has_collection(collection_name="chat_collection"):
             schema = MilvusClient.create_schema(
@@ -123,8 +133,17 @@ class MilvusOperator:
                 index_params=index_params,
             )
 
+    def _get_async_client(self) -> AsyncMilvusClient:
+        """确保在当前运行的 loop 中获取或创建 client"""
+        # 如果 client 不存在，或者属于旧的 loop（虽然 Python 对象本身不绑定 loop，但内部 gRPC channel 绑定）
+        # 这里的简单做法是每次检测，或者为了安全，每次请求都创建一个新的（如果连接开销可接受）
+        # 对于生产环境，建议使用连接池或检查当前的 loop 上下文
+        if self.async_client is None:
+            self.async_client = AsyncMilvusClient(self.uri, self.user, self.password)
+        return self.async_client
 
-    def insert(self, text, session_id, collection_name="chat_collection"):
+    async def insert(self, text, session_id, collection_name="chat_collection"):
+        client = self._get_async_client()
         encoded = self.ef.encode_documents([text])
         dense_vector = encoded["dense"][0]
         data = {
@@ -133,10 +152,10 @@ class MilvusOperator:
             "dense": dense_vector,
             "created_at": int(time.time() * 1000),
         }
-        res = self.client.insert(collection_name=collection_name, data=data)
+        res = await client.insert(collection_name=collection_name, data=data)
         return res
 
-    def batch_insert(self, texts, session_id, collection_name="chat_collection"):
+    async def batch_insert(self, texts, session_id, collection_name="chat_collection"):
         """批量插入向量"""
         if not texts:
             return []
@@ -161,10 +180,11 @@ class MilvusOperator:
             batch_data.append(data_item)
 
         # 批量插入到Milvus
-        res = self.client.insert(collection_name=collection_name, data=batch_data)
+        client = self._get_async_client()
+        res = await client.insert(collection_name=collection_name, data=batch_data)
         return res
 
-    def insert_media(self, media_id, image_urls, collection_name="media_collection"):
+    async def insert_media(self, media_id, image_urls, collection_name="media_collection"):
         image_embeddings = self.clip_model.encode_image(
             image_urls
         )  # also accepts PIL.Image.Image, local filenames, dataURI
@@ -174,17 +194,20 @@ class MilvusOperator:
             "dense": dense_vector,
             "created_at": int(time.time() * 1000),
         }
-        res = self.client.insert(collection_name=collection_name, data=data)
+        client = self._get_async_client()
+        res = await client.insert(collection_name=collection_name, data=data)
         return res
 
-    def search(
-        self,
-        text: list[str],
-        search_filter: Optional[str] = None,
-        collection_name="chat_collection",
+    async def search(
+            self,
+            text: list[str],
+            search_filter: Optional[str] = None,
+            collection_name="chat_collection",
     ):
-        encoded = self.ef.encode_documents(text)
+        async with self.embed_semaphore:
+            encoded = await asyncio.to_thread(self.ef.encode_documents, text)
         dense_vector = encoded["dense"][0]
+
         search_param_1 = {
             "data": [dense_vector],
             "anns_field": "dense",
@@ -202,29 +225,45 @@ class MilvusOperator:
             "expr": search_filter,
         }
         request_2 = AnnSearchRequest(**search_param_2)
-
         reqs = [request_1, request_2]
-        res = self.client.hybrid_search(
+
+        client = self._get_async_client()
+        res = await client.hybrid_search(
             collection_name=collection_name,
             reqs=reqs,
             ranker=self.ranker,
             limit=10,
         )
-        texts = MilvusOP.query_ids([i["id"] for i in res[0]], collection_name=collection_name)
-        text_list = [i["text"] for i in texts]
-        results = self.bge_rf(text[0], text_list)
-        if not results:
-            return None, None
-        # 找到最佳结果在原始列表中的索引
-        best_text = results[0].text
-        best_index = text_list.index(best_text)
-        # 返回对应的id和文本
-        return texts[best_index]["id"], best_text
 
-    def search_media(self, text):
+        # 快速检查结果，避免后续空列表报错
+        if not res or not res[0]:
+            return None
+
+        ids = [i["id"] for i in res[0]]
+
+        texts = await client.get(
+            collection_name=collection_name,
+            ids=ids,
+            output_fields=["text"]
+        )
+
+
+        text_list = [i["text"] for i in texts]
+
+        async with self.rerank_semaphore:
+            results = await asyncio.to_thread(self.bge_rf, text[0], text_list)
+
+        if not results:
+            return None
+
+        best_texts = [i.text for i in results]
+        return best_texts
+
+    async def search_media(self, text):
         text_embeddings = self.clip_model.encode_text(text)
         dense_vector = text_embeddings[0]
-        res = self.client.search(
+        client = self._get_async_client()
+        res = await client.search(
             collection_name="media_collection",
             anns_field="dense",
             data=[dense_vector],
@@ -233,54 +272,7 @@ class MilvusOperator:
         )
         return [i["id"] for i in res[0]]
 
-    def query_ids(self, ids: list[int], collection_name="chat_collection"):
-        res = self.client.get(
-            collection_name=collection_name, ids=ids, output_fields=["text"]
-        )
-        return res
-
-
-class MilvusAsyncWrapper:
-    def __init__(self):
-        self._queue = Queue()
-        self._thread = threading.Thread(target=self._worker, daemon=True)
-        self._thread.start()
-
-    def _worker(self):
-        """专用线程,避免 tokenizer 冲突"""
-        while True:
-            task = self._queue.get()
-            if task is None:
-                break
-
-            func, args, kwargs, future = task
-            try:
-                result = func(*args, **kwargs)
-                future.set_result(result)
-            except Exception as e:
-                future.set_exception(e)
-
-    async def search(self, *args, **kwargs):
-        """异步搜索接口"""
-        loop = asyncio.get_event_loop()
-        future = loop.create_future()
-
-        # 将任务放入队列
-        self._queue.put((MilvusOP.search, args, kwargs, future))
-
-        return await future
-
-    async def search_media(self, *args, **kwargs):
-        """异步媒体搜索接口"""
-        loop = asyncio.get_event_loop()
-        future = loop.create_future()
-
-        self._queue.put((MilvusOP.search_media, args, kwargs, future))
-
-        return await future
-
 
 plugin_config = get_plugin_config(Config)
 
 MilvusOP = MilvusOperator(plugin_config.milvus_uri, plugin_config.milvus_user, plugin_config.milvus_password)
-milvus_async = MilvusAsyncWrapper()

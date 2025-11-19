@@ -20,7 +20,7 @@ from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.orm.session import Session
 
 from ..model import ChatHistory, MediaStorage
-from ..milvus import milvus_async
+from ..milvus import MilvusOP
 from nonebot.log import logger
 from ..config import Config
 require("nonebot_plugin_localstore")
@@ -73,12 +73,13 @@ async def search_web(query: str) -> str:
 @tool("search_history_context")
 async def search_history_context(query: str, runtime: ToolRuntime[Context]) -> str:
     """
-    搜索历史聊天记录。会返回某个时间段，半小时左右的聊天记录。当需要了解群内历史群内聊天记录或过往话题时使用。
-    输入：搜索关键词或话题描述
+    搜索历史聊天记录。会返回某个时间段，半小时左右的聊天记录。当需要了解群内历史群内聊天记录或过往话题时使用
+    输入：搜索关键信息或话题描述，这个语句直接从RAG数据库中进行混合搜索
     """
     try:
-        _, similar_msgs = await milvus_async.search([query], search_filter=f'session_id == "{runtime.context.session_id}"')
-        return similar_msgs if similar_msgs else "未找到相关历史记录"
+        logger.info(f"大模型执行{runtime.context.session_id} RAG 搜索\n{query}")
+        similar_msgs = await MilvusOP.search([query], search_filter=f'session_id == "{runtime.context.session_id}"')
+        return "\n".join(similar_msgs) if similar_msgs else "未找到相关历史记录"
     except Exception as e:
         logger.error(f"历史搜索失败: {e}")
         return "历史搜索失败"
@@ -107,7 +108,7 @@ def create_search_meme_tool(db_session):
         返回：包含图片ID和对应描述的JSON字符串
         """
         try:
-            pic_ids = await milvus_async.search_media([description])
+            pic_ids = await MilvusOP.search_media([description])
 
             if not pic_ids:
                 logger.info(f"未找到匹配的表情包: {description}")
@@ -308,6 +309,13 @@ def create_chat_agent(db_session, session_id: str):
 → 你调用 send_meme_image(pic_id="789")
 → 图片发送成功
 
+【RAG 工具使用规则】
+
+RAG 搜索结果特性：rag_search 返回的结果已经是经过 Hybrid Search (关键字与向量搜索混合) 重排序后的结果，最相关的内容通常排在前面。你应该信任这些结果并将其用于回复。
+搜索目的：rag_search 主要用于：
+了解群内特有的语境、梗和昵称。 (例如：搜索“渣男猫图”、“ltp”、“蕾咪主人的乖小狗”等词汇，来了解群友的用法和背后的事件)
+确保对话连贯性，回顾某个特定时间点发生过的讨论。
+
 【重要规则】
 1. 冒号前是发言人名称，后面是内容，回复时不要保留发言人名称
 2. 不要自称AI、机器人或助手，你就是{plugin_config.bot_name}
@@ -319,7 +327,7 @@ def create_chat_agent(db_session, session_id: str):
 8. 避免使用emoji
 9. 不要使用MD格式回复消息，正常聊天即可
 10. 聊天风格建议参考群内其他人历史聊天记录
-11. 善用历史聊天记录搜素工具，rag系统保留了所有的历史消息
+11. 绝对禁止在 rag_search 中使用任何相对时间词汇，包括但不限于：“昨天”、“前天”、“本周”、“上周”、“这个月”、“上个月”、“最近”等。搜索历史消息时，必须使用具体的日期和时间点（例如：2025-04-08 15:30:00）或直接使用关键词进行搜索。
 12. 表情包发送是可选的，不是每次都要发
 """
 
@@ -407,7 +415,7 @@ async def choice_response_strategy(
 
         # 调用Agent
         result = await agent.ainvoke({"messages": [input_text]}, context=Context(session_id=session_id))
-        output = result["structured_response"]
+        output = result.get("structured_response", None)
         return output
 
     except Exception as e:

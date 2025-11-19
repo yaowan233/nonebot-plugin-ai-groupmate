@@ -24,7 +24,7 @@ from sqlalchemy import Select
 from sqlalchemy.exc import IntegrityError
 
 from .agent import choice_response_strategy
-from .milvus import MilvusOP, milvus_async
+from .milvus import MilvusOP
 from .model import ChatHistory, MediaStorage, ChatHistorySchema, MediaStorageSchema
 from .utils import (
     generate_file_hash,
@@ -128,7 +128,7 @@ async def handle_message(
         )
 
     # ========== 步骤3: 决定是否回复 ==========
-    if msg.extract_plain_text().strip().startswith(plugin_config.bot_name):
+    if msg.extract_plain_text().strip().lower().startswith(plugin_config.bot_name):
         to_me = True
     should_reply = to_me or (random.random() < plugin_config.reply_probability)
     if not event.get_plaintext() and not imgs:
@@ -368,7 +368,7 @@ async def _(db_session: async_scoped_session, session: Uninfo, arg: Message = Co
     await UniMessage.image(raw=image_bytes).send(reply_to=True)
 
 
-@scheduler.scheduled_job("interval", minutes=20)
+@scheduler.scheduled_job("interval", minutes=60)
 async def vectorize_message_history():
     async with get_session() as db_session:
         session_ids = await db_session.execute(Select(ChatHistory.session_id.distinct()))
@@ -411,9 +411,8 @@ async def vectorize_media():
                     db_session.add(media)
                     continue
 
-                # 插入向量数据库 (MilvusOP is synchronous in original use)
                 try:
-                    MilvusOP.insert_media(media.media_id, [PILImage.open(file_path)])
+                    await MilvusOP.insert_media(media.media_id, [PILImage.open(file_path)])
                     media.vectorized = True
                     db_session.add(media)
                     logger.info("向量化成功")

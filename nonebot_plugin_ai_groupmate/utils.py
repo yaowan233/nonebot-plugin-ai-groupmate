@@ -344,14 +344,7 @@ async def insert_vectors_with_retry(
     """
     for attempt in range(max_retries):
         try:
-            # 如果 MilvusOP.batch_insert 是同步的，需要在线程池中执行
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(
-                None,
-                MilvusOP.batch_insert,
-                contexts,
-                session_id
-            )
+            await MilvusOP.batch_insert(contexts, session_id)
             return
         except Exception as e:
             if attempt == max_retries - 1:
