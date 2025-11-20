@@ -33,6 +33,7 @@ class MilvusOperator:
         self.password = password
         self.embed_semaphore = asyncio.Semaphore(1)
         self.rerank_semaphore = asyncio.Semaphore(1)
+        self.clip_semaphore = asyncio.Semaphore(1)
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.ef = BGEM3EmbeddingFunction(
             model_name="BAAI/bge-m3",  # Specify the model name
@@ -144,7 +145,8 @@ class MilvusOperator:
 
     async def insert(self, text, session_id, collection_name="chat_collection"):
         client = self._get_async_client()
-        encoded = self.ef.encode_documents([text])
+        async with self.embed_semaphore:
+            encoded = self.ef.encode_documents([text])
         dense_vector = encoded["dense"][0]
         data = {
             "session_id": session_id,
@@ -161,7 +163,8 @@ class MilvusOperator:
             return []
 
         # 批量编码所有文本
-        encoded = self.ef.encode_documents(texts)
+        async with self.embed_semaphore:
+            encoded = self.ef.encode_documents(texts)
         dense_vectors = encoded["dense"]
 
         # 准备批量插入数据
@@ -185,9 +188,10 @@ class MilvusOperator:
         return res
 
     async def insert_media(self, media_id, image_urls, collection_name="media_collection"):
-        image_embeddings = self.clip_model.encode_image(
-            image_urls
-        )  # also accepts PIL.Image.Image, local filenames, dataURI
+        async with self.clip_semaphore:
+            image_embeddings = await asyncio.to_thread(self.clip_model.encode_image(
+                image_urls
+            ))  # also accepts PIL.Image.Image, local filenames, dataURI
         dense_vector = image_embeddings[0]
         data = {
             "id": media_id,
@@ -260,7 +264,8 @@ class MilvusOperator:
         return best_texts
 
     async def search_media(self, text):
-        text_embeddings = self.clip_model.encode_text(text)
+        async with self.clip_semaphore:
+            text_embeddings = await asyncio.to_thread(self.clip_model.encode_text, text)
         dense_vector = text_embeddings[0]
         client = self._get_async_client()
         res = await client.search(
