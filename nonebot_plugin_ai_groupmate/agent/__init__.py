@@ -269,6 +269,12 @@ def calculate_expression(expression: str) -> str:
 
 
 tools = [search_web, search_history_context, calculate_expression]
+model = ChatOpenAI(
+    model=plugin_config.openai_model,
+    api_key=plugin_config.openai_token,
+    base_url=plugin_config.openai_base_url,
+    temperature=0.7,
+)
 
 
 def create_chat_agent(db_session, session_id: str):
@@ -338,12 +344,6 @@ RAG 搜索结果特性：rag_search 返回的结果已经是经过 Hybrid Search
 12. 表情包发送是可选的，不是每次都要发
 """
 
-    model = ChatOpenAI(
-        model=plugin_config.openai_model,
-        api_key=plugin_config.openai_token,
-        base_url=plugin_config.openai_base_url,
-        temperature=0.7,
-    )
     search_meme_tool = create_search_meme_tool(db_session)
     send_meme_tool = create_send_meme_tool(db_session, session_id)
 
