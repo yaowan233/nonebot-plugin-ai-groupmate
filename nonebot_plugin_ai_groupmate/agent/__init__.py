@@ -244,23 +244,7 @@ def calculate_expression(expression: str) -> str:
     注意：可以使用如 math.sqrt() (开方), math.log() (自然对数), math.pi (圆周率) 等标准数学函数。
     """
     try:
-        # 使用安全的 globals/locals 限制执行环境，仅允许内置函数和 math 库
-        # 为了安全和精准，这里我们限定了可用的函数和模块。
-        allowed_globals = {
-            '__builtins__': None,  # 禁用所有内置函数
-            'math': math,
-            'sqrt': math.sqrt,
-            'pow': math.pow,
-            'log': math.log,
-            'sin': math.sin,
-            'cos': math.cos,
-            'tan': math.tan,
-            'pi': math.pi
-        }
-
-        # 使用 eval() 来执行数学表达式
         result = simple_eval(expression)
-
         # 返回格式化的结果，最多保留10位小数
         return f"计算结果是：{result:.10f}" if isinstance(result, float) else str(result)
 
