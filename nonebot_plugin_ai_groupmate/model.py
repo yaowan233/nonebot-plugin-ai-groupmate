@@ -53,6 +53,16 @@ class UserRelation(Model):
         onupdate=datetime.now
     )
 
+    def get_status_desc(self) -> str:
+        """根据分数返回关系描述"""
+        score = self.favorability
+        if score <= -30: return "厌恶/仇视"
+        if score <= -10: return "冷淡/防备"
+        if score <= 10:  return "陌生/普通"
+        if score <= 40:  return "友善/熟人"
+        if score <= 70:  return "亲密/死党"
+        return "恋人/依赖"
+
 
 class ChatHistorySchema(BaseModel):
     msg_id: int
