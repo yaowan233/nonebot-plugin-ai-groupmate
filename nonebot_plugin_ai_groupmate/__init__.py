@@ -1,6 +1,8 @@
 import asyncio
 import datetime
 import random
+import traceback
+
 import jieba
 import aiofiles
 from io import BytesIO
@@ -16,7 +18,7 @@ from wordcloud import WordCloud
 from PIL import Image as PILImage
 require("nonebot_plugin_alconna")
 require("nonebot_plugin_orm")
-from nonebot_plugin_alconna import Image, image_fetch, UniMessage
+from nonebot_plugin_alconna import Image, image_fetch, UniMessage, get_message_id
 from nonebot_plugin_orm import async_scoped_session, get_session
 from nonebot_plugin_alconna.uniseg import UniMsg
 from nonebot_plugin_uninfo import Uninfo
@@ -73,7 +75,7 @@ async def handle_message(
     """处理消息的主函数"""
     bot_name = plugin_config.bot_name
     imgs = msg.include(Image)
-    content = f"id: {msg.get_message_id(event)}\n"
+    content = f"id: {get_message_id()}\n"
     to_me = False
     is_text = False
     if event.is_tome():
@@ -124,7 +126,7 @@ async def handle_message(
     for img in imgs:
         await process_image_message(
             db_session, img, event, bot, state,
-            session, user_name, f"id: {msg.get_message_id(event)}\n"
+            session, user_name, f"id: {get_message_id()}\n"
         )
 
     # ========== 步骤3: 决定是否回复 ==========
@@ -137,8 +139,14 @@ async def handle_message(
         should_reply = False
     if not event.get_plaintext() and not event.is_tome():
         should_reply = False
+    if to_me:
+        user_id = session.user.id
+        user_name = session.user.name or session.user.nick
+    else:
+        user_id = ""
+        user_name = ""
     if should_reply:
-        await handle_reply_logic(db_session, session, bot_name, event)
+        await handle_reply_logic(db_session, session, bot_name, user_id, user_name)
 
     await db_session.commit()
 
@@ -244,7 +252,8 @@ async def handle_reply_logic(
         db_session,
         session: Uninfo,
         bot_name: str,
-        event: Event,
+        user_id: str,
+        user_name: str,
 ):
     """处理回复逻辑"""
     try:
@@ -271,7 +280,7 @@ async def handle_reply_logic(
 
         # 使用Agent决定回复策略
         logger.info("开始调用Agent决策...")
-        strategy = await choice_response_strategy(db_session, session.scene.id, last_msg, "")
+        strategy = await choice_response_strategy(db_session, session.scene.id, last_msg, user_id, user_name, "")
 
         logger.info(f"Agent决策结果: {strategy}")
 
@@ -382,6 +391,7 @@ async def vectorize_message_history():
                 else:
                     logger.info(f"{session_id} 无需向量化")
             except Exception as e:
+                print(traceback.format_exc())
                 logger.error(f"向量化会话 {session_id} 失败: {e}")
                 continue
 

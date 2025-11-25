@@ -1,8 +1,8 @@
 from datetime import datetime
-from typing import Optional
+from typing import Optional, List
 
 from nonebot_plugin_orm import Model
-from sqlalchemy import String, Boolean
+from sqlalchemy import String, Boolean, JSON
 from sqlalchemy.orm import Mapped, mapped_column
 from pydantic import BaseModel
 
@@ -39,6 +39,20 @@ class ChatHistory(Model):
     user_name: Mapped[str]
     media_id: Mapped[Optional[int]]  # 媒体消息专用
     vectorized: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+
+
+class UserRelation(Model):
+    """用户关系/好感度表"""
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    user_id: Mapped[str] = mapped_column(index=True)
+    user_name: Mapped[str]
+    favorability: Mapped[int] = mapped_column(default=0)  # 好感度，默认0
+    tags: Mapped[List[str]] = mapped_column(JSON, default=list)
+    updated_at: Mapped[datetime] = mapped_column(
+        default=datetime.now,
+        onupdate=datetime.now
+    )
+
 
 class ChatHistorySchema(BaseModel):
     msg_id: int

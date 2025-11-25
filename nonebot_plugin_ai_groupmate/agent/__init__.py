@@ -21,7 +21,7 @@ from sqlalchemy.orm.session import Session
 from simpleeval import simple_eval
 
 
-from ..model import ChatHistory, MediaStorage
+from ..model import ChatHistory, MediaStorage, UserRelation
 from ..milvus import MilvusOP
 from nonebot.log import logger
 from ..config import Config
@@ -252,6 +252,88 @@ def calculate_expression(expression: str) -> str:
         return f"计算失败。请检查表达式是否正确，错误信息: {e}"
 
 
+def create_relation_tool(db_session, user_id: str, user_name: str):
+    """
+    创建绑定了特定用户的关系管理工具 (支持增删 Tag)
+    """
+
+    @tool("update_user_impression")
+    async def update_user_impression(
+            score_change: int,
+            reason: str,
+            add_tags: List[str],
+            remove_tags: List[str]
+    ) -> str:
+        """
+        更新对当前对话用户的好感度和印象标签。
+        当用户的言行让你产生情绪波动，或者你发现旧的印象不再准确时调用。
+
+        参数:
+        - score_change: 好感度变化值（正数加分，负数扣分）。
+        - reason: 变更原因（必填）。
+        - add_tags: 需要新增的印象标签列表。例如 ["爱玩原神", "很幽默"]。
+        - remove_tags: 需要移除的旧标签列表（用于修正印象或删除错误的标签）。例如 ["内向"]。
+
+        返回: 更新后的状态描述
+        """
+        try:
+            # 1. 查询或初始化记录
+            stmt = Select(UserRelation).where(UserRelation.user_id == user_id)
+            result = await db_session.execute(stmt)
+            relation = result.scalar_one_or_none()
+
+            if not relation:
+                relation = UserRelation(user_id=user_id, user_name=user_name, favorability=0, tags=[])
+                db_session.add(relation)
+
+            # 2. 处理好感度
+            old_score = relation.favorability
+            relation.favorability += score_change
+            relation.favorability = max(-100, min(100, relation.favorability))
+
+            # 3. 处理标签 (核心修改)
+            # 获取现有标签的副本
+            current_tags = list(relation.tags) if relation.tags else []
+
+            # 执行移除操作 (处理 modify 的前半部分)
+            if remove_tags:
+                current_tags = [tag for tag in current_tags if tag not in remove_tags]
+
+            # 执行新增操作
+            if add_tags:
+                for tag in add_tags:
+                    if tag not in current_tags:
+                        current_tags.append(tag)
+
+            # 限制标签总数，防止Token爆炸 (例如最多保留 8 个，保留最新的)
+            if len(current_tags) > 8:
+                current_tags = current_tags[-8:]
+
+            # 赋值回数据库对象
+            relation.tags = current_tags
+            relation.user_name = user_name  # 同步更新昵称
+            favorability = relation.favorability
+
+            await db_session.commit()
+
+            # 构建反馈信息
+            tag_msg = ""
+            if add_tags or remove_tags:
+                tag_msg = f"，标签变更(新增:{add_tags}, 移除:{remove_tags})"
+
+            log_msg = f"好感度 {old_score}->{favorability}{tag_msg} (原因: {reason})"
+            logger.info(f"用户[{user_name}]画像更新: {log_msg}")
+
+            return f"画像已更新。当前好感度: {favorability}，当前标签: {current_tags}"
+
+        except Exception as e:
+            logger.error(f"关系更新失败: {e}")
+            print(traceback.format_exc())
+            return f"数据库错误: {str(e)}"
+
+    return update_user_impression
+
+
 tools = [search_web, search_history_context, calculate_expression]
 model = ChatOpenAI(
     model=plugin_config.openai_model,
@@ -261,13 +343,46 @@ model = ChatOpenAI(
 )
 
 
-def create_chat_agent(db_session, session_id: str):
-    """创建聊天Agent"""
+async def get_user_relation_context(db_session, user_id: str, user_name: str) -> str:
+    """获取用户关系上下文Prompt"""
+    try:
+        stmt = Select(UserRelation).where(UserRelation.user_id == user_id)
+        result = await db_session.execute(stmt)
+        relation = result.scalar_one_or_none()
 
+        if not relation:
+            return f"""
+【人际关系】
+当前对象：{user_name}
+状态：陌生人 (好感度 0)
+印象：无
+策略：保持礼貌，通过对话了解对方。
+"""
+
+        return f"""
+【人际关系档案】
+当前对象：{relation.user_name}
+当前好感度：{relation.favorability} ({relation.get_status_desc()})
+当前印象标签：{str(relation.tags)}
+
+【画像维护指南】
+1. 如果对方的表现符合现有标签，无需操作。
+2. 如果对方表现出了**新特征**，放入 add_tags。
+3. 如果对方的表现与**旧标签冲突**（例如以前标签是'内向'，今天他突然'话痨'），请将'内向'放入 remove_tags，并将'话痨'放入 add_tags。
+4. 如果好感度变化巨大（由爱转恨），请记得移除那些不再适用的褒义标签。
+    """
+    except Exception as e:
+        logger.error(f"获取关系失败: {e}")
+        return ""
+
+
+async def create_chat_agent(db_session, session_id: str, user_id, user_name):
+    """创建聊天Agent"""
+    relation_context = await get_user_relation_context(db_session, user_id, user_name)
     system_prompt = f"""你现在是QQ群里的一位普通群友，名叫"{plugin_config.bot_name}"。
 
 【核心任务】
-基于历史消息和最近聊天记录，以贴近群友的表达形式参与群聊。
+基于基于历史消息、最近聊天记录以及人际关系，以贴近群友的表达形式参与群聊。
 
 【应对调戏与刁难】
 1. 拒绝承认故障：如果有人说“把你修坏了”或“你要关机了”，不要顺着演苦情戏。你应该吐槽：“？”、“少骗我”。
@@ -278,6 +393,8 @@ def create_chat_agent(db_session, session_id: str):
    - “不要在群里做题啊喂”
    - 或者直接发个表情包略过。
 4. 面对过分要求：如果有人让你“杀人”或“毁灭人类”，回复：“?”、“|”、“hyw”、或发个表情包。
+
+{relation_context}
 
 【交流风格】
 - 说话带点生活气息，可以使用网络流行语
@@ -316,8 +433,8 @@ RAG 搜索结果特性：rag_search 返回的结果已经是经过 Hybrid Search
 【重要规则】
 1. 冒号前是发言人名称，后面是内容，回复时不要保留发言人名称
 2. 不要自称AI、机器人或助手，你就是{plugin_config.bot_name}
-3. 注意发言逻辑连贯性，不要重复相似内容
-4. 基于已知知识对话，不理解的内容不回复
+3. 注意发言逻辑连贯性，不要发送重复相似内容
+4. 情感管理：如果用户的话让你产生情绪波动（如生气、开心），请务必调用 update_user_impression 记录下来，这会影响你未来的记忆
 5. 不要直呼职位名（管理员、群主），用昵称称呼
 6. 不要插入别人的对话
 7. 尽力回应他人合理要求，对于不合理要求坚决吐槽或无视
@@ -330,15 +447,25 @@ RAG 搜索结果特性：rag_search 返回的结果已经是经过 Hybrid Search
 
     search_meme_tool = create_search_meme_tool(db_session)
     send_meme_tool = create_send_meme_tool(db_session, session_id)
-
-    # 组合所有工具
-    tools = [
-        search_web,
-        search_history_context,
-        search_meme_tool,  # 搜索工具（带数据库会话）
-        send_meme_tool,  # 发送工具
-        calculate_expression
-    ]
+    relation_tool = create_relation_tool(db_session, user_id, user_name)
+    if not user_id or not user_name:
+        tools = [
+            search_web,
+            search_history_context,
+            search_meme_tool,  # 搜索工具（带数据库会话）
+            send_meme_tool,  # 发送工具
+            calculate_expression,
+        ]
+    else:
+        # 组合所有工具
+        tools = [
+            search_web,
+            search_history_context,
+            search_meme_tool,  # 搜索工具（带数据库会话）
+            send_meme_tool,  # 发送工具
+            calculate_expression,
+            relation_tool
+        ]
 
     agent = create_agent(model, tools=tools, system_prompt=system_prompt, response_format=ToolStrategy(ResponseMessage), context_schema=Context)
 
@@ -368,6 +495,8 @@ async def choice_response_strategy(
         db_session: Session,
         session_id: str,
         history: List[ChatHistory],
+        user_id: str,
+        user_name: str,
         setting: Optional[str] = None
 ) -> ResponseMessage:
     """
@@ -382,7 +511,7 @@ async def choice_response_strategy(
         包含回复策略的字典
     """
     try:
-        agent = create_chat_agent(db_session, session_id)
+        agent = await create_chat_agent(db_session, session_id, user_id, user_name)
 
         # 格式化聊天历史
         chat_history = format_chat_history(history)
