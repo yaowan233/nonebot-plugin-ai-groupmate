@@ -398,7 +398,7 @@ async def vectorize_message_history():
 async def vectorize_media():
     async with get_session() as db_session:
         medias_res = await db_session.execute(
-            Select(MediaStorage).where(MediaStorage.references >= 3, MediaStorage.vectorized == False)
+            Select(MediaStorage).where(MediaStorage.references >= 3, MediaStorage.vectorized.is_(False))
         )
         medias = medias_res.scalars().all()
         logger.info(f"待向量化媒体数量: {len(medias)}")
