@@ -4,7 +4,6 @@ import random
 import traceback
 
 import jieba
-import aiofiles
 from io import BytesIO
 from pathlib import Path
 
@@ -27,11 +26,10 @@ from sqlalchemy.exc import IntegrityError
 
 from .agent import choice_response_strategy
 from .milvus import MilvusOP
-from .model import ChatHistory, MediaStorage, ChatHistorySchema, MediaStorageSchema
+from .model import ChatHistory, MediaStorage, ChatHistorySchema
 from .utils import (
     generate_file_hash,
     check_and_compress_image_bytes,
-    bytes_to_base64,
     process_and_vectorize_session_chats,
 )
 from .vlm import image_vl
@@ -47,7 +45,7 @@ plugin_data_dir: Path = store.get_plugin_data_dir()
 pic_dir = plugin_data_dir / "pics"
 pic_dir.mkdir(parents=True, exist_ok=True)
 plugin_config = get_plugin_config(Config)
-with open(Path(__file__).parent / "stop_words.txt", "r", encoding="utf-8") as f:
+with open(Path(__file__).parent / "stop_words.txt", encoding="utf-8") as f:
     stop_words = f.read().splitlines() + ["id"]
 
 
@@ -442,7 +440,6 @@ async def vectorize_media():
 @scheduler.scheduled_job("interval", minutes=35)
 async def clear_cache_pic():
     async with get_session() as db_session:
-        cutoff = datetime.datetime.now() - datetime.timedelta(days=30)
         result = await db_session.execute(
             Select(MediaStorage).where(MediaStorage.references < 3, datetime.datetime.now() - MediaStorage.created_at > datetime.timedelta(days=30))
         )

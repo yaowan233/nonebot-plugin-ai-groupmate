@@ -1,5 +1,4 @@
 from .config import Config
-from typing import Optional
 from nonebot import get_plugin_config
 from ollama import ChatResponse, Message, Image, AsyncClient
 
@@ -9,11 +8,12 @@ client = AsyncClient(
   host=plugin_config.vlm_ollama_base_url, timeout=15
 )
 
-async def image_vl(file_path, prompt: str = "请描述一下这个图片") -> Optional[str]:
+async def image_vl(file_path, prompt: str = "请描述一下这个图片") -> str | None:
     global client
     try:
         response: ChatResponse = await client.chat(model=plugin_config.vlm_model, messages=[
-            Message(role='user', content=prompt, images=[Image(value=file_path)])], options={"repeat_penalty": 1.5, "num_ctx": 1024})
+            Message(role="user", content=prompt, images=[Image(value=file_path)])],
+                                                   options={"repeat_penalty": 1.5, "num_ctx": 1024})
     except Exception as e:
         print(file_path)
         print(e)

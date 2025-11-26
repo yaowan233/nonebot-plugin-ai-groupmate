@@ -36,6 +36,15 @@ dependencies = [
 ]
 
 
+[tool.ruff]
+line-length = 300
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "UP", "C", "T", "PYI", "PT", "Q"]
+ignore = ["C901", "T201", "E731", "E402"]
+
+
 [project.urls]
 Homepage = "https://github.com/yaowan233/nonebot-plugin-ai-groupmate"
 Repository = "https://github.com/yaowan233/nonebot-plugin-ai-groupmate"

@@ -4,8 +4,6 @@ os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 import time
-from typing import Optional
-
 import torch
 from nonebot import get_plugin_config
 from pymilvus import (
@@ -32,16 +30,16 @@ class MilvusOperator:
         self.user = user
         self.password = password
         self.semaphore = asyncio.Semaphore(1)
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.ef = BGEM3EmbeddingFunction(
             model_name="BAAI/bge-m3",  # Specify the model name
-            device='cuda' if torch.cuda.is_available() else 'cpu',  # Specify the device to use, e.g., 'cpu' or 'cuda:0'
+            device="cuda" if torch.cuda.is_available() else "cpu",  # Specify the device to use, e.g., 'cpu' or 'cuda:0'
         )
         self.bge_rf = BGERerankFunction(
             model_name="BAAI/bge-reranker-v2-m3",  # Specify the model name. Defaults to `BAAI/bge-reranker-v2-m3`.
-            device='cuda' if torch.cuda.is_available() else 'cpu'  # Specify the device to use, e.g., 'cpu' or 'cuda:0'
+            device="cuda" if torch.cuda.is_available() else "cpu"  # Specify the device to use, e.g., 'cpu' or 'cuda:0'
         )
-        self.clip_model = AutoModel.from_pretrained('jinaai/jina-clip-v2', trust_remote_code=True).to(device)
+        self.clip_model = AutoModel.from_pretrained("jinaai/jina-clip-v2", trust_remote_code=True).to(device)
         # Put model in evaluation mode
         self.clip_model.eval()
         self.client = MilvusClient(uri, user, password)
@@ -187,7 +185,7 @@ class MilvusOperator:
 
     async def insert_media(self, media_id, image_urls, collection_name="media_collection"):
         async with self.semaphore:
-            image_embeddings = await asyncio.to_thread(self.clip_model.encode_image, image_urls)  # also accepts PIL.Image.Image, local filenames, dataURI
+            image_embeddings = await asyncio.to_thread(self.clip_model.encode_image, image_urls)
         dense_vector = image_embeddings[0]
         data = {
             "id": media_id,
@@ -201,7 +199,7 @@ class MilvusOperator:
     async def search(
             self,
             text: list[str],
-            search_filter: Optional[str] = None,
+            search_filter: str | None = None,
             collection_name="chat_collection",
     ):
         async with self.semaphore:

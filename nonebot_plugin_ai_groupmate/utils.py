@@ -3,7 +3,6 @@ import base64
 import hashlib
 import traceback
 from datetime import timedelta
-from typing import List, Optional, Dict, Tuple
 
 from PIL import Image
 import io
@@ -129,7 +128,7 @@ async def split_chat_into_context_groups(
         max_time_gap: timedelta = timedelta(hours=1),
         max_token_count: int = 700,
         max_messages: int = 50,
-) -> List[List[ChatHistory]]:
+) -> list[list[ChatHistory]]:
     """
     将一个会话内的聊天记录智能切分为多个上下文组
 
@@ -226,7 +225,7 @@ async def process_and_vectorize_session_chats(
         max_token_count: int = 1000,
         chunk_size: int = 100,
         commit_interval: int = 500,
-) -> Optional[Dict]:
+) -> dict | None:
     """
     处理并向量化一个会话内的聊天记录，按上下文智能切分
 
@@ -313,7 +312,7 @@ async def process_and_vectorize_session_chats(
 
 def combine_messages_into_context(
         messages: list[ChatHistory]
-) -> Tuple[str, List[str]]:
+) -> tuple[str, list[str]]:
     context_parts = []
     msg_ids = []
 
@@ -335,7 +334,7 @@ def combine_messages_into_context(
 
 
 async def insert_vectors_with_retry(
-        contexts: List[str],
+        contexts: list[str],
         session_id: str,
         max_retries: int = 3
 ) -> None:
@@ -357,7 +356,7 @@ async def insert_vectors_with_retry(
 
 async def update_messages_in_batches(
         db_session: AsyncSession,
-        msg_ids: List[str],
+        msg_ids: list[str],
         batch_size: int = 500
 ) -> None:
     """
@@ -382,7 +381,7 @@ async def update_messages_in_batches(
 
 async def update_messages_one_by_one(
         db_session: AsyncSession,
-        msg_ids: List[str]
+        msg_ids: list[str]
 ) -> None:
     """
     逐条更新（降级方案）

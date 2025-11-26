@@ -1,10 +1,9 @@
 import asyncio
 import datetime
 import json
-import math
 import traceback
 from dataclasses import dataclass
-from typing import List, Optional, Any
+from typing import Any
 from sqlalchemy import Select
 
 from langchain.agents.structured_output import ToolStrategy
@@ -44,17 +43,17 @@ class Context:
 class ResponseMessage(BaseModel):
     """模型回复内容"""
     need_reply: bool = Field(description="是否需要回复")
-    text: Optional[str] = Field(description="回复文本(可选)")
+    text: str | None = Field(description="回复文本(可选)")
 
     # 定义一个 field_validator 来处理 text 字段
-    @field_validator('text', mode='before')
+    @field_validator("text", mode="before")
     @classmethod
-    def convert_null_string_to_none(cls, value: Any) -> Optional[str]:
+    def convert_null_string_to_none(cls, value: Any) -> str | None:
         """
         在字段验证之前运行，将字符串 'null' (不区分大小写) 转换为 None。
         """
         # 检查值是否是字符串，并且在转换为小写后是否等于 'null'
-        if isinstance(value, str) and value.lower() == 'null':
+        if isinstance(value, str) and value.lower() == "null":
             return None  # 返回 None，Pydantic 将其视为缺失或 null 值
 
         return value
@@ -171,7 +170,7 @@ def create_send_meme_tool(db_session, session_id: str):
     """
 
     @tool("send_meme_image")
-    async def send_meme_image(pic_id: Optional[str] = None) -> str:
+    async def send_meme_image(pic_id: str | None = None) -> str:
         """
         发送表情包图片到聊天中。
 
@@ -261,8 +260,8 @@ def create_relation_tool(db_session, user_id: str, user_name: str):
     async def update_user_impression(
             score_change: int,
             reason: str,
-            add_tags: List[str],
-            remove_tags: List[str]
+            add_tags: list[str],
+            remove_tags: list[str]
     ) -> str:
         """
         更新对当前对话用户的好感度和印象标签。
@@ -370,7 +369,7 @@ async def get_user_relation_context(db_session, user_id: str, user_name: str) ->
 2. 如果对方表现出了**新特征**，放入 add_tags。
 3. 如果对方的表现与**旧标签冲突**（例如以前标签是'内向'，今天他突然'话痨'），请将'内向'放入 remove_tags，并将'话痨'放入 add_tags。
 4. 如果好感度变化巨大（由爱转恨），请记得移除那些不再适用的褒义标签。
-    """
+"""
     except Exception as e:
         logger.error(f"获取关系失败: {e}")
         return ""
@@ -414,7 +413,7 @@ async def create_chat_agent(db_session, session_id: str, user_id, user_name):
 
 示例流程：
 用户："太好笑了"
-→ 你调用 search_meme_image("笑") 
+→ 你调用 search_meme_image("笑")
 → 返回：
   - pic_id: 123, 描述: "一只猫咪笑得眯起眼睛"
   - pic_id: 456, 描述: "熊猫捂嘴偷笑"
@@ -467,12 +466,13 @@ RAG 搜索结果特性：rag_search 返回的结果已经是经过 Hybrid Search
             relation_tool
         ]
 
-    agent = create_agent(model, tools=tools, system_prompt=system_prompt, response_format=ToolStrategy(ResponseMessage), context_schema=Context)
+    agent = create_agent(model, tools=tools, system_prompt=system_prompt,
+                         response_format=ToolStrategy(ResponseMessage), context_schema=Context)
 
     return agent
 
 
-def format_chat_history(history: List[ChatHistory]) -> List:
+def format_chat_history(history: list[ChatHistory]) -> list:
     """将聊天历史格式化为LangChain消息格式"""
     messages = []
     for msg in history:
@@ -494,10 +494,10 @@ def format_chat_history(history: List[ChatHistory]) -> List:
 async def choice_response_strategy(
         db_session: Session,
         session_id: str,
-        history: List[ChatHistory],
+        history: list[ChatHistory],
         user_id: str,
         user_name: str,
-        setting: Optional[str] = None
+        setting: str | None = None
 ) -> ResponseMessage:
     """
     使用Agent决定回复策略
@@ -544,7 +544,7 @@ async def choice_response_strategy(
         return ResponseMessage(need_reply=False, text="")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     model = ChatOpenAI(
         model=plugin_config.openai_model,
         api_key=plugin_config.openai_token,

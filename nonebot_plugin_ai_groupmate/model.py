@@ -1,5 +1,4 @@
 from datetime import datetime
-from typing import Optional, List
 
 from nonebot_plugin_orm import Model
 from sqlalchemy import String, Boolean, JSON
@@ -37,7 +36,7 @@ class ChatHistory(Model):
     content: Mapped[str]
     created_at: Mapped[datetime] = mapped_column(default=datetime.now, index=True)
     user_name: Mapped[str]
-    media_id: Mapped[Optional[int]]  # 媒体消息专用
+    media_id: Mapped[int | None]  # 媒体消息专用
     vectorized: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
 
 
@@ -47,7 +46,7 @@ class UserRelation(Model):
     user_id: Mapped[str] = mapped_column(index=True)
     user_name: Mapped[str]
     favorability: Mapped[int] = mapped_column(default=0)  # 好感度，默认0
-    tags: Mapped[List[str]] = mapped_column(JSON, default=list)
+    tags: Mapped[list[str]] = mapped_column(JSON, default=list)
     updated_at: Mapped[datetime] = mapped_column(
         default=datetime.now,
         onupdate=datetime.now
@@ -56,11 +55,16 @@ class UserRelation(Model):
     def get_status_desc(self) -> str:
         """根据分数返回关系描述"""
         score = self.favorability
-        if score <= -30: return "厌恶/仇视"
-        if score <= -10: return "冷淡/防备"
-        if score <= 10:  return "陌生/普通"
-        if score <= 40:  return "友善/熟人"
-        if score <= 70:  return "亲密/死党"
+        if score <= -30:
+            return "厌恶/仇视"
+        if score <= -10:
+            return "冷淡/防备"
+        if score <= 10:
+            return "陌生/普通"
+        if score <= 40:
+            return "友善/熟人"
+        if score <= 70:
+            return "亲密/死党"
         return "恋人/依赖"
 
 
@@ -72,8 +76,8 @@ class ChatHistorySchema(BaseModel):
     content: str
     created_at: datetime
     user_name: str
-    media_id: Optional[int] = None
-    vectorized: Optional[bool] = False
+    media_id: int | None = None
+    vectorized: bool | None = False
 
     class Config:
         from_attributes = True  # ✅ 允许从 ORM 对象创建
