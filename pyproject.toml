@@ -71,6 +71,7 @@ ignore = ["C901", "T201", "E731", "E402"]
 force-sort-within-sections = true
 
 [tool.nonebot]
+adapters = []
 plugins = ["nonebot_plugin_ai_groupmate"]
 
 [tool.poe.tasks]
