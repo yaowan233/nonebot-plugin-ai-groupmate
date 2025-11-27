@@ -31,7 +31,11 @@ plugin_data_dir = store.get_plugin_data_dir()
 pic_dir = plugin_data_dir / "pics"
 
 plugin_config = get_plugin_config(Config)
-tavily_search = TavilySearch(max_results=3, tavily_api_key=plugin_config.tavily_api_key)
+
+if plugin_config.tavily_api_key:
+    tavily_search = TavilySearch(max_results=3, tavily_api_key=plugin_config.tavily_api_key)
+else:
+    tavily_search = None
 
 
 @dataclass
@@ -65,6 +69,9 @@ async def search_web(query: str) -> str:
     用于搜索最新的实时信息。当你需要最新的事实信息、天气或新闻时使用。
     输入：需要搜索的内容。
     """
+    if not tavily_search:
+        logger.error("没有配置 tavily_api_key, 无法进行搜索")
+        return "没有配置 tavily_api_key, 无法进行搜索"
     # TavilySearch 已经内置了 ainvoke 方法
     results = await tavily_search.ainvoke(query)
     return results
