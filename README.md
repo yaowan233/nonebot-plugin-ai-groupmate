@@ -27,7 +27,7 @@ _✨ ai groupmate ✨_
 
 接入vlm，并且自动学习表情包，自动在群内学习并偷取表情包。
 
-
+使用 langchain，利用 agent 进行决策
 ## 💿 安装
 
 <details>
