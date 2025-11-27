@@ -69,6 +69,11 @@ ignore = ["C901", "T201", "E731", "E402"]
 [tool.ruff.lint.isort]
 force-sort-within-sections = true
 
+[tool.poe.tasks]
+test = "pytest --cov=src --cov-report xml --junitxml=./junit.xml -n auto"
+bump = "bump-my-version bump"
+show-bump = "bump-my-version show-bump"
+
 [tool.pyright]
 pythonVersion = "3.10"
 pythonPlatform = "All"
