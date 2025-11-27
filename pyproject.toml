@@ -69,6 +69,9 @@ ignore = ["C901", "T201", "E731", "E402"]
 [tool.ruff.lint.isort]
 force-sort-within-sections = true
 
+[tool.nonebot]
+plugins = ["nonebot_plugin_ai_groupmate"]
+
 [tool.poe.tasks]
 test = "pytest --cov=src --cov-report xml --junitxml=./junit.xml -n auto"
 bump = "bump-my-version bump"
