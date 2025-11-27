@@ -11,7 +11,7 @@ async def test_pip(app: App):
 
     event = fake_group_message_event_v11(message="hello")
     try:
-        from src.nonebot_plugin_ai_groupmate import record  # type:ignore
+        from nonebot_plugin_ai_groupmate import record  # type:ignore
     except ImportError:
         pytest.skip("nonebot_plugin_ai_groupmate.record not found")
 
