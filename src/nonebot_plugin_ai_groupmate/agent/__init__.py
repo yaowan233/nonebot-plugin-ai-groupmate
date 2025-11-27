@@ -554,7 +554,7 @@ if __name__ == "__main__":
     model = ChatOpenAI(
         model=plugin_config.openai_model,
         api_key=plugin_config.openai_token,
-        base_url=plugin_config.base_url,
+        base_url=plugin_config.openai_base_url,
         temperature=0.7,
     )
     agent = create_agent(model, tools=tools, response_format=ToolStrategy(ResponseMessage))

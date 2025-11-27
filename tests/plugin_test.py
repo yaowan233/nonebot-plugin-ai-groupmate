@@ -19,4 +19,24 @@ async def test_pip(app: App):
         adapter = nonebot.get_adapter(OnebotV11Adapter)
         bot = ctx.create_bot(base=Bot, adapter=adapter)
         ctx.receive_event(bot, event)
+        ctx.should_call_api(
+            "get_group_info",
+            {"group_id": 87654321},  # 这里的 ID 必须和 fake.py 里定义的一致
+            result={"group_id": 87654321, "group_name": "Test Group", "member_count": 10} # 模拟的返回值
+        )
+        ctx.should_call_api(
+            "get_group_member_info",
+            {
+                "group_id": 87654321,
+                "user_id": 12345678,
+                "no_cache": True   # 注意：报错里显示 uninfo 传了 no_cache=True，这里必须完全一致
+            },
+            result={
+                "group_id": 87654321,
+                "user_id": 12345678,
+                "nickname": "test_nick",
+                "card": "",
+                "role": "member",
+            }
+        )
         ctx.should_finished()
