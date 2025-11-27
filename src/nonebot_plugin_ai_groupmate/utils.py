@@ -1,21 +1,19 @@
 import asyncio
 import base64
-import hashlib
-import traceback
 from datetime import timedelta
-
-from PIL import Image
+import hashlib
 import io
+import traceback
 
+from nonebot import get_plugin_config, logger
 from nonebot_plugin_orm import AsyncSession
+from PIL import Image
 from sqlalchemy import Select, Update
-
-from nonebot import logger, get_plugin_config
 from tqdm import tqdm
 
-from .model import ChatHistory, ChatHistorySchema
-from .milvus import MilvusOP
 from .config import Config
+from .milvus import MilvusOP
+from .model import ChatHistory, ChatHistorySchema
 
 plugin_config = get_plugin_config(Config)
 

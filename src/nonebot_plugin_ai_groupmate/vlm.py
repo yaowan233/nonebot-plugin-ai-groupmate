@@ -1,9 +1,11 @@
 import base64
 import mimetypes
 
-from openai import AsyncOpenAI
-from ollama import ChatResponse, Message, Image, AsyncClient as OllamaClient
 from nonebot import get_plugin_config, logger
+from ollama import AsyncClient as OllamaClient
+from ollama import ChatResponse, Image, Message
+from openai import AsyncOpenAI
+
 from .config import Config
 
 plugin_config = get_plugin_config(Config)

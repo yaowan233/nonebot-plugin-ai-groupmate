@@ -1,22 +1,16 @@
 import asyncio
 import os
+
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 import time
-import torch
+
 from nonebot import get_plugin_config
-from pymilvus import (
-    MilvusClient,
-    DataType,
-    Function,
-    FunctionType,
-    AnnSearchRequest,
-    WeightedRanker,
-    AsyncMilvusClient
-)
+from pymilvus import AnnSearchRequest, AsyncMilvusClient, DataType, Function, FunctionType, MilvusClient, WeightedRanker
 from pymilvus.model.hybrid import BGEM3EmbeddingFunction
 from pymilvus.model.reranker import BGERerankFunction
+import torch
 from transformers import AutoModel
 
 from ..config import Config

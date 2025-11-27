@@ -1,39 +1,39 @@
 import asyncio
 import datetime
+from io import BytesIO
+from pathlib import Path
 import random
 import traceback
 
 import jieba
-from io import BytesIO
-from pathlib import Path
-
-from nonebot import on_message, require, Bot, logger, get_plugin_config, on_command
+from nonebot import Bot, get_plugin_config, logger, on_command, on_message, require
 from nonebot.adapters.onebot.v11 import GroupMessageEvent
 from nonebot.internal.adapter import Event, Message
 from nonebot.internal.rule import Rule
 from nonebot.params import CommandArg
 from nonebot.typing import T_State
-from wordcloud import WordCloud
 from PIL import Image as PILImage
+from wordcloud import WordCloud
+
 require("nonebot_plugin_alconna")
 require("nonebot_plugin_orm")
-from nonebot_plugin_alconna import Image, image_fetch, UniMessage, get_message_id
-from nonebot_plugin_orm import async_scoped_session, get_session
+from nonebot_plugin_alconna import Image, UniMessage, get_message_id, image_fetch
 from nonebot_plugin_alconna.uniseg import UniMsg
+from nonebot_plugin_orm import async_scoped_session, get_session
 from nonebot_plugin_uninfo import Uninfo
 from sqlalchemy import Select
 from sqlalchemy.exc import IntegrityError
 
 from .agent import choice_response_strategy
+from .config import Config
 from .milvus import MilvusOP
-from .model import ChatHistory, MediaStorage, ChatHistorySchema
+from .model import ChatHistory, ChatHistorySchema, MediaStorage
 from .utils import (
-    generate_file_hash,
     check_and_compress_image_bytes,
+    generate_file_hash,
     process_and_vectorize_session_chats,
 )
 from .vlm import image_vl
-from .config import Config
 
 require("nonebot_plugin_localstore")
 require("nonebot_plugin_apscheduler")
