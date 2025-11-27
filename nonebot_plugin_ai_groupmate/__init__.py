@@ -46,7 +46,7 @@ pic_dir = plugin_data_dir / "pics"
 pic_dir.mkdir(parents=True, exist_ok=True)
 plugin_config = get_plugin_config(Config)
 with open(Path(__file__).parent / "stop_words.txt", encoding="utf-8") as f:
-    stop_words = f.read().splitlines() + ["id"]
+    stop_words = f.read().splitlines() + ["id", "回复"]
 
 
 async def check_group_permission(event: GroupMessageEvent):
