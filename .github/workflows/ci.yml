@@ -76,7 +76,7 @@ jobs:
         run: uv sync --no-dev
 
       - name: Run migrations
-        run: uv run nb-cli orm upgrade
+        run: uv run nb orm upgrade
 
       - name: Run Pytest
         run: uv run poe test

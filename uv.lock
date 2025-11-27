@@ -2343,7 +2343,6 @@ dependencies = [
     { name = "langchain-openai" },
     { name = "langchain-tavily" },
     { name = "matplotlib" },
-    { name = "nb-cli" },
     { name = "nonebot-adapter-onebot" },
     { name = "nonebot-plugin-alconna" },
     { name = "nonebot-plugin-apscheduler" },
@@ -2374,6 +2373,7 @@ dev = [
     { name = "ruff" },
 ]
 test = [
+    { name = "nb-cli" },
     { name = "nonebot-adapter-onebot" },
     { name = "nonebot-plugin-orm", extra = ["default"] },
     { name = "nonebot2", extra = ["fastapi"] },
@@ -2395,7 +2395,6 @@ requires-dist = [
     { name = "langchain-openai", specifier = ">=1.0.3" },
     { name = "langchain-tavily", specifier = ">=0.2.13" },
     { name = "matplotlib", specifier = ">=3.10.1" },
-    { name = "nb-cli", specifier = ">=1.5.0" },
     { name = "nonebot-adapter-onebot", specifier = ">=2.4.6" },
     { name = "nonebot-plugin-alconna", specifier = ">=0.60.3" },
     { name = "nonebot-plugin-apscheduler", specifier = ">=0.5.0" },
@@ -2425,6 +2424,7 @@ dev = [
     { name = "ruff", specifier = ">=0.14.5,<1.0.0" },
 ]
 test = [
+    { name = "nb-cli", specifier = ">=1.5.0" },
     { name = "nonebot-adapter-onebot", specifier = ">=2.4.6,<3.0.0" },
     { name = "nonebot-plugin-orm", extras = ["default"], specifier = ">=0.8.2" },
     { name = "nonebot2", extras = ["fastapi"], specifier = ">=2.4.4,<3.0.0" },
