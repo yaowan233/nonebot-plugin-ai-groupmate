@@ -33,7 +33,7 @@ jobs:
           version: "latest"
 
       - name: Install Dependencies
-        run: uv sync --locked
+        run: uv sync
 
       - name: Static typing check
         run: uvx basedpyright
