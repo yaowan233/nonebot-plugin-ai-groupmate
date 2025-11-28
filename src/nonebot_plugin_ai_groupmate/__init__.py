@@ -30,7 +30,7 @@ from sqlalchemy.exc import IntegrityError
 
 from .agent import choice_response_strategy
 from .config import Config
-from .milvus import MilvusOP, MilvusOperator
+from .milvus import MilvusOP
 from .model import ChatHistory, ChatHistorySchema, MediaStorage
 from .utils import (
     check_and_compress_image_bytes,
@@ -55,13 +55,6 @@ pic_dir.mkdir(parents=True, exist_ok=True)
 plugin_config = get_plugin_config(Config)
 with open(Path(__file__).parent / "stop_words.txt", encoding="utf-8") as f:
     stop_words = f.read().splitlines() + ["id", "回复"]
-
-driver = get_driver()
-
-
-@driver.on_startup
-async def init_milvus():
-    MilvusOP = MilvusOperator(plugin_config.milvus_uri, plugin_config.milvus_user, plugin_config.milvus_password)
 
 
 record = on_message(
