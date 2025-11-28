@@ -1,12 +1,12 @@
 import asyncio
 import os
+import time
 
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
-import time
 
-from nonebot import get_plugin_config
+from nonebot import get_plugin_config, get_driver, logger
 from pymilvus import AnnSearchRequest, AsyncMilvusClient, DataType, Function, FunctionType, MilvusClient, WeightedRanker
 from pymilvus.model.hybrid import BGEM3EmbeddingFunction
 from pymilvus.model.reranker import BGERerankFunction
@@ -20,31 +20,73 @@ class MilvusOperator:
     def __init__(
             self, uri: str = "http://localhost:19530", user: str = "", password: str = ""
     ):
+        # 1. __init__ 中只保存配置，不连接数据库，不加载模型
         self.uri = uri
         self.user = user
         self.password = password
         self.semaphore = asyncio.Semaphore(1)
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.ef = BGEM3EmbeddingFunction(
-            model_name="BAAI/bge-m3",  # Specify the model name
-            device="cuda" if torch.cuda.is_available() else "cpu",  # Specify the device to use, e.g., 'cpu' or 'cuda:0'
-        )
-        self.bge_rf = BGERerankFunction(
-            model_name="BAAI/bge-reranker-v2-m3",  # Specify the model name. Defaults to `BAAI/bge-reranker-v2-m3`.
-            device="cuda" if torch.cuda.is_available() else "cpu"  # Specify the device to use, e.g., 'cpu' or 'cuda:0'
-        )
-        self.clip_model = AutoModel.from_pretrained("jinaai/jina-clip-v2", trust_remote_code=True).to(device)
-        # Put model in evaluation mode
-        self.clip_model.eval()
-        self.client = MilvusClient(uri, user, password)
+
+        # 将模型和客户端占位符设为 None
+        self.ef = None
+        self.bge_rf = None
+        self.clip_model = None
+        self.client = None
         self.async_client = None
-        self.ranker = WeightedRanker(0.8, 0.3)
+        self.ranker = None
+        self.initialized = False
+
+    async def init_models(self):
+        """
+        2. 创建一个专门的初始化方法，在 NoneBot 启动时调用
+        """
+        if self.initialized:
+            return
+
+        logger.info("正在加载 Milvus 模型和连接数据库...")
+        try:
+            # 这里的耗时操作只会发生在启动阶段，而不是 import 阶段
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+            # 使用 asyncio.to_thread 避免阻塞主线程（虽然模型加载主要是 CPU/IO 密集型）
+            self.ef = await asyncio.to_thread(BGEM3EmbeddingFunction,
+                                              model_name="BAAI/bge-m3",
+                                              device=str(device)
+                                              )
+
+            self.bge_rf = await asyncio.to_thread(BGERerankFunction,
+                                                  model_name="BAAI/bge-reranker-v2-m3",
+                                                  device=str(device)
+                                                  )
+
+            self.clip_model = await asyncio.to_thread(
+                AutoModel.from_pretrained,
+                "jinaai/jina-clip-v2",
+                trust_remote_code=True
+            )
+            self.clip_model.to(device)
+            self.clip_model.eval()
+
+            # 初始化客户端
+            self.client = MilvusClient(self.uri, self.user, self.password)
+            self.ranker = WeightedRanker(0.8, 0.3)
+
+            # 初始化 Collections (逻辑保持不变)
+            self._init_collections()
+
+            self.initialized = True
+            logger.success("Milvus 模型加载及数据库连接完成。")
+
+        except Exception as e:
+            logger.error(f"Milvus 初始化失败: {e}")
+            raise e
+
+    def _init_collections(self):
+        """将创建 Collection 的逻辑抽离出来"""
         if not self.client.has_collection(collection_name="chat_collection"):
             schema = MilvusClient.create_schema(
                 auto_id=True,
                 enable_dynamic_field=True,
             )
-            # Add fields to schema
             schema.add_field(field_name="id", datatype=DataType.INT64, is_primary=True)
             schema.add_field(
                 field_name="session_id", datatype=DataType.VARCHAR, max_length=1000
@@ -90,13 +132,13 @@ class MilvusOperator:
                 index_type="SPARSE_INVERTED_INDEX",  # Index type for sparse vectors
                 metric_type="BM25",  # Set to `BM25` when using function to generate sparse vectors
                 params={"inverted_index_algo": "DAAT_MAXSCORE"},
-                # The ratio of small vector values to be dropped during indexing
             )
             self.client.create_collection(
                 collection_name="chat_collection",
                 schema=schema,
                 index_params=index_params,
             )
+
         if not self.client.has_collection(collection_name="media_collection"):
             schema = MilvusClient.create_schema(
                 enable_dynamic_field=True,
@@ -117,7 +159,6 @@ class MilvusOperator:
                 index_type="AUTOINDEX",
                 metric_type="IP"
             )
-
             self.client.create_collection(
                 collection_name="media_collection",
                 schema=schema,
@@ -126,17 +167,20 @@ class MilvusOperator:
 
     def _get_async_client(self) -> AsyncMilvusClient:
         """确保在当前运行的 loop 中获取或创建 client"""
-        # 如果 client 不存在，或者属于旧的 loop（虽然 Python 对象本身不绑定 loop，但内部 gRPC channel 绑定）
-        # 这里的简单做法是每次检测，或者为了安全，每次请求都创建一个新的（如果连接开销可接受）
-        # 对于生产环境，建议使用连接池或检查当前的 loop 上下文
         if self.async_client is None:
             self.async_client = AsyncMilvusClient(self.uri, self.user, self.password)
         return self.async_client
 
     async def insert(self, text, session_id, collection_name="chat_collection"):
+        # 安全检查：确保初始化完成
+        if not self.initialized:
+            logger.warning("MilvusOperator 尚未初始化，正在尝试初始化...")
+            await self.init_models()
+
         client = self._get_async_client()
         async with self.semaphore:
-            encoded = self.ef.encode_documents([text])
+            # 此时 self.ef 已经被初始化
+            encoded = await asyncio.to_thread(self.ef.encode_documents, [text])
         dense_vector = encoded["dense"][0]
         data = {
             "session_id": session_id,
@@ -148,22 +192,20 @@ class MilvusOperator:
         return res
 
     async def batch_insert(self, texts, session_id, collection_name="chat_collection"):
-        """批量插入向量"""
+        if not self.initialized:
+            await self.init_models()
+
         if not texts:
             return []
 
-        # 批量编码所有文本
         async with self.semaphore:
-            encoded = self.ef.encode_documents(texts)
+            encoded = await asyncio.to_thread(self.ef.encode_documents, texts)
         dense_vectors = encoded["dense"]
 
-        # 准备批量插入数据
         batch_data = []
         current_time = int(time.time() * 1000)
 
         for i, text in enumerate(texts):
-            # 处理稀疏向量
-            # 构建数据项
             data_item = {
                 "session_id": session_id,
                 "text": text,
@@ -172,12 +214,14 @@ class MilvusOperator:
             }
             batch_data.append(data_item)
 
-        # 批量插入到Milvus
         client = self._get_async_client()
         res = await client.insert(collection_name=collection_name, data=batch_data)
         return res
 
     async def insert_media(self, media_id, image_urls, collection_name="media_collection"):
+        if not self.initialized:
+            await self.init_models()
+
         async with self.semaphore:
             image_embeddings = await asyncio.to_thread(self.clip_model.encode_image, image_urls)
         dense_vector = image_embeddings[0]
@@ -196,6 +240,9 @@ class MilvusOperator:
             search_filter: str | None = None,
             collection_name="chat_collection",
     ):
+        if not self.initialized:
+            await self.init_models()
+
         async with self.semaphore:
             encoded = await asyncio.to_thread(self.ef.encode_documents, text)
         dense_vector = encoded["dense"][0]
@@ -239,7 +286,6 @@ class MilvusOperator:
             output_fields=["text"]
         )
 
-
         text_list = [i["text"] for i in texts]
 
         async with self.semaphore:
@@ -252,6 +298,9 @@ class MilvusOperator:
         return best_texts
 
     async def search_media(self, text):
+        if not self.initialized:
+            await self.init_models()
+
         async with self.semaphore:
             text_embeddings = await asyncio.to_thread(self.clip_model.encode_text, text)
         dense_vector = text_embeddings[0]
@@ -269,3 +318,12 @@ class MilvusOperator:
 plugin_config = get_plugin_config(Config)
 
 MilvusOP = MilvusOperator(plugin_config.milvus_uri, plugin_config.milvus_user, plugin_config.milvus_password)
+
+# 4. 获取驱动器并注册启动钩子
+driver = get_driver()
+
+
+@driver.on_startup
+async def _():
+    # 5. 在机器人启动时才真正下载模型、连接数据库
+    await MilvusOP.init_models()
