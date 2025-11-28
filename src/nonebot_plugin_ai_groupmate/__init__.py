@@ -40,9 +40,9 @@ from .utils import (
 from .vlm import image_vl
 
 __plugin_meta__ = PluginMetadata(
-    name="名称",
-    description="描述",
-    usage="用法",
+    name="nonebot-plugin-ai-groupmate",
+    description="AI虚拟群友",
+    usage="@bot 让bot进行回复\n/词频 <统计天数>\n/群词频<统计天数>",
     type="application",
     homepage="https://github.com/yaowan233/nonebot-plugin-ai-groupmate",
     config=Config,
