@@ -1,6 +1,7 @@
 import asyncio
 import os
 import time
+from typing import Optional
 
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
@@ -17,6 +18,12 @@ from ..config import Config
 
 
 class MilvusOperator:
+    client: Optional[MilvusClient]
+    async_client: Optional[AsyncMilvusClient]
+    ef: Optional[BGEM3EmbeddingFunction]
+    bge_rf: Optional[BGERerankFunction]
+    ranker: Optional[WeightedRanker]
+
     def __init__(
             self, uri: str = "http://localhost:19530", user: str = "", password: str = ""
     ):
@@ -47,25 +54,20 @@ class MilvusOperator:
             # 这里的耗时操作只会发生在启动阶段，而不是 import 阶段
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-            # 使用 asyncio.to_thread 避免阻塞主线程（虽然模型加载主要是 CPU/IO 密集型）
-            self.ef = await asyncio.to_thread(BGEM3EmbeddingFunction,
-                                              model_name="BAAI/bge-m3",
-                                              device=str(device)
-                                              )
-
-            self.bge_rf = await asyncio.to_thread(BGERerankFunction,
-                                                  model_name="BAAI/bge-reranker-v2-m3",
-                                                  device=str(device)
-                                                  )
-
-            self.clip_model = await asyncio.to_thread(
-                AutoModel.from_pretrained,
-                "jinaai/jina-clip-v2",
-                trust_remote_code=True
+            self.ef = BGEM3EmbeddingFunction(
+                model_name="BAAI/bge-m3",  # Specify the model name
+                device="cuda" if torch.cuda.is_available() else "cpu",
+                # Specify the device to use, e.g., 'cpu' or 'cuda:0'
             )
-            self.clip_model.to(device)
-            self.clip_model.eval()
-
+            self.bge_rf = BGERerankFunction(
+                model_name="BAAI/bge-reranker-v2-m3",  # Specify the model name. Defaults to `BAAI/bge-reranker-v2-m3`.
+                device="cuda" if torch.cuda.is_available() else "cpu"
+                # Specify the device to use, e.g., 'cpu' or 'cuda:0'
+            )
+            self.clip_model = AutoModel.from_pretrained("jinaai/jina-clip-v2", trust_remote_code=True).to(device)
+            # Put model in evaluation mode
+            if self.clip_model:
+                self.clip_model.eval()
             # 初始化客户端
             self.client = MilvusClient(self.uri, self.user, self.password)
             self.ranker = WeightedRanker(0.8, 0.3)
@@ -82,6 +84,8 @@ class MilvusOperator:
 
     def _init_collections(self):
         """将创建 Collection 的逻辑抽离出来"""
+        assert self.client is not None, "MilvusClient is not initialized"
+
         if not self.client.has_collection(collection_name="chat_collection"):
             schema = MilvusClient.create_schema(
                 auto_id=True,
@@ -178,6 +182,7 @@ class MilvusOperator:
             await self.init_models()
 
         client = self._get_async_client()
+        assert self.ef is not None, "Embedding function not initialized"
         async with self.semaphore:
             # 此时 self.ef 已经被初始化
             encoded = await asyncio.to_thread(self.ef.encode_documents, [text])
@@ -197,7 +202,7 @@ class MilvusOperator:
 
         if not texts:
             return []
-
+        assert self.ef is not None, "Embedding function not initialized"
         async with self.semaphore:
             encoded = await asyncio.to_thread(self.ef.encode_documents, texts)
         dense_vectors = encoded["dense"]
@@ -221,7 +226,7 @@ class MilvusOperator:
     async def insert_media(self, media_id, image_urls, collection_name="media_collection"):
         if not self.initialized:
             await self.init_models()
-
+        assert self.clip_model is not None, "CLIP model not initialized"
         async with self.semaphore:
             image_embeddings = await asyncio.to_thread(self.clip_model.encode_image, image_urls)
         dense_vector = image_embeddings[0]
@@ -242,7 +247,9 @@ class MilvusOperator:
     ):
         if not self.initialized:
             await self.init_models()
-
+        assert self.ef is not None, "Embedding function not initialized"
+        assert self.ranker is not None, "Ranker not initialized"
+        assert self.bge_rf is not None, "Reranker not initialized"
         async with self.semaphore:
             encoded = await asyncio.to_thread(self.ef.encode_documents, text)
         dense_vector = encoded["dense"][0]
@@ -300,7 +307,7 @@ class MilvusOperator:
     async def search_media(self, text):
         if not self.initialized:
             await self.init_models()
-
+        assert self.clip_model is not None, "CLIP model not initialized"
         async with self.semaphore:
             text_embeddings = await asyncio.to_thread(self.clip_model.encode_text, text)
         dense_vector = text_embeddings[0]
