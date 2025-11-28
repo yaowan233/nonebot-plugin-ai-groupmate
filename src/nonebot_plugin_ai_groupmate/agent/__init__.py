@@ -3,7 +3,7 @@ from dataclasses import dataclass
 import datetime
 import json
 import traceback
-from typing import Any
+from typing import Any, cast
 
 from langchain.agents import create_agent
 from langchain.agents.structured_output import ToolStrategy
@@ -533,7 +533,7 @@ async def choice_response_strategy(
 
         messages = [HumanMessage(content=input_text)]
         invoke_input: dict[str, Any] = {"messages": messages}
-        result = await agent.ainvoke(invoke_input, context=Context(session_id=session_id))
+        result = await agent.ainvoke(cast(Any, invoke_input), context=Context(session_id=session_id))
 
         raw_output = result.get("structured_response")
 
