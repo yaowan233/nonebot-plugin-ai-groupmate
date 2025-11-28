@@ -16,8 +16,13 @@ from wordcloud import WordCloud
 
 require("nonebot_plugin_alconna")
 require("nonebot_plugin_orm")
+require("nonebot_plugin_uninfo")
+require("nonebot_plugin_localstore")
+require("nonebot_plugin_apscheduler")
 from nonebot_plugin_alconna import Image, UniMessage, get_message_id, image_fetch
 from nonebot_plugin_alconna.uniseg import UniMsg
+from nonebot_plugin_apscheduler import scheduler
+import nonebot_plugin_localstore as store
 from nonebot_plugin_orm import async_scoped_session, get_session
 from nonebot_plugin_uninfo import Uninfo
 from sqlalchemy import Select
@@ -33,12 +38,6 @@ from .utils import (
     process_and_vectorize_session_chats,
 )
 from .vlm import image_vl
-
-require("nonebot_plugin_localstore")
-require("nonebot_plugin_apscheduler")
-
-from nonebot_plugin_apscheduler import scheduler
-import nonebot_plugin_localstore as store
 
 __plugin_meta__ = PluginMetadata(
     name="名称",
