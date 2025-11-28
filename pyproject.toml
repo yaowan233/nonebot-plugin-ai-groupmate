@@ -1,7 +1,7 @@
 [project]
 name = "nonebot-plugin-ai-groupmate"
 version = "1.0.0"
-description = "miyuki"
+description = "ai 群友"
 readme = "README.md"
 requires-python = ">=3.10,<3.14"
 authors = [
