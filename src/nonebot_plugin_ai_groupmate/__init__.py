@@ -7,9 +7,7 @@ import traceback
 
 import jieba
 from nonebot import get_plugin_config, logger, on_command, on_message, require
-from nonebot.adapters.onebot.v11 import GroupMessageEvent
 from nonebot.internal.adapter import Bot, Event, Message
-from nonebot.internal.rule import Rule
 from nonebot.params import CommandArg
 from nonebot.plugin import PluginMetadata, inherit_supported_adapters
 from nonebot.typing import T_State
@@ -60,14 +58,8 @@ with open(Path(__file__).parent / "stop_words.txt", encoding="utf-8") as f:
     stop_words = f.read().splitlines() + ["id", "回复"]
 
 
-async def check_group_permission(event: GroupMessageEvent):
-    # 检查是否为群聊
-    return True
-
-
 record = on_message(
     priority=999,
-    rule=Rule(check_group_permission),
     block=True,
 )
 
@@ -93,10 +85,13 @@ async def handle_message(
     for i in msg:
         if i.type == "at":
             qq = i.target
-            res = await bot.get_group_member_info(group_id=session.scene.id, user_id=qq, no_cache=False)
-            name = res["nickname"]
-            content += "@" + name + " "
-            is_text = True
+            try:
+                res = await bot.get_group_member_info(group_id=session.scene.id, user_id=qq, no_cache=False)
+                name = res["nickname"]
+                content += "@" + name + " "
+                is_text = True
+            except Exception:
+                continue
         if i.type == "reply":
             content += "回复id:" + i.id
         if i.type == "text":
