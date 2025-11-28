@@ -2,7 +2,7 @@ from pydantic import BaseModel
 
 
 class Config(BaseModel):
-    bot_name: str = "bot"
+    ai_bot_name: str = "bot"
     reply_probability: float = 0.01
     personality_setting: str = ""
     milvus_uri: str = "milvus_demo.db"

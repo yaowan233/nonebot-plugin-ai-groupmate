@@ -73,14 +73,14 @@ async def handle_message(
         state: T_State,
 ):
     """处理消息的主函数"""
-    bot_name = plugin_config.bot_name
+    bot_name = plugin_config.ai_bot_name
     imgs = msg.include(Image)
     content = f"id: {get_message_id()}\n"
     to_me = False
     is_text = False
     if event.is_tome():
         to_me = True
-        content += f"@{plugin_config.bot_name} "
+        content += f"@{plugin_config.ai_bot_name} "
     for i in msg:
         if i.type == "at":
             qq = i.target
@@ -135,7 +135,7 @@ async def handle_message(
         )
 
     # ========== 步骤3: 决定是否回复 ==========
-    if msg.extract_plain_text().strip().lower().startswith(plugin_config.bot_name):
+    if msg.extract_plain_text().strip().lower().startswith(plugin_config.ai_bot_name):
         to_me = True
     should_reply = to_me or (random.random() < plugin_config.reply_probability)
     if not event.get_plaintext() and not imgs:

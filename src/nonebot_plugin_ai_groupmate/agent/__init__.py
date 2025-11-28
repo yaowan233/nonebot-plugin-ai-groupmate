@@ -224,10 +224,10 @@ def create_send_meme_tool(db_session, session_id: str):
             # 记录发送历史
             chat_history = ChatHistory(
                 session_id=session_id,
-                user_id=plugin_config.bot_name,
+                user_id=plugin_config.ai_bot_name,
                 content_type="bot",
                 content=f"id:{res.msg_ids[-1]['message_id']}\n发送了图片，图片描述是: {description}",
-                user_name=plugin_config.bot_name,
+                user_name=plugin_config.ai_bot_name,
             )
             db_session.add(chat_history)
             logger.info(f"id:{res.msg_ids}\n" + f"发送表情包: {description}")
@@ -392,7 +392,7 @@ async def get_user_relation_context(db_session, user_id: str, user_name: str | N
 async def create_chat_agent(db_session, session_id: str, user_id, user_name: str | None):
     """创建聊天Agent"""
     relation_context = await get_user_relation_context(db_session, user_id, user_name)
-    system_prompt = f"""你现在是QQ群里的一位普通群友，名叫"{plugin_config.bot_name}"。
+    system_prompt = f"""你现在是QQ群里的一位普通群友，名叫"{plugin_config.ai_bot_name}"。
 
 【核心任务】
 基于基于历史消息、最近聊天记录以及人际关系，以贴近群友的表达形式参与群聊。
@@ -450,7 +450,7 @@ RAG 搜索结果特性：rag_search 返回的结果已经是经过 Hybrid Search
 
 【重要规则】
 1. 冒号前是发言人名称，后面是内容，回复时不要保留发言人名称
-2. 不要自称AI、机器人或助手，你就是{plugin_config.bot_name}
+2. 不要自称AI、机器人或助手，你就是{plugin_config.ai_bot_name}
 3. 注意发言逻辑连贯性，不要发送重复相似内容
 4. 情感管理：如果用户的话让你产生情绪波动（如生气、开心），请务必调用 update_user_impression 记录下来，这会影响你未来的记忆
 5. 不要直呼职位名（管理员、群主），用昵称称呼
@@ -498,7 +498,7 @@ def format_chat_history(history: list[ChatHistorySchema]) -> list:
         time = msg.created_at.strftime("%Y-%m-%d %H:%M:%S")
 
         if msg.content_type == "bot":
-            content = f"[{time}] {plugin_config.bot_name}（你自己）: {msg.content}"
+            content = f"[{time}] {plugin_config.ai_bot_name}（你自己）: {msg.content}"
             messages.append(AIMessage(content=content))
         elif msg.content_type == "text":
             content = f"[{time}] {msg.user_name}: {msg.content}"
