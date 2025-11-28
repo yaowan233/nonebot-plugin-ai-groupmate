@@ -11,6 +11,7 @@ from nonebot.adapters.onebot.v11 import GroupMessageEvent
 from nonebot.internal.adapter import Bot, Event, Message
 from nonebot.internal.rule import Rule
 from nonebot.params import CommandArg
+from nonebot.plugin import PluginMetadata, inherit_supported_adapters
 from nonebot.typing import T_State
 from PIL import Image as PILImage
 from wordcloud import WordCloud
@@ -41,6 +42,16 @@ require("nonebot_plugin_apscheduler")
 from nonebot_plugin_apscheduler import scheduler
 import nonebot_plugin_localstore as store
 
+__plugin_meta__ = PluginMetadata(
+    name="名称",
+    description="描述",
+    usage="用法",
+    type="application",
+    homepage="https://github.com/yaowan233/nonebot-plugin-ai-groupmate",
+    config=Config,
+    supported_adapters=inherit_supported_adapters("nonebot_plugin_alconna", "nonebot_plugin_uninfo"),
+    extra={"author": "yaowan233 <572473053@qq.com>"},
+)
 plugin_data_dir: Path = store.get_plugin_data_dir()
 pic_dir = plugin_data_dir / "pics"
 pic_dir.mkdir(parents=True, exist_ok=True)
