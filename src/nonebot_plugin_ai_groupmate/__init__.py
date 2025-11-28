@@ -6,7 +6,7 @@ import random
 import traceback
 
 import jieba
-from nonebot import get_plugin_config, logger, on_command, on_message, require, get_driver
+from nonebot import get_plugin_config, logger, on_command, on_message, require
 from nonebot.internal.adapter import Bot, Event, Message
 from nonebot.params import CommandArg
 from nonebot.plugin import PluginMetadata, inherit_supported_adapters

@@ -1,13 +1,12 @@
 import asyncio
 import os
 import time
-from typing import Optional
 
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 
-from nonebot import get_plugin_config, get_driver, logger
+from nonebot import get_driver, get_plugin_config, logger
 from pymilvus import AnnSearchRequest, AsyncMilvusClient, DataType, Function, FunctionType, MilvusClient, WeightedRanker
 from pymilvus.model.hybrid import BGEM3EmbeddingFunction
 from pymilvus.model.reranker import BGERerankFunction
@@ -18,11 +17,11 @@ from ..config import Config
 
 
 class MilvusOperator:
-    client: Optional[MilvusClient]
-    async_client: Optional[AsyncMilvusClient]
-    ef: Optional[BGEM3EmbeddingFunction]
-    bge_rf: Optional[BGERerankFunction]
-    ranker: Optional[WeightedRanker]
+    client: MilvusClient | None
+    async_client: AsyncMilvusClient | None
+    ef: BGEM3EmbeddingFunction | None
+    bge_rf: BGERerankFunction | None
+    ranker: WeightedRanker | None
 
     def __init__(
             self, uri: str = "http://localhost:19530", user: str = "", password: str = ""
