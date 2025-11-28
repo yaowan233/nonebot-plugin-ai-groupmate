@@ -58,6 +58,7 @@ def check_and_compress_image_bytes(
         # 尝试不同的质量等级直到文件大小小于目标大小
         quality = quality_start
         compressed_image = io.BytesIO()
+        compressed_size = compressed_image.tell()
 
         while quality > 10:
             compressed_image.seek(0)
@@ -68,7 +69,6 @@ def check_and_compress_image_bytes(
                 compressed_image, format=image_format, quality=quality, optimize=True
             )
 
-            compressed_size = compressed_image.tell()
 
             if compressed_size <= max_size_bytes:
                 break
@@ -84,7 +84,7 @@ def check_and_compress_image_bytes(
             new_width = int(width * ratio * 0.9)  # 稍微减小一点以确保大小达标
             new_height = int(height * ratio * 0.9)
 
-            img = img.resize((new_width, new_height), Image.LANCZOS)
+            img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
 
             compressed_image.seek(0)
             compressed_image.truncate(0)
@@ -310,7 +310,7 @@ async def process_and_vectorize_session_chats(
 
 def combine_messages_into_context(
         messages: list[ChatHistory]
-) -> tuple[str, list[str]]:
+) -> tuple[str, list[int]]:
     context_parts = []
     msg_ids = []
 
@@ -354,7 +354,7 @@ async def insert_vectors_with_retry(
 
 async def update_messages_in_batches(
         db_session: AsyncSession,
-        msg_ids: list[str],
+        msg_ids: list[int],
         batch_size: int = 500
 ) -> None:
     """
@@ -379,7 +379,7 @@ async def update_messages_in_batches(
 
 async def update_messages_one_by_one(
         db_session: AsyncSession,
-        msg_ids: list[str]
+        msg_ids: list[int]
 ) -> None:
     """
     逐条更新（降级方案）

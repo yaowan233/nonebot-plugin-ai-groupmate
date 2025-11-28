@@ -6,9 +6,9 @@ import random
 import traceback
 
 import jieba
-from nonebot import Bot, get_plugin_config, logger, on_command, on_message, require
+from nonebot import get_plugin_config, logger, on_command, on_message, require
 from nonebot.adapters.onebot.v11 import GroupMessageEvent
-from nonebot.internal.adapter import Event, Message
+from nonebot.internal.adapter import Event, Message, Bot
 from nonebot.internal.rule import Rule
 from nonebot.params import CommandArg
 from nonebot.typing import T_State
@@ -95,12 +95,14 @@ async def handle_message(
 
     # 构建用户名（包含昵称和职位）
     user_name = session.user.name
-    if session.member.nick:
-        user_name = f"({session.member.nick}){user_name}"
-    if session.member.role.name == "owner":
-        user_name = f"群主-{user_name}"
-    elif session.member.role.name == "admin":
-        user_name = f"管理员-{user_name}"
+    if session.member:
+        if session.member.nick:
+            user_name = f"({session.member.nick}){user_name}"
+        if session.member.role:
+            if session.member.role.name == "owner":
+                user_name = f"群主-{user_name}"
+            elif session.member.role.name == "admin":
+                user_name = f"管理员-{user_name}"
 
     # ========== 步骤1: 处理文本消息（快速） ==========
     if is_text:
@@ -156,26 +158,27 @@ async def process_image_message(
         bot: Bot,
         state: T_State,
         session: Uninfo,
-        user_name: str,
+        user_name: str | None,
         content: str,
 ):
     """处理单张图片消息"""
+    content_type = "image"
+    if not img.id:
+        return
+    image_format = img.id.split(".")[-1]
+
+    # 获取和压缩图片
+    pic = await image_fetch(event, bot, state, img)
+    pic = await asyncio.to_thread(
+        check_and_compress_image_bytes, pic, image_format=image_format.upper()
+    )
+    file_hash = generate_file_hash(pic)
+    file_path = pic_dir / f"{file_hash}.{image_format}"
+
+    # 保存文件
+    if not file_path.exists():
+        file_path.write_bytes(pic)
     try:
-        content_type = "image"
-        image_format = img.id.split(".")[-1]
-
-        # 获取和压缩图片
-        pic = await image_fetch(event, bot, state, img)
-        pic = await asyncio.to_thread(
-            check_and_compress_image_bytes, pic, image_format=image_format.upper()
-        )
-        file_hash = generate_file_hash(pic)
-        file_path = pic_dir / f"{file_hash}.{image_format}"
-
-        # 保存文件
-        if not file_path.exists():
-            file_path.write_bytes(pic)
-
         # 查询或创建媒体记录
         existing_media = (
             await db_session.execute(
@@ -212,7 +215,7 @@ async def process_image_message(
                 user_id=session.user.id,
                 content_type=content_type,
                 content=content + image_description,
-                user_name=user_name,
+                user_name=user_name or "",
                 media_id=existing_media.media_id,
             )
             db_session.add(chat_history)
@@ -235,7 +238,7 @@ async def process_image_message(
                 user_id=session.user.id,
                 content_type=content_type,
                 content=content + existing_media.description,
-                user_name=user_name,
+                user_name=user_name or "",
                 media_id=existing_media.media_id,
             )
             db_session.add(chat_history)
@@ -251,7 +254,7 @@ async def handle_reply_logic(
         session: Uninfo,
         bot_name: str,
         user_id: str,
-        user_name: str,
+        user_name: str | None,
 ):
     """处理回复逻辑"""
     try:

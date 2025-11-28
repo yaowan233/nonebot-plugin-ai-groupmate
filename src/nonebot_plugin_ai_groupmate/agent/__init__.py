@@ -14,14 +14,14 @@ from langchain_tavily import TavilySearch
 from nonebot import get_plugin_config, require
 from nonebot.log import logger
 from nonebot_plugin_alconna import UniMessage
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, SecretStr
 from simpleeval import simple_eval
 from sqlalchemy import Select
 from sqlalchemy.orm.session import Session
 
 from ..config import Config
 from ..milvus import MilvusOP
-from ..model import ChatHistory, MediaStorage, UserRelation
+from ..model import ChatHistory, MediaStorage, UserRelation, ChatHistorySchema
 
 require("nonebot_plugin_localstore")
 
@@ -72,7 +72,6 @@ async def search_web(query: str) -> str:
     if not tavily_search:
         logger.error("没有配置 tavily_api_key, 无法进行搜索")
         return "没有配置 tavily_api_key, 无法进行搜索"
-    # TavilySearch 已经内置了 ainvoke 方法
     results = await tavily_search.ainvoke(query)
     return results
 
@@ -192,7 +191,8 @@ def create_send_meme_tool(db_session, session_id: str):
             if pic_id:
                 selected_pic_id = int(pic_id)
                 logger.info(f"使用指定的图片ID: {pic_id}")
-
+            if not selected_pic_id:
+                return "没有指定图片id"
 
             # 从数据库获取图片信息
             pic = (
@@ -257,7 +257,7 @@ def calculate_expression(expression: str) -> str:
         return f"计算失败。请检查表达式是否正确，错误信息: {e}"
 
 
-def create_relation_tool(db_session, user_id: str, user_name: str):
+def create_relation_tool(db_session, user_id: str, user_name: str | None):
     """
     创建绑定了特定用户的关系管理工具 (支持增删 Tag)
     """
@@ -288,7 +288,7 @@ def create_relation_tool(db_session, user_id: str, user_name: str):
             relation = result.scalar_one_or_none()
 
             if not relation:
-                relation = UserRelation(user_id=user_id, user_name=user_name, favorability=0, tags=[])
+                relation = UserRelation(user_id=user_id, user_name=user_name or "", favorability=0, tags=[])
                 db_session.add(relation)
 
             # 2. 处理好感度
@@ -316,7 +316,7 @@ def create_relation_tool(db_session, user_id: str, user_name: str):
 
             # 赋值回数据库对象
             relation.tags = current_tags
-            relation.user_name = user_name  # 同步更新昵称
+            relation.user_name = user_name or ""  # 同步更新昵称
             favorability = relation.favorability
 
             await db_session.commit()
@@ -342,13 +342,13 @@ def create_relation_tool(db_session, user_id: str, user_name: str):
 tools = [search_web, search_history_context, calculate_expression]
 model = ChatOpenAI(
     model=plugin_config.openai_model,
-    api_key=plugin_config.openai_token,
+    api_key=SecretStr(plugin_config.openai_token),
     base_url=plugin_config.openai_base_url,
     temperature=0.7,
 )
 
 
-async def get_user_relation_context(db_session, user_id: str, user_name: str) -> str:
+async def get_user_relation_context(db_session, user_id: str, user_name: str | None) -> str:
     """获取用户关系上下文Prompt"""
     try:
         stmt = Select(UserRelation).where(UserRelation.user_id == user_id)
@@ -381,7 +381,7 @@ async def get_user_relation_context(db_session, user_id: str, user_name: str) ->
         return ""
 
 
-async def create_chat_agent(db_session, session_id: str, user_id, user_name):
+async def create_chat_agent(db_session, session_id: str, user_id, user_name: str | None):
     """创建聊天Agent"""
     relation_context = await get_user_relation_context(db_session, user_id, user_name)
     system_prompt = f"""你现在是QQ群里的一位普通群友，名叫"{plugin_config.bot_name}"。
@@ -478,7 +478,7 @@ RAG 搜索结果特性：rag_search 返回的结果已经是经过 Hybrid Search
     return agent
 
 
-def format_chat_history(history: list[ChatHistory]) -> list:
+def format_chat_history(history: list[ChatHistorySchema]) -> list:
     """将聊天历史格式化为LangChain消息格式"""
     messages = []
     for msg in history:
@@ -500,21 +500,13 @@ def format_chat_history(history: list[ChatHistory]) -> list:
 async def choice_response_strategy(
         db_session: Session,
         session_id: str,
-        history: list[ChatHistory],
+        history: list[ChatHistorySchema],
         user_id: str,
-        user_name: str,
+        user_name: str | None,
         setting: str | None = None
 ) -> ResponseMessage:
     """
     使用Agent决定回复策略
-
-    Args:
-        contexts: 相关历史对话上下文
-        history: 最近的聊天历史
-        setting: 额外设置（可选）
-
-    Returns:
-        包含回复策略的字典
     """
     try:
         agent = await create_chat_agent(db_session, session_id, user_id, user_name)
@@ -539,21 +531,40 @@ async def choice_response_strategy(
 基于上述对话历史，判断是否需要回复，以及如何回复。
 """
 
-        # 调用Agent
-        result = await agent.ainvoke({"messages": [input_text]}, context=Context(session_id=session_id))
-        output = result.get("structured_response", None)
-        return output
+        messages = [HumanMessage(content=input_text)]
+        invoke_input: dict[str, Any] = {"messages": messages}
+        result = await agent.ainvoke(invoke_input, context=Context(session_id=session_id))
+
+        raw_output = result.get("structured_response")
+
+        # 情况 A: 如果 Agent 没返回 structured_response (为 None)
+        if raw_output is None:
+            logger.warning(f"Agent session {session_id} 未返回有效结构化数据")
+            # 返回一个默认的安全对象，防止报错
+            return ResponseMessage(need_reply=False, text=None)
+
+        # 情况 B: 如果 Agent 返回的是字典 (Dict)，需要转为 Pydantic 模型
+        if isinstance(raw_output, dict):
+            return ResponseMessage.model_validate(raw_output)
+
+        # 情况 C: 如果 Agent 直接返回了 ResponseMessage 对象 (某些高级Agent框架会这样)
+        if isinstance(raw_output, ResponseMessage):
+            return raw_output
+
+        # 兜底：虽然有值但类型不对
+        logger.error(f"Agent 返回类型未知: {type(raw_output)}")
+        return ResponseMessage(need_reply=False, text=None)
 
     except Exception as e:
-        print(traceback.format_exc())
-        logger.error(f"Agent执行失败: {e}")
-        return ResponseMessage(need_reply=False, text="")
+        logger.exception("Agent 决策过程发生异常")
+        # 发生异常时也需要返回一个符合类型签名的对象
+        return ResponseMessage(need_reply=False, text=None)
 
 
 if __name__ == "__main__":
     model = ChatOpenAI(
         model=plugin_config.openai_model,
-        api_key=plugin_config.openai_token,
+        api_key=SecretStr(plugin_config.openai_token),
         base_url=plugin_config.openai_base_url,
         temperature=0.7,
     )

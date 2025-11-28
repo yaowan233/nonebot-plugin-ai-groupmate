@@ -5,6 +5,7 @@ from nonebot import get_plugin_config, logger
 from ollama import AsyncClient as OllamaClient
 from ollama import ChatResponse, Image, Message
 from openai import AsyncOpenAI
+from openai.types.chat import ChatCompletion
 
 from .config import Config
 
@@ -44,7 +45,7 @@ async def image_vl(file_path, prompt: str = "请描述一下这个图片") -> st
                 logger.error("Ollama client not initialized")
                 return None
 
-            response: ChatResponse = await ollama_client.chat(
+            response = await ollama_client.chat(
                 model=plugin_config.vlm_model,
                 messages=[
                     Message(role="user", content=prompt, images=[Image(value=file_path)])
