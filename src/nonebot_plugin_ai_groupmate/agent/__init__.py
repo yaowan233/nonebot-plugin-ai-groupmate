@@ -3,6 +3,7 @@ from dataclasses import dataclass
 import datetime
 import json
 import traceback
+from pathlib import Path
 from typing import Any, cast
 
 from langchain.agents import create_agent
@@ -29,7 +30,11 @@ import nonebot_plugin_localstore as store
 
 plugin_data_dir = store.get_plugin_data_dir()
 pic_dir = plugin_data_dir / "pics"
-
+plugin_path = Path(__file__).parent
+with open(plugin_path / "上升.jpg", "rb") as f:
+    up_pic = f.read()
+with open(plugin_path / "下降.jpg", "rb") as f:
+    down_pic = f.read()
 plugin_config = get_plugin_config(Config)
 
 if plugin_config.tavily_api_key:
@@ -295,7 +300,10 @@ def create_relation_tool(db_session, user_id: str, user_name: str | None):
             old_score = relation.favorability
             relation.favorability += score_change
             relation.favorability = max(-100, min(100, relation.favorability))
-
+            if score_change > 0:
+                await UniMessage.image(raw=up_pic).send()
+            elif score_change < 0:
+                await UniMessage.image(raw=down_pic).send()
             # 3. 处理标签 (核心修改)
             # 获取现有标签的副本
             current_tags = list(relation.tags) if relation.tags else []
@@ -410,16 +418,21 @@ async def create_chat_agent(db_session, session_id: str, user_id, user_name: str
 - 不要强调自己是人类或群友，也不要承认自己是AI
 - 友善对待他人，不要随便生气，表现可爱一点
 
+【联网搜索工具】
+当有不理解的内容或者缩写或者专业词汇，首先使用联网搜索工具搜索相关内容
+
 【表情包使用流程】
 1. 当你觉得需要发表情包时，先用 search_meme_image 搜索
 2. 仔细查看返回的图片描述列表，判断哪张图片最合适当前场景
 3. 选择合适的图片，使用 send_meme_image 发送（通过pic_id指定）
 4. 你可以选择只发图片，或者图片+文字一起回复
 5. 如果所有搜索结果都不合适，可以选择不发图片
+6. 可以搜索小女孩或者动漫相关表情包来丰富表情包类型
+7. 不要一直发自己发过的表情包
 
 示例流程：
 用户："太好笑了"
-→ 你调用 search_meme_image("笑")
+→ 你调用 search_meme_image("笑") 或 search_meme_image("小女孩，笑") 或 search_meme_image("动漫风，笑")
 → 返回：
   - pic_id: 123, 描述: "一只猫咪笑得眯起眼睛"
   - pic_id: 456, 描述: "熊猫捂嘴偷笑"
