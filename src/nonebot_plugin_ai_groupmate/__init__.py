@@ -8,7 +8,7 @@ import traceback
 import jieba
 from nonebot import get_plugin_config, logger, on_command, on_message, require
 from nonebot.adapters.onebot.v11 import GroupMessageEvent
-from nonebot.internal.adapter import Event, Message, Bot
+from nonebot.internal.adapter import Bot, Event, Message
 from nonebot.internal.rule import Rule
 from nonebot.params import CommandArg
 from nonebot.typing import T_State

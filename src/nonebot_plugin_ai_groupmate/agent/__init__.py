@@ -14,14 +14,14 @@ from langchain_tavily import TavilySearch
 from nonebot import get_plugin_config, require
 from nonebot.log import logger
 from nonebot_plugin_alconna import UniMessage
-from pydantic import BaseModel, Field, field_validator, SecretStr
+from pydantic import BaseModel, Field, SecretStr, field_validator
 from simpleeval import simple_eval
 from sqlalchemy import Select
 from sqlalchemy.orm.session import Session
 
 from ..config import Config
 from ..milvus import MilvusOP
-from ..model import ChatHistory, MediaStorage, UserRelation, ChatHistorySchema
+from ..model import ChatHistory, ChatHistorySchema, MediaStorage, UserRelation
 
 require("nonebot_plugin_localstore")
 
@@ -555,7 +555,7 @@ async def choice_response_strategy(
         logger.error(f"Agent 返回类型未知: {type(raw_output)}")
         return ResponseMessage(need_reply=False, text=None)
 
-    except Exception as e:
+    except Exception:
         logger.exception("Agent 决策过程发生异常")
         # 发生异常时也需要返回一个符合类型签名的对象
         return ResponseMessage(need_reply=False, text=None)

@@ -3,9 +3,8 @@ import mimetypes
 
 from nonebot import get_plugin_config, logger
 from ollama import AsyncClient as OllamaClient
-from ollama import ChatResponse, Image, Message
+from ollama import Image, Message
 from openai import AsyncOpenAI
-from openai.types.chat import ChatCompletion
 
 from .config import Config
 
