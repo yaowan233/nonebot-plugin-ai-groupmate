@@ -26,13 +26,13 @@
 <summary>使用 nb-cli 安装</summary>
 在 nonebot2 项目的根目录下打开命令行, 输入以下指令即可安装
 
-    nb plugin install {plugin-name} --upgrade
+    nb plugin install nonebot-plugin-ai-groupmate --upgrade
 使用 **pypi** 源安装
 
-    nb plugin install {plugin-name} --upgrade -i "https://pypi.org/simple"
+    nb plugin install nonebot-plugin-ai-groupmate --upgrade -i "https://pypi.org/simple"
 使用**清华源**安装
 
-    nb plugin install {plugin-name} --upgrade -i "https://pypi.tuna.tsinghua.edu.cn/simple"
+    nb plugin install nonebot-plugin-ai-groupmate --upgrade -i "https://pypi.tuna.tsinghua.edu.cn/simple"
 
 
 </details>
@@ -44,27 +44,27 @@
 <details open>
 <summary>uv</summary>
 
-    uv add {plugin-name}
+    uv add nonebot-plugin-ai-groupmate
 安装仓库 master 分支
 
-    uv add git+https://github.com/{owner}/{plugin-name}@master
+    uv add git+https://github.com/yaowan233/nonebot-plugin-ai-groupmate@master
 </details>
 
 <details>
 <summary>pdm</summary>
 
-    pdm add {plugin-name}
+    pdm add nonebot-plugin-ai-groupmate
 安装仓库 master 分支
 
-    pdm add git+https://github.com/{owner}/{plugin-name}@master
+    pdm add git+https://github.com/yaowan233/nonebot-plugin-ai-groupmate@master
 </details>
 <details>
 <summary>poetry</summary>
 
-    poetry add {plugin-name}
+    poetry add nonebot-plugin-ai-groupmate
 安装仓库 master 分支
 
-    poetry add git+https://github.com/{owner}/{plugin-name}@master
+    poetry add git+https://github.com/yaowan233/nonebot-plugin-ai-groupmate@master
 </details>
 
 打开 nonebot2 项目根目录下的 `pyproject.toml` 文件, 在 `[tool.nonebot]` 部分追加写入
@@ -78,13 +78,13 @@
 
 [nbr](https://github.com/fllesser/nbr) 是一个基于 uv 的 nb-cli，可以方便地管理 nonebot2
 
-    nbr plugin install {plugin-name}
+    nbr plugin install nonebot-plugin-ai-groupmate
 使用 **pypi** 源安装
 
-    nbr plugin install {plugin-name} -i "https://pypi.org/simple"
+    nbr plugin install nonebot-plugin-ai-groupmate -i "https://pypi.org/simple"
 使用**清华源**安装
 
-    nbr plugin install {plugin-name} -i "https://pypi.tuna.tsinghua.edu.cn/simple"
+    nbr plugin install nonebot-plugin-ai-groupmate -i "https://pypi.tuna.tsinghua.edu.cn/simple"
 
 </details>
 
