@@ -1,21 +1,21 @@
-import asyncio
-import base64
-from datetime import timedelta
-import hashlib
 import io
+import base64
+import asyncio
+import hashlib
 import traceback
-import tiktoken
+from datetime import timedelta
 from functools import lru_cache
 
-from nonebot import get_plugin_config, logger
-from nonebot_plugin_orm import AsyncSession
+import tiktoken
 from PIL import Image
-from sqlalchemy import Select, Update
 from tqdm import tqdm
+from nonebot import logger, get_plugin_config
+from sqlalchemy import Select, Update
+from nonebot_plugin_orm import AsyncSession
 
+from .model import ChatHistory, ChatHistorySchema
 from .config import Config
 from .milvus import MilvusOP
-from .model import ChatHistory, ChatHistorySchema
 
 plugin_config = get_plugin_config(Config)
 
@@ -204,7 +204,7 @@ async def split_chat_into_context_groups(
     return context_groups
 
 # 缓存 encoder，避免重复加载
-@lru_cache()
+@lru_cache
 def get_encoder():
     return tiktoken.get_encoding("cl100k_base")
 

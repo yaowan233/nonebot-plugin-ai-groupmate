@@ -1,9 +1,9 @@
 from datetime import datetime
 
-from nonebot_plugin_orm import Model
 from pydantic import BaseModel
-from sqlalchemy import JSON, Boolean, String
+from sqlalchemy import JSON, String, Boolean
 from sqlalchemy.orm import Mapped, mapped_column
+from nonebot_plugin_orm import Model
 
 
 class MediaStorage(Model):

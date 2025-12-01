@@ -71,7 +71,9 @@ select = ["E", "W", "F", "UP", "C", "T", "PYI", "PT", "Q", "I"]
 ignore = ["C901", "T201", "E731", "E402"]
 
 [tool.ruff.lint.isort]
-force-sort-within-sections = true
+length-sort = true
+combine-as-imports = true
+known-first-party = ["nonebot_plugin_ai_groupmate"]
 
 [tool.nonebot]
 adapters = []
