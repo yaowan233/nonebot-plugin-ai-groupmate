@@ -4,6 +4,8 @@ from datetime import timedelta
 import hashlib
 import io
 import traceback
+import tiktoken
+from functools import lru_cache
 
 from nonebot import get_plugin_config, logger
 from nonebot_plugin_orm import AsyncSession
@@ -201,19 +203,20 @@ async def split_chat_into_context_groups(
 
     return context_groups
 
+# 缓存 encoder，避免重复加载
+@lru_cache()
+def get_encoder():
+    return tiktoken.get_encoding("cl100k_base")
+
+
 
 def estimate_token_count(text: str) -> int:
-    """
-    估算文本的token数量，一个粗略的估计是每4个字符约1个token
-
-    参数:
-        text: 需要计算的文本
-
-    返回:
-        估计的token数量
-    """
-    # 使用简单的估算方法，实际情况应使用与向量模型匹配的tokenizer
-    return len(text) // 3 + 1  # 简化估算，生产环境应使用模型的tokenizer
+    try:
+        encoder = get_encoder()
+        return len(encoder.encode(text))
+    except Exception as e:
+        logger.warning(f"Tiktoken 计算失败，回退到字符估算: {e}")
+        return len(text)  # 最后的保底
 
 
 async def process_and_vectorize_session_chats(
