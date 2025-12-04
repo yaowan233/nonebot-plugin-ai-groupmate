@@ -1,13 +1,12 @@
+import pytest
 from fake import fake_group_message_event_v11
 from nonebug import App
-import pytest
 
 
 @pytest.mark.asyncio
 async def test_pip(app: App):
     import nonebot
-    from nonebot.adapters.onebot.v11 import Adapter as OnebotV11Adapter
-    from nonebot.adapters.onebot.v11 import Bot
+    from nonebot.adapters.onebot.v11 import Bot, Adapter as OnebotV11Adapter
 
     event = fake_group_message_event_v11(message="hello")
     try:

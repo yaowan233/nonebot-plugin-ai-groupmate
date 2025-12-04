@@ -2331,7 +2331,7 @@ wheels = [
 
 [[package]]
 name = "nonebot-plugin-ai-groupmate"
-version = "0.3.0"
+version = "1.0.0"
 source = { editable = "." }
 dependencies = [
     { name = "datasets" },
@@ -2358,6 +2358,7 @@ dependencies = [
     { name = "pillow" },
     { name = "pymilvus", extra = ["milvus-lite", "model"] },
     { name = "simpleeval" },
+    { name = "tiktoken" },
     { name = "timm" },
     { name = "torch" },
     { name = "torchaudio" },
@@ -2409,6 +2410,7 @@ requires-dist = [
     { name = "pillow", specifier = ">=11.1.0" },
     { name = "pymilvus", extras = ["milvus-lite", "model"], specifier = ">=2.6.3" },
     { name = "simpleeval", specifier = ">=1.0.3" },
+    { name = "tiktoken", specifier = ">=0.12.0" },
     { name = "timm", specifier = ">=1.0.22" },
     { name = "torch", specifier = ">=2.7.0" },
     { name = "torchaudio", specifier = ">=2.7.0" },

@@ -1,43 +1,43 @@
+import random
 import asyncio
 import datetime
+import traceback
 from io import BytesIO
 from pathlib import Path
-import random
-import traceback
 
 import jieba
-from nonebot import get_plugin_config, logger, on_command, on_message, require
-from nonebot.internal.adapter import Bot, Event, Message
+from PIL import Image as PILImage
+from nonebot import logger, require, on_command, on_message, get_plugin_config
+from wordcloud import WordCloud
 from nonebot.params import CommandArg
 from nonebot.plugin import PluginMetadata, inherit_supported_adapters
 from nonebot.typing import T_State
-from PIL import Image as PILImage
-from wordcloud import WordCloud
+from nonebot.internal.adapter import Bot, Event, Message
 
 require("nonebot_plugin_alconna")
 require("nonebot_plugin_orm")
 require("nonebot_plugin_uninfo")
 require("nonebot_plugin_localstore")
 require("nonebot_plugin_apscheduler")
-from nonebot_plugin_alconna import Image, UniMessage, get_message_id, image_fetch
-from nonebot_plugin_alconna.uniseg import UniMsg
-from nonebot_plugin_apscheduler import scheduler
 import nonebot_plugin_localstore as store
-from nonebot_plugin_orm import async_scoped_session, get_session
-from nonebot_plugin_uninfo import Uninfo
 from sqlalchemy import Select
 from sqlalchemy.exc import IntegrityError
+from nonebot_plugin_orm import get_session, async_scoped_session
+from nonebot_plugin_uninfo import Uninfo
+from nonebot_plugin_alconna import Image, UniMessage, image_fetch, get_message_id
+from nonebot_plugin_apscheduler import scheduler
+from nonebot_plugin_alconna.uniseg import UniMsg
 
+from .vlm import image_vl
 from .agent import choice_response_strategy
-from .config import Config
-from .milvus import MilvusOP
-from .model import ChatHistory, ChatHistorySchema, MediaStorage
+from .model import ChatHistory, MediaStorage, ChatHistorySchema
 from .utils import (
-    check_and_compress_image_bytes,
     generate_file_hash,
+    check_and_compress_image_bytes,
     process_and_vectorize_session_chats,
 )
-from .vlm import image_vl
+from .config import Config
+from .milvus import MilvusOP
 
 __plugin_meta__ = PluginMetadata(
     name="nonebot-plugin-ai-groupmate",

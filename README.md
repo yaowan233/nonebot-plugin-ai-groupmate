@@ -15,11 +15,14 @@
 </div>
 
 ## 📖 介绍
-使用 RAG 技术，自动对聊天历史储存，储存长记忆。学习群内群友发言习惯，使得 bot 更像真人。
+本插件主体使用使用 langchain 的 agent 进行决策，由 langchain 调用 tools 进行一系列任务。
 
-接入vlm，并且自动学习表情包，自动在群内学习并偷取表情包。
+tools 中包含 RAG ，可以自动对聊天历史储存，储存长记忆。学习群内群友发言习惯，使得 bot 更像真人。
 
-使用 langchain，利用 agent 进行决策
+对于群内的表情包，使用了 vlm + clip 模型，自动从群内学习并偷取表情包，然后从向量库内选取合适表情包进行回答。
+
+对于模型选择方面：推荐使用 glm-4.6 模型，以及本地部署 qwen3-vl 作为 vlm 模型，如果 embedding、 rerank、vlm 和 clip 模型都使用了显卡加速的话，大约需要 16G 显存的显卡。若只有 8G 显存，将 vlm 模型调整为 api 调用的话，就可以流畅使用了。
+
 ## 💿 安装
 
 <details open>
@@ -69,7 +72,7 @@
 
 打开 nonebot2 项目根目录下的 `pyproject.toml` 文件, 在 `[tool.nonebot]` 部分追加写入
 
-    plugins = ["nonebot_plugin_template"]
+    plugins = [nonebot-plugin-ai-groupmate"]
 
 </details>
 
@@ -112,5 +115,19 @@
 
 ## 🎉 使用
 
-待补充
-### 指令
+ai会自动偷群内使用的表情包，增加至向量库当中，在回答时通过向量库内容搜索表情包，由于使用了vlm模型，搜索的准确率十分高。
+![Screenshot_20251201_134203](https://github.com/user-attachments/assets/cbf95194-ac33-45e0-a83d-cb6639c204fb)
+内置了好感度系统，增加了趣味性。
+![Screenshot_20251201_134157](https://github.com/user-attachments/assets/68b8d563-7ad5-4d83-be4b-0a05f16df09a)
+利用强大的 RAG，进行总结或进行任何检索聊天相关功能。
+![Screenshot_20251201_133320](https://github.com/user-attachments/assets/b7e96bd0-8245-4da5-b28b-33e8aad5fc63)
+发送群内偷学到的表情包
+![Screenshot_20251201_132723](https://github.com/user-attachments/assets/6fbd036f-e7ec-4ced-9cd7-557976306553)
+
+### 指令表
+由于 AI 功能需要记录聊天记录，基于已记录的聊天记录，可以很轻松的做到词频统计，所以顺带加上了。
+
+|     指令      |    说明    |
+|:-----------:|:--------:|
+|  /词频 <统计天数> | 生成个人词频词云 |
+| /群词频 <统计天数> | 生成群词频词云  |
