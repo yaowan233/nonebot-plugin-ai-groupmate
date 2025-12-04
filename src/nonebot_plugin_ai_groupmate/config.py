@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class ScopedConfig(BaseModel):
@@ -19,4 +19,4 @@ class ScopedConfig(BaseModel):
     vlm_openai_api_key: str = ""
 
 class Config(BaseModel):
-    ai_groupmate: ScopedConfig
+    ai_groupmate: ScopedConfig = Field(default_factory=ScopedConfig)
