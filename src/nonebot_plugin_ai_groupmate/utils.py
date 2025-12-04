@@ -9,15 +9,13 @@ from functools import lru_cache
 import tiktoken
 from PIL import Image
 from tqdm import tqdm
-from nonebot import logger, get_plugin_config
+from nonebot import logger
 from sqlalchemy import Select, Update
 from nonebot_plugin_orm import AsyncSession
 
 from .model import ChatHistory, ChatHistorySchema
-from .config import Config
 from .milvus import MilvusOP
 
-plugin_config = get_plugin_config(Config)
 
 
 def generate_file_hash(file_data: bytes) -> str:

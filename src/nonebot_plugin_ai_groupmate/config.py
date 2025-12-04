@@ -1,8 +1,8 @@
 from pydantic import BaseModel
 
 
-class Config(BaseModel):
-    ai_bot_name: str = "bot"
+class ScopedConfig(BaseModel):
+    bot_name: str = "bot"
     reply_probability: float = 0.01
     personality_setting: str = ""
     milvus_uri: str = "milvus_demo.db"
@@ -17,3 +17,6 @@ class Config(BaseModel):
     vlm_provider: str = "ollama"  # 可选: "ollama", "openai"
     vlm_openai_base_url: str = ""
     vlm_openai_api_key: str = ""
+
+class Config(BaseModel):
+    ai_groupmate: ScopedConfig

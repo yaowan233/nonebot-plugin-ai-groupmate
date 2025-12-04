@@ -321,7 +321,7 @@ class MilvusOperator:
         return [i["id"] for i in res[0]]
 
 
-plugin_config = get_plugin_config(Config)
+plugin_config = get_plugin_config(Config).ai_groupmate
 
 MilvusOP = MilvusOperator(plugin_config.milvus_uri, plugin_config.milvus_user, plugin_config.milvus_password)
 

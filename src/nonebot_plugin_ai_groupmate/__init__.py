@@ -12,7 +12,7 @@ from wordcloud import WordCloud
 from nonebot.params import CommandArg
 from nonebot.plugin import PluginMetadata, inherit_supported_adapters
 from nonebot.typing import T_State
-from nonebot.internal.adapter import Bot, Event, Message
+from nonebot.adapters import Bot, Event, Message
 
 require("nonebot_plugin_alconna")
 require("nonebot_plugin_orm")
@@ -23,7 +23,7 @@ import nonebot_plugin_localstore as store
 from sqlalchemy import Select
 from sqlalchemy.exc import IntegrityError
 from nonebot_plugin_orm import get_session, async_scoped_session
-from nonebot_plugin_uninfo import Uninfo
+from nonebot_plugin_uninfo import Uninfo, SceneType, QryItrface
 from nonebot_plugin_alconna import Image, UniMessage, image_fetch, get_message_id
 from nonebot_plugin_apscheduler import scheduler
 from nonebot_plugin_alconna.uniseg import UniMsg
@@ -52,7 +52,7 @@ __plugin_meta__ = PluginMetadata(
 plugin_data_dir: Path = store.get_plugin_data_dir()
 pic_dir = plugin_data_dir / "pics"
 pic_dir.mkdir(parents=True, exist_ok=True)
-plugin_config = get_plugin_config(Config)
+plugin_config = get_plugin_config(Config).ai_groupmate
 with open(Path(__file__).parent / "stop_words.txt", encoding="utf-8") as f:
     stop_words = f.read().splitlines() + ["id", "回复"]
 
@@ -71,6 +71,7 @@ async def handle_message(
         event: Event,
         bot: Bot,
         state: T_State,
+        interface: QryItrface
 ):
     """处理消息的主函数"""
     bot_name = plugin_config.ai_bot_name
@@ -83,14 +84,15 @@ async def handle_message(
         content += f"@{plugin_config.ai_bot_name} "
     for i in msg:
         if i.type == "at":
-            qq = i.target
-            try:
-                res = await bot.get_group_member_info(group_id=session.scene.id, user_id=qq, no_cache=False)
-                name = res["nickname"]
-                content += "@" + name + " "
-                is_text = True
-            except Exception:
+            members = await interface.get_members(SceneType.GROUP, session.scene.id)
+            for member in members:
+                if member.id == i.target:
+                    name = member.user.name
+                    break
+            else:
                 continue
+            content += "@" + name + " "
+            is_text = True
         if i.type == "reply":
             content += "回复id:" + i.id
         if i.type == "text":

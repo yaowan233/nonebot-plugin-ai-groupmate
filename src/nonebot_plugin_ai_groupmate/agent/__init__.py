@@ -35,7 +35,7 @@ with open(plugin_path / "上升.jpg", "rb") as f:
     up_pic = f.read()
 with open(plugin_path / "下降.jpg", "rb") as f:
     down_pic = f.read()
-plugin_config = get_plugin_config(Config)
+plugin_config = get_plugin_config(Config).ai_groupmate
 
 if plugin_config.tavily_api_key:
     tavily_search = TavilySearch(max_results=3, tavily_api_key=plugin_config.tavily_api_key)

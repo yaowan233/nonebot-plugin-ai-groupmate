@@ -7,7 +7,7 @@ from nonebot import logger, get_plugin_config
 
 from .config import Config
 
-plugin_config = get_plugin_config(Config)
+plugin_config = get_plugin_config(Config).ai_groupmate
 
 ollama_client = None
 openai_client = None
