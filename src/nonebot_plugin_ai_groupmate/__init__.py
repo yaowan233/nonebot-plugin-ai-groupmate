@@ -87,7 +87,7 @@ async def handle_message(
             members = await interface.get_members(SceneType.GROUP, session.scene.id)
             for member in members:
                 if member.id == i.target:
-                    name = member.user.name
+                    name = member.user.name if member.user.name else ""
                     break
             else:
                 continue
