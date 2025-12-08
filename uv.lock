@@ -812,15 +812,6 @@ wheels = [
 ]
 
 [[package]]
-name = "expiringdict"
-version = "1.2.2"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/fc/62/c2af4ebce24c379b949de69d49e3ba97c7e9c9775dc74d18307afa8618b7/expiringdict-1.2.2.tar.gz", hash = "sha256:300fb92a7e98f15b05cf9a856c1415b3bc4f2e132be07daa326da6414c23ee09", size = 8137, upload-time = "2022-06-21T09:12:30.415Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/cb/84/a04c59324445f4bcc98dc05b39a1cd07c242dde643c1a3c21e4f7beaf2f2/expiringdict-1.2.2-py3-none-any.whl", hash = "sha256:09a5d20bc361163e6432a874edd3179676e935eb81b925eccef48d409a8a45e8", size = 8456, upload-time = "2022-06-21T09:12:28.652Z" },
-]
-
-[[package]]
 name = "fastapi"
 version = "0.122.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2331,19 +2322,17 @@ wheels = [
 
 [[package]]
 name = "nonebot-plugin-ai-groupmate"
-version = "1.0.0"
+version = "1.0.2"
 source = { editable = "." }
 dependencies = [
     { name = "datasets" },
     { name = "einops" },
-    { name = "expiringdict" },
     { name = "flagembedding" },
     { name = "jieba" },
     { name = "langchain" },
     { name = "langchain-openai" },
     { name = "langchain-tavily" },
     { name = "matplotlib" },
-    { name = "nonebot-adapter-onebot" },
     { name = "nonebot-plugin-alconna" },
     { name = "nonebot-plugin-apscheduler" },
     { name = "nonebot-plugin-localstore" },
@@ -2389,14 +2378,12 @@ test = [
 requires-dist = [
     { name = "datasets", specifier = ">=3.4.1" },
     { name = "einops", specifier = ">=0.8.1" },
-    { name = "expiringdict", specifier = ">=1.2.2" },
     { name = "flagembedding", specifier = ">=1.3.5" },
     { name = "jieba", specifier = ">=0.42.1" },
     { name = "langchain", specifier = ">=1.1.0" },
     { name = "langchain-openai", specifier = ">=1.0.3" },
     { name = "langchain-tavily", specifier = ">=0.2.13" },
     { name = "matplotlib", specifier = ">=3.10.1" },
-    { name = "nonebot-adapter-onebot", specifier = ">=2.4.6" },
     { name = "nonebot-plugin-alconna", specifier = ">=0.60.3" },
     { name = "nonebot-plugin-apscheduler", specifier = ">=0.5.0" },
     { name = "nonebot-plugin-localstore", specifier = ">=0.7.4" },

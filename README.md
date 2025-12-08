@@ -97,21 +97,21 @@ tools 中包含 RAG ，可以自动对聊天历史储存，储存长记忆。学
 配置说明
 | 配置项 | 必填 | 默认值 | 说明 |
 |:-----:|:----:|:----:|:----:|
-| bot_name | 是 | 无 | bot 名 |
-| reply_probability | 否 | 0.01 | 群内发言概率 |
-| personality_setting | 否 | 无 | 自定义人设 |
-| milvus_uri | 否 | 无 | milvus 地址 |
-| milvus_user | 否 | 无| milvus 用户名 |
-| milvus_password | 否 | 无 | milvus 密码 |
-| tavily_api_key | 否 | 无 | tavily api 密钥 |
-| openai_base_url | 否 | 无| openai 请求地址 |
-| openai_token | 否 | 无 | openai token |
-| openai_model | 否 | 无 | openai 模型名 |
-| vlm_ollama_base_url | 否 | 无| vlm 地址 |
-| vlm_model | 否 | 无 | vlm 模型名 |
-| vlm_provider | 否 | ollama| ollama 或 openai |
-| vlm_openai_base_url | 否 | 无 | vlm openai 请求地址 |
-| vlm_openai_api_key | 否 | 无 | vlm openai api key |
+| ai_groupmate__bot_name | 是 | 无 | bot 名 |
+| ai_groupmate__reply_probability | 否 | 0.01 | 群内发言概率 |
+| ai_groupmate__personality_setting | 否 | 无 | 自定义人设 |
+| ai_groupmate__milvus_uri | 否 | 无 | milvus 地址 |
+| ai_groupmate__milvus_user | 否 | 无| milvus 用户名 |
+| ai_groupmate__milvus_password | 否 | 无 | milvus 密码 |
+| ai_groupmate__tavily_api_key | 否 | 无 | tavily api 密钥 |
+| ai_groupmate__openai_base_url | 否 | 无| openai 请求地址 |
+| ai_groupmate__openai_token | 否 | 无 | openai token |
+| ai_groupmate__openai_model | 否 | 无 | openai 模型名 |
+| ai_groupmate__vlm_ollama_base_url | 否 | 无| vlm 地址 |
+| ai_groupmate__vlm_model | 否 | 无 | vlm 模型名 |
+| ai_groupmate__vlm_provider | 否 | ollama| ollama 或 openai |
+| ai_groupmate__vlm_openai_base_url | 否 | 无 | vlm openai 请求地址 |
+| ai_groupmate__vlm_openai_api_key | 否 | 无 | vlm openai api key |
 
 ## 🎉 使用
 
