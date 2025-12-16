@@ -290,7 +290,8 @@ def create_report_tool(db_session, session_id: str, user_id: str, user_name: str
             chain = report_prompt | llm_client
             response_msg = await chain.ainvoke(prompt_input)
             final_report_text = response_msg.content
-
+            if not isinstance(final_report_text, str):
+                return "输出结果失败"
             # ==========================================
             # 第三步：直接发送结果
             # ==========================================
