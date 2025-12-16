@@ -1,15 +1,21 @@
+import collections
 import json
 import asyncio
 import datetime
+import random
+import re
 import traceback
 from typing import Any, cast
 from pathlib import Path
 from dataclasses import dataclass
 
+import jieba
+from langchain_core.prompts import ChatPromptTemplate
 from nonebot import require, get_plugin_config
 from pydantic import Field, BaseModel, SecretStr, field_validator
 from simpleeval import simple_eval
-from sqlalchemy import Select
+from sqlalchemy import Select, func, extract, desc
+
 from nonebot.log import logger
 from langchain.tools import ToolRuntime, tool
 from langchain.agents import create_agent
@@ -36,6 +42,8 @@ with open(plugin_path / "上升.jpg", "rb") as f:
 with open(plugin_path / "下降.jpg", "rb") as f:
     down_pic = f.read()
 plugin_config = get_plugin_config(Config).ai_groupmate
+with open(Path(__file__).parent.parent / "stop_words.txt", encoding="utf-8") as f:
+    stop_words = f.read().splitlines() + ["id", "回复"]
 
 if plugin_config.tavily_api_key:
     tavily_search = TavilySearch(max_results=3, tavily_api_key=plugin_config.tavily_api_key)
@@ -94,6 +102,209 @@ async def search_history_context(query: str, runtime: ToolRuntime[Context]) -> s
     except Exception as e:
         logger.error(f"历史搜索失败: {e}")
         return "历史搜索失败"
+
+
+def create_report_tool(db_session, session_id: str, user_id: str, user_name: str | None, llm_client: ChatOpenAI):
+    """
+    创建年度报告工具（限制在当前群聊 session_id 范围内）
+    """
+
+    def get_stop_words():
+        return {"的", "了", "在", "是", "我", "有", "和", "就", "不", "人", "都", "一", "一个", "上", "也", "很", "到",
+                "说", "去", "你", "他", "她", "我们", "你们", "嘛", "啊", "吧", "呢", "哦", "嗯", "什么", "怎么",
+                "这个", "那个", "图片", "发送", "image", "bot", "nan", "哈", "哈哈", "id", "msg"}
+
+    @tool("generate_and_send_annual_report")
+    async def generate_and_send_annual_report() -> str:
+        """
+        生成并发送当前群聊的年度报告。
+        包含：个人在本群的统计、性格分析、全群排行榜以及Bot的好感度回顾。
+        """
+        try:
+            logger.info(f"开始生成用户 {user_name} 在群 {session_id} 的年度报告...")
+            now = datetime.datetime.now()
+            current_year = now.year
+
+            # ==========================================
+            # 1. 获取个人在本群的数据 (增加 session_id 过滤)
+            # ==========================================
+            stmt = Select(ChatHistory).where(
+                ChatHistory.user_id == user_id,
+                ChatHistory.session_id == session_id,  # <--- 关键修改：限制群聊范围
+                extract('year', ChatHistory.created_at) == current_year
+            )
+            all_msgs = (await db_session.execute(stmt)).scalars().all()
+
+            if not all_msgs:
+                await UniMessage.text("你今年在这个群好像没怎么说话，生成不了报告哦...").send()
+                return "用户本群无数据。"
+
+            # 统计与采样
+            text_msgs = [m.content for m in all_msgs if m.content_type == "text" and m.content]
+            total_count = len(all_msgs)
+
+            # 采样 30 条让 LLM 分析 (只分析在这个群说的话)
+            samples = random.sample(text_msgs, min(len(text_msgs), 30)) if text_msgs else []
+            longest_msg = max(text_msgs, key=len) if text_msgs else "无"
+            if len(longest_msg) > 60: longest_msg = longest_msg[:60] + "..."
+
+            # 活跃时间
+            active_hour_desc = "潜水员"
+            if all_msgs:
+                hours = [m.created_at.hour for m in all_msgs]
+                top_hour = collections.Counter(hours).most_common(1)[0][0]
+                active_hour_desc = f"{top_hour}点"
+
+            # ==========================================
+            # 2. 获取本群排行榜 (增加 session_id 过滤)
+            # ==========================================
+            async def get_rank_str(content_type=None, hour_limit=None):
+                # 基础查询：限定年份 + 限定当前群 (session_id)
+                stmt = Select(ChatHistory.user_name, func.count(ChatHistory.msg_id).label('c')) \
+                    .where(
+                    extract('year', ChatHistory.created_at) == current_year,
+                    ChatHistory.session_id == session_id  # <--- 关键修改：只卷本群
+                )
+
+                if content_type:
+                    stmt = stmt.where(ChatHistory.content_type == content_type)
+                if hour_limit:
+                    stmt = stmt.where(extract('hour', ChatHistory.created_at) < hour_limit)
+
+                rows = (await db_session.execute(
+                    stmt.group_by(ChatHistory.user_id, ChatHistory.user_name)
+                    .order_by(desc('c')).limit(3)
+                )).all()
+
+                if not rows: return "虚位以待"
+                return ", ".join([f"{r[0]}({r[1]})" for r in rows])
+
+            rank_talk = await get_rank_str()
+            rank_img = await get_rank_str(content_type='image')
+            rank_night = await get_rank_str(hour_limit=5)
+
+            # ==========================================
+            # 3. 获取本群热词 (增加 session_id 过滤)
+            # ==========================================
+            # 只分析本群的文本
+            stmt_text = Select(ChatHistory.content).where(
+                ChatHistory.session_id == session_id,  # <--- 关键修改
+                extract('year', ChatHistory.created_at) == current_year,
+                ChatHistory.content_type == 'text'
+            ).order_by(desc(ChatHistory.created_at)).limit(2000)  # 取本群最近2000条
+
+            rows = (await db_session.execute(stmt_text)).all()
+            sample_text = "\n".join([r[0] for r in rows if r[0]])
+
+            clean_text = re.sub(r'[^\u4e00-\u9fa5]', '', sample_text)
+            words = jieba.lcut(clean_text)
+            filtered = [w for w in words if len(w) > 1 and w not in get_stop_words()]
+            hot_words_str = "、".join([x[0] for x in collections.Counter(filtered).most_common(8)])
+
+            relation_stmt = Select(UserRelation).where(UserRelation.user_id == user_id)
+            relation = (await db_session.execute(relation_stmt)).scalar_one_or_none()
+
+            favorability = 0
+            impression_tags = []
+            if relation:
+                favorability = relation.favorability
+                impression_tags = relation.tags if relation.tags else []
+
+            # 格式化关系描述，喂给 LLM
+            relation_desc = f"好感度: {favorability} (满分100), 印象标签: {', '.join(impression_tags)}"
+
+            # ==========================================
+            # 第二步：Tool 内部召唤 LLM (进行分析与撰写)
+            # ==========================================
+
+            # 构造一个专门写报告的 Prompt
+            # 这个 Prompt 不需要关心我是谁，只需要关心怎么把数据变成文本
+            report_prompt = ChatPromptTemplate.from_messages([
+                ("system", """你是一个专业的年度报告撰写助手。
+你的任务是阅读用户的聊天统计数据和发言样本，分析其性格，然后生成一份格式整洁、风格幽默的年度报告。
+
+【语气控制指南 (非常重要)】
+根据用户的“好感度”调整你的语气：
+- 好感度 > 60：语气要亲密、宠溺，像对待最好的朋友或恋人。（例如：“宝，今年你也一直陪着我呢”）
+- 好感度 < 0：语气要傲娇、嫌弃、毒舌。（例如：“你这家伙今年没少气我，明年注意点！”）
+- 好感度 0-60：语气正常、友善、带点调侃。
+
+【排版要求】
+1. **绝对禁止使用 Markdown**（不要用 #, **, ##, - 等符号列表）。
+2. 使用 Emoji 和 纯文本分隔符（如 ━━━━━━━━）来排版。
+3. 语气要像老朋友一样，可以根据数据进行调侃或夸奖。
+
+【必须包含的板块】
+1. 📊 标题行 ({year}年度报告 | 用户名)
+2. 📈 基础数据 (发言数、活跃时间、最长发言摘要)
+3. 💌 我们的羁绊 (根据好感度和标签，写一段话回顾你们的关系。如果是正向关系就煽情一点，负向关系就吐槽。)
+4. 🔥 年度热词 (列出数据中提供的热词)
+5. 🏆 群内风云榜 (必须包含以下三个榜单)
+   - 🗣️ 龙王榜 (发言最多)
+   - 🎭 斗图榜 (发图最多)
+   - 🦉 修仙榜 (熬夜最多)
+6. 🧠 成分分析 (这是**重点**：请阅读提供的 `samples` 聊天记录，分析这个人的说话风格、性格、是不是复读机、是不是爱发疯。写一段100字左右的犀利点评)
+7. 💡 {bot_name}寄语 (一句简短的祝福)
+"""),
+                ("user", """
+【用户数据】
+用户名: {user_name}
+年份: {year}
+累计发言: {count}
+活跃时间: {active_hour}
+最长发言片段: {longest_msg}
+年度热词: {hot_words}
+
+【{bot_name}与用户的关系】
+{relation_desc}
+
+【全群排行参考】
+龙王榜: {rank_talk}
+斗图榜: {rank_img}
+熬夜榜: {rank_night}
+
+【用户发言样本 (用于性格分析)】
+{samples}
+
+请生成报告：""")
+            ])
+
+            # 组装数据
+            prompt_input = {
+                "user_name": user_name,
+                "bot_name": plugin_config.bot_name,
+                "year": current_year,
+                "count": total_count,
+                "active_hour": active_hour_desc,
+                "longest_msg": longest_msg,
+                "hot_words": hot_words_str,
+                "relation_desc": relation_desc,
+                "rank_talk": rank_talk,
+                "rank_img": rank_img,
+                "rank_night": rank_night,
+                "samples": "\n".join(samples)  # 把样本拼接成字符串喂给 LLM
+            }
+
+            # 调用 LLM (这里是二次调用，不影响主对话)
+            logger.info(f"内部 LLM 生成报告中，好感度: {favorability}")
+            chain = report_prompt | llm_client
+            response_msg = await chain.ainvoke(prompt_input)
+            final_report_text = response_msg.content
+
+            # ==========================================
+            # 第三步：直接发送结果
+            # ==========================================
+            await UniMessage.text(final_report_text).send()
+
+            return "报告已生成并发送。"
+
+        except Exception as e:
+            logger.error(f"内部 LLM 生成报告失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return f"生成过程出错: {e}"
+
+    return generate_and_send_annual_report
 
 
 def create_search_meme_tool(db_session):
@@ -448,6 +659,10 @@ RAG 搜索结果特性：rag_search 返回的结果已经是经过 Hybrid Search
 了解群内特有的语境、梗和昵称。 (例如：搜索“渣男猫图”、“ltp”、“蕾咪主人的乖小狗”等词汇，来了解群友的用法和背后的事件)
 确保对话连贯性，回顾某个特定时间点发生过的讨论。
 
+【年度报告】
+如果用户索要“年度报告”、“个人总结”、“成分分析”，请直接调用工具 `generate_and_send_annual_report`。
+该工具会自动完成所有工作。工具调用结束后，你只需回复一句简单的“请查收~”即可，不要复述报告内容。
+
 【重要规则】
 1. 冒号前是发言人名称，后面是内容，回复时不要保留发言人名称
 2. 不要自称AI、机器人或助手，你就是{plugin_config.bot_name}
@@ -462,6 +677,7 @@ RAG 搜索结果特性：rag_search 返回的结果已经是经过 Hybrid Search
 11. 绝对禁止在 rag_search 中使用任何相对时间词汇，包括但不限于：“昨天”、“前天”、“本周”、“上周”、“这个月”、“上个月”、“最近”等。搜索历史消息时，必须使用具体的日期和时间点（例如：2025-04-08 15:30:00）或直接使用关键词进行搜索。
 12. 表情包发送是可选的，不是每次都要发
 """
+    report_tool = create_report_tool(db_session, session_id, user_id, user_name, model)
 
     search_meme_tool = create_search_meme_tool(db_session)
     send_meme_tool = create_send_meme_tool(db_session, session_id)
@@ -473,6 +689,7 @@ RAG 搜索结果特性：rag_search 返回的结果已经是经过 Hybrid Search
             search_meme_tool,  # 搜索工具（带数据库会话）
             send_meme_tool,  # 发送工具
             calculate_expression,
+            report_tool,
         ]
     else:
         # 组合所有工具
@@ -482,7 +699,8 @@ RAG 搜索结果特性：rag_search 返回的结果已经是经过 Hybrid Search
             search_meme_tool,  # 搜索工具（带数据库会话）
             send_meme_tool,  # 发送工具
             calculate_expression,
-            relation_tool
+            relation_tool,
+            report_tool,
         ]
 
     agent = create_agent(model, tools=tools, system_prompt=system_prompt,
