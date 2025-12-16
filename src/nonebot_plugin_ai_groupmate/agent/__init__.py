@@ -109,11 +109,6 @@ def create_report_tool(db_session, session_id: str, user_id: str, user_name: str
     创建年度报告工具（限制在当前群聊 session_id 范围内）
     """
 
-    def get_stop_words():
-        return {"的", "了", "在", "是", "我", "有", "和", "就", "不", "人", "都", "一", "一个", "上", "也", "很", "到",
-                "说", "去", "你", "他", "她", "我们", "你们", "嘛", "啊", "吧", "呢", "哦", "嗯", "什么", "怎么",
-                "这个", "那个", "图片", "发送", "image", "bot", "nan", "哈", "哈哈", "id", "msg"}
-
     @tool("generate_and_send_annual_report")
     async def generate_and_send_annual_report() -> str:
         """
@@ -198,7 +193,7 @@ def create_report_tool(db_session, session_id: str, user_id: str, user_name: str
 
             clean_text = re.sub(r'[^\u4e00-\u9fa5]', '', sample_text)
             words = jieba.lcut(clean_text)
-            filtered = [w for w in words if len(w) > 1 and w not in get_stop_words()]
+            filtered = [w for w in words if len(w) > 1 and w not in stop_words]
             hot_words_str = "、".join([x[0] for x in collections.Counter(filtered).most_common(8)])
 
             relation_stmt = Select(UserRelation).where(UserRelation.user_id == user_id)
