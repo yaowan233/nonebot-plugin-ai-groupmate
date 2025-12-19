@@ -154,11 +154,10 @@ def create_report_tool(db_session, session_id: str, user_id: str, user_name: str
             # 2. 获取本群排行榜 (增加 session_id 过滤)
             # ==========================================
             async def get_rank_str(content_type=None, hour_limit=None):
-                # 基础查询：限定年份 + 限定当前群 (session_id)
-                stmt = Select(ChatHistory.user_name, func.count(ChatHistory.msg_id).label('c')) \
+                stmt = Select(ChatHistory.user_id, func.count(ChatHistory.msg_id).label('c')) \
                     .where(
                     extract('year', ChatHistory.created_at) == current_year,
-                    ChatHistory.session_id == session_id  # <--- 关键修改：只卷本群
+                    ChatHistory.session_id == session_id
                 )
 
                 if content_type:
@@ -166,13 +165,28 @@ def create_report_tool(db_session, session_id: str, user_id: str, user_name: str
                 if hour_limit:
                     stmt = stmt.where(extract('hour', ChatHistory.created_at) < hour_limit)
 
-                rows = (await db_session.execute(
-                    stmt.group_by(ChatHistory.user_id, ChatHistory.user_name)
-                    .order_by(desc('c')).limit(3)
-                )).all()
+                # 核心修改：只 group_by user_id
+                stmt = stmt.group_by(ChatHistory.user_id).order_by(desc('c')).limit(3)
 
-                if not rows: return "虚位以待"
-                return ", ".join([f"{r[0]}({r[1]})" for r in rows])
+                # 获取结果，此时是 List[(user_id, count)]
+                rows = (await db_session.execute(stmt)).all()
+
+                if not rows:
+                    return "虚位以待"
+
+                rank_items = []
+                for uid, count in rows:
+                    # 查询该用户最近的一条消息记录，取当时的名字
+                    name_stmt = Select(ChatHistory.user_name).where(
+                        ChatHistory.user_id == uid
+                    ).order_by(desc(ChatHistory.created_at)).limit(1)
+
+                    latest_name = (await db_session.execute(name_stmt)).scalar()
+
+                    # 兜底：如果查不到名字（极少情况），用 ID 代替
+                    display_name = latest_name if latest_name else f"用户{uid}"
+                    rank_items.append(f"{display_name}({count})")
+                return ", ".join(rank_items)
 
             rank_talk = await get_rank_str()
             rank_img = await get_rank_str(content_type='image')
