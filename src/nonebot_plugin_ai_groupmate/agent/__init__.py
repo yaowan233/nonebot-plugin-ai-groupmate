@@ -120,12 +120,9 @@ def create_report_tool(db_session, session_id: str, user_id: str, user_name: str
             now = datetime.datetime.now()
             current_year = now.year
 
-            # ==========================================
-            # 1. 获取个人在本群的数据 (增加 session_id 过滤)
-            # ==========================================
             stmt = Select(ChatHistory).where(
                 ChatHistory.user_id == user_id,
-                ChatHistory.session_id == session_id,  # <--- 关键修改：限制群聊范围
+                ChatHistory.session_id == session_id,
                 extract('year', ChatHistory.created_at) == current_year
             )
             all_msgs = (await db_session.execute(stmt)).scalars().all()
@@ -150,9 +147,6 @@ def create_report_tool(db_session, session_id: str, user_id: str, user_name: str
                 top_hour = collections.Counter(hours).most_common(1)[0][0]
                 active_hour_desc = f"{top_hour}点"
 
-            # ==========================================
-            # 2. 获取本群排行榜 (增加 session_id 过滤)
-            # ==========================================
             async def get_rank_str(content_type=None, hour_limit=None):
                 stmt = Select(ChatHistory.user_id, func.count(ChatHistory.msg_id).label('c')) \
                     .where(
@@ -192,15 +186,13 @@ def create_report_tool(db_session, session_id: str, user_id: str, user_name: str
             rank_img = await get_rank_str(content_type='image')
             rank_night = await get_rank_str(hour_limit=5)
 
-            # ==========================================
-            # 3. 获取本群热词 (增加 session_id 过滤)
-            # ==========================================
             # 只分析本群的文本
             stmt_text = Select(ChatHistory.content).where(
-                ChatHistory.session_id == session_id,  # <--- 关键修改
+                ChatHistory.session_id == session_id,
                 extract('year', ChatHistory.created_at) == current_year,
-                ChatHistory.content_type == 'text'
-            ).order_by(desc(ChatHistory.created_at)).limit(2000)  # 取本群最近2000条
+                ChatHistory.content_type == 'text',
+                ChatHistory.user_id == user_id,
+            ).order_by(desc(ChatHistory.created_at))
 
             rows = (await db_session.execute(stmt_text)).all()
             sample_text = "\n".join([r[0] for r in rows if r[0]])
@@ -222,12 +214,7 @@ def create_report_tool(db_session, session_id: str, user_id: str, user_name: str
             # 格式化关系描述，喂给 LLM
             relation_desc = f"好感度: {favorability} (满分100), 印象标签: {', '.join(impression_tags)}"
 
-            # ==========================================
-            # 第二步：Tool 内部召唤 LLM (进行分析与撰写)
-            # ==========================================
 
-            # 构造一个专门写报告的 Prompt
-            # 这个 Prompt 不需要关心我是谁，只需要关心怎么把数据变成文本
             report_prompt = ChatPromptTemplate.from_messages([
                 ("system", """你是一个专业的年度报告撰写助手。
 你的任务是阅读用户的聊天统计数据和发言样本，分析其性格，然后生成一份格式整洁、风格幽默的年度报告。
@@ -294,16 +281,12 @@ def create_report_tool(db_session, session_id: str, user_id: str, user_name: str
                 "samples": "\n".join(samples)  # 把样本拼接成字符串喂给 LLM
             }
 
-            # 调用 LLM (这里是二次调用，不影响主对话)
             logger.info(f"内部 LLM 生成报告中，好感度: {favorability}")
             chain = report_prompt | llm_client
             response_msg = await chain.ainvoke(prompt_input)
             final_report_text = response_msg.content
             if not isinstance(final_report_text, str):
                 return "输出结果失败"
-            # ==========================================
-            # 第三步：直接发送结果
-            # ==========================================
             await UniMessage.text(final_report_text).send()
 
             return "报告已生成并发送。"
