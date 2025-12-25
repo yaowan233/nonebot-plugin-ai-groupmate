@@ -13,15 +13,9 @@ ollama_client = None
 openai_client = None
 
 if plugin_config.vlm_provider == "ollama":
-    ollama_client = OllamaClient(
-        host=plugin_config.vlm_ollama_base_url, timeout=15
-    )
+    ollama_client = OllamaClient(host=plugin_config.vlm_ollama_base_url, timeout=15)
 elif plugin_config.vlm_provider == "openai":
-    openai_client = AsyncOpenAI(
-        api_key=plugin_config.vlm_openai_api_key,
-        base_url=plugin_config.vlm_openai_base_url,
-        timeout=15.0
-    )
+    openai_client = AsyncOpenAI(api_key=plugin_config.vlm_openai_api_key, base_url=plugin_config.vlm_openai_base_url, timeout=15.0)
 
 
 def encode_image_to_base64(file_path: str) -> str:
@@ -43,13 +37,7 @@ async def image_vl(file_path, prompt: str = "请描述一下这个图片") -> st
                 logger.error("Ollama client not initialized")
                 return None
 
-            response = await ollama_client.chat(
-                model=plugin_config.vlm_model,
-                messages=[
-                    Message(role="user", content=prompt, images=[Image(value=file_path)])
-                ],
-                options={"repeat_penalty": 1.5, "num_ctx": 1024}
-            )
+            response = await ollama_client.chat(model=plugin_config.vlm_model, messages=[Message(role="user", content=prompt, images=[Image(value=file_path)])], options={"repeat_penalty": 1.5, "num_ctx": 1024})
             content = response.message.content
 
         elif plugin_config.vlm_provider == "openai":
@@ -71,14 +59,12 @@ async def image_vl(file_path, prompt: str = "请描述一下这个图片") -> st
                             {"type": "text", "text": prompt},
                             {
                                 "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:{mime_type};base64,{base64_image}"
-                                },
+                                "image_url": {"url": f"data:{mime_type};base64,{base64_image}"},
                             },
                         ],
                     }
                 ],
-                max_tokens=1024
+                max_tokens=1024,
             )
             content = response.choices[0].message.content
 

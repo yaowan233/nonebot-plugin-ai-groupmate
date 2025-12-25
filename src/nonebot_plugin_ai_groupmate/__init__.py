@@ -64,15 +64,7 @@ record = on_message(
 
 
 @record.handle()
-async def handle_message(
-        db_session: async_scoped_session,
-        msg: UniMsg,
-        session: Uninfo,
-        event: Event,
-        bot: Bot,
-        state: T_State,
-        interface: QryItrface
-):
+async def handle_message(db_session: async_scoped_session, msg: UniMsg, session: Uninfo, event: Event, bot: Bot, state: T_State, interface: QryItrface):
     """处理消息的主函数"""
     bot_name = plugin_config.bot_name
     imgs = msg.include(Image)
@@ -98,7 +90,6 @@ async def handle_message(
         if i.type == "text":
             content += i.text
             is_text = True
-
 
     # 构建用户名（包含昵称和职位）
     user_name = session.user.name
@@ -131,10 +122,7 @@ async def handle_message(
 
     # ========== 步骤2: 处理图片消息（耗时） ==========
     for img in imgs:
-        await process_image_message(
-            db_session, img, event, bot, state,
-            session, user_name, f"id: {get_message_id()}\n"
-        )
+        await process_image_message(db_session, img, event, bot, state, session, user_name, f"id: {get_message_id()}\n")
 
     # ========== 步骤3: 决定是否回复 ==========
     if msg.extract_plain_text().strip().lower().startswith(plugin_config.bot_name):
@@ -159,14 +147,14 @@ async def handle_message(
 
 
 async def process_image_message(
-        db_session,
-        img: Image,
-        event: Event,
-        bot: Bot,
-        state: T_State,
-        session: Uninfo,
-        user_name: str | None,
-        content: str,
+    db_session,
+    img: Image,
+    event: Event,
+    bot: Bot,
+    state: T_State,
+    session: Uninfo,
+    user_name: str | None,
+    content: str,
 ):
     """处理单张图片消息"""
     content_type = "image"
@@ -176,9 +164,7 @@ async def process_image_message(
 
     # 获取和压缩图片
     pic = await image_fetch(event, bot, state, img)
-    pic = await asyncio.to_thread(
-        check_and_compress_image_bytes, pic, image_format=image_format.upper()
-    )
+    pic = await asyncio.to_thread(check_and_compress_image_bytes, pic, image_format=image_format.upper())
     file_hash = generate_file_hash(pic)
     file_path = pic_dir / f"{file_hash}.{image_format}"
 
@@ -187,11 +173,7 @@ async def process_image_message(
         file_path.write_bytes(pic)
     try:
         # 查询或创建媒体记录
-        existing_media = (
-            await db_session.execute(
-                Select(MediaStorage).where(MediaStorage.file_hash == file_hash)
-            )
-        ).scalar()
+        existing_media = (await db_session.execute(Select(MediaStorage).where(MediaStorage.file_hash == file_hash))).scalar()
 
         if existing_media:
             # 已存在，直接使用描述
@@ -232,11 +214,7 @@ async def process_image_message(
     except IntegrityError:
         # 处理并发插入冲突
         await db_session.rollback()
-        existing_media = (
-            await db_session.execute(
-                Select(MediaStorage).where(MediaStorage.file_hash == file_hash)
-            )
-        ).scalar()
+        existing_media = (await db_session.execute(Select(MediaStorage).where(MediaStorage.file_hash == file_hash))).scalar()
 
         if existing_media:
             existing_media.references += 1
@@ -257,26 +235,17 @@ async def process_image_message(
 
 
 async def handle_reply_logic(
-        db_session,
-        session: Uninfo,
-        bot_name: str,
-        user_id: str,
-        user_name: str | None,
+    db_session,
+    session: Uninfo,
+    bot_name: str,
+    user_id: str,
+    user_name: str | None,
 ):
     """处理回复逻辑"""
     try:
-
         # 获取最近1小时内的消息历史
         cutoff_time = datetime.datetime.now() - datetime.timedelta(hours=1)
-        last_msg = (
-            await db_session.execute(
-                Select(ChatHistory)
-                .where(ChatHistory.session_id == session.scene.id)
-                .where(ChatHistory.created_at >= cutoff_time)
-                .order_by(ChatHistory.msg_id.desc())
-                .limit(20)
-            )
-        ).scalars().all()
+        last_msg = (await db_session.execute(Select(ChatHistory).where(ChatHistory.session_id == session.scene.id).where(ChatHistory.created_at >= cutoff_time).order_by(ChatHistory.msg_id.desc()).limit(20))).scalars().all()
 
         if not last_msg:
             logger.info("没有历史消息，跳过回复")
@@ -288,29 +257,8 @@ async def handle_reply_logic(
 
         # 使用Agent决定回复策略
         logger.info("开始调用Agent决策...")
-        strategy = await choice_response_strategy(db_session, session.scene.id, last_msg, user_id, user_name, "")
+        await choice_response_strategy(db_session, session.scene.id, last_msg, user_id, user_name, "")
 
-        logger.info(f"Agent决策结果: {strategy}")
-
-        # 检查是否需要回复
-        if not strategy.text:
-            logger.info("Agent决定不回复")
-            return
-
-        # 处理文本回复
-        if strategy.text:
-            text = strategy.text
-            res = await record.send(text)
-            logger.info(f"发送文本回复: {text}")
-            chat_history = ChatHistory(
-                session_id=session.scene.id,
-                user_id=bot_name,
-                content_type="bot",
-                content= f"id:{res['message_id']}\n" +text,
-                user_name=bot_name,
-            )
-            db_session.add(chat_history)
-            await db_session.commit()
     except Exception as e:
         logger.error(f"回复逻辑执行失败: {e}")
         await db_session.rollback()
@@ -407,9 +355,7 @@ async def vectorize_message_history():
 @scheduler.scheduled_job("interval", minutes=30)
 async def vectorize_media():
     async with get_session() as db_session:
-        medias_res = await db_session.execute(
-            Select(MediaStorage).where(MediaStorage.references >= 3, MediaStorage.vectorized.is_(False))
-        )
+        medias_res = await db_session.execute(Select(MediaStorage).where(MediaStorage.references >= 3, MediaStorage.vectorized.is_(False)))
         medias = medias_res.scalars().all()
         logger.info(f"待向量化媒体数量: {len(medias)}")
 
@@ -450,9 +396,7 @@ async def vectorize_media():
 @scheduler.scheduled_job("interval", minutes=35)
 async def clear_cache_pic():
     async with get_session() as db_session:
-        result = await db_session.execute(
-            Select(MediaStorage).where(MediaStorage.references < 3, datetime.datetime.now() - MediaStorage.created_at > datetime.timedelta(days=30))
-        )
+        result = await db_session.execute(Select(MediaStorage).where(MediaStorage.references < 3, datetime.datetime.now() - MediaStorage.created_at > datetime.timedelta(days=30)))
         medias = result.scalars().all()
 
         if not medias:

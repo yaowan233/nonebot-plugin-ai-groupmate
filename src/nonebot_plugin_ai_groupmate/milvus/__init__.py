@@ -23,9 +23,7 @@ class MilvusOperator:
     bge_rf: BGERerankFunction | None
     ranker: WeightedRanker | None
 
-    def __init__(
-            self, uri: str = "http://localhost:19530", user: str = "", password: str = ""
-    ):
+    def __init__(self, uri: str = "http://localhost:19530", user: str = "", password: str = ""):
         # 1. __init__ 中只保存配置，不连接数据库，不加载模型
         self.uri = uri
         self.user = user
@@ -60,7 +58,7 @@ class MilvusOperator:
             )
             self.bge_rf = BGERerankFunction(
                 model_name="BAAI/bge-reranker-v2-m3",  # Specify the model name. Defaults to `BAAI/bge-reranker-v2-m3`.
-                device="cuda" if torch.cuda.is_available() else "cpu"
+                device="cuda" if torch.cuda.is_available() else "cpu",
                 # Specify the device to use, e.g., 'cpu' or 'cuda:0'
             )
             self.clip_model = AutoModel.from_pretrained("jinaai/jina-clip-v2", trust_remote_code=True).to(device)
@@ -91,9 +89,7 @@ class MilvusOperator:
                 enable_dynamic_field=True,
             )
             schema.add_field(field_name="id", datatype=DataType.INT64, is_primary=True)
-            schema.add_field(
-                field_name="session_id", datatype=DataType.VARCHAR, max_length=1000
-            )
+            schema.add_field(field_name="session_id", datatype=DataType.VARCHAR, max_length=1000)
             schema.add_field(
                 field_name="text",
                 datatype=DataType.VARCHAR,
@@ -102,15 +98,11 @@ class MilvusOperator:
             )
             # Define a sparse vector field to generate spare vectors with BM25
             schema.add_field(field_name="sparse", datatype=DataType.SPARSE_FLOAT_VECTOR)
-            schema.add_field(
-                field_name="dense", datatype=DataType.FLOAT_VECTOR, dim=1024
-            )
+            schema.add_field(field_name="dense", datatype=DataType.FLOAT_VECTOR, dim=1024)
             schema.add_field(field_name="created_at", datatype=DataType.INT64)
             bm25_function = Function(
                 name="text_bm25_emb",  # Function name
-                input_field_names=[
-                    "text"
-                ],  # Name of the VARCHAR field containing raw text data
+                input_field_names=["text"],  # Name of the VARCHAR field containing raw text data
                 output_field_names=["sparse"],
                 # Name of the SPARSE_FLOAT_VECTOR field reserved to store generated embeddings
                 function_type=FunctionType.BM25,
@@ -148,20 +140,13 @@ class MilvusOperator:
             )
             # Add fields to schema
             schema.add_field(field_name="id", datatype=DataType.INT64, is_primary=True)
-            schema.add_field(
-                field_name="dense", datatype=DataType.FLOAT_VECTOR, dim=1024
-            )
+            schema.add_field(field_name="dense", datatype=DataType.FLOAT_VECTOR, dim=1024)
             schema.add_field(field_name="created_at", datatype=DataType.INT64)
             # Prepare index parameters
             index_params = self.client.prepare_index_params()
 
             # Add indexes
-            index_params.add_index(
-                field_name="dense",
-                index_name="dense_index",
-                index_type="AUTOINDEX",
-                metric_type="IP"
-            )
+            index_params.add_index(field_name="dense", index_name="dense_index", index_type="AUTOINDEX", metric_type="IP")
             self.client.create_collection(
                 collection_name="media_collection",
                 schema=schema,
@@ -239,10 +224,10 @@ class MilvusOperator:
         return res
 
     async def search(
-            self,
-            text: list[str],
-            search_filter: str | None = None,
-            collection_name="chat_collection",
+        self,
+        text: list[str],
+        search_filter: str | None = None,
+        collection_name="chat_collection",
     ):
         if not self.initialized:
             await self.init_models()
@@ -286,11 +271,7 @@ class MilvusOperator:
 
         ids = [i["id"] for i in res[0]]
 
-        texts = await client.get(
-            collection_name=collection_name,
-            ids=ids,
-            output_fields=["text"]
-        )
+        texts = await client.get(collection_name=collection_name, ids=ids, output_fields=["text"])
 
         text_list = [i["text"] for i in texts]
 
@@ -311,15 +292,25 @@ class MilvusOperator:
             text_embeddings = await asyncio.to_thread(self.clip_model.encode_text, text)
         dense_vector = text_embeddings[0]
         client = self._get_async_client()
+        res = await client.search(collection_name="media_collection", anns_field="dense", data=[dense_vector], limit=3, search_params={"metric_type": "IP"})
+        return [i["id"] for i in res[0]]
+
+    async def search_media_by_pic(self, image_urls):
+        if not self.initialized:
+            await self.init_models()
+        assert self.clip_model is not None, "CLIP model not initialized"
+        async with self.semaphore:
+            image_embeddings = await asyncio.to_thread(self.clip_model.encode_image, image_urls)  # also accepts PIL.Image.Image, local filenames, dataURI
+        dense_vector = image_embeddings[0]
+        client = self._get_async_client()
         res = await client.search(
             collection_name="media_collection",
             anns_field="dense",
             data=[dense_vector],
-            limit=3,
+            limit=5,
             search_params={"metric_type": "IP"}
         )
         return [i["id"] for i in res[0]]
-
 
 plugin_config = get_plugin_config(Config).ai_groupmate
 
