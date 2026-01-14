@@ -66,7 +66,6 @@ record = on_message(
 @record.handle()
 async def handle_message(db_session: async_scoped_session, msg: UniMsg, session: Uninfo, event: Event, bot: Bot, state: T_State, interface: QryItrface):
     """处理消息的主函数"""
-    bot_name = plugin_config.bot_name
     imgs = msg.include(Image)
     content = f"id: {get_message_id()}\n"
     to_me = False
@@ -141,7 +140,7 @@ async def handle_message(db_session: async_scoped_session, msg: UniMsg, session:
         user_id = ""
         user_name = ""
     if should_reply:
-        await handle_reply_logic(db_session, session, bot_name, user_id, user_name)
+        await handle_reply_logic(db_session, session, user_id, user_name)
 
     await db_session.commit()
 
@@ -163,7 +162,7 @@ async def process_image_message(
     image_format = img.id.split(".")[-1]
 
     # 获取和压缩图片
-    pic = await image_fetch(event, bot, state, img)
+    pic = await asyncio.wait_for(image_fetch(event, bot, state, img), timeout=15.0)
     pic = await asyncio.to_thread(check_and_compress_image_bytes, pic, image_format=image_format.upper())
     file_hash = generate_file_hash(pic)
     file_path = pic_dir / f"{file_hash}.{image_format}"
@@ -237,7 +236,6 @@ async def process_image_message(
 async def handle_reply_logic(
     db_session,
     session: Uninfo,
-    bot_name: str,
     user_id: str,
     user_name: str | None,
 ):
@@ -257,7 +255,11 @@ async def handle_reply_logic(
 
         # 使用Agent决定回复策略
         logger.info("开始调用Agent决策...")
-        await choice_response_strategy(db_session, session.scene.id, last_msg, user_id, user_name, "")
+        try:
+            await asyncio.wait_for(choice_response_strategy(db_session, session.scene.id, last_msg, user_id, user_name, ""),timeout=120.0)
+        except asyncio.TimeoutError:
+            logger.warning(f"Agent 思考超时，跳过回复 - session: {session.scene.id}")
+            return
 
     except Exception as e:
         logger.error(f"回复逻辑执行失败: {e}")
@@ -333,7 +335,7 @@ async def _(db_session: async_scoped_session, session: Uninfo, arg: Message = Co
     await UniMessage.image(raw=image_bytes).send(reply_to=True)
 
 
-@scheduler.scheduled_job("interval", minutes=60)
+@scheduler.scheduled_job("interval", minutes=60, max_instances=1, coalesce=True, id="vectorize_chat")
 async def vectorize_message_history():
     async with get_session() as db_session:
         session_ids = await db_session.execute(Select(ChatHistory.session_id.distinct()))
@@ -352,7 +354,7 @@ async def vectorize_message_history():
                 continue
 
 
-@scheduler.scheduled_job("interval", minutes=30)
+@scheduler.scheduled_job("interval", minutes=30, max_instances=1, coalesce=True, id="vectorize_media")
 async def vectorize_media():
     async with get_session() as db_session:
         medias_res = await db_session.execute(Select(MediaStorage).where(MediaStorage.references >= 3, MediaStorage.vectorized.is_(False)))
@@ -393,7 +395,7 @@ async def vectorize_media():
         logger.info("向量化媒体完成")
 
 
-@scheduler.scheduled_job("interval", minutes=35)
+@scheduler.scheduled_job("interval", minutes=35, max_instances=1, coalesce=True, id="clear_cache")
 async def clear_cache_pic():
     async with get_session() as db_session:
         result = await db_session.execute(Select(MediaStorage).where(MediaStorage.references < 3, datetime.datetime.now() - MediaStorage.created_at > datetime.timedelta(days=30)))
