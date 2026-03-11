@@ -16,5 +16,6 @@ class ScopedConfig(BaseModel):
     rerank_api_key: str = ""
 
 
+
 class Config(BaseModel):
     ai_groupmate: ScopedConfig = Field(default_factory=ScopedConfig)

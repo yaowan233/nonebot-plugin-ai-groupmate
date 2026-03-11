@@ -42,15 +42,13 @@ class ChatHistory(Model):
 
 class UserRelation(Model):
     """用户关系/好感度表"""
+
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     user_id: Mapped[str] = mapped_column(index=True)
     user_name: Mapped[str]
     favorability: Mapped[int] = mapped_column(default=0)  # 好感度，默认0
     tags: Mapped[list[str]] = mapped_column(JSON, default=list)
-    updated_at: Mapped[datetime] = mapped_column(
-        default=datetime.now,
-        onupdate=datetime.now
-    )
+    updated_at: Mapped[datetime] = mapped_column(default=datetime.now, onupdate=datetime.now)
 
     def get_status_desc(self) -> str:
         """根据分数返回关系描述"""
