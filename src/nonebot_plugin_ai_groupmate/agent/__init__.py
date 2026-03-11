@@ -1,33 +1,32 @@
-import base64
-import collections
+import re
 import json
+import base64
+import random
 import asyncio
 import datetime
 import mimetypes
-import random
-import re
 import traceback
+import collections
 from typing import Any, cast
 from pathlib import Path
 from dataclasses import dataclass
 
 import jieba
-from langchain.agents.middleware import ToolCallLimitMiddleware
-from langchain_core.prompts import ChatPromptTemplate
 from nonebot import require, get_plugin_config
-from nonebot_plugin_orm import get_session
 from pydantic import Field, BaseModel, SecretStr, field_validator
 from simpleeval import simple_eval
-from sqlalchemy import Select, func, extract, desc
-
+from sqlalchemy import Select, desc, func, extract
 from nonebot.log import logger
 from langchain.tools import ToolRuntime, tool
 from langchain.agents import create_agent
 from langchain_openai import ChatOpenAI
 from langchain_tavily import TavilySearch
+from nonebot_plugin_orm import get_session
+from langchain_core.prompts import ChatPromptTemplate
 from nonebot_plugin_alconna import UniMessage
 from sqlalchemy.orm.session import Session
-from langchain_core.messages import AIMessage, HumanMessage, BaseMessage, SystemMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from langchain.agents.middleware import ToolCallLimitMiddleware
 from langchain.agents.structured_output import ToolStrategy
 
 from ..model import ChatHistory, MediaStorage, UserRelation, ChatHistorySchema
@@ -178,7 +177,7 @@ def create_report_tool(db_session, session_id: str, user_id: str, user_name: str
             stmt = Select(ChatHistory).where(
                 ChatHistory.user_id == user_id,
                 ChatHistory.session_id == session_id,
-                extract('year', ChatHistory.created_at) == current_year
+                extract("year", ChatHistory.created_at) == current_year
             )
             all_msgs = (await db_session.execute(stmt)).scalars().all()
 
@@ -193,7 +192,8 @@ def create_report_tool(db_session, session_id: str, user_id: str, user_name: str
             # 采样 30 条让 LLM 分析 (只分析在这个群说的话)
             samples = random.sample(text_msgs, min(len(text_msgs), 30)) if text_msgs else []
             longest_msg = max(text_msgs, key=len) if text_msgs else "无"
-            if len(longest_msg) > 60: longest_msg = longest_msg[:60] + "..."
+            if len(longest_msg) > 60:
+                longest_msg = longest_msg[:60] + "..."
 
             # 活跃时间
             active_hour_desc = "潜水员"
@@ -203,19 +203,19 @@ def create_report_tool(db_session, session_id: str, user_id: str, user_name: str
                 active_hour_desc = f"{top_hour}点"
 
             async def get_rank_str(content_type=None, hour_limit=None):
-                stmt = Select(ChatHistory.user_id, func.count(ChatHistory.msg_id).label('c')) \
+                stmt = Select(ChatHistory.user_id, func.count(ChatHistory.msg_id).label("c")) \
                     .where(
-                    extract('year', ChatHistory.created_at) == current_year,
+                    extract("year", ChatHistory.created_at) == current_year,
                     ChatHistory.session_id == session_id
                 )
 
                 if content_type:
                     stmt = stmt.where(ChatHistory.content_type == content_type)
                 if hour_limit:
-                    stmt = stmt.where(extract('hour', ChatHistory.created_at) < hour_limit)
+                    stmt = stmt.where(extract("hour", ChatHistory.created_at) < hour_limit)
 
                 # 核心修改：只 group_by user_id
-                stmt = stmt.group_by(ChatHistory.user_id).order_by(desc('c')).limit(3)
+                stmt = stmt.group_by(ChatHistory.user_id).order_by(desc("c")).limit(3)
 
                 # 获取结果，此时是 List[(user_id, count)]
                 rows = (await db_session.execute(stmt)).all()
@@ -238,21 +238,21 @@ def create_report_tool(db_session, session_id: str, user_id: str, user_name: str
                 return ", ".join(rank_items)
 
             rank_talk = await get_rank_str()
-            rank_img = await get_rank_str(content_type='image')
+            rank_img = await get_rank_str(content_type="image")
             rank_night = await get_rank_str(hour_limit=5)
 
             # 只分析本群的文本
             stmt_text = Select(ChatHistory.content).where(
                 ChatHistory.session_id == session_id,
-                extract('year', ChatHistory.created_at) == current_year,
-                ChatHistory.content_type == 'text',
+                extract("year", ChatHistory.created_at) == current_year,
+                ChatHistory.content_type == "text",
                 ChatHistory.user_id == user_id,
             ).order_by(desc(ChatHistory.created_at))
 
             rows = (await db_session.execute(stmt_text)).all()
             sample_text = "\n".join([r[0] for r in rows if r[0]])
 
-            clean_text = re.sub(r'[^\u4e00-\u9fa5]', '', sample_text)
+            clean_text = re.sub(r"[^\u4e00-\u9fa5]", "", sample_text)
             words = jieba.lcut(clean_text)
             filtered = [w for w in words if len(w) > 1 and w not in stop_words]
             hot_words_str = "、".join([x[0] for x in collections.Counter(filtered).most_common(8)])
@@ -366,7 +366,7 @@ def create_similar_meme_tool(db_session, session_id: str):
         根据指定的历史最新图片，搜索与之相似的表情包。
         当用户说“找一张跟这张差不多的”或引用某张图片求相似图时使用。
         """
-        logger.info(f"正在搜索相似图片...")
+        logger.info("正在搜索相似图片...")
 
         try:
             # 1. 从 ChatHistory 查找本群最近的一条图片消息
@@ -458,7 +458,7 @@ def create_reply_tool(db_session, session_id: str):
         try:
             # 1. 实际发送消息 (Side Effect)
             res = await UniMessage.text(content).send()
-            msg_id = res.msg_ids[-1]['message_id'] if res.msg_ids else "unknown"
+            msg_id = res.msg_ids[-1]["message_id"] if res.msg_ids else "unknown"
             chat_history = ChatHistory(
                 session_id=session_id,
                 user_id=plugin_config.bot_name,
@@ -941,7 +941,7 @@ def get_image_data_uri(file_name: str) -> str | None:
             mime_type = "image/jpeg"  # 默认 fallback
 
         with open(file_path, "rb") as image_file:
-            encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
+            encoded_string = base64.b64encode(image_file.read()).decode("utf-8")
             return f"data:{mime_type};base64,{encoded_string}"
     except Exception as e:
         logger.error(f"读取图片失败 {file_name}: {e}")
@@ -973,7 +973,7 @@ def format_chat_history(history: list[ChatHistorySchema]) -> list[BaseMessage]:
             # 例如: "id:12345\nxf82...jpg"
             # 我们需要拆分出文件名
 
-            parts = msg.content.strip().split('\n')
+            parts = msg.content.strip().split("\n")
             # 假设最后一行是文件名，前面是 ID 或其他前缀
             file_name = parts[-1].strip()
             prefix_info = "\n".join(parts[:-1]) if len(parts) > 1 else ""

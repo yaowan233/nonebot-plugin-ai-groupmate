@@ -1,16 +1,15 @@
-import asyncio
-import base64
-import mimetypes
 import os
 import time
 import uuid
-import httpx
-from typing import List, Optional
+import base64
+import asyncio
+import mimetypes
 
+import httpx
 from openai import AsyncOpenAI
-from qdrant_client import AsyncQdrantClient, models
 from nonebot import get_plugin_config
 from nonebot.log import logger
+from qdrant_client import AsyncQdrantClient, models
 
 from .config import Config
 
@@ -86,7 +85,7 @@ class VectorDBOperator:
 
             self._collections_ready = True
 
-    async def _get_text_embedding(self, text: str) -> Optional[List[float]]:
+    async def _get_text_embedding(self, text: str) -> list[float] | None:
         """调用 API 获取文本 Dense 向量 (BGE-M3)"""
         try:
             resp = await self.emb_client.embeddings.create(
@@ -98,7 +97,7 @@ class VectorDBOperator:
             logger.error(f"Embedding API Error: {e}")
             return None
 
-    async def _get_qwen_vl_embedding(self, text: str = "", image_source: str = "") -> Optional[List[float]]:
+    async def _get_qwen_vl_embedding(self, text: str = "", image_source: str = "") -> list[float] | None:
         """调用阿里云 Qwen3-VL-Embedding 获取多模态向量 (纯异步版)"""
 
         # 阿里云多模态 Embedding 的原生 REST API 地址
@@ -124,7 +123,7 @@ class VectorDBOperator:
                 mime_type = mime_type or "image/jpeg"  # 兜底
 
                 with open(image_source, "rb") as f:
-                    base64_data = base64.b64encode(f.read()).decode('utf-8')
+                    base64_data = base64.b64encode(f.read()).decode("utf-8")
                     # ⚠️ 阿里要求必须拼装上 data:image/... 的头部
                     item["image"] = f"data:{mime_type};base64,{base64_data}"
 
@@ -192,12 +191,14 @@ class VectorDBOperator:
         return None
 
 
-    async def _rerank(self, query: str, docs: List[str]) -> List[str]:
+    async def _rerank(self, query: str, docs: list[str]) -> list[str]:
         """调用 Rerank API 对结果精排"""
-        if not docs: return []
+        if not docs:
+            return []
 
         # 如果只有一条，没必要 Rerank
-        if len(docs) == 1: return docs
+        if len(docs) == 1:
+            return docs
 
         try:
             headers = {
@@ -232,7 +233,8 @@ class VectorDBOperator:
         """插入新的聊天记录"""
         await self._ensure_collections()
         vector = await self._get_text_embedding(text)
-        if not vector: return
+        if not vector:
+            return
 
         point_id = str(uuid.uuid4())
 
@@ -258,7 +260,8 @@ class VectorDBOperator:
         await self._ensure_collections()
         # 1. 获取向量
         vector = await self._get_text_embedding(query)
-        if not vector: return "无法连接记忆库"
+        if not vector:
+            return "无法连接记忆库"
 
         # 2. Qdrant 向量搜索
         # 使用 query_points() 接口
@@ -296,7 +299,8 @@ class VectorDBOperator:
         """插入新表情包 (新图入库用)"""
         await self._ensure_collections()
         vector = await self._get_qwen_vl_embedding(image_source=image_url, text=description)
-        if not vector: return
+        if not vector:
+            return
 
         await self.client.upsert(
             collection_name=self.media_col,
@@ -311,11 +315,12 @@ class VectorDBOperator:
             ]
         )
 
-    async def _get_batch_text_embeddings(self, texts: List[str]) -> List[List[float]]:
+    async def _get_batch_text_embeddings(self, texts: list[str]) -> list[list[float]]:
         """
         批量调用 API 获取文本向量 (自动处理 Batch Size 限制)
         """
-        if not texts: return []
+        if not texts:
+            return []
 
         # 硅基流动限制单次 max=64，我们设为 50 以保万无一失
         API_BATCH_LIMIT = 50
@@ -344,7 +349,7 @@ class VectorDBOperator:
             # 如果中间失败了，返回空列表，触发上层重试机制
             return []
 
-    async def batch_insert(self, texts: List[str], session_id: str):
+    async def batch_insert(self, texts: list[str], session_id: str):
         """
         批量插入聊天记录 (用于 utils.py 中的历史数据向量化)
         """
@@ -391,7 +396,7 @@ class VectorDBOperator:
             logger.error(f"Qdrant 批量写入失败: {e}")
             raise e  # 抛出异常让 utils.py 的重试机制捕获
 
-    async def search_meme(self, description: str) -> List[int]:
+    async def search_meme(self, description: str) -> list[int]:
         """
         根据描述搜表情包
         Text -> Clip Vector -> Search Qdrant -> Return IDs
@@ -399,7 +404,8 @@ class VectorDBOperator:
         await self._ensure_collections()
         # 1. 文本转向量
         vector = await self._get_qwen_vl_embedding(text=description)
-        if not vector: return []
+        if not vector:
+            return []
 
         # 2. Qdrant 搜索
         search_result = await self.client.query_points(
@@ -412,7 +418,7 @@ class VectorDBOperator:
         # 3. 只返回 ID 列表
         return [int(point.id) for point in search_result.points]
 
-    async def search_similar_meme(self, file_path: str, limit: int = 6) -> Optional[List[int]]:
+    async def search_similar_meme(self, file_path: str, limit: int = 6) -> list[int] | None:
         """
         根据图片找图片 (猜你喜欢/找相似)
         ID -> Retrieve Vector -> Search Qdrant -> Return IDs
@@ -420,7 +426,8 @@ class VectorDBOperator:
         await self._ensure_collections()
 
         target_vector = await self._get_qwen_vl_embedding(file_path)
-        if not target_vector: return []
+        if not target_vector:
+            return []
 
         search_result = await self.client.query_points(
             collection_name=self.media_col,

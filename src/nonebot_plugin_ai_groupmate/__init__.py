@@ -1,5 +1,5 @@
-import base64
 import json
+import base64
 import random
 import asyncio
 import datetime
@@ -8,15 +8,15 @@ from io import BytesIO
 from pathlib import Path
 
 import jieba
-from langchain_core.messages import HumanMessage
-from langchain_openai import ChatOpenAI
 from nonebot import logger, require, on_command, on_message, get_plugin_config
 from pydantic import SecretStr
 from wordcloud import WordCloud
 from nonebot.params import CommandArg
 from nonebot.plugin import PluginMetadata, inherit_supported_adapters
 from nonebot.typing import T_State
+from langchain_openai import ChatOpenAI
 from nonebot.adapters import Bot, Event, Message
+from langchain_core.messages import HumanMessage
 
 require("nonebot_plugin_alconna")
 require("nonebot_plugin_orm")
@@ -32,7 +32,7 @@ from nonebot_plugin_alconna import Image, UniMessage, image_fetch, get_message_i
 from nonebot_plugin_apscheduler import scheduler
 from nonebot_plugin_alconna.uniseg import UniMsg
 
-from .agent import choice_response_strategy, check_if_should_reply
+from .agent import check_if_should_reply, choice_response_strategy
 from .model import ChatHistory, MediaStorage, ChatHistorySchema
 from .utils import (
     generate_file_hash,
@@ -41,7 +41,6 @@ from .utils import (
 )
 from .config import Config
 from .memory import DB
-
 
 __plugin_meta__ = PluginMetadata(
     name="nonebot-plugin-ai-groupmate",
@@ -446,7 +445,7 @@ async def vectorize_media():
     async with get_session() as db_session:
         # 只处理引用次数 >= 3 且未向量化的图片
         medias_res = await db_session.execute(
-            Select(MediaStorage).where(MediaStorage.references >= 3, MediaStorage.vectorized == False)
+            Select(MediaStorage).where(MediaStorage.references >= 3, MediaStorage.vectorized.is_(False))
         )
         medias = medias_res.scalars().all()
         logger.info(f"待处理高频图片数量: {len(medias)}")
@@ -465,12 +464,13 @@ async def vectorize_media():
                 try:
                     with open(file_path, "rb") as image_file:
                         file_data = image_file.read()
-                        encoded_string = base64.b64encode(file_data).decode('utf-8')
+                        encoded_string = base64.b64encode(file_data).decode("utf-8")
 
                         # 构造 Data URI
-                        ext = media.file_path.split('.')[-1].lower()
+                        ext = media.file_path.split(".")[-1].lower()
                         mime = "image/png" if ext == "png" else "image/jpeg"
-                        if ext == "gif": mime = "image/gif"  # Qwen-VL 支持 GIF
+                        if ext == "gif":
+                            mime = "image/gif"  # Qwen-VL 支持 GIF
 
                         img_data_uri = f"data:{mime};base64,{encoded_string}"
                 except Exception as e:
