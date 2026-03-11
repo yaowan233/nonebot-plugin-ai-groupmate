@@ -14,7 +14,7 @@ from sqlalchemy import Select, Update
 from nonebot_plugin_orm import AsyncSession
 
 from .model import ChatHistory, ChatHistorySchema
-from .milvus import MilvusOP
+from .memory import DB
 
 
 
@@ -39,69 +39,90 @@ def check_and_compress_image_bytes(
     返回:
     bytes: 压缩后的图片bytes数据
     """
-    if image_format.upper() == "JPG":
+    # 1. 格式标准化
+    if image_format.upper() in ["JPG", "JPEG"]:
         image_format = "JPEG"
-    # 将MB转为字节
-    max_size_bytes = max_size_mb * 1024 * 1024
+    elif image_format.upper() == "PNG":
+        image_format = "PNG"
 
-    # 检查bytes大小
+    # 2. 初始检查
+    max_size_bytes = int(max_size_mb * 1024 * 1024)
     file_size = len(image_bytes)
 
     if file_size <= max_size_bytes:
-        # print(f"图片大小为 {file_size / 1024 / 1024:.2f}MB，无需压缩")
         return image_bytes
 
     try:
-        # 读取图片
         img = Image.open(io.BytesIO(image_bytes))
 
-        # 尝试不同的质量等级直到文件大小小于目标大小
+        # JPEG 不支持透明通道 (RGBA)，必须转 RGB
+        if image_format == "JPEG" and img.mode in ("RGBA", "P"):
+            img = img.convert("RGB")
+
         quality = quality_start
         compressed_image = io.BytesIO()
-        compressed_size = compressed_image.tell()
+        compressed_size = file_size  # 初始默认为原大小，或者设为无限大也可以
 
-        while quality > 10:
-            compressed_image.seek(0)
-            compressed_image.truncate(0)  # 清空BytesIO对象
-            if img.mode != "RGB":
-                img = img.convert("RGB")
-            img.save(
-                compressed_image, format=image_format, quality=quality, optimize=True
-            )
+        # 3. 尝试降低质量压缩 (Quality Loop)
+        # 注意：PNG 格式忽略 quality 参数，会直接跳过或无效循环
+        if image_format != "PNG":
+            while quality >= 10:
+                compressed_image.seek(0)
+                compressed_image.truncate(0)
+
+                img.save(
+                    compressed_image,
+                    format=image_format,
+                    quality=quality,
+                    optimize=True
+                )
+
+                compressed_size = compressed_image.tell()
+
+                if compressed_size <= max_size_bytes:
+                    logger.info(
+                        f"图片通过降质压缩成功 (Q={quality}): {file_size / 1024 / 1024:.2f}MB -> {compressed_size / 1024 / 1024:.2f}MB")
+                    return compressed_image.getvalue()
+
+                quality -= 15
 
 
-            if compressed_size <= max_size_bytes:
-                break
-
-            quality -= 15
-
-        # 如果压缩后的图像仍然大于目标大小，可以考虑调整图像尺寸
+        # 4. 尝试缩小尺寸 (Resize)
         if compressed_size > max_size_bytes:
-            logger.info("通过调整质量无法达到目标大小，尝试调整图像尺寸...")
-            width, height = img.size
-            ratio = (max_size_bytes / compressed_size) ** 0.5  # 估算缩放比例
+            logger.info("降质无法满足要求(或为PNG)，开始缩小尺寸...")
+            current_size = compressed_size if compressed_size < file_size else file_size
 
-            new_width = int(width * ratio * 0.9)  # 稍微减小一点以确保大小达标
-            new_height = int(height * ratio * 0.9)
+            width, height = img.size
+            # 计算缩放比例
+            ratio = min((max_size_bytes / current_size) ** 0.5, 0.9)
+
+            new_width = max(int(width * ratio), 1)
+            new_height = max(int(height * ratio), 1)
 
             img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
 
             compressed_image.seek(0)
             compressed_image.truncate(0)
+
+            # 使用最后一次有效的 quality (防止负数)
+            final_quality = max(quality, 75)
+
             img.save(
-                compressed_image, format=image_format, quality=quality, optimize=True
+                compressed_image,
+                format=image_format,
+                quality=final_quality,
+                optimize=True
             )
 
-        compressed_bytes = compressed_image.getvalue()
-        final_size = len(compressed_bytes)
+        final_data = compressed_image.getvalue()
         logger.info(
-            f"图片已压缩: {file_size / 1024 / 1024:.2f}MB -> {final_size / 1024 / 1024:.2f}MB (质量: {quality})"
+            f"图片最终压缩: {file_size / 1024 / 1024:.2f}MB -> {len(final_data) / 1024 / 1024:.2f}MB"
         )
-        return compressed_bytes
+        return final_data
 
     except Exception as e:
         logger.error(f"压缩图片时出错: {e}")
-        print(traceback.format_exc())
+        # 出错时降级策略：返回原图
         return image_bytes
 
 
@@ -342,7 +363,7 @@ async def insert_vectors_with_retry(
     """
     for attempt in range(max_retries):
         try:
-            await MilvusOP.batch_insert(contexts, session_id)
+            await DB.batch_insert(contexts, session_id)
             return
         except Exception as e:
             if attempt == max_retries - 1:

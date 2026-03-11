@@ -1,7 +1,9 @@
+import base64
 import collections
 import json
 import asyncio
 import datetime
+import mimetypes
 import random
 import re
 import traceback
@@ -10,8 +12,10 @@ from pathlib import Path
 from dataclasses import dataclass
 
 import jieba
+from langchain.agents.middleware import ToolCallLimitMiddleware
 from langchain_core.prompts import ChatPromptTemplate
 from nonebot import require, get_plugin_config
+from nonebot_plugin_orm import get_session
 from pydantic import Field, BaseModel, SecretStr, field_validator
 from simpleeval import simple_eval
 from sqlalchemy import Select, func, extract, desc
@@ -23,12 +27,12 @@ from langchain_openai import ChatOpenAI
 from langchain_tavily import TavilySearch
 from nonebot_plugin_alconna import UniMessage
 from sqlalchemy.orm.session import Session
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, BaseMessage, SystemMessage
 from langchain.agents.structured_output import ToolStrategy
 
 from ..model import ChatHistory, MediaStorage, UserRelation, ChatHistorySchema
 from ..config import Config
-from ..milvus import MilvusOP
+from ..memory import DB
 
 require("nonebot_plugin_localstore")
 
@@ -75,6 +79,57 @@ class ResponseMessage(BaseModel):
         return value
 
 
+flash_model = ChatOpenAI(
+    model="qwen-flash",
+    api_key=SecretStr(plugin_config.qwen_token),
+    base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+    temperature=0,  # 设为0，由它做决策需要绝对理性，不需要发散
+    max_completion_tokens=10,  # 我们只需要它回答 YES 或 NO，限制输出长度省钱
+)
+
+
+async def check_if_should_reply(
+        history_summary: str,
+        current_msg: str,
+        bot_name: str
+) -> bool:
+    """
+    使用 qwen-flash 快速判断是否需要回复
+    """
+    system_prompt = f"""
+你是一个群聊消息过滤器。你的任务是判断群内的最新消息是否需要机器人 "{bot_name}" 进行回复。
+
+判断规则：
+1. 如果用户明显在向 "{bot_name}" 提问、求助或打招呼，返回 YES。
+2. 如果用户在讨论 "{bot_name}" 相关的话题且期待回应，返回 YES。
+3. 如果是群友之间的闲聊、无关的刷屏、或者语意不通的消息，返回 NO。
+4. 如果你不确定，返回 NO。
+
+请仅输出 "YES" 或 "NO"，不要输出任何其他内容。
+"""
+
+    # 组合 Prompt
+    # 只需要最近的一两条消息即可，不需要长篇大论的历史
+    input_text = f"【最近上下文】\n{history_summary}\n\n【最新消息】\n{current_msg}\n\n请判断是否回复(YES/NO):"
+
+    try:
+        # 调用 Flash 模型
+        resp = await flash_model.ainvoke([
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=input_text)
+        ])
+        if not isinstance(resp.content, str):
+            return False
+
+        content = resp.content.strip().upper()
+        # 移除可能的标点符号
+        content = content.replace(".", "").replace("。", "")
+
+        return content == "YES"
+    except Exception as e:
+        logger.error(f"决策模型调用失败: {e}")
+        return False  # 报错时默认不回，保守策略
+
 # 如果想封装成自定义的 @tool，可以这样写:
 @tool("search_web")
 async def search_web(query: str) -> str:
@@ -97,7 +152,7 @@ async def search_history_context(query: str, runtime: ToolRuntime[Context]) -> s
     """
     try:
         logger.info(f"大模型执行{runtime.context.session_id} RAG 搜索\n{query}")
-        similar_msgs = await MilvusOP.search([query], search_filter=f'session_id == "{runtime.context.session_id}"')
+        similar_msgs = await DB.search_chat(query, runtime.context.session_id)
         return "\n".join(similar_msgs) if similar_msgs else "未找到相关历史记录"
     except Exception as e:
         logger.error(f"历史搜索失败: {e}")
@@ -300,6 +355,127 @@ def create_report_tool(db_session, session_id: str, user_id: str, user_name: str
     return generate_and_send_annual_report
 
 
+def create_similar_meme_tool(db_session, session_id: str):
+    """
+    创建基于消息ID搜索相似表情包的工具
+    """
+
+    @tool("search_similar_meme_by_id")
+    async def search_similar_meme_by_pic() -> str:
+        """
+        根据指定的历史最新图片，搜索与之相似的表情包。
+        当用户说“找一张跟这张差不多的”或引用某张图片求相似图时使用。
+        """
+        logger.info(f"正在搜索相似图片...")
+
+        try:
+            # 1. 从 ChatHistory 查找本群最近的一条图片消息
+            stmt = (
+                Select(ChatHistory)
+                .where(
+                    ChatHistory.session_id == session_id,
+                    ChatHistory.content_type == "image"
+                )
+                .order_by(desc(ChatHistory.created_at))
+                .limit(1)
+            )
+            result = await db_session.execute(stmt)
+            msg = result.scalar_one_or_none()
+
+            if not msg:
+                return "本群近期没有发送过图片，无法进行相似搜索。"
+
+            # 2. 获取该图片的物理路径或 URL (需要根据你的表结构调整字段名)
+            stmt = Select(MediaStorage).where(MediaStorage.media_id == msg.media_id)
+            media_obj = (await db_session.execute(stmt)).scalar_one_or_none()
+
+            if not media_obj or not media_obj.file_path:  # 假设你的路径存放在 file_path
+                return "无法找到原图文件，无法进行分析。"
+
+            # 调用 database.py 中的新接口
+            # search_similar_meme(id) -> 返回相似图片的 ID 列表
+            pic_ids = await DB.search_similar_meme(media_obj.file_path)
+
+            if not pic_ids:
+                logger.info(f"未找到相似图片, source_id: {msg.media_id}")
+                return "没有搜索到相似图片"
+
+            # 3. 从 SQL 数据库获取图片详情
+            # 虽然 Qdrant 返回了 ID，但 LLM 还是需要知道这些图大概是啥（描述），以便决定发哪张
+            images_info = []
+
+            # 批量查询 SQL (比循环查更高效)
+            stmt = Select(MediaStorage).where(MediaStorage.media_id.in_(pic_ids))
+            rows = (await db_session.execute(stmt)).scalars().all()
+
+            # 为了保持顺序（Qdrant返回的是按相似度排序的），我们重新对齐一下
+            # 建立 id -> obj 映射
+            media_map = {m.media_id: m for m in rows}
+
+            for pid in pic_ids:
+                if pid in media_map:
+                    media_obj = media_map[pid]
+                    images_info.append({
+                        "pic_id": str(pid),  # 转字符串方便模型理解
+                        # 注意：如果是新图片，description 可能是 "[图片]" 占位符
+                        # 如果是迁移过来的旧图片，则是真实的描述
+                        "description": media_obj.description or "未知描述",
+                    })
+
+            return json.dumps({
+                "success": True,
+                "source_media_id": msg.media_id,
+                "images": images_info,
+                "count": len(images_info),
+                "note": "请根据 pic_id 调用 send_meme_image 发送"
+            }, ensure_ascii=False, indent=2)
+
+        except Exception as e:
+            logger.error(f"相似图片搜索失败: {e}")
+            return f"搜索出错: {e}"
+
+    return search_similar_meme_by_pic
+
+
+def create_reply_tool(db_session, session_id: str):
+    """
+    核心工具：用于发送消息。
+    """
+    @tool("reply_user")
+    async def reply_user(content: str) -> str:
+        """
+        向当前群聊发送文本回复。
+        注意：如果你想对用户说话，必须调用这个工具。不要直接返回文本。
+        Args:
+            content: 你想发送的内容。
+        """
+        if content.strip() == "OVER":
+            return "不要通过这个函数结束对话"
+
+        if not content or not content.strip():
+            return "内容为空，未发送。"
+
+        try:
+            # 1. 实际发送消息 (Side Effect)
+            res = await UniMessage.text(content).send()
+            msg_id = res.msg_ids[-1]['message_id'] if res.msg_ids else "unknown"
+            chat_history = ChatHistory(
+                session_id=session_id,
+                user_id=plugin_config.bot_name,
+                content_type="bot",
+                content= f"id:{msg_id}\n" + content,
+                user_name=plugin_config.bot_name,
+            )
+            db_session.add(chat_history)
+            logger.info(f"Bot已回复: {content}")
+            return "回复已成功发送，如果没有新的、不同的内容要补充，请立即结束回复(输出 OVER)。"
+        except Exception as e:
+            logger.error(f"发送消息异常: {e}")
+            await db_session.rollback()
+            return f"发送失败: {e}"
+
+    return reply_user
+
 def create_search_meme_tool(db_session):
     """
     创建一个带数据库会话的表情包搜索工具
@@ -319,11 +495,15 @@ def create_search_meme_tool(db_session):
         这个工具只负责搜索，不会发送图片。搜索后会返回匹配的图片列表及其详细描述。
         你可以查看这些图片的描述，判断是否合适，然后使用 send_meme_image 工具发送。
 
-        输入：表情包的描述，如"一只白色的猫咪"、"无语的表情"、"鼓掌"等
+        输入：表情包的描述（具体画面+情绪）：
+        - "二次元猫耳女孩，皱眉张嘴，生气抗议"
+        - "卡通小鸡，大笑得意，双手举起"
+        - "熊猫头，流泪叹气，悲伤无奈"
+        - "一只白色的猫咪，翻白眼，无语的表情"
         返回：包含图片ID和对应描述的JSON字符串
         """
         try:
-            pic_ids = await MilvusOP.search_media([description])
+            pic_ids = await DB.search_meme(description)
 
             if not pic_ids:
                 logger.info(f"未找到匹配的表情包: {description}")
@@ -360,12 +540,14 @@ def create_search_meme_tool(db_session):
                 "count": len(images_info),
             }, ensure_ascii=False, indent=2)
 
+
         except Exception as e:
-            logger.error(f"表情包搜索失败: {e}")
+            logger.error(f"表情包搜索失败: {repr(e)}")  # 使用 repr() 可以看到异常类型，比 str() 更详细
+            logger.error(traceback.format_exc())  # 打印完整报错路径
             return json.dumps({
                 "success": False,
                 "images": [],
-                "error": str(e)
+                "error": str(e) or "未知错误"
             }, ensure_ascii=False)
 
     return search_meme_image
@@ -490,73 +672,90 @@ def create_relation_tool(db_session, user_id: str, user_name: str | None):
 
         返回: 更新后的状态描述
         """
-        try:
-            # 1. 查询或初始化记录
-            stmt = Select(UserRelation).where(UserRelation.user_id == user_id)
-            result = await db_session.execute(stmt)
-            relation = result.scalar_one_or_none()
+        async with get_session() as session:
+            try:
+                # 1. 查询或初始化记录
+                stmt = Select(UserRelation).where(UserRelation.user_id == user_id)
+                result = await session.execute(stmt)
+                relation = result.scalar_one_or_none()
 
-            if not relation:
-                relation = UserRelation(user_id=user_id, user_name=user_name or "", favorability=0, tags=[])
-                db_session.add(relation)
+                if not relation:
+                    relation = UserRelation(user_id=user_id, user_name=user_name or "", favorability=0, tags=[])
+                    session.add(relation)
+                else:
+                    await session.refresh(relation, attribute_names=["tags"])
 
-            # 2. 处理好感度
-            old_score = relation.favorability
-            relation.favorability += score_change
-            relation.favorability = max(-100, min(100, relation.favorability))
-            if score_change > 0:
-                await UniMessage.image(raw=up_pic).send()
-            elif score_change < 0:
-                await UniMessage.image(raw=down_pic).send()
-            # 3. 处理标签 (核心修改)
-            # 获取现有标签的副本
-            current_tags = list(relation.tags) if relation.tags else []
+                # 2. 处理好感度
+                old_score = relation.favorability
 
-            # 执行移除操作 (处理 modify 的前半部分)
-            if remove_tags:
-                current_tags = [tag for tag in current_tags if tag not in remove_tags]
+                final_change = score_change
 
-            # 执行新增操作
-            if add_tags:
-                for tag in add_tags:
-                    if tag not in current_tags:
-                        current_tags.append(tag)
+                # 【救赎机制】：当好感度低于 -60 且 试图加分时，效果翻倍并额外奖励
+                if old_score < -60 and score_change > 0:
+                    final_change = int(score_change * 1.5) + 5
+                    logger.info(f"触发救赎机制：原始分 {score_change} -> 修正分 {final_change}")
 
-            # 限制标签总数，防止Token爆炸 (例如最多保留 8 个，保留最新的)
-            if len(current_tags) > 8:
-                current_tags = current_tags[-8:]
+                # 【破防机制】：当好感度高于 80 且 试图扣分时，伤害加深 (可选)
+                elif old_score > 80 and score_change < 0:
+                    final_change = int(score_change * 1.2) - 2
+                    logger.info(f"触发破防机制：原始分 {score_change} -> 修正分 {final_change}")
 
-            # 赋值回数据库对象
-            relation.tags = current_tags
-            relation.user_name = user_name or ""  # 同步更新昵称
-            favorability = relation.favorability
+                relation.favorability += final_change
+                relation.favorability = max(-100, min(100, relation.favorability))
+                if score_change > 0:
+                    await UniMessage.image(raw=up_pic).send()
+                elif score_change < 0:
+                    await UniMessage.image(raw=down_pic).send()
+                # 3. 处理标签 (核心修改)
+                # 获取现有标签的副本
+                current_tags = list(relation.tags) if relation.tags else []
 
-            await db_session.commit()
+                # 执行移除操作 (处理 modify 的前半部分)
+                if remove_tags:
+                    current_tags = [tag for tag in current_tags if tag not in remove_tags]
 
-            # 构建反馈信息
-            tag_msg = ""
-            if add_tags or remove_tags:
-                tag_msg = f"，标签变更(新增:{add_tags}, 移除:{remove_tags})"
+                # 执行新增操作
+                if add_tags:
+                    for tag in add_tags:
+                        if tag not in current_tags:
+                            current_tags.append(tag)
 
-            log_msg = f"好感度 {old_score}->{favorability}{tag_msg} (原因: {reason})"
-            logger.info(f"用户[{user_name}]画像更新: {log_msg}")
+                # 限制标签总数，防止Token爆炸 (例如最多保留 8 个，保留最新的)
+                if len(current_tags) > 8:
+                    current_tags = current_tags[-8:]
 
-            return f"画像已更新。当前好感度: {favorability}，当前标签: {current_tags}"
+                # 赋值回数据库对象
+                relation.tags = current_tags
+                relation.user_name = user_name or ""  # 同步更新昵称
+                favorability = relation.favorability
 
-        except Exception as e:
-            logger.error(f"关系更新失败: {e}")
-            print(traceback.format_exc())
-            return f"数据库错误: {str(e)}"
+                await session.commit()
+
+                # 构建反馈信息
+                tag_msg = ""
+                if add_tags or remove_tags:
+                    tag_msg = f"，标签变更(新增:{add_tags}, 移除:{remove_tags})"
+
+                log_msg = f"好感度 {old_score}->{favorability}{tag_msg} (原因: {reason})"
+                logger.info(f"用户[{user_name}]画像更新: {log_msg}")
+
+                return f"画像已更新。当前好感度: {favorability}，当前标签: {current_tags}"
+
+            except Exception as e:
+                logger.error(f"关系更新失败: {e}")
+                print(traceback.format_exc())
+                return f"数据库错误: {str(e)}"
+        return None
 
     return update_user_impression
 
 
 tools = [search_web, search_history_context, calculate_expression]
 model = ChatOpenAI(
-    model=plugin_config.openai_model,
-    api_key=SecretStr(plugin_config.openai_token),
-    base_url=plugin_config.openai_base_url,
-    temperature=0.7,
+    model=plugin_config.base_model,
+    api_key=SecretStr(plugin_config.qwen_token),
+    base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+    temperature=1,
 )
 
 
@@ -575,6 +774,12 @@ async def get_user_relation_context(db_session, user_id: str, user_name: str | N
 印象：无
 策略：保持礼貌，通过对话了解对方。
 """
+        if relation.favorability <= -80:
+            strategy = "策略：你非常讨厌他，但如果他**诚恳道歉**或**做出实质性补偿**，请给他一个改过自新的机会（给予大幅好感度加分），不要一直死咬着不放。"
+        elif relation.favorability >= 90:
+            strategy = "策略：你们关系极好，但不要对他无底线纵容。"
+        else:
+            strategy = ""
 
         return f"""
 【人际关系档案】
@@ -586,7 +791,8 @@ async def get_user_relation_context(db_session, user_id: str, user_name: str | N
 1. 如果对方的表现符合现有标签，无需操作。
 2. 如果对方表现出了**新特征**，放入 add_tags。
 3. 如果对方的表现与**旧标签冲突**（例如以前标签是'内向'，今天他突然'话痨'），请将'内向'放入 remove_tags，并将'话痨'放入 add_tags。
-4. 如果好感度变化巨大（由爱转恨），请记得移除那些不再适用的褒义标签。
+4. **关于好感度评分**：请基于**本次对话内容的质量**评分。即使当前好感度是-100，如果用户这次说了让你很开心的话，也必须给出正向分（例如 +10），不要受过去分数影响而吝啬给分。
+{strategy}
 """
     except Exception as e:
         logger.error(f"获取关系失败: {e}")
@@ -645,6 +851,13 @@ async def create_chat_agent(db_session, session_id: str, user_id, user_name: str
 → 你调用 send_meme_image(pic_id="789")
 → 图片发送成功
 
+【表情包高级搜索】
+1. 如果用户描述画面（如“找个猫猫图”），用 `search_meme_image`。
+2. 如果用户引用了一张图说“求类似的”、“再来一张这种”，或者指明了某条消息，请：
+   - 在聊天记录中找到用户发送的图片消息的 `id:xxxxx`。
+   - 调用 `search_similar_meme_by_id(target_msg_id="xxxxx")`。
+   - 根据返回结果，选择一张合适的，再调用 `send_meme_image` 发送。
+
 【RAG 工具使用规则】
 
 RAG 搜索结果特性：rag_search 返回的结果已经是经过 Hybrid Search (关键字与向量搜索混合) 重排序后的结果，最相关的内容通常排在前面。你应该信任这些结果并将其用于回复。
@@ -669,17 +882,23 @@ RAG 搜索结果特性：rag_search 返回的结果已经是经过 Hybrid Search
 10. 聊天风格建议参考群内其他人历史聊天记录
 11. 绝对禁止在 rag_search 中使用任何相对时间词汇，包括但不限于：“昨天”、“前天”、“本周”、“上周”、“这个月”、“上个月”、“最近”等。搜索历史消息时，必须使用具体的日期和时间点（例如：2025-04-08 15:30:00）或直接使用关键词进行搜索。
 12. 表情包发送是可选的，不是每次都要发
+13. 你的所有回复必须通过 `reply_user` 或 `send_meme_image` 工具发送。
+14. 不要直接输出内容，直接调工具。
+15. 发送完毕后，直接输出 "OVER" 结束（不要调用工具）。
 """
     report_tool = create_report_tool(db_session, session_id, user_id, user_name, model)
 
     search_meme_tool = create_search_meme_tool(db_session)
     send_meme_tool = create_send_meme_tool(db_session, session_id)
     relation_tool = create_relation_tool(db_session, user_id, user_name)
+    similar_meme_tool = create_similar_meme_tool(db_session, session_id)
     if not user_id or not user_name:
         tools = [
             search_web,
             search_history_context,
+            create_reply_tool(db_session, session_id),
             search_meme_tool,  # 搜索工具（带数据库会话）
+            similar_meme_tool,
             send_meme_tool,  # 发送工具
             calculate_expression,
             report_tool,
@@ -689,34 +908,99 @@ RAG 搜索结果特性：rag_search 返回的结果已经是经过 Hybrid Search
         tools = [
             search_web,
             search_history_context,
+            create_reply_tool(db_session, session_id),
             search_meme_tool,  # 搜索工具（带数据库会话）
+            similar_meme_tool,
             send_meme_tool,  # 发送工具
             calculate_expression,
             relation_tool,
             report_tool,
         ]
 
-    agent = create_agent(model, tools=tools, system_prompt=system_prompt,
-                         response_format=ToolStrategy(ResponseMessage), context_schema=Context)
+    agent = create_agent(model, tools=tools, system_prompt=system_prompt, context_schema=Context, middleware=[ToolCallLimitMiddleware(thread_limit=8, run_limit=8),
+                                                                                                              ToolCallLimitMiddleware(
+            tool_name="reply_user",
+            thread_limit=1,
+            run_limit=1,
+        )])
 
     return agent
 
 
-def format_chat_history(history: list[ChatHistorySchema]) -> list:
-    """将聊天历史格式化为LangChain消息格式"""
-    messages = []
-    for msg in history:
-        time = msg.created_at.strftime("%Y-%m-%d %H:%M:%S")
+def get_image_data_uri(file_name: str) -> str | None:
+    """
+    辅助函数：读取本地图片并转换为 Data URI (Base64)
+    """
+    file_path = pic_dir / file_name
+    if not file_path.exists():
+        return None
 
+    try:
+        mime_type, _ = mimetypes.guess_type(file_path)
+        if not mime_type:
+            mime_type = "image/jpeg"  # 默认 fallback
+
+        with open(file_path, "rb") as image_file:
+            encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
+            return f"data:{mime_type};base64,{encoded_string}"
+    except Exception as e:
+        logger.error(f"读取图片失败 {file_name}: {e}")
+        return None
+
+
+def format_chat_history(history: list[ChatHistorySchema]) -> list[BaseMessage]:
+    """
+    将历史记录格式化为 Qwen 3.5 可接受的多模态格式
+    """
+    messages = []
+
+    for msg in history:
+        time_str = msg.created_at.strftime("%Y-%m-%d %H:%M:%S")
+
+        # === 机器人回复 (通常是纯文本) ===
         if msg.content_type == "bot":
-            content = f"[{time}] {plugin_config.bot_name}（你自己）: {msg.content}"
-            messages.append(AIMessage(content=content))
+            # 如果 Bot 回复里也有 id，保持原样
+            messages.append(AIMessage(content=msg.content))
+
+        # === 用户纯文本 ===
         elif msg.content_type == "text":
-            content = f"[{time}] {msg.user_name}: {msg.content}"
+            content = f"[{time_str}] {msg.user_name}: {msg.content}"
             messages.append(HumanMessage(content=content))
+
+        # === 用户图片 (核心修改) ===
         elif msg.content_type == "image":
-            content = f"[{time}] {msg.user_name} 发送了一张图片\n该图片的描述为: {msg.content}"
-            messages.append(HumanMessage(content=content))
+            # 在 __init__.py 里，我们把 content 存为了 "前缀\n文件名.jpg"
+            # 例如: "id:12345\nxf82...jpg"
+            # 我们需要拆分出文件名
+
+            parts = msg.content.strip().split('\n')
+            # 假设最后一行是文件名，前面是 ID 或其他前缀
+            file_name = parts[-1].strip()
+            prefix_info = "\n".join(parts[:-1]) if len(parts) > 1 else ""
+
+            # 尝试读取图片数据
+            image_data = get_image_data_uri(file_name)
+
+            if image_data:
+                # 构造多模态消息 (List[Dict])
+                # Qwen 3.5 会同时看到这段文字说明和图片c
+                content_parts = [
+                    {
+                        "type": "text",
+                        "text": f"[{time_str}] {msg.user_name} {prefix_info} 发送了一张图片："
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": image_data
+                        }
+                    }
+                ]
+                messages.append(HumanMessage(content=content_parts))
+            else:
+                # 如果图片文件没了（被清理了），回退到纯文本，避免报错
+                content = f"[{time_str}] {msg.user_name} {prefix_info} [图片已过期/无法加载]"
+                messages.append(HumanMessage(content=content))
 
     return messages
 
@@ -735,61 +1019,50 @@ async def choice_response_strategy(
     try:
         agent = await create_chat_agent(db_session, session_id, user_id, user_name)
 
-        # 格式化聊天历史
-        chat_history = format_chat_history(history)
+        # 1. 获取多模态格式的历史消息列表 (List[BaseMessage])
+        # 这里面已经包含了图片 Base64 数据
+        chat_history_messages = format_chat_history(history)
 
-        # 构建输入
+        # 2. 构建当前环境信息的 Prompt (纯文本)
         today = datetime.datetime.now()
         weekdays = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
 
-        input_text = f"""
-【历史对话】
-{chat_history}
-
-【当前时间】
-{today.strftime('%Y-%m-%d %H:%M:%S')} {weekdays[today.weekday()]}
-
-{f'【额外设置】{setting}' if setting else ''}
+        prompt_text = f"""
+【当前环境】
+时间: {today.strftime('%Y-%m-%d %H:%M:%S')} {weekdays[today.weekday()]}
+{f'额外设置: {setting}' if setting else ''}
 
 【任务】
-基于上述对话历史，判断是否需要回复，以及如何回复。
+请根据上述对话历史，判断是否需要回复。如果需要，请调用相应工具。
+如果是针对图片的消息（例如"这张图什么意思"），请务必结合图片内容进行回答。
+如果不需要回复，请保持沉默。
 """
 
-        messages = [HumanMessage(content=input_text)]
-        invoke_input: dict[str, Any] = {"messages": messages}
-        result = await agent.ainvoke(cast(Any, invoke_input), context=Context(session_id=session_id))
+        # 3. 组合消息列表 (核心修改)
+        # 结构：[历史消息1(文本/图), 历史消息2, ..., 当前环境提示词]
+        # 这样 LLM 才能真正“看到”历史记录里的图片对象
+        final_messages = chat_history_messages + [HumanMessage(content=prompt_text)]
 
-        raw_output = result.get("structured_response")
+        invoke_input: dict[str, Any] = {"messages": final_messages}
 
-        # 情况 A: 如果 Agent 没返回 structured_response (为 None)
-        if raw_output is None:
-            logger.warning(f"Agent session {session_id} 未返回有效结构化数据")
-            # 返回一个默认的安全对象，防止报错
-            return ResponseMessage(need_reply=False, text=None)
+        # 4. 调用 Agent
+        await agent.ainvoke(
+            cast(Any, invoke_input),
+            context=Context(session_id=session_id)
+        )
 
-        # 情况 B: 如果 Agent 返回的是字典 (Dict)，需要转为 Pydantic 模型
-        if isinstance(raw_output, dict):
-            return ResponseMessage.model_validate(raw_output)
-
-        # 情况 C: 如果 Agent 直接返回了 ResponseMessage 对象 (某些高级Agent框架会这样)
-        if isinstance(raw_output, ResponseMessage):
-            return raw_output
-
-        # 兜底：虽然有值但类型不对
-        logger.error(f"Agent 返回类型未知: {type(raw_output)}")
         return ResponseMessage(need_reply=False, text=None)
 
     except Exception:
         logger.exception("Agent 决策过程发生异常")
-        # 发生异常时也需要返回一个符合类型签名的对象
         return ResponseMessage(need_reply=False, text=None)
 
 
 if __name__ == "__main__":
     model = ChatOpenAI(
-        model=plugin_config.openai_model,
-        api_key=SecretStr(plugin_config.openai_token),
-        base_url=plugin_config.openai_base_url,
+        model=plugin_config.base_model,
+        api_key=SecretStr(plugin_config.qwen_token),
+        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
         temperature=0.7,
     )
     agent = create_agent(model, tools=tools, response_format=ToolStrategy(ResponseMessage))
