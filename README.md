@@ -107,10 +107,10 @@ tools 中包含 RAG ，可以自动对聊天历史储存，储存长记忆。学
 | ai_groupmate__qwen_token | 否 | 无 | 阿里云 token |
 | ai_groupmate__qdrant_uri | 否 | 无| qdrant 地址 |
 | ai_groupmate__qdrant_api_key | 否 | 无 | qdrant api key |
-| ai_groupmate__embedding_api_key | 否 | 无 | embedding api key |
-| ai_groupmate__embedding_base_url | 否 | 无 | vlm embedding base url |
-| ai_groupmate__rerank_api_url | 否 | 无 | vlm rerank api url |
-| ai_groupmate__rerank_api_key | 否 | 无 | vlm rerank api key |
+| ai_groupmate__embedding_api_key | 否 | 无 | embedding api key (推荐使用硅基流动，免费)|
+| ai_groupmate__embedding_base_url | 否 | 无 | embedding base url (推荐使用硅基流动，免费)|
+| ai_groupmate__rerank_api_url | 否 | 无 | rerank api url (推荐使用硅基流动，免费)|
+| ai_groupmate__rerank_api_key | 否 | 无 | rerank api key (推荐使用硅基流动，免费)|
 
 ## 🎉 使用
 
