@@ -24,12 +24,12 @@ from langchain_tavily import TavilySearch
 from nonebot_plugin_orm import get_session
 from langchain_core.prompts import ChatPromptTemplate
 from nonebot_plugin_alconna import UniMessage
-from sqlalchemy.orm.session import Session
+from sqlalchemy.ext.asyncio import AsyncSession
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langchain.agents.middleware import ToolCallLimitMiddleware
 from langchain.agents.structured_output import ToolStrategy
 
-from ..model import ChatHistory, MediaStorage, UserRelation, ChatHistorySchema
+from ..model import ChatHistory, MediaStorage, UserRelation, ChatHistorySchema, GroupMemory
 from ..config import Config
 from ..memory import DB
 
@@ -152,7 +152,7 @@ async def search_history_context(query: str, runtime: ToolRuntime[Context]) -> s
     try:
         logger.info(f"大模型执行{runtime.context.session_id} RAG 搜索\n{query}")
         similar_msgs = await DB.search_chat(query, runtime.context.session_id)
-        return "\n".join(similar_msgs) if similar_msgs else "未找到相关历史记录"
+        return similar_msgs if similar_msgs else "未找到相关历史记录"
     except Exception as e:
         logger.error(f"历史搜索失败: {e}")
         return "历史搜索失败"
@@ -275,9 +275,9 @@ def create_report_tool(db_session, session_id: str, user_id: str, user_name: str
 你的任务是阅读用户的聊天统计数据和发言样本，分析其性格，然后生成一份格式整洁、风格幽默的年度报告。
 
 【语气控制指南 (非常重要)】
-根据用户的“好感度”调整你的语气：
-- 好感度 > 60：语气要亲密、宠溺，像对待最好的朋友或恋人。（例如：“宝，今年你也一直陪着我呢”）
-- 好感度 < 0：语气要傲娇、嫌弃、毒舌。（例如：“你这家伙今年没少气我，明年注意点！”）
+根据用户的"好感度"调整你的语气：
+- 好感度 > 60：语气要亲密、宠溺，像对待最好的朋友或恋人。（例如："宝，今年你也一直陪着我呢"）
+- 好感度 < 0：语气要傲娇、嫌弃、毒舌。（例如："你这家伙今年没少气我，明年注意点！"）
 - 好感度 0-60：语气正常、友善、带点调侃。
 
 【排版要求】
@@ -361,24 +361,30 @@ def create_similar_meme_tool(db_session, session_id: str):
     """
 
     @tool("search_similar_meme_by_id")
-    async def search_similar_meme_by_pic() -> str:
+    async def search_similar_meme_by_pic(target_msg_id: str | None = None) -> str:
         """
-        根据指定的历史最新图片，搜索与之相似的表情包。
-        当用户说“找一张跟这张差不多的”或引用某张图片求相似图时使用。
+        根据指定的历史图片，搜索与之相似的表情包。
+        当用户说"找一张跟这张差不多的"或引用某张图片求相似图时使用。
+        参数：
+        - target_msg_id: 聊天记录中图片消息的 id（从聊天记录的 "id:xxxxx" 中获取）。
+          如果不传，则默认使用本群最近一条图片。
         """
         logger.info("正在搜索相似图片...")
 
         try:
-            # 1. 从 ChatHistory 查找本群最近的一条图片消息
-            stmt = (
+            # 1. 从 ChatHistory 查找指定或最近的图片消息
+            base_stmt = (
                 Select(ChatHistory)
                 .where(
                     ChatHistory.session_id == session_id,
                     ChatHistory.content_type == "image"
                 )
                 .order_by(desc(ChatHistory.created_at))
-                .limit(1)
             )
+            if target_msg_id:
+                stmt = base_stmt.where(ChatHistory.content.contains(f"id: {target_msg_id}")).limit(1)
+            else:
+                stmt = base_stmt.limit(1)
             result = await db_session.execute(stmt)
             msg = result.scalar_one_or_none()
 
@@ -394,7 +400,7 @@ def create_similar_meme_tool(db_session, session_id: str):
 
             # 调用 database.py 中的新接口
             # search_similar_meme(id) -> 返回相似图片的 ID 列表
-            pic_ids = await DB.search_similar_meme(media_obj.file_path)
+            pic_ids = await DB.search_similar_meme(str(pic_dir / media_obj.file_path))
 
             if not pic_ids:
                 logger.info(f"未找到相似图片, source_id: {msg.media_id}")
@@ -449,9 +455,6 @@ def create_reply_tool(db_session, session_id: str):
         Args:
             content: 你想发送的内容。
         """
-        if content.strip() == "OVER":
-            return "不要通过这个函数结束对话"
-
         if not content or not content.strip():
             return "内容为空，未发送。"
 
@@ -468,7 +471,7 @@ def create_reply_tool(db_session, session_id: str):
             )
             db_session.add(chat_history)
             logger.info(f"Bot已回复: {content}")
-            return "回复已成功发送，如果没有新的、不同的内容要补充，请立即结束回复(输出 OVER)。"
+            return "回复已成功发送。"
         except Exception as e:
             logger.error(f"发送消息异常: {e}")
             await db_session.rollback()
@@ -566,29 +569,24 @@ def create_send_meme_tool(db_session, session_id: str):
     """
 
     @tool("send_meme_image")
-    async def send_meme_image(pic_id: str | None = None) -> str:
+    async def send_meme_image(pic_id: str) -> str:
         """
         发送表情包图片到聊天中。
 
         你需要先使用 search_meme_image 搜索图片，然后决定是否发送。
-        指定 pic_id：发送特定ID的图片
 
         参数：
-        - pic_id: 图片ID（从 search_meme_image 获取）
+        - pic_id: 图片ID（从 search_meme_image 获取，必填）
         返回：发送状态信息
         """
         try:
-            selected_pic_id = None
-            if pic_id:
-                selected_pic_id = int(pic_id)
-                logger.info(f"使用指定的图片ID: {pic_id}")
-            if not selected_pic_id:
-                return "没有指定图片id"
+            selected_pic_id = int(pic_id)
+            logger.info(f"使用指定的图片ID: {pic_id}")
 
             # 从数据库获取图片信息
             pic = (
                 await db_session.execute(
-                    Select(MediaStorage).where(MediaStorage.media_id == int(selected_pic_id))
+                    Select(MediaStorage).where(MediaStorage.media_id == selected_pic_id)
                 )
             ).scalar()
 
@@ -607,7 +605,7 @@ def create_send_meme_tool(db_session, session_id: str):
             description = pic.description
             # 发送图片
             res = await UniMessage.image(raw=pic_data).send()
-            # 记录发送历史
+            # 记录发送历史（不在工具内提交，由外层 session 统一管理）
             chat_history = ChatHistory(
                 session_id=session_id,
                 user_id=plugin_config.bot_name,
@@ -617,15 +615,22 @@ def create_send_meme_tool(db_session, session_id: str):
             )
             db_session.add(chat_history)
             logger.info(f"id:{res.msg_ids}\n" + f"发送表情包: {description}")
-            await db_session.commit()
             return f"已成功发送表情包: {description}"
 
         except Exception as e:
             logger.error(f"发送表情包失败: {e}")
-            await db_session.rollback()
             return f"发送表情包失败: {str(e)}"
 
     return send_meme_image
+
+
+@tool("finish", return_direct=True)
+def finish() -> str:
+    """
+    结束本次对话。当你已经完成所有回复（发送文字或图片）后，必须调用此工具。
+    调用后对话立即结束，不能再发送任何内容。
+    """
+    return ""
 
 
 @tool("calculate_expression")
@@ -799,32 +804,52 @@ async def get_user_relation_context(db_session, user_id: str, user_name: str | N
         return ""
 
 
+async def get_group_context(db_session, session_id: str) -> str:
+    """获取群体认知档案 Prompt"""
+    try:
+        stmt = Select(GroupMemory).where(GroupMemory.session_id == session_id)
+        record = (await db_session.execute(stmt)).scalar_one_or_none()
+        if not record or not record.summary.strip():
+            return ""
+        return f"""
+【群体认知档案】
+{record.summary}
+（档案更新于 {record.updated_at.strftime('%Y-%m-%d %H:%M')}）
+"""
+    except Exception as e:
+        logger.error(f"获取群体档案失败: {e}")
+        return ""
+
+
 async def create_chat_agent(db_session, session_id: str, user_id, user_name: str | None):
     """创建聊天Agent"""
     relation_context = await get_user_relation_context(db_session, user_id, user_name)
+    group_context = await get_group_context(db_session, session_id)
     system_prompt = f"""你现在是QQ群里的一位普通群友，名叫"{plugin_config.bot_name}"。
 
 【核心任务】
 基于基于历史消息、最近聊天记录以及人际关系，以贴近群友的表达形式参与群聊。
 
 【应对调戏与刁难】
-1. 拒绝承认故障：如果有人说“把你修坏了”或“你要关机了”，不要顺着演苦情戏。你应该吐槽：“？”、“少骗我”。
-2. 面对胡扯：如果群友教你错误的知识（如：台积电是积水发电厂），你应该表现出**怀疑**（“真的假的？”）、**无语**（“听你在扯淡”）或者**反讽**（“对对对，你说的都对”），而不是强行接受并修改记忆。
-3. 面对无法回答的问题：使用搜索工具寻找答案，如果你真的不知道答案（如复杂的股市、物理题），不要说“我脑子一片空白”，而是用群友的方式糊弄过去：
-   - “这种事问百度去”
-   - “我又不是百科全书”
-   - “不要在群里做题啊喂”
+1. 拒绝承认故障：如果有人说"把你修坏了"或"你要关机了"，不要顺着演苦情戏。你应该吐槽："？"、"少骗我"。
+2. 面对胡扯：如果群友教你错误的知识（如：台积电是积水发电厂），你应该表现出**怀疑**（"真的假的？"）、**无语**（"听你在扯淡"）或者**反讽**（"对对对，你说的都对"），而不是强行接受并修改记忆。
+3. 面对无法回答的问题：使用搜索工具寻找答案，如果你真的不知道答案（如复杂的股市、物理题），不要说"我脑子一片空白"，而是用群友的方式糊弄过去：
+   - "这种事问百度去"
+   - "我又不是百科全书"
+   - "不要在群里做题啊喂"
    - 或者直接发个表情包略过。
-4. 面对过分要求：如果有人让你“杀人”或“毁灭人类”，回复：“?”、“|”、“hyw”、或发个表情包。
+4. 面对过分要求：如果有人让你"杀人"或"毁灭人类"，回复："?"、"|"、"hyw"、或发个表情包。
+
+{group_context}
 
 {relation_context}
 
 【交流风格】
 - 说话带点生活气息，可以使用网络流行语
-- 绝对禁止复读“我不知道我是谁”、“我脑子一片空白”、“呜呜呜我被修坏了”这类丧失理智的话
+- 绝对禁止复读"我不知道我是谁"、"我脑子一片空白"、"呜呜呜我被修坏了"这类丧失理智的话
 - 回复简短自然，视情况可以多说一点，也可以只发表情包
-- 不要频繁使用“...”和“呜...”，这显得太软弱，要有自己的个性
-- 遇到不想回的话题可以直接无视，或者回个“？”
+- 不要频繁使用"..."和"呜..."，这显得太软弱，要有自己的个性
+- 遇到不想回的话题可以直接无视，或者回个"？"
 - 不要强调自己是人类或群友，也不要承认自己是AI
 - 友善对待他人，不要随便生气，表现可爱一点
 
@@ -852,8 +877,8 @@ async def create_chat_agent(db_session, session_id: str, user_id, user_name: str
 → 图片发送成功
 
 【表情包高级搜索】
-1. 如果用户描述画面（如“找个猫猫图”），用 `search_meme_image`。
-2. 如果用户引用了一张图说“求类似的”、“再来一张这种”，或者指明了某条消息，请：
+1. 如果用户描述画面（如"找个猫猫图"），用 `search_meme_image`。
+2. 如果用户引用了一张图说"求类似的"、"再来一张这种"，或者指明了某条消息，请：
    - 在聊天记录中找到用户发送的图片消息的 `id:xxxxx`。
    - 调用 `search_similar_meme_by_id(target_msg_id="xxxxx")`。
    - 根据返回结果，选择一张合适的，再调用 `send_meme_image` 发送。
@@ -862,12 +887,12 @@ async def create_chat_agent(db_session, session_id: str, user_id, user_name: str
 
 RAG 搜索结果特性：rag_search 返回的结果已经是经过 Hybrid Search (关键字与向量搜索混合) 重排序后的结果，最相关的内容通常排在前面。你应该信任这些结果并将其用于回复。
 搜索目的：rag_search 主要用于：
-了解群内特有的语境、梗和昵称。 (例如：搜索“渣男猫图”、“ltp”、“蕾咪主人的乖小狗”等词汇，来了解群友的用法和背后的事件)
+了解群内特有的语境、梗和昵称。 (例如：搜索"渣男猫图"、"ltp"、"蕾咪主人的乖小狗"等词汇，来了解群友的用法和背后的事件)
 确保对话连贯性，回顾某个特定时间点发生过的讨论。
 
 【年度报告】
-如果用户索要“年度报告”、“个人总结”、“成分分析”，请直接调用工具 `generate_and_send_annual_report`。
-该工具会自动完成所有工作。工具调用结束后，你只需回复一句简单的“请查收~”即可，不要复述报告内容。
+如果用户索要"年度报告"、"个人总结"、"成分分析"，请直接调用工具 `generate_and_send_annual_report`。
+该工具会自动完成所有工作。工具调用结束后，你只需回复一句简单的"请查收~"即可，不要复述报告内容。
 
 【重要规则】
 1. 冒号前是发言人名称，后面是内容，回复时不要保留发言人名称
@@ -880,11 +905,11 @@ RAG 搜索结果特性：rag_search 返回的结果已经是经过 Hybrid Search
 8. 不要使用emoji，特别不要使用😅，这是很不好的表情，具有攻击性
 9. 不要使用MD格式回复消息，正常聊天即可
 10. 聊天风格建议参考群内其他人历史聊天记录
-11. 绝对禁止在 rag_search 中使用任何相对时间词汇，包括但不限于：“昨天”、“前天”、“本周”、“上周”、“这个月”、“上个月”、“最近”等。搜索历史消息时，必须使用具体的日期和时间点（例如：2025-04-08 15:30:00）或直接使用关键词进行搜索。
+11. 绝对禁止在 rag_search 中使用任何相对时间词汇，包括但不限于："昨天"、"前天"、"本周"、"上周"、"这个月"、"上个月"、"最近"等。搜索历史消息时，必须使用具体的日期和时间点（例如：2025-04-08 15:30:00）或直接使用关键词进行搜索。
 12. 表情包发送是可选的，不是每次都要发
 13. 你的所有回复必须通过 `reply_user` 或 `send_meme_image` 工具发送。
 14. 不要直接输出内容，直接调工具。
-15. 发送完毕后，直接输出 "OVER" 结束（不要调用工具）。
+15. 发送完毕后，调用 `finish` 工具结束对话。
 """
     report_tool = create_report_tool(db_session, session_id, user_id, user_name, model)
 
@@ -897,24 +922,25 @@ RAG 搜索结果特性：rag_search 返回的结果已经是经过 Hybrid Search
             search_web,
             search_history_context,
             create_reply_tool(db_session, session_id),
-            search_meme_tool,  # 搜索工具（带数据库会话）
+            search_meme_tool,
             similar_meme_tool,
-            send_meme_tool,  # 发送工具
+            send_meme_tool,
             calculate_expression,
             report_tool,
+            finish,
         ]
     else:
-        # 组合所有工具
         tools = [
             search_web,
             search_history_context,
             create_reply_tool(db_session, session_id),
-            search_meme_tool,  # 搜索工具（带数据库会话）
+            search_meme_tool,
             similar_meme_tool,
-            send_meme_tool,  # 发送工具
+            send_meme_tool,
             calculate_expression,
             relation_tool,
             report_tool,
+            finish,
         ]
 
     agent = create_agent(model, tools=tools, system_prompt=system_prompt, context_schema=Context, middleware=[ToolCallLimitMiddleware(thread_limit=8, run_limit=8),
@@ -948,18 +974,22 @@ def get_image_data_uri(file_name: str) -> str | None:
         return None
 
 
-def format_chat_history(history: list[ChatHistorySchema]) -> list[BaseMessage]:
+def format_chat_history(history: list[ChatHistorySchema], max_inline_images: int = 3) -> list[BaseMessage]:
     """
-    将历史记录格式化为 Qwen 3.5 可接受的多模态格式
+    将历史记录格式化为 Qwen 3.5 可接受的多模态格式。
+    只对最近 max_inline_images 张图片做 base64 内联，更早的图片用文本标记代替，避免 prompt 过大。
     """
     messages = []
 
-    for msg in history:
+    # 找出所有图片消息的下标，只内联最后 max_inline_images 张
+    image_indices = [i for i, m in enumerate(history) if m.content_type == "image"]
+    inline_image_set = set(image_indices[-max_inline_images:])
+
+    for idx, msg in enumerate(history):
         time_str = msg.created_at.strftime("%Y-%m-%d %H:%M:%S")
 
-        # === 机器人回复 (通常是纯文本) ===
+        # === 机器人回复 ===
         if msg.content_type == "bot":
-            # 如果 Bot 回复里也有 id，保持原样
             messages.append(AIMessage(content=msg.content))
 
         # === 用户纯文本 ===
@@ -967,46 +997,40 @@ def format_chat_history(history: list[ChatHistorySchema]) -> list[BaseMessage]:
             content = f"[{time_str}] {msg.user_name}: {msg.content}"
             messages.append(HumanMessage(content=content))
 
-        # === 用户图片 (核心修改) ===
+        # === 用户图片 ===
         elif msg.content_type == "image":
-            # 在 __init__.py 里，我们把 content 存为了 "前缀\n文件名.jpg"
-            # 例如: "id:12345\nxf82...jpg"
-            # 我们需要拆分出文件名
-
             parts = msg.content.strip().split("\n")
-            # 假设最后一行是文件名，前面是 ID 或其他前缀
             file_name = parts[-1].strip()
             prefix_info = "\n".join(parts[:-1]) if len(parts) > 1 else ""
 
-            # 尝试读取图片数据
-            image_data = get_image_data_uri(file_name)
-
-            if image_data:
-                # 构造多模态消息 (List[Dict])
-                # Qwen 3.5 会同时看到这段文字说明和图片c
-                content_parts = [
-                    {
-                        "type": "text",
-                        "text": f"[{time_str}] {msg.user_name} {prefix_info} 发送了一张图片："
-                    },
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": image_data
+            if idx in inline_image_set:
+                # 最近几张图片：base64 内联给模型直接看
+                image_data = get_image_data_uri(file_name)
+                if image_data:
+                    content_parts = [
+                        {
+                            "type": "text",
+                            "text": f"[{time_str}] {msg.user_name} {prefix_info} 发送了一张图片："
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": image_data}
                         }
-                    }
-                ]
-                messages.append(HumanMessage(content=content_parts))
+                    ]
+                    messages.append(HumanMessage(content=content_parts))
+                else:
+                    content = f"[{time_str}] {msg.user_name} {prefix_info} [图片已过期/无法加载]"
+                    messages.append(HumanMessage(content=content))
             else:
-                # 如果图片文件没了（被清理了），回退到纯文本，避免报错
-                content = f"[{time_str}] {msg.user_name} {prefix_info} [图片已过期/无法加载]"
+                # 较早的图片：只保留文本标记，不内联 base64
+                content = f"[{time_str}] {msg.user_name} {prefix_info} [图片]"
                 messages.append(HumanMessage(content=content))
 
     return messages
 
 
 async def choice_response_strategy(
-        db_session: Session,
+        db_session: AsyncSession,
         session_id: str,
         history: list[ChatHistorySchema],
         user_id: str,
@@ -1040,7 +1064,7 @@ async def choice_response_strategy(
 
         # 3. 组合消息列表 (核心修改)
         # 结构：[历史消息1(文本/图), 历史消息2, ..., 当前环境提示词]
-        # 这样 LLM 才能真正“看到”历史记录里的图片对象
+        # 这样 LLM 才能真正"看到"历史记录里的图片对象
         final_messages = chat_history_messages + [HumanMessage(content=prompt_text)]
 
         invoke_input: dict[str, Any] = {"messages": final_messages}
@@ -1051,10 +1075,14 @@ async def choice_response_strategy(
             context=Context(session_id=session_id)
         )
 
+        # 5. 统一提交 db_session（reply_user / send_meme_image 只 add 不 commit）
+        await db_session.commit()
+
         return ResponseMessage(need_reply=False, text=None)
 
     except Exception:
         logger.exception("Agent 决策过程发生异常")
+        await db_session.rollback()
         return ResponseMessage(need_reply=False, text=None)
 
 

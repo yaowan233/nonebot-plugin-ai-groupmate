@@ -66,6 +66,16 @@ class UserRelation(Model):
         return "恋人/依赖"
 
 
+class GroupMemory(Model):
+    """群体认知档案（每群一条记录）"""
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    session_id: Mapped[str] = mapped_column(unique=True, index=True)
+    summary: Mapped[str] = mapped_column(default="")
+    msg_count_at_last_update: Mapped[int] = mapped_column(default=0)
+    updated_at: Mapped[datetime] = mapped_column(default=datetime.now, onupdate=datetime.now, index=True)
+
+
 class ChatHistorySchema(BaseModel):
     msg_id: int
     session_id: str
