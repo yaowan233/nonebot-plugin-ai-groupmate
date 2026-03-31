@@ -983,7 +983,11 @@ def format_chat_history(history: list[ChatHistorySchema], max_inline_images: int
 
     # 找出所有图片消息的下标，只内联最后 max_inline_images 张
     image_indices = [i for i, m in enumerate(history) if m.content_type == "image"]
-    inline_image_set = set(image_indices[-max_inline_images:])
+    if max_inline_images <= 0:
+        # 当 max_inline_images <= 0 时，不内联任何图片，避免 -0 切片导致全部内联
+        inline_image_set = set()
+    else:
+        inline_image_set = set(image_indices[-max_inline_images:])
 
     for idx, msg in enumerate(history):
         time_str = msg.created_at.strftime("%Y-%m-%d %H:%M:%S")
