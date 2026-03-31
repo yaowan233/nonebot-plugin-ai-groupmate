@@ -382,7 +382,7 @@ def create_similar_meme_tool(db_session, session_id: str):
                 .order_by(desc(ChatHistory.created_at))
             )
             if target_msg_id:
-                stmt = base_stmt.where(ChatHistory.content.contains(f"id: {target_msg_id}")).limit(1)
+                stmt = base_stmt.where(ChatHistory.content.contains(f"id: {target_msg_id}\n")).limit(1)
             else:
                 stmt = base_stmt.limit(1)
             result = await db_session.execute(stmt)
