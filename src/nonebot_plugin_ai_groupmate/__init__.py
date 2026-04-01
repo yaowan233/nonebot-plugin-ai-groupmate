@@ -25,7 +25,6 @@ require("nonebot_plugin_localstore")
 require("nonebot_plugin_apscheduler")
 import nonebot_plugin_localstore as store
 from sqlalchemy import Select
-from sqlalchemy.exc import IntegrityError
 from nonebot_plugin_orm import get_session, async_scoped_session
 from nonebot_plugin_uninfo import Uninfo, SceneType, QryItrface
 from nonebot_plugin_alconna import Image, UniMessage, image_fetch, get_message_id
@@ -233,13 +232,12 @@ async def process_image_message(
                     await db_session.flush()
                     media_obj = new_media
 
-            except IntegrityError:
-                # C. 如果捕获到“唯一约束冲突”，说明刚才那瞬间有人插进去了
-                # 不需要手动 rollback，begin_nested 会自动回滚这个子事务
+            except Exception:
+                # C. begin_nested 已自动回滚 savepoint，重新查询判断是否为唯一约束冲突
+                media_obj = (await db_session.execute(stmt)).scalar_one_or_none()
+                if media_obj is None:
+                    raise  # 非唯一约束冲突，重新抛出
                 logger.info(f"图片并发插入冲突 {file_hash}，转为更新模式")
-
-                # 重新查询 (这时候一定有了)
-                media_obj = (await db_session.execute(stmt)).scalar_one()
                 media_obj.references += 1
                 db_session.add(media_obj)
 
@@ -461,10 +459,15 @@ async def vectorize_media():
             Select(MediaStorage).where(MediaStorage.references >= 3, MediaStorage.vectorized.is_(False))
         )
         medias = medias_res.scalars().all()
-        logger.info(f"待处理高频图片数量: {len(medias)}")
+        # 在任何 commit/rollback 之前，一次性读出所有 ID
+        # 每次 commit 后 session 会 expire 所有对象，后续循环用 get() 重新拉取
+        media_ids = [m.media_id for m in medias]
+        logger.info(f"待处理高频图片数量: {len(media_ids)}")
 
-        for media in medias:
-            media_id = media.media_id  # 提前读出，防止 rollback 后 session expire 导致懒加载崩溃
+        for media_id in media_ids:
+            media = await db_session.get(MediaStorage, media_id)
+            if media is None:
+                continue
             try:
                 file_path = pic_dir / media.file_path
                 if not file_path.exists():

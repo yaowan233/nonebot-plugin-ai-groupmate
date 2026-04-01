@@ -411,7 +411,8 @@ class VectorDBOperator:
         search_result = await self.client.query_points(
             collection_name=self.media_col,
             query=vector,
-            limit=10
+            limit=10,
+            with_payload=False
         )
         if not search_result or not search_result.points:
             return []
