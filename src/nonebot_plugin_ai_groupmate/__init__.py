@@ -25,7 +25,6 @@ require("nonebot_plugin_localstore")
 require("nonebot_plugin_apscheduler")
 import nonebot_plugin_localstore as store
 from sqlalchemy import Select
-from sqlalchemy.exc import IntegrityError
 from nonebot_plugin_orm import get_session, async_scoped_session
 from nonebot_plugin_uninfo import Uninfo, SceneType, QryItrface
 from nonebot_plugin_alconna import Image, UniMessage, image_fetch, get_message_id
@@ -33,7 +32,7 @@ from nonebot_plugin_apscheduler import scheduler
 from nonebot_plugin_alconna.uniseg import UniMsg
 
 from .agent import check_if_should_reply, choice_response_strategy
-from .model import ChatHistory, MediaStorage, ChatHistorySchema
+from .model import ChatHistory, MediaStorage, ChatHistorySchema, GroupMemory
 from .utils import (
     generate_file_hash,
     check_and_compress_image_bytes,
@@ -58,6 +57,14 @@ pic_dir.mkdir(parents=True, exist_ok=True)
 plugin_config = get_plugin_config(Config).ai_groupmate
 with open(Path(__file__).parent / "stop_words.txt", encoding="utf-8") as f:
     stop_words = f.read().splitlines() + ["id", "回复"]
+
+summary_model = ChatOpenAI(
+    model="qwen-flash",
+    api_key=SecretStr(plugin_config.qwen_token),
+    base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+    temperature=0.3,
+    max_completion_tokens=800,
+)
 
 
 record = on_message(
@@ -132,11 +139,10 @@ async def handle_message(
         logger.error(f"保存文本消息失败: {e}")
         await db_session.rollback()
 
-    # ========== 步骤2: 处理图片消息（耗时） ==========
+    # ========== 步骤2: 处理图片消息（后台异步，不阻塞回复决策） ==========
     for img in imgs:
-        await process_image_message(
-            db_session, img, event, bot, state,
-            session, user_name, f"id: {get_message_id()}\n"
+        asyncio.create_task(
+            _process_image_task(img, event, bot, state, session, user_name, f"id: {get_message_id()}\n")
         )
 
     # ========== 步骤3: 决定是否回复 ==========
@@ -147,7 +153,7 @@ async def handle_message(
         should_reply = False
     if event.get_plaintext().startswith(("!", "！", "/", "#", "?", "\\")):
         should_reply = False
-    if not event.get_plaintext() and not event.is_tome():
+    if not event.get_plaintext() and not to_me:
         should_reply = False
     if to_me:
         user_id = session.user.id
@@ -226,13 +232,12 @@ async def process_image_message(
                     await db_session.flush()
                     media_obj = new_media
 
-            except IntegrityError:
-                # C. 如果捕获到“唯一约束冲突”，说明刚才那瞬间有人插进去了
-                # 不需要手动 rollback，begin_nested 会自动回滚这个子事务
+            except Exception:
+                # C. begin_nested 已自动回滚 savepoint，重新查询判断是否为唯一约束冲突
+                media_obj = (await db_session.execute(stmt)).scalar_one_or_none()
+                if media_obj is None:
+                    raise  # 非唯一约束冲突，重新抛出
                 logger.info(f"图片并发插入冲突 {file_hash}，转为更新模式")
-
-                # 重新查询 (这时候一定有了)
-                media_obj = (await db_session.execute(stmt)).scalar_one()
                 media_obj.references += 1
                 db_session.add(media_obj)
 
@@ -260,6 +265,12 @@ async def process_image_message(
         await db_session.rollback()
 
 
+async def _process_image_task(img, event, bot, state, session, user_name, content_prefix):
+    """后台图片处理任务，使用独立的数据库会话，不阻塞主消息流程"""
+    async with get_session() as db_session:
+        await process_image_message(db_session, img, event, bot, state, session, user_name, content_prefix)
+
+
 async def handle_reply_logic(
         db_session,
         session: Uninfo,
@@ -275,7 +286,7 @@ async def handle_reply_logic(
         recent_msgs = (
             await db_session.execute(
                 Select(ChatHistory)
-                .where(ChatHistory.session_id == session.scene.id)
+                .where(ChatHistory.session_id == session.scene.id, ChatHistory.content_type != "bot")
                 .order_by(ChatHistory.msg_id.desc())
                 .limit(3)
             )
@@ -381,7 +392,7 @@ async def _(db_session: async_scoped_session, session: Uninfo, arg: Message = Co
     if not words:
         await frequency.finish("在指定时间内，没有说过话呢")
 
-    image_bytes = _build_wordcloud_image(words)
+    image_bytes = await asyncio.to_thread(_build_wordcloud_image, words)
     await UniMessage.image(raw=image_bytes).send(reply_to=True)
 
 
@@ -403,7 +414,7 @@ async def _(db_session: async_scoped_session, session: Uninfo, arg: Message = Co
     if not words:
         await group_frequency.finish("在指定时间内，没有消息可统计")
 
-    image_bytes = _build_wordcloud_image(words)
+    image_bytes = await asyncio.to_thread(_build_wordcloud_image, words)
     await UniMessage.image(raw=image_bytes).send(reply_to=True)
 
 
@@ -448,9 +459,15 @@ async def vectorize_media():
             Select(MediaStorage).where(MediaStorage.references >= 3, MediaStorage.vectorized.is_(False))
         )
         medias = medias_res.scalars().all()
-        logger.info(f"待处理高频图片数量: {len(medias)}")
+        # 在任何 commit/rollback 之前，一次性读出所有 ID
+        # 每次 commit 后 session 会 expire 所有对象，后续循环用 get() 重新拉取
+        media_ids = [m.media_id for m in medias]
+        logger.info(f"待处理高频图片数量: {len(media_ids)}")
 
-        for media in medias:
+        for media_id in media_ids:
+            media = await db_session.get(MediaStorage, media_id)
+            if media is None:
+                continue
             try:
                 file_path = pic_dir / media.file_path
                 if not file_path.exists():
@@ -517,12 +534,18 @@ async def vectorize_media():
                     description = res_json.get("description", "")
 
                 except Exception as e:
-                    logger.error(f"模型识别图片失败 {media.media_id}: {e}")
+                    err_str = str(e)
+                    logger.error(f"模型识别图片失败 {media_id}: {e}")
+                    # 400 错误（图片尺寸/格式非法、内容违规）不可重试，标记跳过
+                    if "Error code: 400" in err_str:
+                        media.vectorized = True
+                        db_session.add(media)
+                        await db_session.commit()
                     continue
 
                 # 3. 结果处理
                 if not is_meme:
-                    logger.info(f"图片 {media.media_id} 被判定为非表情包(杂图)，跳过入库")
+                    logger.info(f"图片 {media_id} 被判定为非表情包(杂图)，跳过入库")
                     media.vectorized = True
                     db_session.add(media)
                     await db_session.commit()
@@ -533,22 +556,22 @@ async def vectorize_media():
                     # A. 存描述到 SQL
                     media.description = description
 
-                    # B. 存向量到 Qdrant
-                    await DB.insert_media(media.media_id, encoded_string, description)
+                    # B. 存向量到 Qdrant (传带 MIME 头的 data URI，避免 PNG/GIF 被误判为 JPEG)
+                    await DB.insert_media(media_id, img_data_uri, description)
 
                     # C. 标记完成
                     media.vectorized = True
                     db_session.add(media)
                     await db_session.commit()
-                    logger.info(f"表情包入库成功 {media.media_id}: {description}")
+                    logger.info(f"表情包入库成功 {media_id}: {description}")
 
                 except Exception as e:
-                    logger.error(f"向量化插入失败 {media.media_id}: {e}")
+                    logger.error(f"向量化插入失败 {media_id}: {e}")
                     await db_session.rollback()
                     continue
 
             except Exception as e:
-                logger.error(f"处理媒体循环异常 {getattr(media, 'media_id', 'unknown')}: {e}")
+                logger.error(f"处理媒体循环异常 {media_id}: {e}")
                 await db_session.rollback()
                 continue
 
@@ -560,32 +583,167 @@ async def vectorize_media():
 @scheduler.scheduled_job("interval", minutes=35, max_instances=1, coalesce=True, id="clear_cache")
 async def clear_cache_pic():
     async with get_session() as db_session:
+        # ── 1. 删除低引用且过期的数据库记录及对应文件 ──
         result = await db_session.execute(
-            Select(MediaStorage).where(MediaStorage.references < 3, datetime.datetime.now() - MediaStorage.created_at > datetime.timedelta(days=30))
+            Select(MediaStorage).where(MediaStorage.references < 3, MediaStorage.created_at < datetime.datetime.now() - datetime.timedelta(days=30))
         )
         medias = result.scalars().all()
 
-        if not medias:
-            logger.info("没有需要清理的媒体文件")
-            return
-
         records_to_delete = []
         for media in medias:
+            media_id = media.media_id
+            media_file_path = media.file_path
             try:
-                file_path = Path(pic_dir / media.file_path)
-                # use pathlib unlink with missing_ok=True to avoid raising if missing
+                file_path = Path(pic_dir / media_file_path)
                 await asyncio.to_thread(file_path.unlink, True)
                 records_to_delete.append(media)
                 logger.debug(f"删除文件: {file_path}")
             except Exception as e:
-                logger.error(f"删除文件失败 {getattr(media, 'file_path', 'unknown')}: {e}")
+                logger.error(f"删除文件失败 {media_file_path}: {e}")
                 records_to_delete.append(media)
 
         for media in records_to_delete:
+            media_id = media.media_id
             try:
                 await db_session.delete(media)
             except Exception as e:
-                logger.error(f"删除数据库记录失败 {getattr(media, 'media_id', 'unknown')}: {e}")
+                logger.error(f"删除数据库记录失败 {media_id}: {e}")
 
         await db_session.commit()
-        logger.info(f"成功清理 {len(records_to_delete)} 个媒体记录")
+        if records_to_delete:
+            logger.info(f"成功清理 {len(records_to_delete)} 个过期媒体记录")
+
+        # ── 2. 删除磁盘上有但数据库里没有的孤立文件 ──
+        known_files_result = await db_session.execute(Select(MediaStorage.file_path))
+        known_files = {row[0] for row in known_files_result.all()}
+
+        disk_files = await asyncio.to_thread(lambda: list(pic_dir.iterdir()))
+        orphaned = [f for f in disk_files if f.is_file() and f.name not in known_files]
+
+        for f in orphaned:
+            try:
+                await asyncio.to_thread(f.unlink, True)
+                logger.debug(f"删除孤立文件: {f.name}")
+            except Exception as e:
+                logger.error(f"删除孤立文件失败 {f.name}: {e}")
+
+        if orphaned:
+            logger.info(f"成功清理 {len(orphaned)} 个孤立文件")
+
+
+async def _call_summary_model(existing_summary: str, chat_text: str) -> str | None:
+    """调用 LLM 更新群体认知档案"""
+    from langchain_core.messages import SystemMessage, HumanMessage as LCHumanMessage
+    system = """你是一个群文化分析师。你的任务是维护一份关于QQ群的认知档案。
+档案包含：群内常见话题、活跃成员特征、内部梗/黑话、群文化氛围。
+规则：
+1. 只能基于提供的聊天记录总结，不要凭空发明内容
+2. 保留档案中仍然有效的内容，用新聊天补充或修正旧内容
+3. 如果某个内容长期（超过30天）无聊天印证，可删除
+4. 输出完整更新后的档案，不超过500字，不要输出任何其他内容"""
+    history_intro = "（无，这是首次建档）" if not existing_summary.strip() else existing_summary
+    user_msg = f"【现有档案】\n{history_intro}\n\n【最新聊天记录】\n{chat_text}\n\n请输出更新后的档案："
+    try:
+        resp = await asyncio.wait_for(
+            summary_model.ainvoke([
+                SystemMessage(content=system),
+                LCHumanMessage(content=user_msg),
+            ]),
+            timeout=120.0,
+        )
+        if not isinstance(resp.content, str) or not resp.content.strip():
+            return None
+        return resp.content.strip()
+    except asyncio.TimeoutError:
+        logger.warning("档案更新 LLM 调用超时（>120s），跳过")
+        return None
+    except Exception as e:
+        logger.error(f"档案更新 LLM 调用失败: {e}")
+        return None
+
+
+async def _update_single_group_memory(db_session, session_id: str):
+    """更新单个群的认知档案（内部函数）"""
+    from sqlalchemy import func as sqlfunc
+    stmt = Select(GroupMemory).where(GroupMemory.session_id == session_id)
+    record = (await db_session.execute(stmt)).scalar_one_or_none()
+
+    # 获取当前消息总量
+    total_count = (await db_session.execute(
+        Select(sqlfunc.count(ChatHistory.msg_id)).where(ChatHistory.session_id == session_id)
+    )).scalar_one()
+
+    last_count = record.msg_count_at_last_update if record else 0
+    new_msg_count = total_count - last_count
+
+    # 双重触发条件：新增消息 >= 100 或 距上次更新 >= 6 小时
+    if record and new_msg_count < 100:
+        time_since = datetime.datetime.now() - record.updated_at
+        if time_since.total_seconds() < 6 * 3600:
+            logger.info(f"群 {session_id} 无需更新档案（新增 {new_msg_count} 条，距上次更新 {time_since}）")
+            return
+
+    # 拉取自上次更新后的文本消息，最多 200 条
+    cutoff = record.updated_at if record else datetime.datetime.min
+    recent_msgs = (await db_session.execute(
+        Select(ChatHistory)
+        .where(
+            ChatHistory.session_id == session_id,
+            ChatHistory.created_at > cutoff,
+            ChatHistory.content_type.in_(["text", "bot"]),
+        )
+        .order_by(ChatHistory.created_at)
+        .limit(200)
+    )).scalars().all()
+
+    if not recent_msgs:
+        return
+
+    chat_text = "\n".join(
+        f"[{m.created_at.strftime('%m-%d %H:%M')}] {m.user_name}: {m.content[:100]}"
+        for m in recent_msgs
+    )
+
+    existing_summary = record.summary if record else ""
+    new_summary = await _call_summary_model(existing_summary, chat_text)
+    if not new_summary:
+        return
+
+    if not record:
+        record = GroupMemory(
+            session_id=session_id,
+            summary=new_summary,
+            msg_count_at_last_update=total_count,
+        )
+        db_session.add(record)
+    else:
+        record.summary = new_summary
+        record.msg_count_at_last_update = total_count
+
+    await db_session.commit()
+    logger.info(f"群 {session_id} 档案更新成功（{len(new_summary)} 字）")
+
+
+@scheduler.scheduled_job("interval", hours=6, max_instances=1, coalesce=True, id="update_group_memory")
+async def update_group_memory():
+    async with get_session() as db_session:
+        # 只查询最近 24 小时内有新消息的群
+        time_threshold = datetime.datetime.now() - datetime.timedelta(days=1)
+        stmt = Select(ChatHistory.session_id.distinct()).where(ChatHistory.created_at > time_threshold)
+        session_ids = (await db_session.execute(stmt)).scalars().all()
+
+    # 如果最近没人说话，直接返回
+    if not session_ids:
+        return
+
+    sem = asyncio.Semaphore(5)  # 最多同时处理 5 个群
+
+    async def _update_one(session_id: str):
+        async with sem:
+            async with get_session() as db_session:
+                try:
+                    await _update_single_group_memory(db_session, session_id)
+                except Exception as e:
+                    logger.error(f"更新群档案失败 {session_id}: {e}")
+
+    await asyncio.gather(*[_update_one(sid) for sid in session_ids])

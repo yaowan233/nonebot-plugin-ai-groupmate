@@ -156,10 +156,10 @@ class VectorDBOperator:
 
         max_retries = 3  # 最多试3次
 
-        for attempt in range(max_retries):
-            try:
-                # 每次请求重新建立 client，防止连接池污染
-                async with httpx.AsyncClient(timeout=60.0) as client:
+        # client 在循环外创建，避免每次 retry 都重新握手
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            for attempt in range(max_retries):
+                try:
                     resp = await client.post(aliyun_url, json=payload, headers=headers)
 
                     if resp.status_code != 200:
@@ -173,20 +173,20 @@ class VectorDBOperator:
                     # 阿里的成功返回 JSON 是: {"output": {"embeddings":[{"embedding": [0.1, 0.2...], "text_index": 0}]}}
                     return resp.json()["output"]["embeddings"][0]["embedding"]
 
-            except (httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError, httpx.PoolTimeout) as e:
-                is_last_attempt = (attempt == max_retries - 1)
+                except (httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError, httpx.PoolTimeout) as e:
+                    is_last_attempt = (attempt == max_retries - 1)
 
-                if is_last_attempt:
-                    logger.error(f"Aliyun API 重试3次后最终失败: {repr(e)}")
+                    if is_last_attempt:
+                        logger.error(f"Aliyun API 重试3次后最终失败: {repr(e)}")
+                        return None
+                    else:
+                        wait_time = 2 * (attempt + 1)  # 2秒, 4秒...
+                        logger.warning(f"Aliyun API 连接抖动 ({repr(e)})，正在第 {attempt + 1} 次重试...")
+                        await asyncio.sleep(wait_time)
+
+                except Exception as e:
+                    logger.error(f"Aliyun API 未知异常: {e}")
                     return None
-                else:
-                    wait_time = 2 * (attempt + 1)  # 2秒, 4秒...
-                    logger.warning(f"Aliyun API 连接抖动 ({repr(e)})，正在第 {attempt + 1} 次重试...")
-                    await asyncio.sleep(wait_time)
-
-            except Exception as e:
-                logger.error(f"Aliyun API 未知异常: {e}")
-                return None
 
         return None
 
@@ -212,7 +212,7 @@ class VectorDBOperator:
                 "top_n": 5  # 只取前5最相关的
             }
 
-            async with httpx.AsyncClient() as client:
+            async with httpx.AsyncClient(timeout=30.0) as client:
                 resp = await client.post(self.rerank_url, json=payload, headers=headers)
                 resp.raise_for_status()
                 results = resp.json().get("results", [])
@@ -411,7 +411,8 @@ class VectorDBOperator:
         search_result = await self.client.query_points(
             collection_name=self.media_col,
             query=vector,
-            limit=10
+            limit=10,
+            with_payload=False
         )
         if not search_result or not search_result.points:
             return []
@@ -425,7 +426,7 @@ class VectorDBOperator:
         """
         await self._ensure_collections()
 
-        target_vector = await self._get_qwen_vl_embedding(file_path)
+        target_vector = await self._get_qwen_vl_embedding(image_source=file_path)
         if not target_vector:
             return []
 

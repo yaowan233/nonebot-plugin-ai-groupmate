@@ -1,0 +1,4 @@
+*.pyc
+CLAUDE.md
+.python-version
+.vscode/
