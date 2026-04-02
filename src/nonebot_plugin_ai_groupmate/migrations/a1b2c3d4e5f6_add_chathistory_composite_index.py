@@ -22,7 +22,7 @@ def upgrade(name: str = "") -> None:
     if name:
         return
     op.create_index(
-        "ix_chathistory_session_type_time",
+        "ix_chat_session_time",
         "nonebot_plugin_ai_groupmate_chathistory",
         ["session_id", "created_at"],
         unique=False,
@@ -33,6 +33,6 @@ def downgrade(name: str = "") -> None:
     if name:
         return
     op.drop_index(
-        "ix_chathistory_session_type_time",
+        "ix_chat_session_time",
         table_name="nonebot_plugin_ai_groupmate_chathistory",
     )
