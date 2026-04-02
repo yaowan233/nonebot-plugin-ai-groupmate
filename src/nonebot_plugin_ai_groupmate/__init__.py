@@ -534,7 +534,13 @@ async def vectorize_media():
                     description = res_json.get("description", "")
 
                 except Exception as e:
+                    err_str = str(e)
                     logger.error(f"模型识别图片失败 {media_id}: {e}")
+                    # 400 错误（图片尺寸/格式非法、内容违规）不可重试，标记跳过
+                    if "Error code: 400" in err_str:
+                        media.vectorized = True
+                        db_session.add(media)
+                        await db_session.commit()
                     continue
 
                 # 3. 结果处理
@@ -638,13 +644,19 @@ async def _call_summary_model(existing_summary: str, chat_text: str) -> str | No
     history_intro = "（无，这是首次建档）" if not existing_summary.strip() else existing_summary
     user_msg = f"【现有档案】\n{history_intro}\n\n【最新聊天记录】\n{chat_text}\n\n请输出更新后的档案："
     try:
-        resp = await summary_model.ainvoke([
-            SystemMessage(content=system),
-            LCHumanMessage(content=user_msg),
-        ])
+        resp = await asyncio.wait_for(
+            summary_model.ainvoke([
+                SystemMessage(content=system),
+                LCHumanMessage(content=user_msg),
+            ]),
+            timeout=120.0,
+        )
         if not isinstance(resp.content, str) or not resp.content.strip():
             return None
         return resp.content.strip()
+    except asyncio.TimeoutError:
+        logger.warning("档案更新 LLM 调用超时（>120s），跳过")
+        return None
     except Exception as e:
         logger.error(f"档案更新 LLM 调用失败: {e}")
         return None
@@ -718,8 +730,15 @@ async def update_group_memory():
         session_ids = (await db_session.execute(
             Select(ChatHistory.session_id.distinct())
         )).scalars().all()
-        for session_id in session_ids:
-            try:
-                await _update_single_group_memory(db_session, session_id)
-            except Exception as e:
-                logger.error(f"更新群档案失败 {session_id}: {e}")
+
+    sem = asyncio.Semaphore(5)  # 最多同时处理 5 个群
+
+    async def _update_one(session_id: str):
+        async with sem:
+            async with get_session() as db_session:
+                try:
+                    await _update_single_group_memory(db_session, session_id)
+                except Exception as e:
+                    logger.error(f"更新群档案失败 {session_id}: {e}")
+
+    await asyncio.gather(*[_update_one(sid) for sid in session_ids])
