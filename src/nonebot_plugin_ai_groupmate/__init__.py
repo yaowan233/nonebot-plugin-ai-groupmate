@@ -727,9 +727,14 @@ async def _update_single_group_memory(db_session, session_id: str):
 @scheduler.scheduled_job("interval", hours=6, max_instances=1, coalesce=True, id="update_group_memory")
 async def update_group_memory():
     async with get_session() as db_session:
-        session_ids = (await db_session.execute(
-            Select(ChatHistory.session_id.distinct())
-        )).scalars().all()
+        # 只查询最近 24 小时内有新消息的群
+        time_threshold = datetime.datetime.now() - datetime.timedelta(days=1)
+        stmt = Select(ChatHistory.session_id.distinct()).where(ChatHistory.created_at > time_threshold)
+        session_ids = (await db_session.execute(stmt)).scalars().all()
+
+    # 如果最近没人说话，直接返回
+    if not session_ids:
+        return
 
     sem = asyncio.Semaphore(5)  # 最多同时处理 5 个群
 
