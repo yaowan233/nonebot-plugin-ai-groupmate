@@ -17,6 +17,11 @@ plugin_config = get_plugin_config(Config).ai_groupmate
 
 class VectorDBOperator:
     def __init__(self):
+        self.enabled = bool(plugin_config.qdrant_uri)
+        if not self.enabled:
+            logger.info("未配置 qdrant_uri，向量库功能已禁用")
+            return
+
         # 1. 初始化 Qdrant 客户端
         self.client = AsyncQdrantClient(
             url=plugin_config.qdrant_uri,
@@ -38,7 +43,6 @@ class VectorDBOperator:
         # 3. Rerank API 配置
         self.rerank_url = plugin_config.rerank_api_url
         self.rerank_key = plugin_config.rerank_api_key
-
 
         self._init_lock = asyncio.Lock()
         self._collections_ready = False
@@ -254,6 +258,8 @@ class VectorDBOperator:
         )
 
     async def search_chat(self, query: str, session_id: str) -> str:
+        if not self.enabled:
+            return "未找到相关历史记录"
         """
         RAG 搜索核心逻辑 (适配 query_points 接口)
         """
@@ -297,6 +303,8 @@ class VectorDBOperator:
 
     async def insert_media(self, media_id: int, image_url: str, description: str) -> None:
         """插入新表情包 (新图入库用)"""
+        if not self.enabled:
+            return
         await self._ensure_collections()
         vector = await self._get_qwen_vl_embedding(image_source=image_url, text=description)
         if not vector:
@@ -353,6 +361,8 @@ class VectorDBOperator:
         """
         批量插入聊天记录 (用于 utils.py 中的历史数据向量化)
         """
+        if not self.enabled:
+            return
         await self._ensure_collections()
         if not texts:
             return
@@ -401,6 +411,8 @@ class VectorDBOperator:
         根据描述搜表情包
         Text -> Clip Vector -> Search Qdrant -> Return IDs
         """
+        if not self.enabled:
+            return []
         await self._ensure_collections()
         # 1. 文本转向量
         vector = await self._get_qwen_vl_embedding(text=description)
@@ -424,6 +436,8 @@ class VectorDBOperator:
         根据图片找图片 (猜你喜欢/找相似)
         ID -> Retrieve Vector -> Search Qdrant -> Return IDs
         """
+        if not self.enabled:
+            return []
         await self._ensure_collections()
 
         target_vector = await self._get_qwen_vl_embedding(image_source=file_path)

@@ -909,35 +909,25 @@ RAG 搜索结果特性：rag_search 返回的结果已经是经过 Hybrid Search
 """
     report_tool = create_report_tool(db_session, session_id, user_id, user_name, model)
 
-    search_meme_tool = create_search_meme_tool(db_session)
-    send_meme_tool = create_send_meme_tool(db_session, session_id)
     relation_tool = create_relation_tool(db_session, user_id, user_name)
-    similar_meme_tool = create_similar_meme_tool(db_session, session_id)
-    if not user_id or not user_name:
-        tools = [
-            search_web,
+
+    base_tools = [
+        search_web,
+        create_reply_tool(db_session, session_id),
+        calculate_expression,
+        report_tool,
+        finish,
+    ]
+    if DB.enabled:
+        base_tools += [
             search_history_context,
-            create_reply_tool(db_session, session_id),
-            search_meme_tool,
-            similar_meme_tool,
-            send_meme_tool,
-            calculate_expression,
-            report_tool,
-            finish,
+            create_search_meme_tool(db_session),
+            create_similar_meme_tool(db_session, session_id),
+            create_send_meme_tool(db_session, session_id),
         ]
-    else:
-        tools = [
-            search_web,
-            search_history_context,
-            create_reply_tool(db_session, session_id),
-            search_meme_tool,
-            similar_meme_tool,
-            send_meme_tool,
-            calculate_expression,
-            relation_tool,
-            report_tool,
-            finish,
-        ]
+    if user_id and user_name:
+        base_tools.append(relation_tool)
+    tools = base_tools
 
     agent = create_agent(model, tools=tools, system_prompt=system_prompt, context_schema=Context, middleware=[ToolCallLimitMiddleware(thread_limit=8, run_limit=8),
                                                                                                               ToolCallLimitMiddleware(
