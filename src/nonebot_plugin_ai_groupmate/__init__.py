@@ -420,6 +420,8 @@ async def _(db_session: async_scoped_session, session: Uninfo, arg: Message = Co
 
 @scheduler.scheduled_job("interval", minutes=60, max_instances=1, coalesce=True, id="vectorize_chat")
 async def vectorize_message_history():
+    if not DB.enabled:
+        return
     async with get_session() as db_session:
         session_ids = await db_session.execute(Select(ChatHistory.session_id.distinct()))
         session_ids = session_ids.scalars().all()
@@ -453,6 +455,8 @@ async def vectorize_media():
     2. 使用 qwen-vl-max 判断是否为表情包 + 生成描述
     3. 写入 SQL (描述) 和 Qdrant (向量)
     """
+    if not DB.enabled:
+        return
     async with get_session() as db_session:
         # 只处理引用次数 >= 3 且未向量化的图片
         medias_res = await db_session.execute(
