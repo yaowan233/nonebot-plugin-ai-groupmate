@@ -6,6 +6,8 @@ import datetime
 import traceback
 from io import BytesIO
 from pathlib import Path
+from dataclasses import dataclass
+
 
 import jieba
 from nonebot import logger, require, on_command, on_message, get_plugin_config
@@ -244,11 +246,11 @@ async def handle_message(
         )
         await set_latest_request_id(group_id, request.request_id)
         async with _group_reply_state_lock:
-            state = _group_reply_states.setdefault(group_id, GroupReplyState())
-            state.latest = request
-            if state.running:
-                if state.task and not state.task.done():
-                    state.task.cancel()
+            reply_state = _group_reply_states.setdefault(group_id, GroupReplyState())
+            reply_state.latest = request
+            if reply_state.running:
+                if reply_state.task and not reply_state.task.done():
+                    reply_state.task.cancel()
                     logger.info(f"群 {group_id} 收到更新请求，已取消旧回复并切换到最新")
                 else:
                     # 兜底：若 running=True 但 worker 已结束（或异常丢失），立即拉起新 worker，
@@ -256,9 +258,9 @@ async def handle_message(
                     logger.warning(
                         f"群 {group_id} 回复状态异常（running=True 但 worker 不可用），已重启并切换到最新请求"
                     )
-                    _start_group_reply_worker_locked(group_id, state)
+                    _start_group_reply_worker_locked(group_id, reply_state)
             else:
-                _start_group_reply_worker_locked(group_id, state)
+                _start_group_reply_worker_locked(group_id, reply_state)
 
     await db_session.commit()
 
@@ -610,7 +612,7 @@ async def vectorize_message_history():
 
 tagging_model = ChatOpenAI(
     model="qwen-vl-max",
-    api_key=SecretStr(plugin_config.openai_token),
+    api_key=SecretStr(plugin_config.qwen_token),
     base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
     temperature=0.01,
 )

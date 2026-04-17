@@ -4,6 +4,7 @@ import base64
 import random
 import asyncio
 import datetime
+import difflib
 import mimetypes
 import traceback
 import collections
@@ -22,6 +23,7 @@ from langchain.agents import create_agent
 from langchain_openai import ChatOpenAI
 from langchain_tavily import TavilySearch
 from nonebot_plugin_orm import get_session
+from nonebot_plugin_uninfo import SceneType, QryItrface
 from langchain_core.prompts import ChatPromptTemplate
 from nonebot_plugin_alconna import UniMessage
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -32,6 +34,8 @@ from langchain.agents.structured_output import ToolStrategy
 from ..model import ChatHistory, MediaStorage, UserRelation, ChatHistorySchema, GroupMemory
 from ..config import Config
 from ..memory import DB
+from ..reply_guard import is_request_active
+
 
 require("nonebot_plugin_localstore")
 
@@ -82,7 +86,7 @@ class ResponseMessage(BaseModel):
 
 flash_model = ChatOpenAI(
     model="qwen-flash",
-    api_key=SecretStr(plugin_config.openai_token),
+    api_key=SecretStr(plugin_config.qwen_token),
     base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
     temperature=0,  # 设为0，由它做决策需要绝对理性，不需要发散
     max_completion_tokens=10,  # 我们只需要它回答 YES 或 NO，限制输出长度省钱
@@ -1081,8 +1085,8 @@ def create_relation_tool(
 
 tools = [search_web, search_history_context, calculate_expression]
 model = ChatOpenAI(
-    model=plugin_config.openai_model,
-    api_key=SecretStr(plugin_config.openai_token),
+    model=plugin_config.base_model,
+    api_key=SecretStr(plugin_config.qwen_token),
     base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
     temperature=0.7,
 )
@@ -1563,8 +1567,8 @@ async def choice_response_strategy(
 
 if __name__ == "__main__":
     model = ChatOpenAI(
-        model=plugin_config.openai_model,
-        api_key=SecretStr(plugin_config.openai_token),
+        model=plugin_config.base_model,
+        api_key=SecretStr(plugin_config.qwen_token),
         base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
         temperature=0.7,
     )
