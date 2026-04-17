@@ -33,6 +33,7 @@ from nonebot_plugin_alconna.uniseg import UniMsg
 
 from .agent import check_if_should_reply, choice_response_strategy
 from .model import ChatHistory, MediaStorage, ChatHistorySchema, GroupMemory
+from .reply_guard import set_latest_request_id
 from .utils import (
     generate_file_hash,
     check_and_compress_image_bytes,
@@ -67,6 +68,70 @@ summary_model = ChatOpenAI(
 )
 
 
+@dataclass
+class ReplyRequest:
+    request_id: str
+    session: Uninfo
+    interface: QryItrface
+    bot_name: str
+    user_id: str
+    user_name: str | None
+    is_tome: bool
+
+
+@dataclass
+class GroupReplyState:
+    running: bool = False
+    latest: ReplyRequest | None = None
+    task: asyncio.Task | None = None
+
+
+# 每个群只保留“最新一条”待处理回复请求，避免高峰期堆积后刷屏。
+_group_reply_states: dict[str, GroupReplyState] = {}
+_group_reply_state_lock = asyncio.Lock()
+
+
+def _start_group_reply_worker_locked(group_id: str, state: GroupReplyState):
+    """在已持有状态锁时启动群回复 worker。"""
+    state.running = True
+    state.task = asyncio.create_task(_run_group_reply_worker(group_id))
+
+
+async def _run_group_reply_worker(group_id: str):
+    """按群串行处理回复，只消费最新请求。"""
+    try:
+        while True:
+            async with _group_reply_state_lock:
+                state = _group_reply_states.get(group_id)
+                if not state:
+                    return
+                request = state.latest
+                state.latest = None
+
+            if request is None:
+                break
+
+            async with get_session() as reply_session:
+                await handle_reply_logic(
+                    reply_session,
+                    request.request_id,
+                    request.session,
+                    request.interface,
+                    request.bot_name,
+                    request.user_id,
+                    request.user_name,
+                    request.is_tome,
+                )
+    finally:
+        async with _group_reply_state_lock:
+            state = _group_reply_states.get(group_id)
+            if state:
+                state.running = False
+                state.task = None
+                if state.latest is not None:
+                    _start_group_reply_worker_locked(group_id, state)
+
+
 record = on_message(
     priority=999,
     block=True,
@@ -75,23 +140,26 @@ record = on_message(
 
 @record.handle()
 async def handle_message(
-        db_session: async_scoped_session,
-        msg: UniMsg,
-        session: Uninfo,
-        event: Event,
-        bot: Bot,
-        state: T_State,
-        interface: QryItrface
+    db_session: async_scoped_session,
+    msg: UniMsg,
+    session: Uninfo,
+    event: Event,
+    bot: Bot,
+    state: T_State,
+    interface: QryItrface,
 ):
     """处理消息的主函数"""
     bot_name = plugin_config.bot_name
     imgs = msg.include(Image)
+    # 第1行固定是本条消息的平台 ID 元数据，格式 "id: {id}"
     content = f"id: {get_message_id()}\n"
     to_me = False
     is_text = False
+    reply_id: str | None = None  # 记录回复 ID，稍后单独成行插入
+    body = ""  # 正文部分单独拼接
     if event.is_tome():
         to_me = True
-        content += f"@{plugin_config.bot_name} "
+        body += f"@{plugin_config.bot_name} "
     for i in msg:
         if i.type == "at":
             members = await interface.get_members(SceneType.GROUP, session.scene.id)
@@ -101,25 +169,25 @@ async def handle_message(
                     break
             else:
                 continue
-            content += "@" + name + " "
+            body += "@" + name + " "
             is_text = True
         if i.type == "reply":
-            content += "回复id:" + i.id
+            reply_id = i.id
         if i.type == "text":
-            content += i.text
+            body += i.text
             is_text = True
 
+    # 第2行（可选）：回复元数据，格式 "回复id: {id}"
+    if reply_id:
+        content += f"回复id: {reply_id}\n"
+    # 第3行起：正文
+    content += body
 
-    # 构建用户名（包含昵称和职位）
-    user_name = session.user.name
-    if session.member:
-        if session.member.nick:
-            user_name = f"({session.member.nick}){user_name}"
-        if session.member.role:
-            if session.member.role.name == "owner":
-                user_name = f"群主-{user_name}"
-            elif session.member.role.name == "admin":
-                user_name = f"管理员-{user_name}"
+    # 构建用户名：仅保留用户真实显示名，不混入群身份标签（群主/管理员）
+    # 避免模型误把“群主-”等前缀当成用户名的一部分。
+    user_name = session.user.name or session.user.nick or session.user.id
+    if session.member and session.member.nick:
+        user_name = session.member.nick
 
     # ========== 步骤1: 处理文本消息（快速） ==========
     if is_text:
@@ -142,7 +210,9 @@ async def handle_message(
     # ========== 步骤2: 处理图片消息（后台异步，不阻塞回复决策） ==========
     for img in imgs:
         asyncio.create_task(
-            _process_image_task(img, event, bot, state, session, user_name, f"id: {get_message_id()}\n")
+            _process_image_task(
+                img, event, bot, state, session, user_name, f"id: {get_message_id()}\n"
+            )
         )
 
     # ========== 步骤3: 决定是否回复 ==========
@@ -162,20 +232,46 @@ async def handle_message(
         user_id = ""
         user_name = ""
     if should_reply:
-        await handle_reply_logic(db_session, session, bot_name, user_id, user_name, to_me)
+        group_id = session.scene.id
+        request = ReplyRequest(
+            request_id=f"{group_id}:{datetime.datetime.now().timestamp()}:{random.random()}",
+            session=session,
+            interface=interface,
+            bot_name=bot_name,
+            user_id=user_id,
+            user_name=user_name,
+            is_tome=to_me,
+        )
+        await set_latest_request_id(group_id, request.request_id)
+        async with _group_reply_state_lock:
+            state = _group_reply_states.setdefault(group_id, GroupReplyState())
+            state.latest = request
+            if state.running:
+                if state.task and not state.task.done():
+                    state.task.cancel()
+                    logger.info(f"群 {group_id} 收到更新请求，已取消旧回复并切换到最新")
+                else:
+                    # 兜底：若 running=True 但 worker 已结束（或异常丢失），立即拉起新 worker，
+                    # 避免最新请求长期卡在 latest 槽位里无人消费。
+                    logger.warning(
+                        f"群 {group_id} 回复状态异常（running=True 但 worker 不可用），已重启并切换到最新请求"
+                    )
+                    _start_group_reply_worker_locked(group_id, state)
+            else:
+                _start_group_reply_worker_locked(group_id, state)
 
     await db_session.commit()
 
 
 async def process_image_message(
-        db_session,
-        img: Image,
-        event: Event,
-        bot: Bot,
-        state: T_State,
-        session: Uninfo,
-        user_name: str | None,
-        content_prefix: str,
+    db_session,
+    img: Image,
+    event: Event,
+    bot: Bot,
+    state: T_State,
+    session: Uninfo,
+    user_name: str | None,
+    content_prefix: str,
 ):
     """处理单张图片消息 (修复并发插入报错)"""
     try:
@@ -188,8 +284,7 @@ async def process_image_message(
         # 1. 获取和压缩图片
         try:
             pic = await asyncio.wait_for(
-                image_fetch(event, bot, state, img),
-                timeout=15.0
+                image_fetch(event, bot, state, img), timeout=15.0
             )
         except asyncio.TimeoutError:
             logger.warning("下载图片超时，跳过")
@@ -265,32 +360,45 @@ async def process_image_message(
         await db_session.rollback()
 
 
-async def _process_image_task(img, event, bot, state, session, user_name, content_prefix):
+async def _process_image_task(
+    img, event, bot, state, session, user_name, content_prefix
+):
     """后台图片处理任务，使用独立的数据库会话，不阻塞主消息流程"""
     async with get_session() as db_session:
-        await process_image_message(db_session, img, event, bot, state, session, user_name, content_prefix)
+        await process_image_message(
+            db_session, img, event, bot, state, session, user_name, content_prefix
+        )
 
 
 async def handle_reply_logic(
-        db_session,
-        session: Uninfo,
-        bot_name: str,
-        user_id: str,
-        user_name: str | None,
-        is_tome: bool,
+    db_session,
+    request_id: str,
+    session: Uninfo,
+    interface: QryItrface,
+    bot_name: str,
+    user_id: str,
+    user_name: str | None,
+    is_tome: bool,
 ):
     """处理回复逻辑"""
     try:
         # 获取最近几条用于 Flash 快速判断
         # 注意：Flash 模型是纯文本模型，它看不懂图片，所以这里我们只喂文本内容
         recent_msgs = (
-            await db_session.execute(
-                Select(ChatHistory)
-                .where(ChatHistory.session_id == session.scene.id, ChatHistory.content_type != "bot")
-                .order_by(ChatHistory.msg_id.desc())
-                .limit(3)
+            (
+                await db_session.execute(
+                    Select(ChatHistory)
+                    .where(
+                        ChatHistory.session_id == session.scene.id,
+                        ChatHistory.content_type != "bot",
+                    )
+                    .order_by(ChatHistory.msg_id.desc())
+                    .limit(3)
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         recent_msgs = recent_msgs[::-1]
 
         if not recent_msgs:
@@ -304,25 +412,35 @@ async def handle_reply_logic(
             else:
                 history_summary += f"{m.user_name}: {m.content}\n"
 
-        current_msg_text = recent_msgs[-1].content if recent_msgs[-1].content_type == "text" else "[图片]"
+        current_msg_text = (
+            recent_msgs[-1].content
+            if recent_msgs[-1].content_type == "text"
+            else "[图片]"
+        )
 
         # === Gatekeeper 判断 ===
         if not is_tome:
-            should_reply = await check_if_should_reply(history_summary, current_msg_text, bot_name)
+            should_reply = await check_if_should_reply(
+                history_summary, current_msg_text, bot_name
+            )
             if not should_reply:
                 return
 
         # === 获取详细历史给 Agent ===
         cutoff_time = datetime.datetime.now() - datetime.timedelta(hours=1)
         last_msg = (
-            await db_session.execute(
-                Select(ChatHistory)
-                .where(ChatHistory.session_id == session.scene.id)
-                .where(ChatHistory.created_at >= cutoff_time)
-                .order_by(ChatHistory.msg_id.desc())
-                .limit(20)
+            (
+                await db_session.execute(
+                    Select(ChatHistory)
+                    .where(ChatHistory.session_id == session.scene.id)
+                    .where(ChatHistory.created_at >= cutoff_time)
+                    .order_by(ChatHistory.msg_id.desc())
+                    .limit(20)
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
 
         if not last_msg:
             logger.info("没有历史消息，跳过回复")
@@ -331,15 +449,40 @@ async def handle_reply_logic(
         last_msg = [ChatHistorySchema.model_validate(m) for m in last_msg]
         last_msg = last_msg[::-1]
 
+        role_map: dict[str, str] = {}
+        try:
+            members = await interface.get_members(SceneType.GROUP, session.scene.id)
+            for member in members:
+                role_name = getattr(getattr(member, "role", None), "name", None)
+                if role_name in {"owner", "admin"}:
+                    role_map[str(member.id)] = role_name
+        except Exception as e:
+            logger.warning(f"获取群成员身份信息失败，降级为无身份标注: {e}")
+
         logger.info("开始调用Agent决策...")
         try:
             strategy = await asyncio.wait_for(
-                choice_response_strategy(db_session, session.scene.id, last_msg, user_id, user_name, ""),
-                timeout=240.0
+                choice_response_strategy(
+                    db_session,
+                    session.scene.id,
+                    request_id,
+                    last_msg,
+                    user_id,
+                    user_name,
+                    "",
+                    interface,
+                    role_map,
+                ),
+                timeout=240.0,
             )
         except asyncio.TimeoutError:
             logger.warning(f"Agent 思考超时 - session: {session.scene.id}")
             return
+
+        except asyncio.CancelledError:
+            logger.info(f"群 {session.scene.id} 回复任务被取消（切换到更新请求）")
+            await db_session.rollback()
+            raise
 
         logger.info(f"Agent决策结果: {strategy}")
 
@@ -351,17 +494,31 @@ async def handle_reply_logic(
 
 def _build_wordcloud_image(words: str) -> BytesIO:
     """Generate a PNG image bytes object from words using WordCloud."""
-    wc = WordCloud(font_path=Path(__file__).parent / "SourceHanSans.otf", width=1000, height=500).generate(words).to_image()
+    wc = (
+        WordCloud(
+            font_path=Path(__file__).parent / "SourceHanSans.otf",
+            width=1000,
+            height=500,
+        )
+        .generate(words)
+        .to_image()
+    )
     image_bytes = BytesIO()
     wc.save(image_bytes, format="PNG")
     image_bytes.seek(0)
     return image_bytes
 
 
-async def _collect_words_from_db(db_session, session_id: str, days: int = 1, user_id: str | None = None) -> str:
+async def _collect_words_from_db(
+    db_session, session_id: str, days: int = 1, user_id: str | None = None
+) -> str:
     """Query chat history and return a cleaned space-joined word string for wordcloud."""
     cutoff = datetime.datetime.now() - datetime.timedelta(days=days)
-    where = [ChatHistory.session_id == session_id, ChatHistory.content_type == "text", ChatHistory.created_at >= cutoff]
+    where = [
+        ChatHistory.session_id == session_id,
+        ChatHistory.content_type == "text",
+        ChatHistory.created_at >= cutoff,
+    ]
     if user_id:
         where.append(ChatHistory.user_id == user_id)
 
@@ -379,7 +536,9 @@ frequency = on_command("词频")
 
 
 @frequency.handle()
-async def _(db_session: async_scoped_session, session: Uninfo, arg: Message = CommandArg()):
+async def _(
+    db_session: async_scoped_session, session: Uninfo, arg: Message = CommandArg()
+):
     session_id = session.scene.id
     arg_text = arg.extract_plain_text().strip()
     if not arg_text:
@@ -388,7 +547,9 @@ async def _(db_session: async_scoped_session, session: Uninfo, arg: Message = Co
         await frequency.finish("统计范围应为纯数字")
     days = int(arg_text)
 
-    words = await _collect_words_from_db(db_session, session_id, days=days, user_id=session.user.id)
+    words = await _collect_words_from_db(
+        db_session, session_id, days=days, user_id=session.user.id
+    )
     if not words:
         await frequency.finish("在指定时间内，没有说过话呢")
 
@@ -400,7 +561,9 @@ group_frequency = on_command("群词频")
 
 
 @group_frequency.handle()
-async def _(db_session: async_scoped_session, session: Uninfo, arg: Message = CommandArg()):
+async def _(
+    db_session: async_scoped_session, session: Uninfo, arg: Message = CommandArg()
+):
     session_id = session.scene.id
     arg_text = arg.extract_plain_text().strip()
     if not arg_text:
@@ -409,7 +572,9 @@ async def _(db_session: async_scoped_session, session: Uninfo, arg: Message = Co
         await group_frequency.finish("统计范围应为纯数字")
     days = int(arg_text)
 
-    words = await _collect_words_from_db(db_session, session_id, days=days, user_id=None)
+    words = await _collect_words_from_db(
+        db_session, session_id, days=days, user_id=None
+    )
     # Even if no words, return an empty wordcloud (original group_frequency didn't check emptiness)
     if not words:
         await group_frequency.finish("在指定时间内，没有消息可统计")
@@ -418,19 +583,23 @@ async def _(db_session: async_scoped_session, session: Uninfo, arg: Message = Co
     await UniMessage.image(raw=image_bytes).send(reply_to=True)
 
 
-@scheduler.scheduled_job("interval", minutes=60, max_instances=1, coalesce=True, id="vectorize_chat")
+@scheduler.scheduled_job(
+    "interval", minutes=60, max_instances=1, coalesce=True, id="vectorize_chat"
+)
 async def vectorize_message_history():
-    if not DB.enabled:
-        return
     async with get_session() as db_session:
-        session_ids = await db_session.execute(Select(ChatHistory.session_id.distinct()))
+        session_ids = await db_session.execute(
+            Select(ChatHistory.session_id.distinct())
+        )
         session_ids = session_ids.scalars().all()
         logger.info("开始向量化会话")
         for session_id in session_ids:
             try:
                 res = await process_and_vectorize_session_chats(db_session, session_id)
                 if res:
-                    logger.info(f"向量化会话 {res['session_id']} 成功，共处理 {res['processed_groups']}/{res['total_groups']} 组")
+                    logger.info(
+                        f"向量化会话 {res['session_id']} 成功，共处理 {res['processed_groups']}/{res['total_groups']} 组"
+                    )
                 else:
                     logger.info(f"{session_id} 无需向量化")
             except Exception as e:
@@ -441,13 +610,15 @@ async def vectorize_message_history():
 
 tagging_model = ChatOpenAI(
     model="qwen-vl-max",
-    api_key=SecretStr(plugin_config.qwen_token),
+    api_key=SecretStr(plugin_config.openai_token),
     base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
     temperature=0.01,
 )
 
 
-@scheduler.scheduled_job("interval", minutes=30, max_instances=1, coalesce=True, id="vectorize_media")
+@scheduler.scheduled_job(
+    "interval", minutes=30, max_instances=1, coalesce=True, id="vectorize_media"
+)
 async def vectorize_media():
     """
     定期处理图片：
@@ -455,16 +626,14 @@ async def vectorize_media():
     2. 使用 qwen-vl-max 判断是否为表情包 + 生成描述
     3. 写入 SQL (描述) 和 Qdrant (向量)
     """
-    if not DB.enabled:
-        return
     async with get_session() as db_session:
         # 只处理引用次数 >= 3 且未向量化的图片
         medias_res = await db_session.execute(
-            Select(MediaStorage).where(MediaStorage.references >= 3, MediaStorage.vectorized.is_(False))
+            Select(MediaStorage).where(
+                MediaStorage.references >= 3, MediaStorage.vectorized.is_(False)
+            )
         )
         medias = medias_res.scalars().all()
-        # 在任何 commit/rollback 之前，一次性读出所有 ID
-        # 每次 commit 后 session 会 expire 所有对象，后续循环用 get() 重新拉取
         media_ids = [m.media_id for m in medias]
         logger.info(f"待处理高频图片数量: {len(media_ids)}")
 
@@ -517,12 +686,19 @@ async def vectorize_media():
 """
                 try:
                     # 调用模型
-                    response = await tagging_model.ainvoke([
-                        HumanMessage(content=[
-                            {"type": "text", "text": prompt},
-                            {"type": "image_url", "image_url": {"url": img_data_uri}}
-                        ])
-                    ])
+                    response = await tagging_model.ainvoke(
+                        [
+                            HumanMessage(
+                                content=[
+                                    {"type": "text", "text": prompt},
+                                    {
+                                        "type": "image_url",
+                                        "image_url": {"url": img_data_uri},
+                                    },
+                                ]
+                            )
+                        ]
+                    )
 
                     if isinstance(response.content, list):
                         # 如果模型返回了一个列表，跳过
@@ -539,12 +715,19 @@ async def vectorize_media():
 
                 except Exception as e:
                     err_str = str(e)
-                    logger.error(f"模型识别图片失败 {media_id}: {e}")
                     # 400 错误（图片尺寸/格式非法、内容违规）不可重试，标记跳过
                     if "Error code: 400" in err_str:
+                        if "data_inspection_failed" in err_str:
+                            logger.warning(f"图片 {media_id} 内容违规，跳过向量化")
+                        else:
+                            logger.warning(
+                                f"图片 {media_id} 请求非法（400），跳过向量化: {e}"
+                            )
                         media.vectorized = True
                         db_session.add(media)
                         await db_session.commit()
+                    else:
+                        logger.error(f"模型识别图片失败 {media_id}: {e}")
                     continue
 
                 # 3. 结果处理
@@ -584,12 +767,18 @@ async def vectorize_media():
             logger.info("本轮图片处理完成")
 
 
-@scheduler.scheduled_job("interval", minutes=35, max_instances=1, coalesce=True, id="clear_cache")
+@scheduler.scheduled_job(
+    "interval", minutes=35, max_instances=1, coalesce=True, id="clear_cache"
+)
 async def clear_cache_pic():
     async with get_session() as db_session:
         # ── 1. 删除低引用且过期的数据库记录及对应文件 ──
         result = await db_session.execute(
-            Select(MediaStorage).where(MediaStorage.references < 3, MediaStorage.created_at < datetime.datetime.now() - datetime.timedelta(days=30))
+            Select(MediaStorage).where(
+                MediaStorage.references < 3,
+                MediaStorage.created_at
+                < datetime.datetime.now() - datetime.timedelta(days=30),
+            )
         )
         medias = result.scalars().all()
 
@@ -636,8 +825,11 @@ async def clear_cache_pic():
 
 
 async def _call_summary_model(existing_summary: str, chat_text: str) -> str | None:
-    """调用 LLM 更新群体认知档案"""
+    """调用 LLM 更新群体认知档案。
+    若触发内容违规（data_inspection_failed），会对聊天记录做二分截断后最多重试 3 次。
+    """
     from langchain_core.messages import SystemMessage, HumanMessage as LCHumanMessage
+
     system = """你是一个群文化分析师。你的任务是维护一份关于QQ群的认知档案。
 档案包含：群内常见话题、活跃成员特征、内部梗/黑话、群文化氛围。
 规则：
@@ -645,37 +837,72 @@ async def _call_summary_model(existing_summary: str, chat_text: str) -> str | No
 2. 保留档案中仍然有效的内容，用新聊天补充或修正旧内容
 3. 如果某个内容长期（超过30天）无聊天印证，可删除
 4. 输出完整更新后的档案，不超过500字，不要输出任何其他内容"""
-    history_intro = "（无，这是首次建档）" if not existing_summary.strip() else existing_summary
-    user_msg = f"【现有档案】\n{history_intro}\n\n【最新聊天记录】\n{chat_text}\n\n请输出更新后的档案："
-    try:
-        resp = await asyncio.wait_for(
-            summary_model.ainvoke([
-                SystemMessage(content=system),
-                LCHumanMessage(content=user_msg),
-            ]),
-            timeout=120.0,
-        )
-        if not isinstance(resp.content, str) or not resp.content.strip():
+    history_intro = (
+        "（无，这是首次建档）" if not existing_summary.strip() else existing_summary
+    )
+
+    lines = chat_text.splitlines()
+    max_retries = 3
+
+    for attempt in range(max_retries + 1):
+        current_text = "\n".join(lines)
+        if not current_text.strip():
+            logger.warning("档案更新：聊天记录经截断后已为空，放弃本次更新")
             return None
-        return resp.content.strip()
-    except asyncio.TimeoutError:
-        logger.warning("档案更新 LLM 调用超时（>120s），跳过")
-        return None
-    except Exception as e:
-        logger.error(f"档案更新 LLM 调用失败: {e}")
-        return None
+
+        user_msg = f"【现有档案】\n{history_intro}\n\n【最新聊天记录】\n{current_text}\n\n请输出更新后的档案："
+        try:
+            resp = await summary_model.ainvoke(
+                [
+                    SystemMessage(content=system),
+                    LCHumanMessage(content=user_msg),
+                ]
+            )
+            if not isinstance(resp.content, str) or not resp.content.strip():
+                return None
+            if attempt > 0:
+                logger.info(
+                    f"档案更新：截断后第 {attempt} 次重试成功（剩余 {len(lines)} 条消息）"
+                )
+            return resp.content.strip()
+        except Exception as e:
+            err_str = str(e)
+            if "data_inspection_failed" in err_str or (
+                "Error code: 400" in err_str and "inappropriate" in err_str
+            ):
+                if attempt < max_retries:
+                    # 去掉后半段消息，逐步缩小范围
+                    lines = lines[: max(1, len(lines) // 2)]
+                    logger.warning(
+                        f"档案更新：内容违规，截断至 {len(lines)} 条消息后重试（第 {attempt + 1}/{max_retries} 次）"
+                    )
+                else:
+                    logger.warning(
+                        f"档案更新：内容违规，已重试 {max_retries} 次仍失败，放弃本次更新"
+                    )
+                    return None
+            else:
+                logger.error(f"档案更新 LLM 调用失败: {e}")
+                return None
+
+    return None
 
 
 async def _update_single_group_memory(db_session, session_id: str):
     """更新单个群的认知档案（内部函数）"""
     from sqlalchemy import func as sqlfunc
+
     stmt = Select(GroupMemory).where(GroupMemory.session_id == session_id)
     record = (await db_session.execute(stmt)).scalar_one_or_none()
 
     # 获取当前消息总量
-    total_count = (await db_session.execute(
-        Select(sqlfunc.count(ChatHistory.msg_id)).where(ChatHistory.session_id == session_id)
-    )).scalar_one()
+    total_count = (
+        await db_session.execute(
+            Select(sqlfunc.count(ChatHistory.msg_id)).where(
+                ChatHistory.session_id == session_id
+            )
+        )
+    ).scalar_one()
 
     last_count = record.msg_count_at_last_update if record else 0
     new_msg_count = total_count - last_count
@@ -684,21 +911,29 @@ async def _update_single_group_memory(db_session, session_id: str):
     if record and new_msg_count < 100:
         time_since = datetime.datetime.now() - record.updated_at
         if time_since.total_seconds() < 6 * 3600:
-            logger.info(f"群 {session_id} 无需更新档案（新增 {new_msg_count} 条，距上次更新 {time_since}）")
+            logger.info(
+                f"群 {session_id} 无需更新档案（新增 {new_msg_count} 条，距上次更新 {time_since}）"
+            )
             return
 
     # 拉取自上次更新后的文本消息，最多 200 条
     cutoff = record.updated_at if record else datetime.datetime.min
-    recent_msgs = (await db_session.execute(
-        Select(ChatHistory)
-        .where(
-            ChatHistory.session_id == session_id,
-            ChatHistory.created_at > cutoff,
-            ChatHistory.content_type.in_(["text", "bot"]),
+    recent_msgs = (
+        (
+            await db_session.execute(
+                Select(ChatHistory)
+                .where(
+                    ChatHistory.session_id == session_id,
+                    ChatHistory.created_at > cutoff,
+                    ChatHistory.content_type.in_(["text", "bot"]),
+                )
+                .order_by(ChatHistory.created_at)
+                .limit(200)
+            )
         )
-        .order_by(ChatHistory.created_at)
-        .limit(200)
-    )).scalars().all()
+        .scalars()
+        .all()
+    )
 
     if not recent_msgs:
         return
@@ -728,12 +963,16 @@ async def _update_single_group_memory(db_session, session_id: str):
     logger.info(f"群 {session_id} 档案更新成功（{len(new_summary)} 字）")
 
 
-@scheduler.scheduled_job("interval", hours=6, max_instances=1, coalesce=True, id="update_group_memory")
+@scheduler.scheduled_job(
+    "interval", hours=6, max_instances=1, coalesce=True, id="update_group_memory"
+)
 async def update_group_memory():
     async with get_session() as db_session:
         # 只查询最近 24 小时内有新消息的群
         time_threshold = datetime.datetime.now() - datetime.timedelta(days=1)
-        stmt = Select(ChatHistory.session_id.distinct()).where(ChatHistory.created_at > time_threshold)
+        stmt = Select(ChatHistory.session_id.distinct()).where(
+            ChatHistory.created_at > time_threshold
+        )
         session_ids = (await db_session.execute(stmt)).scalars().all()
 
     # 如果最近没人说话，直接返回

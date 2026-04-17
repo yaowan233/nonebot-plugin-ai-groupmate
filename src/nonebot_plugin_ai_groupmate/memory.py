@@ -258,11 +258,11 @@ class VectorDBOperator:
         )
 
     async def search_chat(self, query: str, session_id: str) -> str:
-        if not self.enabled:
-            return "未找到相关历史记录"
         """
         RAG 搜索核心逻辑 (适配 query_points 接口)
         """
+        if not self.enabled:
+            return "未找到相关历史记录"
         await self._ensure_collections()
         # 1. 获取向量
         vector = await self._get_text_embedding(query)
