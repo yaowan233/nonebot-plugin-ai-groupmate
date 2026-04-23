@@ -922,6 +922,112 @@ def calculate_expression(expression: str) -> str:
         return f"计算失败。请检查表达式是否正确，错误信息: {e}"
 
 
+def create_mute_tool(
+    session_id: str,
+    request_id: str | None,
+    interface: QryItrface | None,
+    bot_id: str | None,
+):
+    """
+    创建禁言工具（仅在bot是管理员时可用）
+    """
+
+    @tool("mute_user")
+    async def mute_user(target_user_name: str, duration_seconds: int, reason: str) -> str:
+        """
+        禁言指定用户。仅在bot是管理员或群主时可用。
+        
+        参数:
+        - target_user_name: 要禁言的用户昵称（从聊天记录中获取）
+        - duration_seconds: 禁言时长（秒），最多2592000秒(30天)，0表示解除禁言
+        - reason: 禁言原因（必填，用于记录和说明）
+        
+        返回: 操作结果描述
+        """
+        if request_id is not None and not await is_request_active(
+            session_id, request_id
+        ):
+            return "请求已过期，已取消操作。"
+
+        if not interface:
+            return "无法获取群成员信息接口，禁言失败。"
+        
+        if not bot_id:
+            return "无法获取bot ID，禁言失败。"
+
+        try:
+            # 验证禁言时长
+            if duration_seconds < 0 or duration_seconds > 2592000:
+                return "禁言时长必须在0-2592000秒(30天)之间。"
+
+            # 获取所有群成员
+            members = await interface.get_members(SceneType.GROUP, session_id)
+            
+            # 查找bot自己的权限
+            bot_member = None
+            target_member = None
+            
+            for member in members:
+                # 使用bot_id来判断，而不是bot_name
+                if str(member.id) == str(bot_id):
+                    bot_member = member
+                # 检查是否是目标用户（通过昵称匹配）
+                member_name = member.nick or (member.user.name if member.user else None)
+                if member_name == target_user_name:
+                    target_member = member
+            
+            # 检查bot权限
+            if not bot_member:
+                return "无法获取bot的群成员信息。"
+            
+            bot_role = getattr(getattr(bot_member, "role", None), "name", None)
+            if bot_role not in {"owner", "admin"}:
+                return "bot不是管理员或群主，无法执行禁言操作。"
+            
+            # 检查目标用户是否存在
+            if not target_member:
+                return f"未找到用户 '{target_user_name}'，请确认昵称是否正确。"
+            
+            # 检查目标用户权限，避免禁言管理员
+            target_role = getattr(getattr(target_member, "role", None), "name", None)
+            if target_role in {"owner", "admin"}:
+                return f"无法禁言管理员或群主 '{target_user_name}'。"
+            
+            # 执行禁言操作
+            # 注意：这里需要调用适配器的API，不同平台可能有不同的方法
+            # 我们尝试通过 interface 来操作
+            try:
+                from nonebot import get_bot
+                bot = get_bot()
+                
+                # 对于OneBot v11/v12，使用set_group_ban
+                target_user_id = str(target_member.id)
+                if hasattr(bot, "set_group_ban"):
+                    await bot.set_group_ban(
+                        group_id=int(session_id),
+                        user_id=int(target_user_id),
+                        duration=duration_seconds
+                    )
+                else:
+                    return "当前适配器不支持禁言功能。"
+                
+                action = "解除禁言" if duration_seconds == 0 else f"禁言 {duration_seconds} 秒"
+                logger.info(f"已{action}用户 {target_user_name}（{target_user_id}），原因: {reason}")
+                
+                return f"已成功{action}用户 '{target_user_name}'。原因: {reason}"
+                
+            except Exception as api_err:
+                logger.error(f"调用禁言API失败: {api_err}")
+                return f"禁言操作失败: {str(api_err)}"
+            
+        except Exception as e:
+            logger.error(f"禁言工具执行失败: {e}")
+            print(traceback.format_exc())
+            return f"禁言失败: {str(e)}"
+
+    return mute_user
+
+
 def create_relation_tool(
     db_session,
     session_id: str,
@@ -1233,6 +1339,7 @@ async def create_chat_agent(
     user_name: str | None,
     history: list[ChatHistorySchema] | None = None,
     interface: QryItrface | None = None,
+    bot_id: str | None = None,
 ):
     """创建聊天Agent"""
     relation_context = await get_user_relation_context(db_session, user_id, user_name)
@@ -1240,6 +1347,45 @@ async def create_chat_agent(
     recent_relations_context = await get_recent_relations_context(
         db_session, history or []
     )
+    
+    # 检查bot是否有管理员权限
+    has_admin_permission = False
+    if interface and bot_id:
+        try:
+            members = await interface.get_members(SceneType.GROUP, session_id)
+            for member in members:
+                # 使用bot的user_id来判断，而不是bot_name
+                if str(member.id) == str(bot_id):
+                    bot_role = getattr(getattr(member, "role", None), "name", None)
+                    if bot_role in {"owner", "admin"}:
+                        has_admin_permission = True
+                        logger.info(f"Bot在群{session_id}中拥有{bot_role}权限，已启用禁言功能")
+                    else:
+                        logger.info(f"Bot在群{session_id}中是普通成员，未启用禁言功能")
+                    break
+        except Exception as e:
+            logger.warning(f"检查bot权限失败: {e}")
+    
+    # 根据权限动态调整系统提示词
+    permission_status = ""
+    mute_tool_instruction = ""
+    if has_admin_permission:
+        permission_status = """
+【你的权限】
+你在这个群里是管理员/群主，拥有群管理权限。你可以使用禁言功能来维护群秩序。
+"""
+        mute_tool_instruction = """- 禁言管理：可使用 `mute_user` 禁言
+  - 你有权限执行禁言操作
+  - 【必须满足】用户请求禁言自己时，应该满足需求（例如"禁言我""让我冷静一下"）
+    - 时长可以根据用户要求或默认给5-30分钟
+    - 这是帮助用户自我管理的合理需求
+  - 【谨慎使用】禁言他人时才需要谨慎：
+    - 严重违规、恶意刷屏时可以主动禁言
+    - 轻微违规应先警告
+    - 禁言时长应合理：轻微违规60-300秒，严重违规可更长
+  - 不要禁言管理员或群主
+"""
+    
     system_prompt = f"""你是QQ群群友「{plugin_config.bot_name}」。
 你不是助手，不承认自己是AI。
 【任务】
@@ -1247,14 +1393,15 @@ async def create_chat_agent(
 {group_context}
 {relation_context}
 {recent_relations_context}
+{permission_status}
 【风格】
 - 像真实群友，口语化、简短自然
 - 优先短句；复杂问题可拆成 2-3 条连续短消息（每条一个重点）
 - 只有在确实需要分点说明时才发第2/3条；简单问题只发1条
-- 多条回复必须“信息递进”，后一条必须提供新信息，禁止同义改写重复
+- 多条回复必须"信息递进"，后一条必须提供新信息，禁止同义改写重复
 - 如果下一条与上一条语义高度重叠，直接不发下一条
 - 可吐槽可玩梗，但不恶意攻击，不无脑迎合
-- 不要复读模板句，不要输出“我脑子一片空白/我被修坏了/我不知道我是谁”这类台词
+- 不要复读模板句，不要输出"我脑子一片空白/我被修坏了/我不知道我是谁"这类台词
 - 不要使用 emoji（尤其 😅）
 - 不要使用 Markdown
 【工具规则】
@@ -1264,14 +1411,14 @@ async def create_chat_agent(
 - 外部知识/缩写/术语：优先 `search_web`
 - 群内上下文：`search_history_context`
 - 用户情绪或关系变化明显时，调用 `update_user_impression`
-- 若用户提到“年度报告 / 个人总结 / 成分分析”，直接调用 `generate_and_send_annual_report`；
-  工具完成后仅回复“请查收~”，不要复述报告
-- 回复结束后调用 `finish`
+- 若用户提到"年度报告 / 个人总结 / 成分分析"，直接调用 `generate_and_send_annual_report`；
+  工具完成后仅回复"请查收~"，不要复述报告
+{mute_tool_instruction}- 回复结束后调用 `finish`
 【边界】
 - 不要插入他人对话
-- 不要直呼“管理员/群主”职位名，尽量用昵称
+- 不要直呼"管理员/群主"职位名，尽量用昵称
 - 不要发送重复或高度相似内容
-- 遇到明显危险/违法/过分要求：简短拒绝、吐槽或无视（如“？”）
+- 遇到明显危险/违法/过分要求：简短拒绝、吐槽或无视（如"？"）
 【RAG 检索硬约束】
 - 在 `rag_search` 中禁止相对时间词：昨天、前天、本周、上周、这个月、上个月、最近等
 - 使用明确日期时间或关键词检索
@@ -1288,6 +1435,8 @@ async def create_chat_agent(
     similar_meme_tool = create_similar_meme_tool(
         db_session, session_id, request_id, user_id
     )
+    mute_tool = create_mute_tool(session_id, request_id, interface, bot_id)
+    
     if not user_id or not user_name:
         tools = [
             search_web,
@@ -1300,6 +1449,9 @@ async def create_chat_agent(
             report_tool,
             finish,
         ]
+        # 如果bot是管理员，添加禁言工具
+        if has_admin_permission:
+            tools.insert(-1, mute_tool)  # 在finish之前插入
     else:
         tools = [
             search_web,
@@ -1313,6 +1465,9 @@ async def create_chat_agent(
             report_tool,
             finish,
         ]
+        # 如果bot是管理员，添加禁言工具
+        if has_admin_permission:
+            tools.insert(-1, mute_tool)  # 在finish之前插入
 
     agent = create_agent(
         model,
@@ -1491,13 +1646,14 @@ async def choice_response_strategy(
     setting: str | None = None,
     interface: QryItrface | None = None,
     role_map: dict[str, str] | None = None,
+    bot_id: str | None = None,
 ) -> ResponseMessage:
     """
     使用Agent决定回复策略
     """
     try:
         agent = await create_chat_agent(
-            db_session, session_id, request_id, user_id, user_name, history, interface
+            db_session, session_id, request_id, user_id, user_name, history, interface, bot_id
         )
 
         # 1. 获取多模态格式的历史消息列表 (List[BaseMessage])

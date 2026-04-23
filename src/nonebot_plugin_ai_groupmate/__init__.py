@@ -315,25 +315,27 @@ async def process_image_message(
             db_session.add(media_obj)
         else:
             # B. 如果不存在，尝试插入
+            new_media = MediaStorage(
+                file_hash=file_hash,
+                file_path=file_name,
+                references=1,
+                description="[图片]",  # 占位符
+            )
+            db_session.add(new_media)
             try:
-                # 使用嵌套事务 (Savepoint)，防止插入失败导致整个 Session 报废
-                async with db_session.begin_nested():
-                    new_media = MediaStorage(
-                        file_hash=file_hash,
-                        file_path=file_name,
-                        references=1,
-                        description="[图片]",  # 占位符
-                    )
-                    db_session.add(new_media)
-                    # 必须 flush 以触发可能的 UniqueViolation 错误
-                    await db_session.flush()
-                    media_obj = new_media
+                # 必须 flush 以触发可能的 UniqueViolation 错误
+                await db_session.flush()
+                media_obj = new_media
 
-            except Exception:
-                # C. begin_nested 已自动回滚 savepoint，重新查询判断是否为唯一约束冲突
+            except Exception as e:
+                # C. 插入失败，从 session 中移除失败的对象，重新查询判断是否为唯一约束冲突
+                db_session.expunge(new_media)
                 media_obj = (await db_session.execute(stmt)).scalar_one_or_none()
                 if media_obj is None:
-                    raise  # 非唯一约束冲突，重新抛出
+                    # 非唯一约束冲突，记录错误并重新抛出
+                    logger.error(f"插入图片记录失败（非并发冲突）: {e}")
+                    raise
+                # 唯一约束冲突，说明是并发插入
                 logger.info(f"图片并发插入冲突 {file_hash}，转为更新模式")
                 media_obj.references += 1
                 db_session.add(media_obj)
@@ -474,6 +476,7 @@ async def handle_reply_logic(
                     "",
                     interface,
                     role_map,
+                    session.self_id,  # 传递bot的ID
                 ),
                 timeout=240.0,
             )
