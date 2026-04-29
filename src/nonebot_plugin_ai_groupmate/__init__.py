@@ -329,7 +329,7 @@ async def process_image_message(
 
             except Exception as e:
                 # C. 插入失败，从 session 中移除失败的对象，重新查询判断是否为唯一约束冲突
-                db_session.expunge(new_media)
+                await db_session.rollback()  # 先回滚，清理 session 状态
                 media_obj = (await db_session.execute(stmt)).scalar_one_or_none()
                 if media_obj is None:
                     # 非唯一约束冲突，记录错误并重新抛出
@@ -345,6 +345,9 @@ async def process_image_message(
         if media_obj:
             # 确保 flush 拿到 media_id (如果是新插入的对象)
             await db_session.flush()
+            
+            # 刷新对象以确保它在当前 session 中
+            await db_session.refresh(media_obj)
 
             chat_history = ChatHistory(
                 session_id=session.scene.id,
@@ -787,29 +790,33 @@ async def clear_cache_pic():
         )
         medias = result.scalars().all()
 
-        records_to_delete = []
-        for media in medias:
-            media_id = media.media_id
-            media_file_path = media.file_path
-            try:
-                file_path = Path(pic_dir / media_file_path)
-                await asyncio.to_thread(file_path.unlink, True)
-                records_to_delete.append(media)
-                logger.debug(f"删除文件: {file_path}")
-            except Exception as e:
-                logger.error(f"删除文件失败 {media_file_path}: {e}")
-                records_to_delete.append(media)
-
-        for media in records_to_delete:
-            media_id = media.media_id
-            try:
+        if medias:
+            # 批量删除文件，减少线程切换
+            media_files = [Path(pic_dir / media.file_path) for media in medias]
+            
+            def _batch_delete_media_files(files: list):
+                deleted = 0
+                for file_path in files:
+                    try:
+                        file_path.unlink(missing_ok=True)
+                        deleted += 1
+                        logger.debug(f"删除文件: {file_path}")
+                    except Exception as e:
+                        logger.error(f"删除文件失败 {file_path}: {e}")
+                return deleted
+            
+            deleted_files = await asyncio.to_thread(_batch_delete_media_files, media_files)
+            
+            # 批量删除数据库记录
+            for media in medias:
                 await db_session.delete(media)
+            
+            try:
+                await db_session.commit()
+                logger.info(f"成功清理 {len(medias)} 个过期媒体记录（{deleted_files} 个文件）")
             except Exception as e:
-                logger.error(f"删除数据库记录失败 {media_id}: {e}")
-
-        await db_session.commit()
-        if records_to_delete:
-            logger.info(f"成功清理 {len(records_to_delete)} 个过期媒体记录")
+                logger.error(f"批量删除数据库记录失败: {e}")
+                await db_session.rollback()
 
         # ── 2. 删除磁盘上有但数据库里没有的孤立文件 ──
         known_files_result = await db_session.execute(Select(MediaStorage.file_path))
@@ -818,15 +825,21 @@ async def clear_cache_pic():
         disk_files = await asyncio.to_thread(lambda: list(pic_dir.iterdir()))
         orphaned = [f for f in disk_files if f.is_file() and f.name not in known_files]
 
-        for f in orphaned:
-            try:
-                await asyncio.to_thread(f.unlink, True)
-                logger.debug(f"删除孤立文件: {f.name}")
-            except Exception as e:
-                logger.error(f"删除孤立文件失败 {f.name}: {e}")
-
         if orphaned:
-            logger.info(f"成功清理 {len(orphaned)} 个孤立文件")
+            # 批量删除文件，减少异步切换开销
+            def _batch_delete_orphaned_files(files: list):
+                deleted = 0
+                for f in files:
+                    try:
+                        f.unlink(missing_ok=True)
+                        deleted += 1
+                        logger.debug(f"删除孤立文件: {f.name}")
+                    except Exception as e:
+                        logger.error(f"删除孤立文件失败 {f.name}: {e}")
+                return deleted
+
+            deleted_count = await asyncio.to_thread(_batch_delete_orphaned_files, orphaned)
+            logger.info(f"成功清理 {deleted_count}/{len(orphaned)} 个孤立文件")
 
 
 async def _call_summary_model(existing_summary: str, chat_text: str) -> str | None:

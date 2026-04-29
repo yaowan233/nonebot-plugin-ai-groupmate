@@ -20,6 +20,7 @@ from sqlalchemy import Select, desc, func, extract
 from nonebot.log import logger
 from langchain.tools import ToolRuntime, tool
 from langchain.agents import create_agent
+from langchain.agents.middleware import AgentMiddleware, ToolCallLimitMiddleware
 from langchain_openai import ChatOpenAI
 from langchain_tavily import TavilySearch
 from nonebot_plugin_orm import get_session
@@ -27,9 +28,9 @@ from nonebot_plugin_uninfo import SceneType, QryItrface
 from langchain_core.prompts import ChatPromptTemplate
 from nonebot_plugin_alconna import UniMessage
 from sqlalchemy.ext.asyncio import AsyncSession
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
-from langchain.agents.middleware import ToolCallLimitMiddleware
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain.agents.structured_output import ToolStrategy
+from langgraph.types import Command
 
 from ..model import ChatHistory, MediaStorage, UserRelation, ChatHistorySchema, GroupMemory
 from ..config import Config
@@ -709,7 +710,7 @@ def create_reply_tool(
             )
             db_session.add(chat_history)
             logger.info(f"Bot已回复: {content}")
-            return "回复已成功发送。"
+            return f"消息已发送，你刚才发送的内容是：\n{content}"
         except Exception as e:
             logger.error(f"发送消息异常: {e}")
             await db_session.rollback()
@@ -923,6 +924,7 @@ def calculate_expression(expression: str) -> str:
 
 
 def create_mute_tool(
+    db_session,
     session_id: str,
     request_id: str | None,
     interface: QryItrface | None,
@@ -1013,7 +1015,16 @@ def create_mute_tool(
                 
                 action = "解除禁言" if duration_seconds == 0 else f"禁言 {duration_seconds} 秒"
                 logger.info(f"已{action}用户 {target_user_name}（{target_user_id}），原因: {reason}")
-                
+
+                chat_history = ChatHistory(
+                    session_id=session_id,
+                    user_id=plugin_config.bot_name,
+                    content_type="bot",
+                    content=f"id: system\n已执行禁言操作: {action}用户 '{target_user_name}'。原因: {reason}",
+                    user_name=plugin_config.bot_name,
+                )
+                db_session.add(chat_history)
+
                 return f"已成功{action}用户 '{target_user_name}'。原因: {reason}"
                 
             except Exception as api_err:
@@ -1159,10 +1170,19 @@ def create_relation_tool(
                     try:
                         if new_tier > old_tier:
                             tip = f"好感度提升！现在的关系是：{_TIER_NAMES[new_tier]}"
-                            await UniMessage.image(raw=up_pic).text(tip).send()
+                            res = await UniMessage.image(raw=up_pic).text(tip).send()
                         else:
                             tip = f"好感度下降…现在的关系是：{_TIER_NAMES[new_tier]}"
-                            await UniMessage.image(raw=down_pic).text(tip).send()
+                            res = await UniMessage.image(raw=down_pic).text(tip).send()
+                        msg_id = res.msg_ids[-1]["message_id"] if res.msg_ids else "unknown"
+                        chat_history = ChatHistory(
+                            session_id=session_id,
+                            user_id=plugin_config.bot_name,
+                            content_type="bot",
+                            content=f"id: {msg_id}\n{tip}",
+                            user_name=plugin_config.bot_name,
+                        )
+                        session.add(chat_history)
                     except Exception as send_err:
                         logger.warning(f"发送好感度图片失败: {send_err}")
 
@@ -1331,6 +1351,58 @@ async def get_recent_relations_context(
         return ""
 
 
+class SequentialReplyMiddleware(AgentMiddleware[Any, Any, Any]):
+    """
+    确保 reply_user 工具顺序执行，并在每次 model 调用后重置计数。
+    这样可以实现：LLM 每轮思考只能调用一次 reply_user，想发第二条必须等下一轮。
+    
+    使用 asyncio.Lock 确保顺序执行，用 before_model 钩子重置计数器。
+    """
+    
+    def __init__(self):
+        super().__init__()
+        self.reply_lock = asyncio.Lock()
+        self.current_round_count = 0
+    
+    async def abefore_model(self, state, runtime):
+        """在每次调用模型前重置计数器"""
+        self.current_round_count = 0
+        logger.debug(f"[Sequential] 新一轮开始，reply_user 计数器重置")
+        return None
+    
+    async def awrap_tool_call(
+        self,
+        request,
+        handler,
+    ) -> ToolMessage | Command:
+        """
+        拦截所有工具调用，对 reply_user 加锁并限制每轮只能调用一次。
+        """
+        tool_name = request.tool_call.get("name", "")
+        
+        # 只对 reply_user 工具加锁和限制
+        if tool_name == "reply_user":
+            async with self.reply_lock:
+                self.current_round_count += 1
+                logger.debug(f"[Sequential] reply_user 调用 #{self.current_round_count}")
+                
+                # 如果这一轮已经调用过 reply_user，则阻止
+                if self.current_round_count > 1:
+                    logger.warning(f"[Sequential] 本轮已经调用过 reply_user，阻止重复调用")
+                    return ToolMessage(
+                        content="本轮已经发送过消息了。如果你想发送更多消息，请等待下一轮。",
+                        tool_call_id=request.tool_call.get("id", ""),
+                    )
+                
+                logger.debug(f"[Sequential] 开始执行 reply_user: {request.tool_call.get('id')}")
+                result = await handler(request)
+                logger.debug(f"[Sequential] 完成执行 reply_user: {request.tool_call.get('id')}")
+                return result
+        
+        # 其他工具正常执行（并发）
+        return await handler(request)
+
+
 async def create_chat_agent(
     db_session,
     session_id: str,
@@ -1435,7 +1507,7 @@ async def create_chat_agent(
     similar_meme_tool = create_similar_meme_tool(
         db_session, session_id, request_id, user_id
     )
-    mute_tool = create_mute_tool(session_id, request_id, interface, bot_id)
+    mute_tool = create_mute_tool(db_session, session_id, request_id, interface, bot_id)
     
     if not user_id or not user_name:
         tools = [
@@ -1475,11 +1547,12 @@ async def create_chat_agent(
         system_prompt=system_prompt,
         context_schema=Context,
         middleware=[
-            ToolCallLimitMiddleware(thread_limit=8, run_limit=8),
+            SequentialReplyMiddleware(),  # 每轮最多调用一次 reply_user，强制多轮思考
+            ToolCallLimitMiddleware(thread_limit=20, run_limit=20),  # 全局工具调用限制
             ToolCallLimitMiddleware(
                 tool_name="reply_user",
-                thread_limit=3,
-                run_limit=3,
+                thread_limit=5,  # 整个对话最多5次
+                run_limit=5,
             ),
         ],
     )
