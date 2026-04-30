@@ -1738,7 +1738,7 @@ def format_chat_history(
             for _ in merged_fallback_images:
                 content_parts[0]["text"] += " [图片]"
 
-            messages.append(HumanMessage(content_parts))
+            messages.append(HumanMessage(content_parts))  # type: ignore[arg-type]
             continue
 
         # === 用户纯文本 ===
@@ -1757,14 +1757,14 @@ def format_chat_history(
                 image_data = get_image_data_uri(file_name)
                 if image_data:
                     role_prefix = _role_prefix(msg.user_id)
-                    content_parts: list[Any] = [
+                    content_parts = [
                         {
                             "type": "text",
                             "text": f"[{time_str}] {role_prefix}{msg.user_name} {reply_prefix}发送了一张图片：",
                         },
                         {"type": "image_url", "image_url": {"url": image_data}},
                     ]
-                    messages.append(HumanMessage(content_parts))
+                    messages.append(HumanMessage(content_parts))  # type: ignore[arg-type]
                 else:
                     role_prefix = _role_prefix(msg.user_id)
                     content = f"[{time_str}] {role_prefix}{msg.user_name} {reply_prefix}[图片已过期/无法加载]"
