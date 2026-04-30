@@ -1720,7 +1720,7 @@ def format_chat_history(
                 continue
 
             # 有内联图片 → 构建多模态消息
-            content_parts: list[dict] = [{"type": "text", "text": text_line}]
+            content_parts: list[Any] = [{"type": "text", "text": text_line}]
             for img_idx in merged_inline_images:
                 img_msg = history[img_idx]
                 parts = img_msg.content.strip().split("\n")
@@ -1757,7 +1757,7 @@ def format_chat_history(
                 image_data = get_image_data_uri(file_name)
                 if image_data:
                     role_prefix = _role_prefix(msg.user_id)
-                    content_parts = [
+                    content_parts: list[Any] = [
                         {
                             "type": "text",
                             "text": f"[{time_str}] {role_prefix}{msg.user_name} {reply_prefix}发送了一张图片：",
