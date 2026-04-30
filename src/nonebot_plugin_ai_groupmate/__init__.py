@@ -178,6 +178,10 @@ async def handle_message(
         if i.type == "text":
             body += i.text
             is_text = True
+        if i.type == "image":
+            body += "[图片]"
+        if i.type == "mface":
+            body += "[表情]"
 
     # 第2行（可选）：回复元数据，格式 "回复id: {id}"
     if reply_id:
@@ -193,14 +197,32 @@ async def handle_message(
 
     # ========== 步骤1: 处理文本消息（快速） ==========
     if is_text:
-        chat_history = ChatHistory(
-            session_id=session.scene.id,
-            user_id=session.user.id,
-            content_type="text",
-            content=content,
-            user_name=user_name,
-        )
-        db_session.add(chat_history)
+        # 检查是否已存在相同的消息 (多bot去重)
+        # 用 body(不含消息ID) + session_id + user_id + 时间窗口 来去重
+        do_insert = True
+        if body:
+            time_window = datetime.datetime.now() - datetime.timedelta(seconds=3)
+            existing = await db_session.execute(
+                Select(ChatHistory).where(
+                    ChatHistory.session_id == session.scene.id,
+                    ChatHistory.user_id == session.user.id,
+                    ChatHistory.content.endswith(body),
+                    ChatHistory.created_at >= time_window,
+                )
+            )
+            if existing.scalar_one_or_none():
+                logger.debug(f"消息已存在，跳过重复记录")
+                do_insert = False
+
+        if do_insert:
+            chat_history = ChatHistory(
+                session_id=session.scene.id,
+                user_id=session.user.id,
+                content_type="text",
+                content=content,
+                user_name=user_name,
+            )
+            db_session.add(chat_history)
 
     # 立即提交文本消息
     try:
@@ -349,15 +371,27 @@ async def process_image_message(
             # 刷新对象以确保它在当前 session 中
             await db_session.refresh(media_obj)
 
-            chat_history = ChatHistory(
-                session_id=session.scene.id,
-                user_id=session.user.id,
-                content_type=content_type,
-                content=f"{content_prefix}{file_name}",
-                user_name=user_name,
-                media_id=media_obj.media_id,
+            # 检查是否已存在相同的图片记录 (多bot去重)
+            time_window = datetime.datetime.now() - datetime.timedelta(seconds=3)
+            existing_img = await db_session.execute(
+                Select(ChatHistory).where(
+                    ChatHistory.session_id == session.scene.id,
+                    ChatHistory.media_id == media_obj.media_id,
+                    ChatHistory.created_at >= time_window,
+                )
             )
-            db_session.add(chat_history)
+            if existing_img.scalar_one_or_none():
+                logger.debug(f"图片记录已存在，跳过重复")
+            else:
+                chat_history = ChatHistory(
+                    session_id=session.scene.id,
+                    user_id=session.user.id,
+                    content_type=content_type,
+                    content=f"{content_prefix}{file_name}",
+                    user_name=user_name,
+                    media_id=media_obj.media_id,
+                )
+                db_session.add(chat_history)
 
         # 5. 最终提交
         await db_session.commit()

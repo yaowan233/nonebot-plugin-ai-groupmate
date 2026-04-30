@@ -1624,6 +1624,8 @@ def format_chat_history(
     将历史记录格式化为 Qwen 3.5 可接受的多模态格式。
     只对最近 max_inline_images 张图片做 base64 内联，更早的图片用文本标记代替，避免 prompt 过大。
     回复引用会被解析为 (回复 用户名 "内容摘要") 的形式，去掉裸数字 ID。
+
+    同一条平台消息中的文字+图片会被合并为一条多模态消息。
     """
     messages = []
     user_roles = user_roles or {}
@@ -1654,15 +1656,41 @@ def format_chat_history(
     else:
         inline_image_set = set(image_indices[-max_inline_images:])
 
+    # ── 3. 将同一条平台消息的文字+图片合并 ──
+    # 建立 own_id -> (text_msg_index, [image_msg_indices]) 的映射
+    text_to_images: dict[str, tuple[int, list[int]]] = {}
+    for i in range(len(history)):
+        own_id, _, _ = _parse_msg_meta(history[i].content)
+        if not own_id:
+            continue
+        if history[i].content_type == "text":
+            # 向后查找同 ID 同用户的图片
+            img_idxs: list[int] = []
+            for j in range(i + 1, len(history)):
+                next_own_id, _, _ = _parse_msg_meta(history[j].content)
+                if next_own_id == own_id and history[j].content_type == "image" and history[j].user_id == history[i].user_id:
+                    img_idxs.append(j)
+                else:
+                    break
+            if img_idxs:
+                text_to_images[own_id] = (i, img_idxs)
+
+    merged_image_indices: set[int] = set()
+    for _tid, (_, img_idxs) in text_to_images.items():
+        merged_image_indices.update(img_idxs)
+
     for idx, msg in enumerate(history):
+        # 被合并的图片跳过
+        if idx in merged_image_indices:
+            continue
+
         time_str = msg.created_at.strftime("%Y-%m-%d %H:%M:%S")
-        _, reply_to_id, body = _parse_msg_meta(msg.content)
+        own_id, reply_to_id, body = _parse_msg_meta(msg.content)
 
         # 把 "回复id:xxx" 解析成可读的引用前缀
         if reply_to_id and reply_to_id in id_to_summary:
             reply_prefix = f"(回复 {id_to_summary[reply_to_id]}) "
         elif reply_to_id:
-            # 窗口外的消息，只标注"回复了一条消息"
             reply_prefix = "(回复了一条消息) "
         else:
             reply_prefix = ""
@@ -1670,16 +1698,58 @@ def format_chat_history(
         # === 机器人回复 ===
         if msg.content_type == "bot":
             messages.append(AIMessage(content=body or msg.content))
+            continue
+
+        # === 带图片的合并文字消息 ===
+        if msg.content_type == "text" and own_id and own_id in text_to_images:
+            role_prefix = _role_prefix(msg.user_id)
+            text_line = f"[{time_str}] {role_prefix}{msg.user_name}: {reply_prefix}{body}"
+
+            merged_inline_images: list[int] = [
+                i for i in text_to_images[own_id][1] if i in inline_image_set
+            ]
+            merged_fallback_images: list[int] = [
+                i for i in text_to_images[own_id][1] if i not in inline_image_set
+            ]
+
+            # 无内联图片 → 纯文本
+            if not merged_inline_images:
+                for _ in merged_fallback_images:
+                    text_line += " [图片]"
+                messages.append(HumanMessage(content=text_line))
+                continue
+
+            # 有内联图片 → 构建多模态消息
+            content_parts: list[dict] = [{"type": "text", "text": text_line}]
+            for img_idx in merged_inline_images:
+                img_msg = history[img_idx]
+                parts = img_msg.content.strip().split("\n")
+                file_name = parts[-1].strip()
+                image_data = get_image_data_uri(file_name)
+                if image_data:
+                    content_parts.append(
+                        {"type": "image_url", "image_url": {"url": image_data}}
+                    )
+                else:
+                    text_line += " [图片已过期]"
+                    content_parts[0]["text"] = text_line
+
+            # 非内联图片追加 [图片] 标记
+            for _ in merged_fallback_images:
+                content_parts[0]["text"] += " [图片]"
+
+            messages.append(HumanMessage(content_parts))
+            continue
 
         # === 用户纯文本 ===
-        elif msg.content_type == "text":
+        if msg.content_type == "text":
             role_prefix = _role_prefix(msg.user_id)
             content = f"[{time_str}] {role_prefix}{msg.user_name}: {reply_prefix}{body}"
             messages.append(HumanMessage(content=content))
+            continue
 
         # === 用户图片 ===
-        elif msg.content_type == "image":
-            # content 末行是文件名，其余行是 prefix_info（已含 id 行，现在改用 reply_prefix）
+        if msg.content_type == "image":
             parts = msg.content.strip().split("\n")
             file_name = parts[-1].strip()
 
@@ -1694,7 +1764,7 @@ def format_chat_history(
                         },
                         {"type": "image_url", "image_url": {"url": image_data}},
                     ]
-                    messages.append(HumanMessage(content=content_parts))
+                    messages.append(HumanMessage(content_parts))
                 else:
                     role_prefix = _role_prefix(msg.user_id)
                     content = f"[{time_str}] {role_prefix}{msg.user_name} {reply_prefix}[图片已过期/无法加载]"
@@ -1705,6 +1775,7 @@ def format_chat_history(
                     f"[{time_str}] {role_prefix}{msg.user_name} {reply_prefix}[图片]"
                 )
                 messages.append(HumanMessage(content=content))
+            continue
 
     return messages
 
