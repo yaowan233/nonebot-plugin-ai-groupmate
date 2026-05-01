@@ -88,9 +88,18 @@ class GroupReplyState:
     task: asyncio.Task | None = None
 
 
-# 每个群只保留“最新一条”待处理回复请求，避免高峰期堆积后刷屏。
+# 每个群只保留"最新一条"待处理回复请求，避免高峰期堆积后刷屏。
 _group_reply_states: dict[str, GroupReplyState] = {}
 _group_reply_state_lock = asyncio.Lock()
+
+# 多bot去重锁: 每个群串行化消息记录,防止并发SELECT查不到对方未提交数据
+_dedup_locks: dict[str, asyncio.Lock] = {}
+
+
+def _get_dedup_lock(session_id: str) -> asyncio.Lock:
+    if session_id not in _dedup_locks:
+        _dedup_locks[session_id] = asyncio.Lock()
+    return _dedup_locks[session_id]
 
 
 def _start_group_reply_worker_locked(group_id: str, state: GroupReplyState):
@@ -196,50 +205,42 @@ async def handle_message(
         user_name = session.member.nick
 
     # ========== 步骤1: 处理文本消息（快速） ==========
-    if is_text:
-        # 检查是否已存在相同的消息 (多bot去重)
-        # 用 body(不含消息ID) + session_id + user_id + 时间窗口 来去重
-        do_insert = True
-        if body:
-            time_window = datetime.datetime.now() - datetime.timedelta(seconds=3)
-            existing = await db_session.execute(
-                Select(ChatHistory).where(
-                    ChatHistory.session_id == session.scene.id,
-                    ChatHistory.user_id == session.user.id,
-                    ChatHistory.content.endswith(body),
-                    ChatHistory.created_at >= time_window,
+    # 用锁保证多bot并发安全: SELECT + INSERT + COMMIT 原子化
+    async with _get_dedup_lock(session.scene.id):
+        if is_text:
+            do_insert = True
+            if body:
+                time_window = datetime.datetime.now() - datetime.timedelta(seconds=3)
+                existing = await db_session.execute(
+                    Select(ChatHistory).where(
+                        ChatHistory.session_id == session.scene.id,
+                        ChatHistory.user_id == session.user.id,
+                        ChatHistory.content.endswith(body),
+                        ChatHistory.created_at >= time_window,
+                    )
                 )
-            )
-            if existing.scalar_one_or_none():
-                logger.debug(f"消息已存在，跳过重复记录")
-                do_insert = False
+                if existing.scalar_one_or_none():
+                    logger.debug(f"消息已存在，跳过重复记录")
+                    do_insert = False
 
-        if do_insert:
-            chat_history = ChatHistory(
-                session_id=session.scene.id,
-                user_id=session.user.id,
-                content_type="text",
-                content=content,
-                user_name=user_name,
-            )
-            db_session.add(chat_history)
+            if do_insert:
+                chat_history = ChatHistory(
+                    session_id=session.scene.id,
+                    user_id=session.user.id,
+                    content_type="text",
+                    content=content,
+                    user_name=user_name,
+                )
+                db_session.add(chat_history)
 
-    # 立即提交文本消息
-    try:
-        await db_session.commit()
-    except Exception as e:
-        logger.error(f"保存文本消息失败: {e}")
-        await db_session.rollback()
+        # 在锁内提交,确保第二个bot的SELECT能看到第一个bot的写入
+        try:
+            await db_session.commit()
+        except Exception as e:
+            logger.error(f"保存文本消息失败: {e}")
+            await db_session.rollback()
 
-    # ========== 步骤2: 处理图片消息（后台异步，不阻塞回复决策） ==========
-    for img in imgs:
-        asyncio.create_task(
-            _process_image_task(
-                img, event, bot, state, session, user_name, f"id: {get_message_id()}\n"
-            )
-        )
-
-    # ========== 步骤3: 决定是否回复 ==========
+    # ========== 步骤2: 决定是否回复（在图片处理前判断） ==========
     if msg.extract_plain_text().strip().lower().startswith(plugin_config.bot_name):
         to_me = True
     should_reply = to_me or (random.random() < plugin_config.reply_probability)
@@ -249,6 +250,25 @@ async def handle_message(
         should_reply = False
     if not event.get_plaintext() and not to_me:
         should_reply = False
+
+    # ========== 步骤3: 处理图片消息 ==========
+    # 如果要回复则同步等待图片处理完成,否则后台异步
+    content_prefix = f"id: {get_message_id()}\n"
+    if imgs:
+        if should_reply:
+            for img in imgs:
+                await process_image_message(
+                    db_session, img, event, bot, state, session, user_name, content_prefix
+                )
+        else:
+            for img in imgs:
+                asyncio.create_task(
+                    _process_image_task(
+                        img, event, bot, state, session, user_name, content_prefix
+                    )
+                )
+
+    # ========== 步骤4: 处理回复 ==========
     if to_me:
         user_id = session.user.id
         user_name = session.user.name or session.user.nick
@@ -365,36 +385,37 @@ async def process_image_message(
         # 4. 添加聊天历史 (ChatHistory)
         # 此时 media_obj 一定是有效的 (无论是新插的还是查出来的)
         if media_obj:
-            # 确保 flush 拿到 media_id (如果是新插入的对象)
-            await db_session.flush()
-            
-            # 刷新对象以确保它在当前 session 中
-            await db_session.refresh(media_obj)
+            async with _get_dedup_lock(session.scene.id):
+                # 确保 flush 拿到 media_id (如果是新插入的对象)
+                await db_session.flush()
+                
+                # 刷新对象以确保它在当前 session 中
+                await db_session.refresh(media_obj)
 
-            # 检查是否已存在相同的图片记录 (多bot去重)
-            time_window = datetime.datetime.now() - datetime.timedelta(seconds=3)
-            existing_img = await db_session.execute(
-                Select(ChatHistory).where(
-                    ChatHistory.session_id == session.scene.id,
-                    ChatHistory.media_id == media_obj.media_id,
-                    ChatHistory.created_at >= time_window,
+                # 检查是否已存在相同的图片记录 (多bot去重)
+                time_window = datetime.datetime.now() - datetime.timedelta(seconds=3)
+                existing_img = await db_session.execute(
+                    Select(ChatHistory).where(
+                        ChatHistory.session_id == session.scene.id,
+                        ChatHistory.media_id == media_obj.media_id,
+                        ChatHistory.created_at >= time_window,
+                    )
                 )
-            )
-            if existing_img.scalar_one_or_none():
-                logger.debug(f"图片记录已存在，跳过重复")
-            else:
-                chat_history = ChatHistory(
-                    session_id=session.scene.id,
-                    user_id=session.user.id,
-                    content_type=content_type,
-                    content=f"{content_prefix}{file_name}",
-                    user_name=user_name,
-                    media_id=media_obj.media_id,
-                )
-                db_session.add(chat_history)
+                if existing_img.scalar_one_or_none():
+                    logger.debug(f"图片记录已存在，跳过重复")
+                else:
+                    chat_history = ChatHistory(
+                        session_id=session.scene.id,
+                        user_id=session.user.id,
+                        content_type=content_type,
+                        content=f"{content_prefix}{file_name}",
+                        user_name=user_name,
+                        media_id=media_obj.media_id,
+                    )
+                    db_session.add(chat_history)
 
-        # 5. 最终提交
-        await db_session.commit()
+                # 5. 在锁内提交
+                await db_session.commit()
 
     except Exception as e:
         logger.error(f"处理图片失败: {e}")
