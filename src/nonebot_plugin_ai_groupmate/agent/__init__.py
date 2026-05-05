@@ -1619,17 +1619,17 @@ def _image_file_name_from_history(msg: ChatHistorySchema) -> str:
     return msg.content.strip().split("\n")[-1].strip()
 
 
-async def _load_replied_image_history(
+async def _load_replied_image_histories(
     db_session: AsyncSession,
     session_id: str,
     reply_to_id: str | None,
-) -> ChatHistorySchema | None:
+) -> list[ChatHistorySchema]:
     if not reply_to_id:
-        return None
+        return []
 
     normalized_reply_id = str(reply_to_id).strip()
     if not normalized_reply_id:
-        return None
+        return []
 
     base_stmt = (
         Select(ChatHistory)
@@ -1638,26 +1638,27 @@ async def _load_replied_image_history(
             ChatHistory.content_type == "image",
             ChatHistory.media_id.is_not(None),
         )
-        .order_by(ChatHistory.msg_id.desc())
+        .order_by(ChatHistory.msg_id.asc())
     )
 
     for marker in (f"id: {normalized_reply_id}\n", f"id:{normalized_reply_id}\n"):
-        msg = (
+        rows = (
             (
                 await db_session.execute(
-                    base_stmt.where(ChatHistory.content.contains(marker)).limit(1)
+                    base_stmt.where(ChatHistory.content.contains(marker))
                 )
             )
             .scalars()
-            .first()
+            .all()
         )
-        if msg:
+        if rows:
+            history_msg_ids = ", ".join(str(msg.msg_id) for msg in rows)
             logger.info(
-                f"命中被回复图片记录 reply_id={normalized_reply_id} history_msg_id={msg.msg_id}"
+                f"命中被回复图片记录 reply_id={normalized_reply_id} history_msg_ids={history_msg_ids}"
             )
-            return ChatHistorySchema.model_validate(msg)
+            return [ChatHistorySchema.model_validate(msg) for msg in rows]
 
-    return None
+    return []
 
 
 def format_chat_history(
@@ -1853,16 +1854,15 @@ async def choice_response_strategy(
 
         # 1. 获取多模态格式的历史消息列表 (List[BaseMessage])
         # 这里面已经包含了图片 Base64 数据
-        replied_image = await _load_replied_image_history(
+        replied_images = await _load_replied_image_histories(
             db_session,
             session_id,
             reply_to_id,
         )
-        extra_inline_images = [replied_image] if replied_image else []
         chat_history_messages = format_chat_history(
             history,
             user_roles=role_map,
-            extra_inline_images=extra_inline_images,
+            extra_inline_images=replied_images,
         )
 
         # 2. 构建当前环境信息的 Prompt (纯文本)
@@ -1892,28 +1892,46 @@ async def choice_response_strategy(
         # 结构：[历史消息1(文本/图), 历史消息2, ..., 当前环境提示词]
         # 这样 LLM 才能真正"看到"历史记录里的图片对象
         final_prompt_content: str | list[Any] = prompt_text
-        if replied_image:
-            file_name = _image_file_name_from_history(replied_image)
-            image_data = get_image_data_uri(file_name)
-            if image_data:
-                final_prompt_content = [
-                    {
-                        "type": "text",
-                        "text": (
-                            f"{prompt_text}\n\n"
-                            "【本轮回复引用的图片】下面这张图片是当前用户回复消息指向的图片，"
-                            "回答图片相关问题时必须优先分析它，不要把其他历史图片当成当前问题对象："
-                        ),
-                    },
-                    {"type": "image_url", "image_url": {"url": image_data}},
-                ]
-                logger.info(f"已将被回复图片绑定到本轮任务提示 msg_id={replied_image.msg_id}")
+        if replied_images:
+            content_parts: list[Any] = [
+                {
+                    "type": "text",
+                    "text": (
+                        f"{prompt_text}\n\n"
+                        "【本轮回复引用的图片】下面图片是当前用户回复消息指向的图片，"
+                        "回答图片相关问题时必须优先分析这些图片，不要把其他历史图片当成当前问题对象。"
+                    ),
+                }
+            ]
+            bound_msg_ids: list[str] = []
+            failed_files: list[str] = []
+            for index, replied_image in enumerate(replied_images, 1):
+                file_name = _image_file_name_from_history(replied_image)
+                image_data = get_image_data_uri(file_name)
+                if image_data:
+                    content_parts.append(
+                        {"type": "text", "text": f"\n引用图{index}："}
+                    )
+                    content_parts.append(
+                        {"type": "image_url", "image_url": {"url": image_data}}
+                    )
+                    bound_msg_ids.append(str(replied_image.msg_id))
+                else:
+                    failed_files.append(file_name)
+
+            if bound_msg_ids:
+                final_prompt_content = content_parts
+                logger.info(
+                    f"已将被回复图片绑定到本轮任务提示 msg_ids={','.join(bound_msg_ids)}"
+                )
+                if failed_files:
+                    logger.warning(f"部分被回复图片文件无法加载 files={failed_files}")
             else:
                 final_prompt_content = (
                     f"{prompt_text}\n\n"
                     "【本轮回复引用的图片】已命中被回复图片记录，但本地图片文件无法加载。"
                 )
-                logger.warning(f"被回复图片文件无法加载 msg_id={replied_image.msg_id} file={file_name}")
+                logger.warning(f"被回复图片文件无法加载 files={failed_files}")
 
         final_messages = chat_history_messages + [HumanMessage(content=final_prompt_content)]
 

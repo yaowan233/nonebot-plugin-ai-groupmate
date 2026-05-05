@@ -123,13 +123,13 @@ def _extract_reply_message_id_from_event(event: Event) -> str | None:
         message_text = str(event)
 
     patterns = (
-        r"\[reply:id=(\d+)[^\]]*\]",
-        r"\[CQ:reply,id=(\d+)[^\]]*\]",
+        r"\[reply:id=([^\],]+)[^\]]*\]",
+        r"\[CQ:reply,(?:[^\]]*,)?id=([^,\]]+)",
     )
     for pattern in patterns:
         match = re.search(pattern, message_text)
-        if match:
-            return match.group(1)
+        if match and match.group(1).strip():
+            return match.group(1).strip()
 
     return None
 
