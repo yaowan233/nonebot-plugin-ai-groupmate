@@ -1,4 +1,5 @@
 import json
+import re
 import base64
 import random
 import asyncio
@@ -79,6 +80,7 @@ class ReplyRequest:
     user_id: str
     user_name: str | None
     is_tome: bool
+    reply_to_id: str | None
 
 
 @dataclass
@@ -100,6 +102,36 @@ def _get_dedup_lock(session_id: str) -> asyncio.Lock:
     if session_id not in _dedup_locks:
         _dedup_locks[session_id] = asyncio.Lock()
     return _dedup_locks[session_id]
+
+
+def _extract_reply_message_id_from_event(event: Event) -> str | None:
+    event_reply = getattr(event, "reply", None)
+    if event_reply is not None:
+        if isinstance(event_reply, dict):
+            reply_id = event_reply.get("message_id") or event_reply.get("id")
+            if reply_id is not None and str(reply_id).strip():
+                return str(reply_id).strip()
+        else:
+            for attr in ("message_id", "id"):
+                reply_id = getattr(event_reply, attr, None)
+                if reply_id is not None and str(reply_id).strip():
+                    return str(reply_id).strip()
+
+    try:
+        message_text = str(event.get_message())
+    except Exception:
+        message_text = str(event)
+
+    patterns = (
+        r"\[reply:id=(\d+)[^\]]*\]",
+        r"\[CQ:reply,id=(\d+)[^\]]*\]",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, message_text)
+        if match:
+            return match.group(1)
+
+    return None
 
 
 def _start_group_reply_worker_locked(group_id: str, state: GroupReplyState):
@@ -132,6 +164,7 @@ async def _run_group_reply_worker(group_id: str):
                     request.user_id,
                     request.user_name,
                     request.is_tome,
+                    request.reply_to_id,
                 )
     finally:
         async with _group_reply_state_lock:
@@ -191,6 +224,9 @@ async def handle_message(
             body += "[图片]"
         if i.type == "mface":
             body += "[表情]"
+
+    if not reply_id:
+        reply_id = _extract_reply_message_id_from_event(event)
 
     # 第2行（可选）：回复元数据，格式 "回复id: {id}"
     if reply_id:
@@ -285,6 +321,7 @@ async def handle_message(
             user_id=user_id,
             user_name=user_name,
             is_tome=to_me,
+            reply_to_id=reply_id,
         )
         await set_latest_request_id(group_id, request.request_id)
         async with _group_reply_state_lock:
@@ -441,6 +478,7 @@ async def handle_reply_logic(
     user_id: str,
     user_name: str | None,
     is_tome: bool,
+    reply_to_id: str | None,
 ):
     """处理回复逻辑"""
     try:
@@ -535,6 +573,7 @@ async def handle_reply_logic(
                     interface,
                     role_map,
                     session.self_id,  # 传递bot的ID
+                    reply_to_id,
                 ),
                 timeout=240.0,
             )

@@ -1615,20 +1615,68 @@ def _parse_msg_meta(content: str) -> tuple[str | None, str | None, str]:
     return own_id, reply_to_id, body
 
 
+def _image_file_name_from_history(msg: ChatHistorySchema) -> str:
+    return msg.content.strip().split("\n")[-1].strip()
+
+
+async def _load_replied_image_history(
+    db_session: AsyncSession,
+    session_id: str,
+    reply_to_id: str | None,
+) -> ChatHistorySchema | None:
+    if not reply_to_id:
+        return None
+
+    normalized_reply_id = str(reply_to_id).strip()
+    if not normalized_reply_id:
+        return None
+
+    base_stmt = (
+        Select(ChatHistory)
+        .where(
+            ChatHistory.session_id == session_id,
+            ChatHistory.content_type == "image",
+            ChatHistory.media_id.is_not(None),
+        )
+        .order_by(ChatHistory.msg_id.desc())
+    )
+
+    for marker in (f"id: {normalized_reply_id}\n", f"id:{normalized_reply_id}\n"):
+        msg = (
+            (
+                await db_session.execute(
+                    base_stmt.where(ChatHistory.content.contains(marker)).limit(1)
+                )
+            )
+            .scalars()
+            .first()
+        )
+        if msg:
+            logger.info(
+                f"命中被回复图片记录 reply_id={normalized_reply_id} history_msg_id={msg.msg_id}"
+            )
+            return ChatHistorySchema.model_validate(msg)
+
+    return None
+
+
 def format_chat_history(
     history: list[ChatHistorySchema],
     max_inline_images: int = 3,
     user_roles: dict[str, str] | None = None,
+    extra_inline_images: list[ChatHistorySchema] | None = None,
 ) -> list[BaseMessage]:
     """
     将历史记录格式化为 Qwen 3.5 可接受的多模态格式。
     只对最近 max_inline_images 张图片做 base64 内联，更早的图片用文本标记代替，避免 prompt 过大。
+    如果传入 extra_inline_images，则禁用普通最近图片内联，避免回复图片时被最近图片干扰。
     回复引用会被解析为 (回复 用户名 "内容摘要") 的形式，去掉裸数字 ID。
 
     同一条平台消息中的文字+图片会被合并为一条多模态消息。
     """
     messages = []
     user_roles = user_roles or {}
+    extra_inline_images = extra_inline_images or []
 
     def _role_prefix(uid: str) -> str:
         role = user_roles.get(uid)
@@ -1640,7 +1688,7 @@ def format_chat_history(
 
     # ── 1. 预先建立 平台消息ID -> (user_name, 正文摘要) 的查找表 ──
     id_to_summary: dict[str, str] = {}
-    for msg in history:
+    for msg in [*history, *extra_inline_images]:
         own_id, _, body = _parse_msg_meta(msg.content)
         if own_id:
             if msg.content_type == "image":
@@ -1649,9 +1697,13 @@ def format_chat_history(
                 snippet = body[:30] + ("…" if len(body) > 30 else "")
             id_to_summary[own_id] = f'{msg.user_name} "{snippet}"'
 
-    # ── 2. 找出所有图片消息的下标，只内联最后 max_inline_images 张 ──
+    has_extra_inline_images = any(
+        msg.content_type == "image" for msg in extra_inline_images
+    )
+
+    # ── 2. 找出所有图片消息的下标。若本轮明确绑定了回复图片，则禁用普通最近图片内联。 ──
     image_indices = [i for i, m in enumerate(history) if m.content_type == "image"]
-    if max_inline_images <= 0:
+    if has_extra_inline_images or max_inline_images <= 0:
         inline_image_set = set()
     else:
         inline_image_set = set(image_indices[-max_inline_images:])
@@ -1723,8 +1775,7 @@ def format_chat_history(
             content_parts: list[Any] = [{"type": "text", "text": text_line}]
             for img_idx in merged_inline_images:
                 img_msg = history[img_idx]
-                parts = img_msg.content.strip().split("\n")
-                file_name = parts[-1].strip()
+                file_name = _image_file_name_from_history(img_msg)
                 image_data = get_image_data_uri(file_name)
                 if image_data:
                     content_parts.append(
@@ -1750,8 +1801,7 @@ def format_chat_history(
 
         # === 用户图片 ===
         if msg.content_type == "image":
-            parts = msg.content.strip().split("\n")
-            file_name = parts[-1].strip()
+            file_name = _image_file_name_from_history(msg)
 
             if idx in inline_image_set:
                 image_data = get_image_data_uri(file_name)
@@ -1791,6 +1841,7 @@ async def choice_response_strategy(
     interface: QryItrface | None = None,
     role_map: dict[str, str] | None = None,
     bot_id: str | None = None,
+    reply_to_id: str | None = None,
 ) -> ResponseMessage:
     """
     使用Agent决定回复策略
@@ -1802,7 +1853,17 @@ async def choice_response_strategy(
 
         # 1. 获取多模态格式的历史消息列表 (List[BaseMessage])
         # 这里面已经包含了图片 Base64 数据
-        chat_history_messages = format_chat_history(history, user_roles=role_map)
+        replied_image = await _load_replied_image_history(
+            db_session,
+            session_id,
+            reply_to_id,
+        )
+        extra_inline_images = [replied_image] if replied_image else []
+        chat_history_messages = format_chat_history(
+            history,
+            user_roles=role_map,
+            extra_inline_images=extra_inline_images,
+        )
 
         # 2. 构建当前环境信息的 Prompt (纯文本)
         today = datetime.datetime.now()
@@ -1830,7 +1891,31 @@ async def choice_response_strategy(
         # 3. 组合消息列表 (核心修改)
         # 结构：[历史消息1(文本/图), 历史消息2, ..., 当前环境提示词]
         # 这样 LLM 才能真正"看到"历史记录里的图片对象
-        final_messages = chat_history_messages + [HumanMessage(content=prompt_text)]
+        final_prompt_content: str | list[Any] = prompt_text
+        if replied_image:
+            file_name = _image_file_name_from_history(replied_image)
+            image_data = get_image_data_uri(file_name)
+            if image_data:
+                final_prompt_content = [
+                    {
+                        "type": "text",
+                        "text": (
+                            f"{prompt_text}\n\n"
+                            "【本轮回复引用的图片】下面这张图片是当前用户回复消息指向的图片，"
+                            "回答图片相关问题时必须优先分析它，不要把其他历史图片当成当前问题对象："
+                        ),
+                    },
+                    {"type": "image_url", "image_url": {"url": image_data}},
+                ]
+                logger.info(f"已将被回复图片绑定到本轮任务提示 msg_id={replied_image.msg_id}")
+            else:
+                final_prompt_content = (
+                    f"{prompt_text}\n\n"
+                    "【本轮回复引用的图片】已命中被回复图片记录，但本地图片文件无法加载。"
+                )
+                logger.warning(f"被回复图片文件无法加载 msg_id={replied_image.msg_id} file={file_name}")
+
+        final_messages = chat_history_messages + [HumanMessage(content=final_prompt_content)]
 
         invoke_input: dict[str, Any] = {"messages": final_messages}
 
