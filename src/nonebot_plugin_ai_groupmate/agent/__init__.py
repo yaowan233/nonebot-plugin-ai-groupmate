@@ -1619,7 +1619,7 @@ def _image_file_name_from_history(msg: ChatHistorySchema) -> str:
     return msg.content.strip().split("\n")[-1].strip()
 
 
-async def _load_replied_image_histories(
+async def _load_replied_message_histories(
     db_session: AsyncSession,
     session_id: str,
     reply_to_id: str | None,
@@ -1631,21 +1631,16 @@ async def _load_replied_image_histories(
     if not normalized_reply_id:
         return []
 
-    base_stmt = (
-        Select(ChatHistory)
-        .where(
-            ChatHistory.session_id == session_id,
-            ChatHistory.content_type == "image",
-            ChatHistory.media_id.is_not(None),
-        )
-        .order_by(ChatHistory.msg_id.asc())
-    )
-
     for marker in (f"id: {normalized_reply_id}\n", f"id:{normalized_reply_id}\n"):
         rows = (
             (
                 await db_session.execute(
-                    base_stmt.where(ChatHistory.content.contains(marker))
+                    Select(ChatHistory)
+                    .where(
+                        ChatHistory.session_id == session_id,
+                        ChatHistory.content.contains(marker),
+                    )
+                    .order_by(ChatHistory.msg_id.asc())
                 )
             )
             .scalars()
@@ -1654,7 +1649,7 @@ async def _load_replied_image_histories(
         if rows:
             history_msg_ids = ", ".join(str(msg.msg_id) for msg in rows)
             logger.info(
-                f"命中被回复图片记录 reply_id={normalized_reply_id} history_msg_ids={history_msg_ids}"
+                f"命中被回复消息记录 reply_id={normalized_reply_id} history_msg_ids={history_msg_ids}"
             )
             return [ChatHistorySchema.model_validate(msg) for msg in rows]
 
@@ -1854,7 +1849,7 @@ async def choice_response_strategy(
 
         # 1. 获取多模态格式的历史消息列表 (List[BaseMessage])
         # 这里面已经包含了图片 Base64 数据
-        replied_images = await _load_replied_image_histories(
+        replied_extra = await _load_replied_message_histories(
             db_session,
             session_id,
             reply_to_id,
@@ -1862,7 +1857,7 @@ async def choice_response_strategy(
         chat_history_messages = format_chat_history(
             history,
             user_roles=role_map,
-            extra_inline_images=replied_images,
+            extra_inline_images=replied_extra,
         )
 
         # 2. 构建当前环境信息的 Prompt (纯文本)
@@ -1892,6 +1887,7 @@ async def choice_response_strategy(
         # 结构：[历史消息1(文本/图), 历史消息2, ..., 当前环境提示词]
         # 这样 LLM 才能真正"看到"历史记录里的图片对象
         final_prompt_content: str | list[Any] = prompt_text
+        replied_images = [m for m in replied_extra if m.content_type == "image"]
         if replied_images:
             content_parts: list[Any] = [
                 {
