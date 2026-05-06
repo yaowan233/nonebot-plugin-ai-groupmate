@@ -1888,6 +1888,8 @@ async def choice_response_strategy(
         # 这样 LLM 才能真正"看到"历史记录里的图片对象
         final_prompt_content: str | list[Any] = prompt_text
         replied_images = [m for m in replied_extra if m.content_type == "image"]
+        replied_texts = [m for m in replied_extra if m.content_type == "text"]
+
         if replied_images:
             content_parts: list[Any] = [
                 {
@@ -1928,6 +1930,20 @@ async def choice_response_strategy(
                     "【本轮回复引用的图片】已命中被回复图片记录，但本地图片文件无法加载。"
                 )
                 logger.warning(f"被回复图片文件无法加载 files={failed_files}")
+
+        if replied_texts:
+            text_lines: list[str] = [
+                "\n【本轮回复引用的消息】当前用户回复了以下历史消息："
+            ]
+            for msg in replied_texts:
+                _, _, body = _parse_msg_meta(msg.content)
+                text_lines.append(f"[{msg.user_name}] {body}")
+            text_block = "\n".join(text_lines)
+
+            if isinstance(final_prompt_content, str):
+                final_prompt_content = final_prompt_content + text_block
+            else:
+                final_prompt_content.append({"type": "text", "text": text_block})
 
         final_messages = chat_history_messages + [HumanMessage(content=final_prompt_content)]
 
