@@ -948,7 +948,8 @@ async def _call_summary_model(existing_summary: str, chat_text: str) -> str | No
 1. 只能基于提供的聊天记录总结，不要凭空发明内容
 2. 保留档案中仍然有效的内容，用新聊天补充或修正旧内容
 3. 如果某个内容长期（超过30天）无聊天印证，可删除
-4. 输出完整更新后的档案，不超过500字，不要输出任何其他内容"""
+4. 输出完整更新后的档案，不超过500字，不要输出任何其他内容
+5. 标注为[BOT]的消息是机器人自身的回复，仅用于理解对话上下文，绝对不要将BOT的回复内容提取为"标准回应模板"、"内部梗"或"黑话"。档案只关注真实用户的发言特征和群文化"""
     history_intro = (
         "（无，这是首次建档）" if not existing_summary.strip() else existing_summary
     )
@@ -1050,10 +1051,16 @@ async def _update_single_group_memory(db_session, session_id: str):
     if not recent_msgs:
         return
 
-    chat_text = "\n".join(
-        f"[{m.created_at.strftime('%m-%d %H:%M')}] {m.user_name}: {m.content[:100]}"
-        for m in recent_msgs
-    )
+    def _format_msg_for_summary(m):
+        content = m.content
+        if m.content_type == "bot":
+            # 去掉 "id: XXXXX\n" 前缀，只保留实际回复内容
+            first_newline = content.find("\n")
+            if first_newline != -1:
+                content = content[first_newline + 1 :]
+        return f"[{m.created_at.strftime('%m-%d %H:%M')}] {'[BOT] ' if m.content_type == 'bot' else ''}{m.user_name}: {content[:100]}"
+
+    chat_text = "\n".join(_format_msg_for_summary(m) for m in recent_msgs)
 
     existing_summary = record.summary if record else ""
     new_summary = await _call_summary_model(existing_summary, chat_text)

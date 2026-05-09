@@ -53,6 +53,9 @@ def check_and_compress_image_bytes(
 
     try:
         img = Image.open(io.BytesIO(image_bytes))
+        # 自动检测真实格式,覆盖传入的 image_format
+        if img.format:
+            image_format = img.format
 
         # JPEG 不支持透明通道 (RGBA)，必须转 RGB
         if image_format == "JPEG" and img.mode in ("RGBA", "P"):
