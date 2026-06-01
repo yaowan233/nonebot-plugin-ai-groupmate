@@ -8,34 +8,30 @@ import difflib
 import mimetypes
 import traceback
 import collections
-from typing import Any, cast
+from typing import Any
 from pathlib import Path
 from dataclasses import dataclass
 
 import jieba
 from nonebot import require, get_plugin_config
-from pydantic import Field, BaseModel, SecretStr, field_validator
+from pydantic import Field, BaseModel, field_validator
 from simpleeval import simple_eval
 from sqlalchemy import Select, desc, func, extract
 from nonebot.log import logger
 from langchain.tools import ToolRuntime, tool
-from langchain.agents import create_agent
-from langchain.agents.middleware import AgentMiddleware, ToolCallLimitMiddleware
-from langchain_openai import ChatOpenAI
 from langchain_tavily import TavilySearch
 from nonebot_plugin_orm import get_session
 from nonebot_plugin_uninfo import SceneType, QryItrface
 from langchain_core.prompts import ChatPromptTemplate
 from nonebot_plugin_alconna import UniMessage
 from sqlalchemy.ext.asyncio import AsyncSession
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
-from langchain.agents.structured_output import ToolStrategy
-from langgraph.types import Command
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 
 from ..model import ChatHistory, MediaStorage, UserRelation, ChatHistorySchema, GroupMemory
-from ..config import Config
+from ..config import Config, create_chat_openai, create_chat_llm
 from ..memory import DB
 from ..reply_guard import is_request_active
+from .graph import build_chat_graph
 
 
 require("nonebot_plugin_localstore")
@@ -85,28 +81,28 @@ class ResponseMessage(BaseModel):
         return value
 
 
-flash_model = ChatOpenAI(
-    model="qwen-flash",
-    api_key=SecretStr(plugin_config.qwen_token),
-    base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
-    temperature=0,  # 设为0，由它做决策需要绝对理性，不需要发散
-    max_completion_tokens=10,  # 我们只需要它回答 YES 或 NO，限制输出长度省钱
-)
+flash_model = create_chat_openai(plugin_config, "flash")
 
 
 async def check_if_should_reply(
-    history_summary: str, current_msg: str, bot_name: str
+    history_summary: str, current_msg: str, bot_name: str, is_private: bool = False
 ) -> bool:
     """
     使用 qwen-flash 快速判断是否需要回复
     """
+    if is_private:
+        scene_desc = "私聊"
+        scene_extra = "3. 如果是无关的闲聊或者语意不通的消息，返回 NO。"
+    else:
+        scene_desc = "群聊"
+        scene_extra = '3. 如果是群友之间的闲聊、无关的刷屏、或者语意不通的消息，返回 NO。'
     system_prompt = f"""
-你是一个群聊消息过滤器。你的任务是判断群内的最新消息是否需要机器人 "{bot_name}" 进行回复。
+你是一个{scene_desc}消息过滤器。你的任务是判断{scene_desc}内的最新消息是否需要机器人 "{bot_name}" 进行回复。
 
 判断规则：
 1. 如果用户明显在向 "{bot_name}" 提问、求助或打招呼，返回 YES。
 2. 如果用户在讨论 "{bot_name}" 相关的话题且期待回应，返回 YES。
-3. 如果是群友之间的闲聊、无关的刷屏、或者语意不通的消息，返回 NO。
+{scene_extra}
 4. 如果你不确定，返回 NO。
 
 请仅输出 "YES" 或 "NO"，不要输出任何其他内容。
@@ -185,7 +181,7 @@ def create_report_tool(
     request_id: str | None,
     user_id: str,
     user_name: str | None,
-    llm_client: ChatOpenAI,
+    llm_client: Any,
 ):
     """
     创建年度报告工具（限制在当前群聊 session_id 范围内）
@@ -1210,12 +1206,7 @@ def create_relation_tool(
 
 
 tools = [search_web, search_history_context, calculate_expression]
-model = ChatOpenAI(
-    model=plugin_config.base_model,
-    api_key=SecretStr(plugin_config.qwen_token),
-    base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
-    temperature=0.7,
-)
+model = create_chat_llm(plugin_config)
 
 
 async def get_user_relation_context(
@@ -1351,59 +1342,7 @@ async def get_recent_relations_context(
         return ""
 
 
-class SequentialReplyMiddleware(AgentMiddleware[Any, Any, Any]):
-    """
-    确保 reply_user 工具顺序执行，并在每次 model 调用后重置计数。
-    这样可以实现：LLM 每轮思考只能调用一次 reply_user，想发第二条必须等下一轮。
-    
-    使用 asyncio.Lock 确保顺序执行，用 before_model 钩子重置计数器。
-    """
-    
-    def __init__(self):
-        super().__init__()
-        self.reply_lock = asyncio.Lock()
-        self.current_round_count = 0
-    
-    async def abefore_model(self, state, runtime):
-        """在每次调用模型前重置计数器"""
-        self.current_round_count = 0
-        logger.debug(f"[Sequential] 新一轮开始，reply_user 计数器重置")
-        return None
-    
-    async def awrap_tool_call(
-        self,
-        request,
-        handler,
-    ) -> ToolMessage | Command:
-        """
-        拦截所有工具调用，对 reply_user 加锁并限制每轮只能调用一次。
-        """
-        tool_name = request.tool_call.get("name", "")
-        
-        # 只对 reply_user 工具加锁和限制
-        if tool_name == "reply_user":
-            async with self.reply_lock:
-                self.current_round_count += 1
-                logger.debug(f"[Sequential] reply_user 调用 #{self.current_round_count}")
-                
-                # 如果这一轮已经调用过 reply_user，则阻止
-                if self.current_round_count > 1:
-                    logger.warning(f"[Sequential] 本轮已经调用过 reply_user，阻止重复调用")
-                    return ToolMessage(
-                        content="本轮已经发送过消息了。如果你想发送更多消息，请等待下一轮。",
-                        tool_call_id=request.tool_call.get("id", ""),
-                    )
-                
-                logger.debug(f"[Sequential] 开始执行 reply_user: {request.tool_call.get('id')}")
-                result = await handler(request)
-                logger.debug(f"[Sequential] 完成执行 reply_user: {request.tool_call.get('id')}")
-                return result
-        
-        # 其他工具正常执行（并发）
-        return await handler(request)
-
-
-async def create_chat_agent(
+async def create_chat_graph(
     db_session,
     session_id: str,
     request_id: str | None,
@@ -1412,21 +1351,24 @@ async def create_chat_agent(
     history: list[ChatHistorySchema] | None = None,
     interface: QryItrface | None = None,
     bot_id: str | None = None,
+    is_private: bool = False,
 ):
-    """创建聊天Agent"""
+    """创建 LangGraph 聊天图"""
     relation_context = await get_user_relation_context(db_session, user_id, user_name)
-    group_context = await get_group_context(db_session, session_id)
-    recent_relations_context = await get_recent_relations_context(
-        db_session, history or []
-    )
+    group_context = ""
+    recent_relations_context = ""
+    if not is_private:
+        group_context = await get_group_context(db_session, session_id)
+        recent_relations_context = await get_recent_relations_context(
+            db_session, history or []
+        )
     
-    # 检查bot是否有管理员权限
+    # 检查bot是否有管理员权限（仅群聊）
     has_admin_permission = False
-    if interface and bot_id:
+    if not is_private and interface and bot_id:
         try:
             members = await interface.get_members(SceneType.GROUP, session_id)
             for member in members:
-                # 使用bot的user_id来判断，而不是bot_name
                 if str(member.id) == str(bot_id):
                     bot_role = getattr(getattr(member, "role", None), "name", None)
                     if bot_role in {"owner", "admin"}:
@@ -1438,7 +1380,6 @@ async def create_chat_agent(
         except Exception as e:
             logger.warning(f"检查bot权限失败: {e}")
     
-    # 根据权限动态调整系统提示词
     permission_status = ""
     mute_tool_instruction = ""
     if has_admin_permission:
@@ -1458,7 +1399,41 @@ async def create_chat_agent(
   - 不要禁言管理员或群主
 """
     
-    system_prompt = f"""你是QQ群群友「{plugin_config.bot_name}」。
+    if is_private:
+        system_prompt = f"""你是{plugin_config.bot_name}，正在和好友私聊。
+你不是助手，不承认自己是AI。
+【任务】
+结合聊天记录和人际关系，判断是否需要回复；需要时用自然的私聊语气回应。
+{relation_context}
+【风格】
+- 像真实好友，口语化、简短自然
+- 优先短句；复杂问题可拆成 2-3 条连续短消息（每条一个重点）
+- 只有在确实需要分点说明时才发第2/3条；简单问题只发1条
+- 多条回复必须"信息递进"，后一条必须提供新信息，禁止同义改写重复
+- 如果下一条与上一条语义高度重叠，直接不发下一条
+- 可吐槽可玩梗，但不恶意攻击，不无脑迎合
+- 不要复读模板句，不要输出"我脑子一片空白/我被修坏了/我不知道我是谁"这类台词
+- 不要使用 emoji（尤其 😅）
+- 不要使用 Markdown
+【工具规则】
+- 只能通过工具发消息，不要直接输出正文
+- 文本：`reply_user`
+- 表情包：先 `search_meme_image` 或 `search_similar_meme_by_id`，再 `send_meme_image`
+- 外部知识/缩写/术语：优先 `search_web`
+- 聊天上下文：`search_history_context`
+- 用户情绪或关系变化明显时，调用 `update_user_impression`
+- 若用户提到"年度报告 / 个人总结 / 成分分析"，直接调用 `generate_and_send_annual_report`；
+  工具完成后仅回复"请查收~"，不要复述报告
+- 回复结束后调用 `finish`
+【边界】
+- 不要发送重复或高度相似内容
+- 遇到明显危险/违法/过分要求：简短拒绝、吐槽或无视（如"？"）
+【RAG 检索硬约束】
+- 在 `rag_search` 中禁止相对时间词：昨天、前天、本周、上周、这个月、上个月、最近等
+- 使用明确日期时间或关键词检索
+"""
+    else:
+        system_prompt = f"""你是QQ群群友「{plugin_config.bot_name}」。
 你不是助手，不承认自己是AI。
 【任务】
 结合聊天记录、群体记忆和人际关系，判断是否需要回复；需要时用自然群聊语气回应。
@@ -1541,23 +1516,9 @@ async def create_chat_agent(
         if has_admin_permission:
             tools.insert(-1, mute_tool)  # 在finish之前插入
 
-    agent = create_agent(
-        model,
-        tools=tools,
-        system_prompt=system_prompt,
-        context_schema=Context,
-        middleware=[
-            SequentialReplyMiddleware(),  # 每轮最多调用一次 reply_user，强制多轮思考
-            ToolCallLimitMiddleware(thread_limit=20, run_limit=20),  # 全局工具调用限制
-            ToolCallLimitMiddleware(
-                tool_name="reply_user",
-                thread_limit=5,  # 整个对话最多5次
-                run_limit=5,
-            ),
-        ],
-    )
+    graph = build_chat_graph(model, tools, system_prompt)
 
-    return agent
+    return graph, tools
 
 
 def get_image_data_uri(file_name: str) -> str | None:
@@ -1838,13 +1799,14 @@ async def choice_response_strategy(
     role_map: dict[str, str] | None = None,
     bot_id: str | None = None,
     reply_to_id: str | None = None,
+    is_private: bool = False,
 ) -> ResponseMessage:
     """
-    使用Agent决定回复策略
+    使用LangGraph Agent决定回复策略
     """
     try:
-        agent = await create_chat_agent(
-            db_session, session_id, request_id, user_id, user_name, history, interface, bot_id
+        graph, _ = await create_chat_graph(
+            db_session, session_id, request_id, user_id, user_name, history, interface, bot_id, is_private=is_private
         )
 
         # 1. 获取多模态格式的历史消息列表 (List[BaseMessage])
@@ -1947,16 +1909,21 @@ async def choice_response_strategy(
 
         final_messages = chat_history_messages + [HumanMessage(content=final_prompt_content)]
 
-        invoke_input: dict[str, Any] = {"messages": final_messages}
+        invoke_state: dict[str, Any] = {
+            "messages": list(final_messages),
+            "session_id": session_id,
+            "request_id": request_id,
+            "reply_count": 0,
+            "tool_count": 0,
+            "reply_this_round": 0,
+            "called_finish": 0,
+        }
 
         # 4. 调用 Agent
         from langchain_community.callbacks import get_openai_callback
 
         with get_openai_callback() as cb:
-            await agent.ainvoke(
-                cast(Any, invoke_input),
-                context=Context(session_id=session_id, request_id=request_id),
-            )
+            await graph.ainvoke(invoke_state, config={"callbacks": [cb]})
         logger.info(
             f"[Token用量] 输入={cb.prompt_tokens} 输出={cb.completion_tokens} "
             f"总计={cb.total_tokens} 费用≈${cb.total_cost:.4f}"
@@ -1981,18 +1948,17 @@ async def choice_response_strategy(
 
 
 if __name__ == "__main__":
-    model = ChatOpenAI(
-        model=plugin_config.base_model,
-        api_key=SecretStr(plugin_config.qwen_token),
-        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
-        temperature=0.7,
-    )
-    agent = create_agent(
-        model, tools=tools, response_format=ToolStrategy(ResponseMessage)
-    )
+    model = create_chat_llm(plugin_config)
+    graph = build_chat_graph(model, tools, "你是一个助手，请调用工具回复用户。")
     result = asyncio.run(
-        agent.ainvoke(
-            {"messages": [{"role": "user", "content": "今天上海的天气怎么样"}]}
-        )
+        graph.ainvoke({
+            "messages": [HumanMessage(content="今天上海的天气怎么样")],
+            "session_id": "test",
+            "request_id": None,
+            "reply_count": 0,
+            "tool_count": 0,
+            "reply_this_round": 0,
+            "called_finish": 0,
+        })
     )
     print(result)

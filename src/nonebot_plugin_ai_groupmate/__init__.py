@@ -12,12 +12,10 @@ from dataclasses import dataclass
 
 import jieba
 from nonebot import logger, require, on_command, on_message, get_plugin_config
-from pydantic import SecretStr
 from wordcloud import WordCloud
 from nonebot.params import CommandArg
 from nonebot.plugin import PluginMetadata, inherit_supported_adapters
 from nonebot.typing import T_State
-from langchain_openai import ChatOpenAI
 from nonebot.adapters import Bot, Event, Message
 from langchain_core.messages import HumanMessage
 
@@ -42,7 +40,7 @@ from .utils import (
     check_and_compress_image_bytes,
     process_and_vectorize_session_chats,
 )
-from .config import Config
+from .config import Config, create_chat_openai, create_tagging_llm
 from .memory import DB
 
 __plugin_meta__ = PluginMetadata(
@@ -62,13 +60,7 @@ plugin_config = get_plugin_config(Config).ai_groupmate
 with open(Path(__file__).parent / "stop_words.txt", encoding="utf-8") as f:
     stop_words = f.read().splitlines() + ["id", "回复"]
 
-summary_model = ChatOpenAI(
-    model="qwen-flash",
-    api_key=SecretStr(plugin_config.qwen_token),
-    base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
-    temperature=0.3,
-    max_completion_tokens=800,
-)
+summary_model = create_chat_openai(plugin_config, "summary")
 
 
 @dataclass
@@ -201,18 +193,24 @@ async def handle_message(
     is_text = False
     reply_id: str | None = None  # 记录回复 ID，稍后单独成行插入
     body = ""  # 正文部分单独拼接
+    has_at_mention = False
     if event.is_tome():
         to_me = True
-        body += f"@{plugin_config.bot_name} "
     for i in msg:
         if i.type == "at":
-            members = await interface.get_members(SceneType.GROUP, session.scene.id)
-            for member in members:
-                if member.id == i.target:
-                    name = member.user.name if member.user.name else ""
-                    break
-            else:
-                continue
+            has_at_mention = True
+            name = ""
+            if session.scene.type == SceneType.GROUP:
+                try:
+                    members = await interface.get_members(SceneType.GROUP, session.scene.id)
+                    for member in members:
+                        if member.id == i.target:
+                            name = member.user.name if member.user.name else ""
+                            break
+                except Exception:
+                    pass
+            if not name:
+                name = i.target or ""
             body += "@" + name + " "
             is_text = True
         if i.type == "reply":
@@ -224,6 +222,18 @@ async def handle_message(
             body += "[图片]"
         if i.type == "mface":
             body += "[表情]"
+
+    if to_me and not has_at_mention:
+        reply_to_bot = False
+        if reply := getattr(event, "reply", None):
+            try:
+                sender = getattr(reply, "sender", None)
+                if sender and str(getattr(sender, "user_id", "")) == str(bot.self_id):
+                    reply_to_bot = True
+            except Exception:
+                pass
+        if not reply_to_bot:
+            body = f"{plugin_config.bot_name} {body}"
 
     if not reply_id:
         reply_id = _extract_reply_message_id_from_event(event)
@@ -481,6 +491,7 @@ async def handle_reply_logic(
     reply_to_id: str | None,
 ):
     """处理回复逻辑"""
+    is_private = session.scene.type == SceneType.PRIVATE
     try:
         # 获取最近几条用于 Flash 快速判断
         # 注意：Flash 模型是纯文本模型，它看不懂图片，所以这里我们只喂文本内容
@@ -521,7 +532,7 @@ async def handle_reply_logic(
         # === Gatekeeper 判断 ===
         if not is_tome:
             should_reply = await check_if_should_reply(
-                history_summary, current_msg_text, bot_name
+                history_summary, current_msg_text, bot_name, is_private=is_private
             )
             if not should_reply:
                 return
@@ -550,14 +561,15 @@ async def handle_reply_logic(
         last_msg = last_msg[::-1]
 
         role_map: dict[str, str] = {}
-        try:
-            members = await interface.get_members(SceneType.GROUP, session.scene.id)
-            for member in members:
-                role_name = getattr(getattr(member, "role", None), "name", None)
-                if role_name in {"owner", "admin"}:
-                    role_map[str(member.id)] = role_name
-        except Exception as e:
-            logger.warning(f"获取群成员身份信息失败，降级为无身份标注: {e}")
+        if not is_private:
+            try:
+                members = await interface.get_members(SceneType.GROUP, session.scene.id)
+                for member in members:
+                    role_name = getattr(getattr(member, "role", None), "name", None)
+                    if role_name in {"owner", "admin"}:
+                        role_map[str(member.id)] = role_name
+            except Exception as e:
+                logger.warning(f"获取群成员身份信息失败，降级为无身份标注: {e}")
 
         logger.info("开始调用Agent决策...")
         try:
@@ -574,6 +586,7 @@ async def handle_reply_logic(
                     role_map,
                     session.self_id,  # 传递bot的ID
                     reply_to_id,
+                    is_private=is_private,
                 ),
                 timeout=240.0,
             )
@@ -710,12 +723,7 @@ async def vectorize_message_history():
                 continue
 
 
-tagging_model = ChatOpenAI(
-    model="qwen-vl-max",
-    api_key=SecretStr(plugin_config.qwen_token),
-    base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
-    temperature=0.01,
-)
+tagging_model = create_tagging_llm(plugin_config)
 
 
 @scheduler.scheduled_job(
@@ -944,12 +952,17 @@ async def _call_summary_model(existing_summary: str, chat_text: str) -> str | No
 
     system = """你是一个群文化分析师。你的任务是维护一份关于QQ群的认知档案。
 档案包含：群内常见话题、活跃成员特征、内部梗/黑话、群文化氛围。
+
+【核心原则】标注为[BOT]的消息是机器人自身的回复。档案只记录真实用户的群文化，绝对不记录机器人的行为模式或回复话术。
+
 规则：
 1. 只能基于提供的聊天记录总结，不要凭空发明内容
 2. 保留档案中仍然有效的内容，用新聊天补充或修正旧内容
 3. 如果某个内容长期（超过30天）无聊天印证，可删除
 4. 输出完整更新后的档案，不超过500字，不要输出任何其他内容
-5. 标注为[BOT]的消息是机器人自身的回复，仅用于理解对话上下文，绝对不要将BOT的回复内容提取为"标准回应模板"、"内部梗"或"黑话"。档案只关注真实用户的发言特征和群文化"""
+5. 【必须执行】如果现有档案中包含BOT的回复话术（如"别得寸进尺"、"？你又来"、"行了行了"等BOT说的话），必须将其删除。内部梗/黑话只能来自真实用户的发言，不能来自BOT。
+6. 【必须执行】"活跃成员特征"部分只描述真实用户，不要把BOT列为活跃成员或描述BOT的行为模式。
+7. 【必须执行】"群文化氛围"只描述用户之间的互动氛围，不要描述用户与BOT之间的互动循环。"""
     history_intro = (
         "（无，这是首次建档）" if not existing_summary.strip() else existing_summary
     )
@@ -1065,6 +1078,30 @@ async def _update_single_group_memory(db_session, session_id: str):
     existing_summary = record.summary if record else ""
     new_summary = await _call_summary_model(existing_summary, chat_text)
     if not new_summary:
+        return
+
+    # 后处理：过滤掉描述BOT自身行为/话术的条目
+    bot_name = plugin_config.bot_name
+    filtered_lines = []
+    for line in new_summary.splitlines():
+        stripped = line.strip().lstrip("-•* ").strip()
+        # 跳过描述bot行为模式的行
+        if bot_name and (
+            f"{bot_name}为" in stripped
+            or f"{bot_name}是" in stripped
+            or f"{bot_name}主导" in stripped
+            or f"{bot_name}维持" in stripped
+            or f"{bot_name}以" in stripped
+        ):
+            logger.info(f"档案过滤：移除BOT行为描述行: {stripped[:50]}")
+            continue
+        # 跳过将bot回复标注为"标准回应"/"模板"的行
+        if "标准回应" in stripped or "回应模板" in stripped:
+            logger.info(f"档案过滤：移除BOT模板描述行: {stripped[:50]}")
+            continue
+        filtered_lines.append(line)
+    new_summary = "\n".join(filtered_lines)
+    if not new_summary.strip():
         return
 
     if not record:
