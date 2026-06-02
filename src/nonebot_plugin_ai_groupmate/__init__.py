@@ -7,6 +7,7 @@ import datetime
 import traceback
 from io import BytesIO
 from pathlib import Path
+from functools import lru_cache
 from dataclasses import dataclass
 
 
@@ -60,7 +61,14 @@ plugin_config = get_plugin_config(Config).ai_groupmate
 with open(Path(__file__).parent / "stop_words.txt", encoding="utf-8") as f:
     stop_words = f.read().splitlines() + ["id", "回复"]
 
-summary_model = create_chat_openai(plugin_config, "summary")
+@lru_cache
+def get_summary_model():
+    return create_chat_openai(plugin_config, "summary")
+
+
+@lru_cache
+def get_tagging_model():
+    return create_tagging_llm(plugin_config)
 
 
 @dataclass
@@ -723,9 +731,6 @@ async def vectorize_message_history():
                 continue
 
 
-tagging_model = create_tagging_llm(plugin_config)
-
-
 @scheduler.scheduled_job(
     "interval", minutes=30, max_instances=1, coalesce=True, id="vectorize_media"
 )
@@ -796,7 +801,7 @@ async def vectorize_media():
 """
                 try:
                     # 调用模型
-                    response = await tagging_model.ainvoke(
+                    response = await get_tagging_model().ainvoke(
                         [
                             HumanMessage(
                                 content=[
@@ -978,7 +983,7 @@ async def _call_summary_model(existing_summary: str, chat_text: str) -> str | No
 
         user_msg = f"【现有档案】\n{history_intro}\n\n【最新聊天记录】\n{current_text}\n\n请输出更新后的档案："
         try:
-            resp = await summary_model.ainvoke(
+            resp = await get_summary_model().ainvoke(
                 [
                     SystemMessage(content=system),
                     LCHumanMessage(content=user_msg),

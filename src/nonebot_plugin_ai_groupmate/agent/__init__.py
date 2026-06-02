@@ -10,6 +10,7 @@ import traceback
 import collections
 from typing import Any
 from pathlib import Path
+from functools import lru_cache
 from dataclasses import dataclass
 
 import jieba
@@ -81,7 +82,14 @@ class ResponseMessage(BaseModel):
         return value
 
 
-flash_model = create_chat_openai(plugin_config, "flash")
+@lru_cache
+def get_flash_model() -> Any:
+    return create_chat_openai(plugin_config, "flash")
+
+
+@lru_cache
+def get_chat_model() -> Any:
+    return create_chat_llm(plugin_config)
 
 
 async def check_if_should_reply(
@@ -114,7 +122,7 @@ async def check_if_should_reply(
 
     try:
         # 调用 Flash 模型
-        resp = await flash_model.ainvoke(
+        resp = await get_flash_model().ainvoke(
             [SystemMessage(content=system_prompt), HumanMessage(content=input_text)]
         )
         if hasattr(resp, "usage_metadata") and resp.usage_metadata:
@@ -1147,7 +1155,6 @@ def create_relation_tool(
 
 
 tools = [search_web, search_history_context, calculate_expression]
-model = create_chat_llm(plugin_config)
 
 ACTIVE_THREAD_TTL = datetime.timedelta(minutes=10)
 ACTIVE_THREAD_MAX_MESSAGES = 24
@@ -1424,6 +1431,7 @@ async def create_chat_graph(
 - 在 `rag_search` 中禁止相对时间词：昨天、前天、本周、上周、这个月、上个月、最近等
 - 使用明确日期时间或关键词检索
 """
+    model = get_chat_model()
     report_tool = create_report_tool(
         db_session, session_id, request_id, user_id, user_name, model
     )
