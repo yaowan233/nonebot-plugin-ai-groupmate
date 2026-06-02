@@ -22,7 +22,6 @@ from langchain.tools import ToolRuntime, tool
 from langchain_tavily import TavilySearch
 from nonebot_plugin_orm import get_session
 from nonebot_plugin_uninfo import SceneType, QryItrface
-from langchain_core.prompts import ChatPromptTemplate
 from nonebot_plugin_alconna import UniMessage
 from sqlalchemy.ext.asyncio import AsyncSession
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
@@ -32,6 +31,7 @@ from ..config import Config, create_chat_openai, create_chat_llm
 from ..memory import DB
 from ..reply_guard import is_request_active
 from .graph import build_chat_graph
+from .prompt_cache import build_system_messages
 
 
 require("nonebot_plugin_localstore")
@@ -193,6 +193,9 @@ def create_report_tool(
         生成并发送当前群聊的年度报告。
         包含：个人在本群的统计、性格分析、全群排行榜以及Bot的好感度回顾。
         """
+        if not user_id:
+            return "当前没有可用于生成报告的用户信息。"
+
         if request_id is not None and not await is_request_active(
             session_id, request_id
         ):
@@ -211,10 +214,7 @@ def create_report_tool(
             all_msgs = (await db_session.execute(stmt)).scalars().all()
 
             if not all_msgs:
-                await UniMessage.text(
-                    "你今年在这个群好像没怎么说话，生成不了报告哦..."
-                ).send()
-                return "用户本群无数据。"
+                return "用户本群今年暂无可用于年度报告的数据。请调用 reply_user 简短告知用户生成不了报告。"
 
             # 统计与采样
             text_msgs = [
@@ -316,104 +316,42 @@ def create_report_tool(
             # 格式化关系描述，喂给 LLM
             relation_desc = f"好感度: {favorability} (满分100), 印象标签: {', '.join(impression_tags)}"
 
-            report_prompt = ChatPromptTemplate.from_messages(
-                [
-                    (
-                        "system",
-                        """你是一个专业的年度报告撰写助手。
-你的任务是阅读用户的聊天统计数据和发言样本，分析其性格，然后生成一份格式整洁、风格幽默的年度报告。
+            samples_text = "\n".join(samples)
+            return f"""【年度报告素材】
+请根据以下素材生成完整年度报告，并调用 `reply_user` 发送给用户；不要直接结束，也不要再调用年度报告工具。
 
-【语气控制指南 (非常重要)】
-根据用户的"好感度"调整你的语气：
-- 好感度 > 60：语气要亲密、宠溺，像对待最好的朋友或恋人。（例如："宝，今年你也一直陪着我呢"）
-- 好感度 < 0：语气要傲娇、嫌弃、毒舌。（例如："你这家伙今年没少气我，明年注意点！"）
-- 好感度 0-60：语气正常、友善、带点调侃。
+【写作要求】
+1. 不要使用 Markdown 标题、粗体或列表符号。
+2. 可以使用 Emoji 和纯文本分隔线排版。
+3. 语气像群友，不要像正式报告。
+4. 根据好感度调整语气：>60 亲密宠溺，<0 傲娇毒舌，0-60 友善调侃。
+5. 必须包含：标题行、基础数据、关系回顾、年度热词、群内风云榜、成分分析、{plugin_config.bot_name}寄语。
+6. 成分分析要重点参考发言样本，写得具体一点。
 
-【排版要求】
-1. **绝对禁止使用 Markdown**（不要用 #, **, ##, - 等符号列表）。
-2. 使用 Emoji 和 纯文本分隔符（如 ━━━━━━━━）来排版。
-3. 语气要像老朋友一样，可以根据数据进行调侃或夸奖。
-
-【必须包含的板块】
-1. 📊 标题行 ({year}年度报告 | 用户名)
-2. 📈 基础数据 (发言数、活跃时间、最长发言摘要)
-3. 💌 我们的羁绊 (根据好感度和标签，写一段话回顾你们的关系。如果是正向关系就煽情一点，负向关系就吐槽。)
-4. 🔥 年度热词 (列出数据中提供的热词)
-5. 🏆 群内风云榜 (必须包含以下三个榜单)
-   - 🗣️ 龙王榜 (发言最多)
-   - 🎭 斗图榜 (发图最多)
-   - 🦉 修仙榜 (熬夜最多)
-6. 🧠 成分分析 (这是**重点**：请阅读提供的 `samples` 聊天记录，分析这个人的说话风格、性格、是不是复读机、是不是爱发疯。写一段100字左右的犀利点评)
-7. 💡 {bot_name}寄语 (一句简短的祝福)
-""",
-                    ),
-                    (
-                        "user",
-                        """
 【用户数据】
 用户名: {user_name}
-年份: {year}
-累计发言: {count}
-活跃时间: {active_hour}
+年份: {current_year}
+累计发言: {total_count}
+活跃时间: {active_hour_desc}
 最长发言片段: {longest_msg}
-年度热词: {hot_words}
+年度热词: {hot_words_str}
 
-【{bot_name}与用户的关系】
+【{plugin_config.bot_name} 与用户的关系】
 {relation_desc}
 
-【全群排行参考】
+【全群排行榜参考】
 龙王榜: {rank_talk}
 斗图榜: {rank_img}
 熬夜榜: {rank_night}
 
-【用户发言样本 (用于性格分析)】
-{samples}
-
-请生成报告：""",
-                    ),
-                ]
-            )
-
-            # 组装数据
-            prompt_input = {
-                "user_name": user_name,
-                "bot_name": plugin_config.bot_name,
-                "year": current_year,
-                "count": total_count,
-                "active_hour": active_hour_desc,
-                "longest_msg": longest_msg,
-                "hot_words": hot_words_str,
-                "relation_desc": relation_desc,
-                "rank_talk": rank_talk,
-                "rank_img": rank_img,
-                "rank_night": rank_night,
-                "samples": "\n".join(samples),  # 把样本拼接成字符串喂给 LLM
-            }
-
-            logger.info(f"内部 LLM 生成报告中，好感度: {favorability}")
-            chain = report_prompt | llm_client
-            response_msg = await chain.ainvoke(prompt_input)
-            final_report_text = response_msg.content
-            if not isinstance(final_report_text, str):
-                return "输出结果失败"
+【用户发言样本】
+{samples_text}
+"""
 
         except Exception as e:
-            logger.error(f"内部 LLM 生成报告失败: {e}")
-            import traceback
-
-            traceback.print_exc()
-            return f"生成过程出错: {e}"
-
-        try:
-            if request_id is not None and not await is_request_active(
-                session_id, request_id
-            ):
-                return "请求已过期，已取消发送。"
-            await UniMessage.text(final_report_text).send()
-        except Exception as send_err:
-            logger.warning(f"发送年度报告失败: {send_err}")
-            return f"报告生成成功但发送失败: {send_err}"
-        return "报告已生成并发送。"
+            logger.error(f"收集年度报告素材失败: {e}")
+            print(traceback.format_exc())
+            return f"收集年度报告素材出错: {e}"
 
     return generate_and_send_annual_report
 
@@ -1062,6 +1000,9 @@ def create_relation_tool(
 
         返回: 更新后的状态描述
         """
+        if not user_id:
+            return "当前没有可更新画像的用户信息。"
+
         if request_id is not None and not await is_request_active(
             session_id, request_id
         ):
@@ -1207,6 +1148,19 @@ def create_relation_tool(
 
 tools = [search_web, search_history_context, calculate_expression]
 model = create_chat_llm(plugin_config)
+
+ACTIVE_THREAD_TTL = datetime.timedelta(minutes=10)
+ACTIVE_THREAD_MAX_MESSAGES = 24
+
+
+@dataclass
+class ActiveConversationThread:
+    messages: list[BaseMessage]
+    last_msg_id: int
+    updated_at: datetime.datetime
+
+
+active_conversation_threads: dict[str, ActiveConversationThread] = {}
 
 
 async def get_user_relation_context(
@@ -1422,8 +1376,8 @@ async def create_chat_graph(
 - 外部知识/缩写/术语：优先 `search_web`
 - 聊天上下文：`search_history_context`
 - 用户情绪或关系变化明显时，调用 `update_user_impression`
-- 若用户提到"年度报告 / 个人总结 / 成分分析"，直接调用 `generate_and_send_annual_report`；
-  工具完成后仅回复"请查收~"，不要复述报告
+- 若用户提到"年度报告 / 个人总结 / 成分分析"，先调用 `generate_and_send_annual_report` 获取素材；
+  工具返回素材后，由你根据素材生成完整报告，并调用 `reply_user` 发送
 - 回复结束后调用 `finish`
 【边界】
 - 不要发送重复或高度相似内容
@@ -1458,8 +1412,8 @@ async def create_chat_graph(
 - 外部知识/缩写/术语：优先 `search_web`
 - 群内上下文：`search_history_context`
 - 用户情绪或关系变化明显时，调用 `update_user_impression`
-- 若用户提到"年度报告 / 个人总结 / 成分分析"，直接调用 `generate_and_send_annual_report`；
-  工具完成后仅回复"请查收~"，不要复述报告
+- 若用户提到"年度报告 / 个人总结 / 成分分析"，先调用 `generate_and_send_annual_report` 获取素材；
+  工具返回素材后，由你根据素材生成完整报告，并调用 `reply_user` 发送
 {mute_tool_instruction}- 回复结束后调用 `finish`
 【边界】
 - 不要插入他人对话
@@ -1484,39 +1438,46 @@ async def create_chat_graph(
     )
     mute_tool = create_mute_tool(db_session, session_id, request_id, interface, bot_id)
     
-    if not user_id or not user_name:
-        tools = [
-            search_web,
-            search_history_context,
-            create_reply_tool(db_session, session_id, request_id, interface),
-            search_meme_tool,
-            similar_meme_tool,
-            send_meme_tool,
-            calculate_expression,
-            report_tool,
-            finish,
-        ]
-        # 如果bot是管理员，添加禁言工具
-        if has_admin_permission:
-            tools.insert(-1, mute_tool)  # 在finish之前插入
-    else:
-        tools = [
-            search_web,
-            search_history_context,
-            create_reply_tool(db_session, session_id, request_id, interface),
-            search_meme_tool,
-            similar_meme_tool,
-            send_meme_tool,
-            calculate_expression,
-            relation_tool,
-            report_tool,
-            finish,
-        ]
-        # 如果bot是管理员，添加禁言工具
-        if has_admin_permission:
-            tools.insert(-1, mute_tool)  # 在finish之前插入
+    tools = [
+        search_web,
+        search_history_context,
+        create_reply_tool(db_session, session_id, request_id, interface),
+        search_meme_tool,
+        similar_meme_tool,
+        send_meme_tool,
+        calculate_expression,
+        relation_tool,
+        report_tool,
+        mute_tool,
+        finish,
+    ]
 
-    graph = build_chat_graph(model, tools, system_prompt)
+    dynamic_context_parts = (
+        [relation_context]
+        if is_private
+        else [
+            group_context,
+            relation_context,
+            recent_relations_context,
+            permission_status,
+            mute_tool_instruction,
+        ]
+    )
+    stable_system_prompt = system_prompt
+    kept_dynamic_context_parts: list[str] = []
+    for context_part in dynamic_context_parts:
+        if not context_part or not context_part.strip():
+            continue
+        stable_system_prompt = stable_system_prompt.replace(context_part, "", 1)
+        kept_dynamic_context_parts.append(context_part.strip())
+
+    system_messages = build_system_messages(
+        stable_system_prompt,
+        "\n\n".join(kept_dynamic_context_parts),
+        use_cache_control=plugin_config.chat_api_format == "anthropic",
+    )
+
+    graph = build_chat_graph(model, tools, system_messages)
 
     return graph, tools
 
@@ -1787,6 +1748,89 @@ def format_chat_history(
     return messages
 
 
+def _trim_thread_messages(messages: list[BaseMessage]) -> list[BaseMessage]:
+    if len(messages) <= ACTIVE_THREAD_MAX_MESSAGES:
+        return messages
+    return messages[-ACTIVE_THREAD_MAX_MESSAGES:]
+
+
+def _get_active_thread(session_id: str) -> ActiveConversationThread | None:
+    thread = active_conversation_threads.get(session_id)
+    if not thread:
+        return None
+    if datetime.datetime.now() - thread.updated_at > ACTIVE_THREAD_TTL:
+        active_conversation_threads.pop(session_id, None)
+        return None
+    return thread
+
+
+def _build_append_only_history(
+    session_id: str,
+    history: list[ChatHistorySchema],
+    *,
+    user_roles: dict[str, str] | None = None,
+    extra_inline_images: list[ChatHistorySchema] | None = None,
+) -> tuple[list[BaseMessage], list[ChatHistorySchema], bool]:
+    thread = _get_active_thread(session_id)
+    if not history:
+        return [], [], False
+
+    if not thread:
+        return (
+            format_chat_history(
+                history,
+                user_roles=user_roles,
+                extra_inline_images=extra_inline_images,
+            ),
+            history,
+            False,
+        )
+
+    new_history = [msg for msg in history if msg.msg_id > thread.last_msg_id]
+    if not new_history:
+        return list(thread.messages), [], True
+
+    new_messages = format_chat_history(
+        new_history,
+        user_roles=user_roles,
+        extra_inline_images=extra_inline_images,
+    )
+    return list(thread.messages) + new_messages, new_history, True
+
+
+async def _update_active_thread(
+    db_session: AsyncSession,
+    session_id: str,
+    base_messages: list[BaseMessage],
+    input_max_msg_id: int,
+) -> None:
+    await db_session.flush()
+    new_rows = (
+        (
+            await db_session.execute(
+                Select(ChatHistory)
+                .where(ChatHistory.session_id == session_id)
+                .where(ChatHistory.msg_id > input_max_msg_id)
+                .order_by(ChatHistory.msg_id.asc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if new_rows:
+        new_history = [ChatHistorySchema.model_validate(row) for row in new_rows]
+        base_messages = base_messages + format_chat_history(new_history, max_inline_images=0)
+        last_msg_id = max(msg.msg_id for msg in new_history)
+    else:
+        last_msg_id = input_max_msg_id
+
+    active_conversation_threads[session_id] = ActiveConversationThread(
+        messages=_trim_thread_messages(base_messages),
+        last_msg_id=last_msg_id,
+        updated_at=datetime.datetime.now(),
+    )
+
+
 async def choice_response_strategy(
     db_session: AsyncSession,
     session_id: str,
@@ -1816,11 +1860,20 @@ async def choice_response_strategy(
             session_id,
             reply_to_id,
         )
-        chat_history_messages = format_chat_history(
+        chat_history_messages, appended_history, reused_thread = _build_append_only_history(
+            session_id,
             history,
             user_roles=role_map,
             extra_inline_images=replied_extra,
         )
+        input_max_msg_id = max((msg.msg_id for msg in history), default=0)
+        active_thread = _get_active_thread(session_id)
+        if reused_thread and active_thread:
+            input_max_msg_id = max(input_max_msg_id, active_thread.last_msg_id)
+        if reused_thread:
+            logger.info(
+                f"[Prompt缓存] 复用群 {session_id} 的连续对话线程，新增历史 {len(appended_history)} 条"
+            )
 
         # 2. 构建当前环境信息的 Prompt (纯文本)
         today = datetime.datetime.now()
@@ -1930,6 +1983,13 @@ async def choice_response_strategy(
         )
 
         # 5. 统一提交 db_session（reply_user / send_meme_image 只 add 不 commit）
+        await _update_active_thread(
+            db_session,
+            session_id,
+            chat_history_messages,
+            input_max_msg_id,
+        )
+
         await db_session.commit()
 
         return ResponseMessage(need_reply=False, text=None)

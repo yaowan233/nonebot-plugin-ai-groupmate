@@ -1,17 +1,18 @@
 """LangGraph-based agent replacement for create_agent + middleware."""
-from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Annotated, Any, TypedDict
-
-from langchain_core.messages import AIMessage, BaseMessage, SystemMessage, ToolMessage
-from langchain_core.tools import BaseTool
-from langchain_core.runnables import RunnableConfig
-from langgraph.graph import END, START, StateGraph
-from langgraph.graph.message import add_messages
+from typing import Any, Annotated, TypedDict
+from dataclasses import dataclass
+from collections.abc import Sequence
 
 from nonebot.log import logger
+from langgraph.graph import END, START, StateGraph
+from langchain_core.tools import BaseTool
+from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
+from langgraph.graph.message import add_messages
+from langchain_core.runnables import RunnableConfig
 
 from ..reply_guard import is_request_active
+from .prompt_cache import normalize_system_messages
 
 MAX_REPLY_COUNT = 5
 MAX_TOOL_COUNT = 20
@@ -34,6 +35,93 @@ class _AgentContext:
     request_id: str | None
 
 
+def _deep_get(data: Any, *path: str) -> Any:
+    current = data
+    for key in path:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return current
+
+
+def _first_int(data: Any, paths: Sequence[tuple[str, ...]]) -> int | None:
+    for path in paths:
+        value = _deep_get(data, *path)
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float):
+            return int(value)
+    return None
+
+
+def _log_llm_cache_usage(response: AIMessage) -> None:
+    usage = response.usage_metadata or {}
+    metadata = response.response_metadata or {}
+    token_usage = metadata.get("token_usage") if isinstance(metadata, dict) else {}
+    combined = {
+        "usage_metadata": usage,
+        "response_metadata": metadata,
+        "token_usage": token_usage if isinstance(token_usage, dict) else {},
+    }
+
+    input_tokens = _first_int(
+        combined,
+        (
+            ("usage_metadata", "input_tokens"),
+            ("usage_metadata", "prompt_tokens"),
+            ("response_metadata", "token_usage", "prompt_tokens"),
+            ("token_usage", "prompt_tokens"),
+        ),
+    )
+    output_tokens = _first_int(
+        combined,
+        (
+            ("usage_metadata", "output_tokens"),
+            ("usage_metadata", "completion_tokens"),
+            ("response_metadata", "token_usage", "completion_tokens"),
+            ("token_usage", "completion_tokens"),
+        ),
+    )
+    total_tokens = _first_int(
+        combined,
+        (
+            ("usage_metadata", "total_tokens"),
+            ("response_metadata", "token_usage", "total_tokens"),
+            ("token_usage", "total_tokens"),
+        ),
+    )
+    cached_tokens = _first_int(
+        combined,
+        (
+            ("usage_metadata", "input_token_details", "cache_read"),
+            ("usage_metadata", "input_token_details", "cached_tokens"),
+            ("usage_metadata", "input_tokens_details", "cached_tokens"),
+            ("response_metadata", "token_usage", "prompt_tokens_details", "cached_tokens"),
+            ("response_metadata", "token_usage", "input_tokens_details", "cached_tokens"),
+            ("response_metadata", "token_usage", "cached_tokens"),
+            ("response_metadata", "token_usage", "cache_read_input_tokens"),
+            ("token_usage", "prompt_tokens_details", "cached_tokens"),
+            ("token_usage", "input_tokens_details", "cached_tokens"),
+            ("token_usage", "cached_tokens"),
+            ("token_usage", "cache_read_input_tokens"),
+        ),
+    )
+
+    if cached_tokens is None:
+        logger.info(
+            f"[LLM缓存] 输入={input_tokens or 0} 输出={output_tokens or 0} "
+            f"总计={total_tokens or 0} 缓存命中=未返回"
+        )
+    else:
+        hit_rate = cached_tokens / input_tokens * 100 if input_tokens else 0
+        logger.info(
+            f"[LLM缓存] 输入={input_tokens or 0} 缓存命中={cached_tokens} "
+            f"命中率={hit_rate:.1f}% 输出={output_tokens or 0} 总计={total_tokens or 0}"
+        )
+    logger.debug(f"[LLM usage_metadata] {usage}")
+    logger.debug(f"[LLM response_metadata] {metadata}")
+
+
 def _build_tool_runtime(ctx: _AgentContext, tool_call_id: str, args: dict) -> Any:
     return SimpleNamespace(
         state=ctx,
@@ -44,12 +132,14 @@ def _build_tool_runtime(ctx: _AgentContext, tool_call_id: str, args: dict) -> An
     )
 
 
-def _make_agent_node(model: Any, tools: list[BaseTool], system_prompt: str):
+def _make_agent_node(model: Any, tools: list[BaseTool], system_prompt: str | Sequence[BaseMessage]) -> Any:
     bound_model = model.bind_tools(tools)
+    system_messages = normalize_system_messages(system_prompt)
 
     async def agent_node(state: AgentState) -> dict:
-        full: list[BaseMessage] = [SystemMessage(content=system_prompt)] + list(state["messages"])
+        full: list[BaseMessage] = system_messages + list(state["messages"])
         response: AIMessage = await bound_model.ainvoke(full)
+        _log_llm_cache_usage(response)
         return {
             "messages": [response],
             "reply_this_round": 0,
@@ -79,22 +169,23 @@ def _make_tool_node(tools_by_name: dict[str, BaseTool]):
 
         for tc in tool_calls:
             name: str = tc["name"]
+            tool_call_id = tc.get("id") or ""
             tool_count += 1
 
             if name == "finish":
                 called_finish += 1
-                results.append(ToolMessage(content="", tool_call_id=tc["id"]))
+                results.append(ToolMessage(content="", tool_call_id=tool_call_id))
                 break
 
             if request_id and not await is_request_active(session_id, request_id):
-                results.append(ToolMessage(content="请求已过期，已取消执行", tool_call_id=tc["id"]))
+                results.append(ToolMessage(content="请求已过期，已取消执行", tool_call_id=tool_call_id))
                 continue
 
             if name == "reply_user":
                 if reply_this_round >= MAX_REPLY_PER_ROUND:
                     results.append(ToolMessage(
                         content="本轮已经发送过消息了。如果你想发送更多，请等待下一轮。",
-                        tool_call_id=tc["id"],
+                        tool_call_id=tool_call_id,
                     ))
                     continue
                 reply_this_round += 1
@@ -102,17 +193,17 @@ def _make_tool_node(tools_by_name: dict[str, BaseTool]):
 
             tool = tools_by_name.get(name)
             if tool is None:
-                results.append(ToolMessage(content=f"未知工具: {name}", tool_call_id=tc["id"]))
+                results.append(ToolMessage(content=f"未知工具: {name}", tool_call_id=tool_call_id))
                 continue
 
             try:
                 args: dict = tc.get("args", {})
-                runtime = _build_tool_runtime(agent_ctx, tc["id"], args)
+                runtime = _build_tool_runtime(agent_ctx, tool_call_id, args)
                 result = await tool.ainvoke(args, runtime=runtime)
-                results.append(ToolMessage(content=str(result), tool_call_id=tc["id"]))
+                results.append(ToolMessage(content=str(result), tool_call_id=tool_call_id))
             except Exception as e:
                 logger.error(f"[Agent] 工具执行失败 {name}: {e}")
-                results.append(ToolMessage(content=f"工具执行出错: {e}", tool_call_id=tc["id"]))
+                results.append(ToolMessage(content=f"工具执行出错: {e}", tool_call_id=tool_call_id))
 
         return {
             "messages": results,
@@ -144,7 +235,7 @@ def _should_continue(state: AgentState) -> str:
     return "agent"
 
 
-def build_chat_graph(model: Any, tools: list[BaseTool], system_prompt: str) -> StateGraph:
+def build_chat_graph(model: Any, tools: list[BaseTool], system_prompt: str | Sequence[BaseMessage]) -> Any:
     tools_by_name: dict[str, BaseTool] = {t.name: t for t in tools}
 
     builder = StateGraph(AgentState)

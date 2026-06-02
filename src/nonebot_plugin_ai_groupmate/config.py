@@ -1,3 +1,5 @@
+from typing import Any
+
 from pydantic import Field, BaseModel, SecretStr
 from langchain_openai import ChatOpenAI
 
@@ -83,7 +85,7 @@ def create_chat_openai(
     return ChatOpenAI(**kwargs)
 
 
-def create_chat_llm(cfg: ScopedConfig) -> ChatOpenAI:
+def create_chat_llm(cfg: ScopedConfig) -> Any:
     if cfg.chat_api_format == "anthropic":
         from langchain_anthropic import ChatAnthropic
 
@@ -91,16 +93,18 @@ def create_chat_llm(cfg: ScopedConfig) -> ChatOpenAI:
         base_url = cfg.chat_base_url or cfg.llm_base_url
 
         return ChatAnthropic(
-            model=cfg.chat_model or cfg.base_model,
+            model_name=cfg.chat_model or cfg.base_model,
             api_key=SecretStr(api_key),
             base_url=base_url,
             temperature=cfg.chat_temperature,
-            max_tokens=4096,
+            max_tokens_to_sample=4096,
+            timeout=None,
+            stop=None,
         )
     return create_chat_openai(cfg, "chat")
 
 
-def create_tagging_llm(cfg: ScopedConfig) -> ChatOpenAI:
+def create_tagging_llm(cfg: ScopedConfig) -> Any:
     if cfg.tagging_api_format == "anthropic":
         from langchain_anthropic import ChatAnthropic
 
@@ -108,10 +112,12 @@ def create_tagging_llm(cfg: ScopedConfig) -> ChatOpenAI:
         base_url = cfg.tagging_base_url or cfg.llm_base_url
 
         return ChatAnthropic(
-            model=cfg.tagging_model,
+            model_name=cfg.tagging_model,
             api_key=SecretStr(api_key),
             base_url=base_url,
             temperature=cfg.tagging_temperature,
-            max_tokens=1024,
+            max_tokens_to_sample=1024,
+            timeout=None,
+            stop=None,
         )
     return create_chat_openai(cfg, "tagging")
