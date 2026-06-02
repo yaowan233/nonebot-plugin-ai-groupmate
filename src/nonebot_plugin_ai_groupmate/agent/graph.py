@@ -1,11 +1,11 @@
 """LangGraph-based agent replacement for create_agent + middleware."""
-from types import SimpleNamespace
 from typing import Any, Annotated, TypedDict
 from dataclasses import dataclass
 from collections.abc import Sequence
 
 from nonebot.log import logger
 from langgraph.graph import END, START, StateGraph
+from langchain.tools import ToolRuntime
 from langchain_core.tools import BaseTool
 from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
 from langgraph.graph.message import add_messages
@@ -123,13 +123,28 @@ def _log_llm_cache_usage(response: AIMessage) -> None:
 
 
 def _build_tool_runtime(ctx: _AgentContext, tool_call_id: str, args: dict) -> Any:
-    return SimpleNamespace(
-        state=ctx,
+    return ToolRuntime(
+        state={"session_id": ctx.session_id, "request_id": ctx.request_id},
         context=ctx,
         config=RunnableConfig(),
+        stream_writer=lambda _: None,
         tool_call_id=tool_call_id,
-        tool_input=args,
+        store=None,
     )
+
+
+def _tool_accepts_runtime(tool: BaseTool) -> bool:
+    args = getattr(tool, "args", None)
+    if isinstance(args, dict) and "runtime" in args:
+        return True
+
+    try:
+        schema = tool.get_input_schema()
+    except Exception:
+        return False
+
+    fields = getattr(schema, "model_fields", None)
+    return isinstance(fields, dict) and "runtime" in fields
 
 
 def _make_agent_node(model: Any, tools: list[BaseTool], system_prompt: str | Sequence[BaseMessage]) -> Any:
@@ -199,7 +214,8 @@ def _make_tool_node(tools_by_name: dict[str, BaseTool]):
             try:
                 args: dict = tc.get("args", {})
                 runtime = _build_tool_runtime(agent_ctx, tool_call_id, args)
-                result = await tool.ainvoke(args, runtime=runtime)
+                tool_input = {**args, "runtime": runtime} if _tool_accepts_runtime(tool) else args
+                result = await tool.ainvoke(tool_input, runtime=runtime)
                 results.append(ToolMessage(content=str(result), tool_call_id=tool_call_id))
             except Exception as e:
                 logger.error(f"[Agent] 工具执行失败 {name}: {e}")
