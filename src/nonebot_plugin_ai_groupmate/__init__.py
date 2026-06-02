@@ -97,11 +97,45 @@ _group_reply_state_lock = asyncio.Lock()
 # 多bot去重锁: 每个群串行化消息记录,防止并发SELECT查不到对方未提交数据
 _dedup_locks: dict[str, asyncio.Lock] = {}
 
+AGENT_HISTORY_LIMIT = 20
+AGENT_RECENT_HISTORY_HOURS = 1
+AGENT_EXTENDED_HISTORY_HOURS = 6
+AGENT_MIN_RECENT_HISTORY = 6
+
 
 def _get_dedup_lock(session_id: str) -> asyncio.Lock:
     if session_id not in _dedup_locks:
         _dedup_locks[session_id] = asyncio.Lock()
     return _dedup_locks[session_id]
+
+
+async def _load_agent_history(db_session, session_id: str) -> list[ChatHistorySchema]:
+    now = datetime.datetime.now()
+
+    async def query_since(hours: int) -> list[ChatHistory]:
+        cutoff_time = now - datetime.timedelta(hours=hours)
+        rows = (
+            (
+                await db_session.execute(
+                    Select(ChatHistory)
+                    .where(ChatHistory.session_id == session_id)
+                    .where(ChatHistory.created_at >= cutoff_time)
+                    .order_by(ChatHistory.msg_id.desc())
+                    .limit(AGENT_HISTORY_LIMIT)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        return list(rows)
+
+    rows = await query_since(AGENT_RECENT_HISTORY_HOURS)
+    if len(rows) < AGENT_MIN_RECENT_HISTORY:
+        extended_rows = await query_since(AGENT_EXTENDED_HISTORY_HOURS)
+        if len(extended_rows) > len(rows):
+            rows = extended_rows
+
+    return [ChatHistorySchema.model_validate(m) for m in reversed(rows)]
 
 
 def _extract_reply_message_id_from_event(event: Event) -> str | None:
@@ -546,27 +580,11 @@ async def handle_reply_logic(
                 return
 
         # === 获取详细历史给 Agent ===
-        cutoff_time = datetime.datetime.now() - datetime.timedelta(hours=1)
-        last_msg = (
-            (
-                await db_session.execute(
-                    Select(ChatHistory)
-                    .where(ChatHistory.session_id == session.scene.id)
-                    .where(ChatHistory.created_at >= cutoff_time)
-                    .order_by(ChatHistory.msg_id.desc())
-                    .limit(20)
-                )
-            )
-            .scalars()
-            .all()
-        )
+        last_msg = await _load_agent_history(db_session, session.scene.id)
 
         if not last_msg:
             logger.info("没有历史消息，跳过回复")
             return
-
-        last_msg = [ChatHistorySchema.model_validate(m) for m in last_msg]
-        last_msg = last_msg[::-1]
 
         role_map: dict[str, str] = {}
         if not is_private:

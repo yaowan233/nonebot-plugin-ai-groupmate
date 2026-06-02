@@ -99,18 +99,56 @@
 配置说明
 | 配置项 | 必填 | 默认值 | 说明 |
 |:-----:|:----:|:----:|:----:|
-| ai_groupmate__bot_name | 是 | `"bot"` | bot 名 |
-| ai_groupmate__qwen_token | 是 | 无 | 阿里云 DashScope API Key |
-| ai_groupmate__base_model | 是 | 无 | 主模型名，推荐 `qwen-plus` / `qwen-max` |
+| ai_groupmate__bot_name | 否 | `"bot"` | bot 名 |
 | ai_groupmate__reply_probability | 否 | `0.01` | 群内主动发言概率 |
 | ai_groupmate__personality_setting | 否 | 无 | 自定义人设 prompt |
 | ai_groupmate__tavily_api_key | 否 | 无 | Tavily 搜索 API 密钥（联网搜索功能） |
+| ai_groupmate__llm_api_key | 推荐 | 无 | 通用 LLM API Key，未单独配置各角色 key 时使用 |
+| ai_groupmate__llm_base_url | 否 | `https://dashscope.aliyuncs.com/compatible-mode/v1` | 通用 OpenAI 兼容接口地址 |
+| ai_groupmate__chat_model | 否 | `qwen3.5-plus` | 主聊天/工具调用模型，推荐 `qwen3.5-plus` 或 `qwen3.7-plus` |
+| ai_groupmate__chat_api_key | 否 | 无 | 主聊天模型专用 API Key，留空则使用 `llm_api_key` / `qwen_token` |
+| ai_groupmate__chat_base_url | 否 | 无 | 主聊天模型专用 Base URL，留空则使用 `llm_base_url` |
+| ai_groupmate__chat_temperature | 否 | `0.7` | 主聊天模型温度 |
+| ai_groupmate__chat_api_format | 否 | `openai` | 主聊天接口格式，可选 `openai` / `anthropic` |
+| ai_groupmate__flash_model | 否 | `qwen-flash` | 快速判断是否需要回复的模型 |
+| ai_groupmate__flash_api_key | 否 | 无 | 快速判断模型专用 API Key |
+| ai_groupmate__flash_base_url | 否 | 无 | 快速判断模型专用 Base URL |
+| ai_groupmate__flash_temperature | 否 | `0.0` | 快速判断模型温度 |
+| ai_groupmate__flash_max_tokens | 否 | `10` | 快速判断模型最大输出 token |
+| ai_groupmate__summary_model | 否 | `qwen-flash` | 群体记忆档案更新模型 |
+| ai_groupmate__summary_api_key | 否 | 无 | 群体记忆模型专用 API Key |
+| ai_groupmate__summary_base_url | 否 | 无 | 群体记忆模型专用 Base URL |
+| ai_groupmate__summary_temperature | 否 | `0.3` | 群体记忆模型温度 |
+| ai_groupmate__summary_max_tokens | 否 | `800` | 群体记忆模型最大输出 token |
+| ai_groupmate__tagging_model | 否 | `qwen-vl-max` | 图片/表情包标注模型 |
+| ai_groupmate__tagging_api_key | 否 | 无 | 图片标注模型专用 API Key |
+| ai_groupmate__tagging_base_url | 否 | 无 | 图片标注模型专用 Base URL |
+| ai_groupmate__tagging_temperature | 否 | `0.01` | 图片标注模型温度 |
+| ai_groupmate__tagging_api_format | 否 | `openai` | 图片标注接口格式，可选 `openai` / `anthropic` |
+| ai_groupmate__qwen_token | 否 | 无 | 兼容旧配置的 DashScope API Key；新配置推荐使用 `llm_api_key` |
+| ai_groupmate__base_model | 否 | 无 | 兼容旧配置的默认模型名；新配置推荐使用 `chat_model` |
 | ai_groupmate__qdrant_uri | 否 | 无 | Qdrant 地址，不填则禁用表情包、RAG 等向量功能 |
 | ai_groupmate__qdrant_api_key | 否 | 无 | Qdrant API Key（使用 Qdrant Cloud 时需要） |
 | ai_groupmate__embedding_api_key | 否 | 无 | Embedding API Key，启用 Qdrant 时必填（推荐硅基流动，免费） |
 | ai_groupmate__embedding_base_url | 否 | 无 | Embedding Base URL，启用 Qdrant 时必填（推荐硅基流动，免费） |
 | ai_groupmate__rerank_api_url | 否 | 无 | Rerank API URL，启用 Qdrant 时使用（推荐硅基流动，免费） |
 | ai_groupmate__rerank_api_key | 否 | 无 | Rerank API Key，启用 Qdrant 时使用（推荐硅基流动，免费） |
+
+最小配置示例：
+
+```dotenv
+AI_GROUPMATE__BOT_NAME=bot
+AI_GROUPMATE__LLM_API_KEY=sk-xxxx
+AI_GROUPMATE__CHAT_MODEL=qwen3.5-plus
+```
+
+如果想使用更强的主聊天模型：
+
+```dotenv
+AI_GROUPMATE__CHAT_MODEL=qwen3.7-plus
+```
+
+插件会尽量复用稳定 system prompt、固定工具 schema，并在连续对话中复用 append-only history，以提高输入缓存命中率。日志中可通过 `[LLM缓存]` 查看缓存命中 token；如果服务商未返回缓存字段，会显示 `缓存命中=未返回`。
 
 ## 🎉 使用
 
