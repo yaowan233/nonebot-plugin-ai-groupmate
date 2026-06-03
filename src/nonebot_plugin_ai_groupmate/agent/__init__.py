@@ -1,10 +1,11 @@
 import re
 import json
+import uuid
 import base64
 import random
 import asyncio
-import datetime
 import difflib
+import datetime
 import mimetypes
 import traceback
 import collections
@@ -23,17 +24,17 @@ from langchain.tools import ToolRuntime, tool
 from langchain_tavily import TavilySearch
 from nonebot_plugin_orm import get_session
 from nonebot_plugin_uninfo import SceneType, QryItrface
-from nonebot_plugin_alconna import UniMessage
+from nonebot_plugin_alconna import Target, UniMessage
 from sqlalchemy.ext.asyncio import AsyncSession
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from nonebot_plugin_apscheduler import scheduler
 
-from ..model import ChatHistory, MediaStorage, UserRelation, ChatHistorySchema, GroupMemory
-from ..config import Config, create_chat_openai, create_chat_llm
+from .graph import build_chat_graph
+from ..model import ChatHistory, GroupMemory, MediaStorage, UserRelation, ChatHistorySchema
+from ..config import Config, create_chat_llm, create_chat_openai
 from ..memory import DB
 from ..reply_guard import is_request_active
-from .graph import build_chat_graph
 from .prompt_cache import build_system_messages
-
 
 require("nonebot_plugin_localstore")
 
@@ -865,6 +866,102 @@ def calculate_expression(expression: str) -> str:
         return f"计算失败。请检查表达式是否正确，错误信息: {e}"
 
 
+async def _send_scheduled_text(
+    session_id: str,
+    content: str,
+    *,
+    is_private: bool,
+    bot_id: str | None,
+) -> None:
+    try:
+        target = Target(
+            id=session_id,
+            private=is_private,
+            self_id=bot_id,
+        )
+        result = await UniMessage.text(content).send(target=target)
+
+        msg_id = "unknown"
+        if result.msg_ids:
+            raw_msg_id = result.msg_ids[-1].get("message_id") or result.msg_ids[-1].get("msg_id")
+            if raw_msg_id is not None:
+                msg_id = str(raw_msg_id)
+
+        async with get_session() as db_session:
+            chat_history = ChatHistory(
+                session_id=session_id,
+                user_id=plugin_config.bot_name,
+                content_type="bot",
+                content=f"id: {msg_id}\n" + content,
+                user_name=plugin_config.bot_name,
+            )
+            db_session.add(chat_history)
+            await db_session.commit()
+
+        logger.info(f"[定时任务] 已发送到 {session_id}: {content}")
+    except Exception as e:
+        logger.error(f"[定时任务] 发送失败 {session_id}: {e}")
+
+
+def create_schedule_message_tool(
+    session_id: str,
+    request_id: str | None,
+    *,
+    is_private: bool,
+    bot_id: str | None,
+):
+    @tool("schedule_message")
+    async def schedule_message(
+        content: str,
+        delay_minutes: float = 0,
+        delay_hours: float = 0,
+    ) -> str:
+        """
+        安排 bot 在几分钟或几小时后向当前群聊/私聊发送一条文本消息。
+        Args:
+            content: 到点后要发送的文本内容。
+            delay_minutes: 延迟多少分钟，可以是小数。
+            delay_hours: 延迟多少小时，可以和 delay_minutes 同时使用。
+        """
+        if request_id is not None and not await is_request_active(
+            session_id, request_id
+        ):
+            return "请求已过期，已取消定时任务。"
+
+        content = content.strip()
+        if not content:
+            return "定时消息内容为空，未创建任务。"
+
+        delay_seconds = delay_hours * 3600 + delay_minutes * 60
+        if delay_seconds <= 0:
+            return "延迟时间必须大于 0。"
+        if delay_seconds < 10:
+            return "延迟时间太短，至少需要 10 秒。"
+        if delay_seconds > 7 * 24 * 3600:
+            return "延迟时间太长，当前最多支持 7 天内的定时消息。"
+
+        run_at = datetime.datetime.now() + datetime.timedelta(seconds=delay_seconds)
+        job_id = f"ai_groupmate_schedule_{session_id}_{uuid.uuid4().hex}"
+
+        scheduler.add_job(
+            _send_scheduled_text,
+            "date",
+            id=job_id,
+            run_date=run_at,
+            kwargs={
+                "session_id": session_id,
+                "content": content,
+                "is_private": is_private,
+                "bot_id": bot_id,
+            },
+            misfire_grace_time=300,
+        )
+
+        return f"定时任务已创建，将在 {run_at.strftime('%Y-%m-%d %H:%M:%S')} 发送：{content}"
+
+    return schedule_message
+
+
 def create_mute_tool(
     db_session,
     session_id: str,
@@ -1382,6 +1479,7 @@ async def create_chat_graph(
 - 表情包：先 `search_meme_image` 或 `search_similar_meme_by_id`，再 `send_meme_image`
 - 外部知识/缩写/术语：优先 `search_web`
 - 聊天上下文：`search_history_context`
+- 用户要求几分钟/几小时后提醒、转告或发送消息时：`schedule_message`
 - 用户情绪或关系变化明显时，调用 `update_user_impression`
 - 若用户提到"年度报告 / 个人总结 / 成分分析"，先调用 `generate_and_send_annual_report` 获取素材；
   工具返回素材后，由你根据素材生成完整报告，并调用 `reply_user` 发送
@@ -1418,6 +1516,7 @@ async def create_chat_graph(
 - 表情包：先 `search_meme_image` 或 `search_similar_meme_by_id`，再 `send_meme_image`
 - 外部知识/缩写/术语：优先 `search_web`
 - 群内上下文：`search_history_context`
+- 用户要求几分钟/几小时后提醒、转告或发送消息时：`schedule_message`
 - 用户情绪或关系变化明显时，调用 `update_user_impression`
 - 若用户提到"年度报告 / 个人总结 / 成分分析"，先调用 `generate_and_send_annual_report` 获取素材；
   工具返回素材后，由你根据素材生成完整报告，并调用 `reply_user` 发送
@@ -1445,6 +1544,9 @@ async def create_chat_graph(
         db_session, session_id, request_id, user_id
     )
     mute_tool = create_mute_tool(db_session, session_id, request_id, interface, bot_id)
+    schedule_tool = create_schedule_message_tool(
+        session_id, request_id, is_private=is_private, bot_id=bot_id
+    )
     
     tools = [
         search_web,
@@ -1457,6 +1559,7 @@ async def create_chat_graph(
         relation_tool,
         report_tool,
         mute_tool,
+        schedule_tool,
         finish,
     ]
 
