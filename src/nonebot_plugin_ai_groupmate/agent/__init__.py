@@ -821,8 +821,13 @@ def create_send_meme_tool(db_session, session_id: str, request_id: str | None = 
                 session_id=session_id,
                 user_id=plugin_config.bot_name,
                 content_type="bot",
-                content=f"id: {res.msg_ids[-1]['message_id']}\n发送了图片，图片描述是: {description}",
+                content=(
+                    f"id: {res.msg_ids[-1]['message_id']}\n"
+                    f"发送了图片，图片描述是: {description}\n"
+                    f"图片文件: {pic.file_path}"
+                ),
                 user_name=plugin_config.bot_name,
+                media_id=pic.media_id,
             )
             db_session.add(chat_history)
             logger.info(f"id:{res.msg_ids}\n" + f"发送表情包: {description}")
@@ -1091,7 +1096,10 @@ def create_relation_tool(
 
     @tool("update_user_impression")
     async def update_user_impression(
-        score_change: int, reason: str, add_tags: list[str], remove_tags: list[str]
+        score_change: int,
+        reason: str,
+        add_tags: list[str] | None = None,
+        remove_tags: list[str] | None = None,
     ) -> str:
         """
         更新对当前对话用户的好感度和印象标签。
@@ -1112,6 +1120,9 @@ def create_relation_tool(
             session_id, request_id
         ):
             return "请求已过期，已取消更新。"
+
+        add_tags = add_tags or []
+        remove_tags = remove_tags or []
 
         async with get_session() as session:
             try:
@@ -1649,7 +1660,17 @@ def _parse_msg_meta(content: str) -> tuple[str | None, str | None, str]:
 
 
 def _image_file_name_from_history(msg: ChatHistorySchema) -> str:
+    for line in reversed(msg.content.strip().splitlines()):
+        line = line.strip()
+        if line.startswith("图片文件:"):
+            return line.split(":", 1)[1].strip()
     return msg.content.strip().split("\n")[-1].strip()
+
+
+def _is_image_history(msg: ChatHistorySchema) -> bool:
+    return msg.content_type == "image" or (
+        msg.content_type == "bot" and msg.media_id is not None
+    )
 
 
 async def _load_replied_message_histories(
@@ -1720,18 +1741,20 @@ def format_chat_history(
     for msg in [*history, *extra_inline_images]:
         own_id, _, body = _parse_msg_meta(msg.content)
         if own_id:
-            if msg.content_type == "image":
+            if _is_image_history(msg):
                 snippet = "[图片]"
             else:
                 snippet = body[:30] + ("…" if len(body) > 30 else "")
             id_to_summary[own_id] = f'{msg.user_name} "{snippet}"'
 
     has_extra_inline_images = any(
-        msg.content_type == "image" for msg in extra_inline_images
+        _is_image_history(msg) for msg in extra_inline_images
     )
 
     # ── 2. 找出所有图片消息的下标。若本轮明确绑定了回复图片，则禁用普通最近图片内联。 ──
-    image_indices = [i for i, m in enumerate(history) if m.content_type == "image"]
+    image_indices = [
+        i for i, m in enumerate(history) if _is_image_history(m) and m.content_type != "bot"
+    ]
     if has_extra_inline_images or max_inline_images <= 0:
         inline_image_set = set()
     else:
@@ -1749,7 +1772,7 @@ def format_chat_history(
             img_idxs: list[int] = []
             for j in range(i + 1, len(history)):
                 next_own_id, _, _ = _parse_msg_meta(history[j].content)
-                if next_own_id == own_id and history[j].content_type == "image" and history[j].user_id == history[i].user_id:
+                if next_own_id == own_id and _is_image_history(history[j]) and history[j].user_id == history[i].user_id:
                     img_idxs.append(j)
                 else:
                     break
@@ -1775,11 +1798,6 @@ def format_chat_history(
             reply_prefix = "(回复了一条消息) "
         else:
             reply_prefix = ""
-
-        # === 机器人回复 ===
-        if msg.content_type == "bot":
-            messages.append(AIMessage(content=body or msg.content))
-            continue
 
         # === 带图片的合并文字消息 ===
         if msg.content_type == "text" and own_id and own_id in text_to_images:
@@ -1828,32 +1846,52 @@ def format_chat_history(
             messages.append(HumanMessage(content=content))
             continue
 
-        # === 用户图片 ===
-        if msg.content_type == "image":
+        # === 机器人文本回复 ===
+        if msg.content_type == "bot" and not _is_image_history(msg):
+            messages.append(AIMessage(content=body or msg.content))
+            continue
+
+        # === 图片消息（包含用户图片和 bot 自己发送的图片） ===
+        if _is_image_history(msg):
             file_name = _image_file_name_from_history(msg)
+            is_bot_image = msg.content_type == "bot"
 
             if idx in inline_image_set:
                 image_data = get_image_data_uri(file_name)
                 if image_data:
                     role_prefix = _role_prefix(msg.user_id)
+                    text = (
+                        f"[{time_str}] {plugin_config.bot_name} {reply_prefix}发送了一张图片："
+                        if is_bot_image
+                        else f"[{time_str}] {role_prefix}{msg.user_name} {reply_prefix}发送了一张图片："
+                    )
                     content_parts = [
                         {
                             "type": "text",
-                            "text": f"[{time_str}] {role_prefix}{msg.user_name} {reply_prefix}发送了一张图片：",
+                            "text": text,
                         },
                         {"type": "image_url", "image_url": {"url": image_data}},
                     ]
-                    messages.append(HumanMessage(content_parts))  # type: ignore[arg-type]
+                    message_cls = AIMessage if is_bot_image else HumanMessage
+                    messages.append(message_cls(content_parts))  # type: ignore[arg-type]
                 else:
                     role_prefix = _role_prefix(msg.user_id)
-                    content = f"[{time_str}] {role_prefix}{msg.user_name} {reply_prefix}[图片已过期/无法加载]"
-                    messages.append(HumanMessage(content=content))
+                    content = (
+                        f"[{time_str}] {plugin_config.bot_name} {reply_prefix}[图片已过期/无法加载]"
+                        if is_bot_image
+                        else f"[{time_str}] {role_prefix}{msg.user_name} {reply_prefix}[图片已过期/无法加载]"
+                    )
+                    message_cls = AIMessage if is_bot_image else HumanMessage
+                    messages.append(message_cls(content=content))
             else:
                 role_prefix = _role_prefix(msg.user_id)
                 content = (
-                    f"[{time_str}] {role_prefix}{msg.user_name} {reply_prefix}[图片]"
+                    f"[{time_str}] {plugin_config.bot_name} {reply_prefix}[图片]"
+                    if is_bot_image
+                    else f"[{time_str}] {role_prefix}{msg.user_name} {reply_prefix}[图片]"
                 )
-                messages.append(HumanMessage(content=content))
+                message_cls = AIMessage if is_bot_image else HumanMessage
+                messages.append(message_cls(content=content))
             continue
 
     return messages
@@ -2013,7 +2051,7 @@ async def choice_response_strategy(
         # 结构：[历史消息1(文本/图), 历史消息2, ..., 当前环境提示词]
         # 这样 LLM 才能真正"看到"历史记录里的图片对象
         final_prompt_content: str | list[Any] = prompt_text
-        replied_images = [m for m in replied_extra if m.content_type == "image"]
+        replied_images = [m for m in replied_extra if _is_image_history(m)]
         replied_texts = [m for m in replied_extra if m.content_type == "text"]
 
         if replied_images:
