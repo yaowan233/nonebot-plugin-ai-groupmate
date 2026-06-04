@@ -1098,8 +1098,8 @@ def create_relation_tool(
     async def update_user_impression(
         score_change: int,
         reason: str,
-        add_tags: list[str] | None = None,
-        remove_tags: list[str] | None = None,
+        add_tags: list[str] | str | None = None,
+        remove_tags: list[str] | str | None = None,
     ) -> str:
         """
         更新对当前对话用户的好感度和印象标签。
@@ -1121,8 +1121,26 @@ def create_relation_tool(
         ):
             return "请求已过期，已取消更新。"
 
-        add_tags = add_tags or []
-        remove_tags = remove_tags or []
+        def normalize_tags(value: list[str] | str | None) -> list[str]:
+            if value is None:
+                return []
+            if isinstance(value, str):
+                value = value.strip()
+                if not value:
+                    return []
+                try:
+                    parsed = json.loads(value)
+                except json.JSONDecodeError:
+                    return [tag.strip() for tag in value.split(",") if tag.strip()]
+                if isinstance(parsed, list):
+                    return [str(tag).strip() for tag in parsed if str(tag).strip()]
+                if isinstance(parsed, str) and parsed.strip():
+                    return [parsed.strip()]
+                return []
+            return [str(tag).strip() for tag in value if str(tag).strip()]
+
+        add_tags = normalize_tags(add_tags)
+        remove_tags = normalize_tags(remove_tags)
 
         async with get_session() as session:
             try:
