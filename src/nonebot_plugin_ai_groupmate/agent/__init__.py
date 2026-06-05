@@ -934,6 +934,35 @@ def create_reaction_tool(
     创建跨适配器的消息表情回复工具，底层使用 nonebot_plugin_alconna.message_reaction。
     """
 
+    def _normalize_reaction_message_id(raw_message_id: str | None) -> str | None:
+        if not raw_message_id:
+            return None
+
+        candidate = str(raw_message_id).strip()
+        if not candidate:
+            return None
+
+        if candidate.lower() in {
+            "current_event",
+            "current",
+            "event",
+            "none",
+            "null",
+            "system",
+        }:
+            logger.debug(f"忽略无效表情回复目标消息占位符: {candidate}")
+            return None
+
+        meta_match = re.search(r"\bid[:：]\s*([A-Za-z0-9_.-]{1,128})", candidate)
+        if meta_match:
+            return meta_match.group(1)
+
+        if re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", candidate):
+            return candidate
+
+        logger.debug(f"忽略不像消息 id 的表情回复目标: {candidate[:80]}")
+        return None
+
     @tool("add_message_reaction")
     async def add_message_reaction(
         mood: ReactionMood,
@@ -970,17 +999,7 @@ def create_reaction_tool(
         if bot is None or event is None:
             return "表情回复失败: 缺少 bot/event 上下文，无法调用 alconna message_reaction。"
 
-        message_id = str(target_msg_id).strip() if target_msg_id else None
-        if message_id and message_id.lower() in {
-            "current_event",
-            "current",
-            "event",
-            "none",
-            "null",
-            "system",
-        }:
-            logger.debug(f"忽略无效表情回复目标消息占位符: {message_id}")
-            message_id = None
+        message_id = _normalize_reaction_message_id(target_msg_id)
         if not message_id:
             logger.debug("未指定表情回复目标消息，使用当前触发事件的消息 id")
 
@@ -1160,6 +1179,7 @@ async def _run_scheduled_agent_task(
                 "reply_count": 0,
                 "tool_count": 0,
                 "reply_this_round": 0,
+                "reaction_this_round": 0,
                 "called_finish": 0,
             })
             await db_session.commit()
@@ -1827,7 +1847,7 @@ async def create_chat_graph(
 【工具规则】
 - 只能通过工具发消息，不要直接输出正文
 - 文本：`reply_user`
-- 表情回复/reaction：`add_message_reaction`，用于只点一个表情表达态度；优先传 `mood`，不要直接传 `emoji`；通常不要传 `target_msg_id`，默认会给当前触发消息点表情。mood 可选：like 赞同，laugh 好笑，surprise 惊讶，speechless 无语，comfort 安慰，sad 难过，angry 生气，ok 收到，love 比心，question 疑问，awkward 尴尬，facepalm 捂脸，eat_melon 吃瓜，clap 鼓掌，cool 酷，plead 拜托，thanks 感谢，good_job 666，shock 惊恐，smirk 坏笑，tease 调侃，proud 得意，excited 开心，unhappy 不开心，continue_streak 续标识/续火，hello 打招呼，passing 路过
+- 表情回复/reaction：`add_message_reaction`，适合轻量表达态度，也可以和 `reply_user` 搭配；可以连续点 1-3 个不同 mood，但不要刷屏；如果用户在提问、求助或需要文字回应，不要只点表情。优先传 `mood`，不要直接传 `emoji`；通常不要传 `target_msg_id`，默认会给当前触发消息点表情。mood 可选：like 赞同，laugh 好笑，surprise 惊讶，speechless 无语，comfort 安慰，sad 难过，angry 生气，ok 收到，love 比心，question 疑问，awkward 尴尬，facepalm 捂脸，eat_melon 吃瓜，clap 鼓掌，cool 酷，plead 拜托，thanks 感谢，good_job 666，shock 惊恐，smirk 坏笑，tease 调侃，proud 得意，excited 开心，unhappy 不开心，continue_streak 续标识/续火，hello 打招呼，passing 路过
 - 表情包图片：先 `search_meme_image` 或 `search_similar_meme_by_id`，再 `send_meme_image`
 - 外部知识/缩写/术语：优先 `search_web`
 - 聊天上下文：`search_history_context`
@@ -1866,7 +1886,7 @@ async def create_chat_graph(
 【工具规则】
 - 只能通过工具发消息，不要直接输出正文
 - 文本：`reply_user`
-- 表情回复/reaction：`add_message_reaction`，用于只点一个表情表达态度；优先传 `mood`，不要直接传 `emoji`；通常不要传 `target_msg_id`，默认会给当前触发消息点表情。mood 可选：like 赞同，laugh 好笑，surprise 惊讶，speechless 无语，comfort 安慰，sad 难过，angry 生气，ok 收到，love 比心，question 疑问，awkward 尴尬，facepalm 捂脸，eat_melon 吃瓜，clap 鼓掌，cool 酷，plead 拜托，thanks 感谢，good_job 666，shock 惊恐，smirk 坏笑，tease 调侃，proud 得意，excited 开心，unhappy 不开心，continue_streak 续标识/续火，hello 打招呼，passing 路过
+- 表情回复/reaction：`add_message_reaction`，适合轻量表达态度，也可以和 `reply_user` 搭配；可以连续点 1-3 个不同 mood，但不要刷屏；如果用户在提问、求助或需要文字回应，不要只点表情。优先传 `mood`，不要直接传 `emoji`；通常不要传 `target_msg_id`，默认会给当前触发消息点表情。mood 可选：like 赞同，laugh 好笑，surprise 惊讶，speechless 无语，comfort 安慰，sad 难过，angry 生气，ok 收到，love 比心，question 疑问，awkward 尴尬，facepalm 捂脸，eat_melon 吃瓜，clap 鼓掌，cool 酷，plead 拜托，thanks 感谢，good_job 666，shock 惊恐，smirk 坏笑，tease 调侃，proud 得意，excited 开心，unhappy 不开心，continue_streak 续标识/续火，hello 打招呼，passing 路过
 - 表情包图片：先 `search_meme_image` 或 `search_similar_meme_by_id`，再 `send_meme_image`
 - 外部知识/缩写/术语：优先 `search_web`
 - 群内上下文：`search_history_context`
@@ -2631,6 +2651,7 @@ async def choice_response_strategy(
             "reply_count": 0,
             "tool_count": 0,
             "reply_this_round": 0,
+            "reaction_this_round": 0,
             "called_finish": 0,
         }
 
@@ -2680,6 +2701,7 @@ if __name__ == "__main__":
             "reply_count": 0,
             "tool_count": 0,
             "reply_this_round": 0,
+            "reaction_this_round": 0,
             "called_finish": 0,
         })
     )

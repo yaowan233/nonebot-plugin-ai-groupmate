@@ -17,6 +17,7 @@ from .prompt_cache import normalize_system_messages
 MAX_REPLY_COUNT = 5
 MAX_TOOL_COUNT = 20
 MAX_REPLY_PER_ROUND = 1  # 每轮只发1条，强制模型逐条思考，上下文连续
+MAX_REACTION_PER_ROUND = 3
 
 
 class AgentState(TypedDict):
@@ -26,6 +27,7 @@ class AgentState(TypedDict):
     reply_count: int
     tool_count: int
     reply_this_round: int
+    reaction_this_round: int
     called_finish: int
 
 
@@ -176,6 +178,7 @@ def _make_tool_node(tools_by_name: dict[str, BaseTool]):
         reply_count = state.get("reply_count", 0)
         tool_count = state.get("tool_count", 0)
         reply_this_round = state.get("reply_this_round", 0)
+        reaction_this_round = state.get("reaction_this_round", 0)
         called_finish = 0
         session_id = state["session_id"]
         request_id = state["request_id"]
@@ -196,7 +199,7 @@ def _make_tool_node(tools_by_name: dict[str, BaseTool]):
                 results.append(ToolMessage(content="请求已过期，已取消执行", tool_call_id=tool_call_id))
                 continue
 
-            if name in {"reply_user", "add_message_reaction"}:
+            if name == "reply_user":
                 if reply_this_round >= MAX_REPLY_PER_ROUND:
                     results.append(ToolMessage(
                         content="本轮已经发送过消息了。如果你想发送更多，请等待下一轮。",
@@ -205,6 +208,15 @@ def _make_tool_node(tools_by_name: dict[str, BaseTool]):
                     continue
                 reply_this_round += 1
                 reply_count += 1
+
+            if name == "add_message_reaction":
+                if reaction_this_round >= MAX_REACTION_PER_ROUND:
+                    results.append(ToolMessage(
+                        content="本轮表情回复已经够多了，避免刷屏。",
+                        tool_call_id=tool_call_id,
+                    ))
+                    continue
+                reaction_this_round += 1
 
             tool = tools_by_name.get(name)
             if tool is None:
@@ -226,6 +238,7 @@ def _make_tool_node(tools_by_name: dict[str, BaseTool]):
             "reply_count": reply_count,
             "tool_count": tool_count,
             "reply_this_round": reply_this_round,
+            "reaction_this_round": reaction_this_round,
             "called_finish": called_finish,
         }
 
