@@ -9,13 +9,14 @@ import datetime
 import mimetypes
 import traceback
 import collections
-from typing import Any
+from typing import Any, Literal
 from pathlib import Path
 from functools import lru_cache
 from dataclasses import dataclass
 
 import jieba
 from nonebot import require, get_plugin_config
+from nonebot.adapters import Bot, Event
 from pydantic import Field, BaseModel, field_validator
 from simpleeval import simple_eval
 from sqlalchemy import Select, desc, func, extract
@@ -24,7 +25,7 @@ from langchain.tools import ToolRuntime, tool
 from langchain_tavily import TavilySearch
 from nonebot_plugin_orm import get_session
 from nonebot_plugin_uninfo import SceneType, QryItrface
-from nonebot_plugin_alconna import Target, UniMessage
+from nonebot_plugin_alconna import Target, UniMessage, message_reaction
 from sqlalchemy.ext.asyncio import AsyncSession
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from nonebot_plugin_apscheduler import scheduler
@@ -50,6 +51,69 @@ with open(plugin_path / "下降.jpg", "rb") as f:
 plugin_config = get_plugin_config(Config).ai_groupmate
 with open(Path(__file__).parent.parent / "stop_words.txt", encoding="utf-8") as f:
     stop_words = f.read().splitlines() + ["id", "回复"]
+
+ReactionMood = Literal[
+    "like",
+    "laugh",
+    "surprise",
+    "speechless",
+    "comfort",
+    "sad",
+    "angry",
+    "ok",
+    "love",
+    "question",
+    "awkward",
+    "sweat",
+    "facepalm",
+    "eat_melon",
+    "clap",
+    "cool",
+    "plead",
+    "thanks",
+    "good_job",
+    "shock",
+    "smirk",
+    "tease",
+    "proud",
+    "excited",
+    "unhappy",
+    "continue_streak",
+    "hello",
+    "passing",
+]
+
+REACTION_EMOJI_MAP: dict[str, tuple[str, ...]] = {
+    "like": ("76", "201", "364", "389"),
+    "laugh": ("178", "182", "193", "283", "387", "378"),
+    "surprise": ("0", "180", "325"),
+    "speechless": ("38", "10", "271"),
+    "comfort": ("49", "111", "353"),
+    "sad": ("5", "9", "15", "107", "194", "379", "382"),
+    "angry": ("11", "326", "365"),
+    "ok": ("124", "398"),
+    "love": ("66", "319", "383"),
+    "question": ("32", "367"),
+    "awkward": ("10", "27"),
+    "sweat": ("27",),
+    "facepalm": ("264",),
+    "eat_melon": ("271",),
+    "clap": ("99", "375"),
+    "cool": ("16",),
+    "plead": ("106", "111", "353"),
+    "thanks": ("118", "63", "78", "409"),
+    "good_job": ("356", "299", "306", "380"),
+    "shock": ("26", "325"),
+    "smirk": ("20", "101", "178", "286"),
+    "tease": ("102", "103", "178"),
+    "proud": ("4", "306"),
+    "excited": ("180", "290", "412", "400", "401"),
+    "unhappy": ("15", "194"),
+    "continue_streak": ("424",),
+    "hello": ("377",),
+    "passing": ("381",),
+}
+SCHEDULED_AGENT_HISTORY_LIMIT = 20
 
 if plugin_config.tavily_api_key:
     tavily_search = TavilySearch(max_results=3, tavily_api_key=plugin_config.tavily_api_key)
@@ -481,6 +545,8 @@ def create_reply_tool(
     session_id: str,
     request_id: str | None = None,
     interface: QryItrface | None = None,
+    *,
+    send_target: Target | None = None,
 ):
     """
     核心工具：用于发送消息。
@@ -642,7 +708,12 @@ def create_reply_tool(
                 return "请求已过期，已取消发送。"
 
             # 1. 实际发送消息 (Side Effect)
-            res = await (message or UniMessage.text(content)).send()
+            outgoing = message or UniMessage.text(content)
+            res = await (
+                outgoing.send(target=send_target)
+                if send_target is not None
+                else outgoing.send()
+            )
             msg_id = res.msg_ids[-1]["message_id"] if res.msg_ids else "unknown"
             chat_history = ChatHistory(
                 session_id=session_id,
@@ -750,7 +821,13 @@ def create_search_meme_tool(db_session, session_id: str, request_id: str | None)
     return search_meme_image
 
 
-def create_send_meme_tool(db_session, session_id: str, request_id: str | None = None):
+def create_send_meme_tool(
+    db_session,
+    session_id: str,
+    request_id: str | None = None,
+    *,
+    send_target: Target | None = None,
+):
     """
     创建一个带上下文的表情包发送工具
 
@@ -815,7 +892,12 @@ def create_send_meme_tool(db_session, session_id: str, request_id: str | None = 
                 return "请求已过期，已取消发送。"
 
             # 发送图片
-            res = await UniMessage.image(raw=pic_data).send()
+            message = UniMessage.image(raw=pic_data)
+            res = await (
+                message.send(target=send_target)
+                if send_target is not None
+                else message.send()
+            )
             # 记录发送历史（不在工具内提交，由外层 session 统一管理）
             chat_history = ChatHistory(
                 session_id=session_id,
@@ -838,6 +920,113 @@ def create_send_meme_tool(db_session, session_id: str, request_id: str | None = 
             return f"发送表情包失败: {str(e)}"
 
     return send_meme_image
+
+
+def create_reaction_tool(
+    db_session,
+    session_id: str,
+    request_id: str | None,
+    user_id: str | None,
+    bot: Bot | None,
+    event: Event | None,
+):
+    """
+    创建跨适配器的消息表情回复工具，底层使用 nonebot_plugin_alconna.message_reaction。
+    """
+
+    @tool("add_message_reaction")
+    async def add_message_reaction(
+        mood: ReactionMood,
+        target_msg_id: str | None = None,
+        delete: bool = False,
+        emoji: str | None = None,
+    ) -> str:
+        """
+        给某条消息添加或取消表情回复。
+
+        当只需要用一个表情表达态度（例如点赞、笑、惊讶、无语）时使用这个工具，
+        不要再调用 reply_user 发送重复文本。
+
+        Args:
+            mood: 表情回复表达的态度。基础 mood: like/laugh/surprise/speechless/comfort/sad/angry/ok。扩展 mood: love/question/awkward/sweat/facepalm/eat_melon/clap/cool/plead/thanks/good_job/shock/smirk/tease/proud/excited/unhappy/continue_streak/hello/passing。
+            target_msg_id: 目标消息 id，来自聊天记录里的 "id: xxxxx"。通常不要传；不传时默认给当前触发 bot 回复的这条消息添加。
+            delete: 是否取消这个表情回复，默认 False。
+            emoji: 可选的适配器原始表情 ID/名称覆盖值。通常不要传，除非明确知道平台支持的表情 ID。
+        """
+        if request_id is not None and not await is_request_active(
+            session_id, request_id
+        ):
+            return "请求已过期，已取消表情回复。"
+
+        mood = str(mood).strip()
+        mood_emojis = REACTION_EMOJI_MAP.get(mood)
+        reaction_emoji = str(emoji).strip() if emoji else (
+            random.choice(mood_emojis) if mood_emojis else None
+        )
+        if not reaction_emoji:
+            supported = ", ".join(REACTION_EMOJI_MAP)
+            return f"表情回复失败: 未知 mood {mood!r}，可选值: {supported}"
+
+        if bot is None or event is None:
+            return "表情回复失败: 缺少 bot/event 上下文，无法调用 alconna message_reaction。"
+
+        message_id = str(target_msg_id).strip() if target_msg_id else None
+        if message_id and message_id.lower() in {
+            "current_event",
+            "current",
+            "event",
+            "none",
+            "null",
+            "system",
+        }:
+            logger.debug(f"忽略无效表情回复目标消息占位符: {message_id}")
+            message_id = None
+        if not message_id:
+            logger.debug("未指定表情回复目标消息，使用当前触发事件的消息 id")
+
+        if request_id is not None and not await is_request_active(
+            session_id, request_id
+        ):
+            return "请求已过期，已取消表情回复。"
+
+        async def _apply_reaction(target_message_id: str | None) -> None:
+            await message_reaction(
+                reaction_emoji,
+                message_id=target_message_id,
+                event=event,
+                bot=bot,
+                delete=delete,
+            )
+
+        try:
+            try:
+                await _apply_reaction(message_id)
+            except Exception as e:
+                if message_id and "msg not found" in str(e).lower():
+                    logger.warning(
+                        f"表情回复目标消息 {message_id} 不存在，回退到当前触发事件消息"
+                    )
+                    await _apply_reaction(None)
+                    message_id = None
+                else:
+                    raise
+            action = "取消" if delete else "添加"
+            reacted_message_desc = f"消息 {message_id}" if message_id else "当前触发消息"
+            chat_history = ChatHistory(
+                session_id=session_id,
+                user_id=plugin_config.bot_name,
+                content_type="bot",
+                content=f"id: system\n已对{reacted_message_desc} {action}表情回复: mood={mood}, emoji={reaction_emoji}",
+                user_name=plugin_config.bot_name,
+            )
+            db_session.add(chat_history)
+            logger.info(f"已对{reacted_message_desc} {action}表情回复 mood={mood}, emoji={reaction_emoji}")
+            return f"已对{reacted_message_desc} {action}表情回复 mood={mood}, emoji={reaction_emoji}"
+        except Exception as e:
+            logger.error(f"表情回复工具执行失败: {e}")
+            return f"表情回复失败: {e}"
+
+    return add_message_reaction
 
 
 @tool("finish", return_direct=True)
@@ -908,6 +1097,77 @@ async def _send_scheduled_text(
         logger.error(f"[定时任务] 发送失败 {session_id}: {e}")
 
 
+async def _run_scheduled_agent_task(
+    session_id: str,
+    task: str,
+    *,
+    is_private: bool,
+    bot_id: str | None,
+) -> None:
+    try:
+        async with get_session() as db_session:
+            rows = (
+                (
+                    await db_session.execute(
+                        Select(ChatHistory)
+                        .where(ChatHistory.session_id == session_id)
+                        .order_by(ChatHistory.msg_id.desc())
+                        .limit(SCHEDULED_AGENT_HISTORY_LIMIT)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            history = [ChatHistorySchema.model_validate(row) for row in rows[::-1]]
+
+            graph, _ = await create_chat_graph(
+                db_session,
+                session_id,
+                None,
+                plugin_config.bot_name,
+                plugin_config.bot_name,
+                history,
+                None,
+                bot_id,
+                None,
+                None,
+                is_private=is_private,
+            )
+
+            prompt = f"""
+【定时任务触发】
+这是之前安排的定时 agent 任务，现在已经到执行时间。
+
+【任务内容】
+{task}
+
+【执行要求】
+- 你必须通过工具完成任务，不要直接输出正文。
+- 如果任务只是提醒/转告，调用 `reply_user`。
+- 如果任务要求查最新信息，先调用 `search_web`，再调用 `reply_user`。
+- 如果任务要求发送表情包图片，先调用 `search_meme_image` 或 `search_similar_meme_by_id`，再调用 `send_meme_image`。
+- 定时任务没有可用的原始消息事件，不要调用 `add_message_reaction`。
+- 任务完成后调用 `finish`。
+"""
+
+            final_messages = format_chat_history(history, max_inline_images=0) + [
+                HumanMessage(content=prompt)
+            ]
+            await graph.ainvoke({
+                "messages": final_messages,
+                "session_id": session_id,
+                "request_id": None,
+                "reply_count": 0,
+                "tool_count": 0,
+                "reply_this_round": 0,
+                "called_finish": 0,
+            })
+            await db_session.commit()
+        logger.info(f"[定时Agent任务] 已执行 {session_id}: {task}")
+    except Exception as e:
+        logger.exception(f"[定时Agent任务] 执行失败 {session_id}: {e}")
+
+
 def create_schedule_message_tool(
     session_id: str,
     request_id: str | None,
@@ -965,6 +1225,66 @@ def create_schedule_message_tool(
         return f"定时任务已创建，将在 {run_at.strftime('%Y-%m-%d %H:%M:%S')} 发送：{content}"
 
     return schedule_message
+
+
+def create_schedule_agent_task_tool(
+    session_id: str,
+    request_id: str | None,
+    *,
+    is_private: bool,
+    bot_id: str | None,
+):
+    @tool("schedule_agent_task")
+    async def schedule_agent_task(
+        task: str,
+        delay_minutes: float = 0,
+        delay_hours: float = 0,
+    ) -> str:
+        """
+        安排 bot 在几分钟或几小时后重新进入 agent，并允许到点后调用可用工具完成任务。
+
+        Args:
+            task: 到点后要完成的任务描述，例如“查一下明天上海天气并提醒我带伞”。
+            delay_minutes: 延迟多少分钟，可以是小数。
+            delay_hours: 延迟多少小时，可以和 delay_minutes 同时使用。
+        """
+        if request_id is not None and not await is_request_active(
+            session_id, request_id
+        ):
+            return "请求已过期，已取消定时任务。"
+
+        task = task.strip()
+        if not task:
+            return "定时 agent 任务内容为空，未创建任务。"
+
+        delay_seconds = delay_hours * 3600 + delay_minutes * 60
+        if delay_seconds <= 0:
+            return "延迟时间必须大于 0。"
+        if delay_seconds < 10:
+            return "延迟时间太短，至少需要 10 秒。"
+        if delay_seconds > 7 * 24 * 3600:
+            return "延迟时间太长，当前最多支持 7 天内的定时 agent 任务。"
+
+        run_at = datetime.datetime.now() + datetime.timedelta(seconds=delay_seconds)
+        job_id = f"ai_groupmate_agent_schedule_{session_id}_{uuid.uuid4().hex}"
+
+        scheduler.add_job(
+            _run_scheduled_agent_task,
+            "date",
+            id=job_id,
+            run_date=run_at,
+            kwargs={
+                "session_id": session_id,
+                "task": task,
+                "is_private": is_private,
+                "bot_id": bot_id,
+            },
+            misfire_grace_time=300,
+        )
+
+        return f"定时 agent 任务已创建，将在 {run_at.strftime('%Y-%m-%d %H:%M:%S')} 执行：{task}"
+
+    return schedule_agent_task
 
 
 def create_mute_tool(
@@ -1438,6 +1758,8 @@ async def create_chat_graph(
     history: list[ChatHistorySchema] | None = None,
     interface: QryItrface | None = None,
     bot_id: str | None = None,
+    bot: Bot | None = None,
+    event: Event | None = None,
     is_private: bool = False,
 ):
     """创建 LangGraph 聊天图"""
@@ -1505,10 +1827,12 @@ async def create_chat_graph(
 【工具规则】
 - 只能通过工具发消息，不要直接输出正文
 - 文本：`reply_user`
-- 表情包：先 `search_meme_image` 或 `search_similar_meme_by_id`，再 `send_meme_image`
+- 表情回复/reaction：`add_message_reaction`，用于只点一个表情表达态度；优先传 `mood`，不要直接传 `emoji`；通常不要传 `target_msg_id`，默认会给当前触发消息点表情。mood 可选：like 赞同，laugh 好笑，surprise 惊讶，speechless 无语，comfort 安慰，sad 难过，angry 生气，ok 收到，love 比心，question 疑问，awkward 尴尬，facepalm 捂脸，eat_melon 吃瓜，clap 鼓掌，cool 酷，plead 拜托，thanks 感谢，good_job 666，shock 惊恐，smirk 坏笑，tease 调侃，proud 得意，excited 开心，unhappy 不开心，continue_streak 续标识/续火，hello 打招呼，passing 路过
+- 表情包图片：先 `search_meme_image` 或 `search_similar_meme_by_id`，再 `send_meme_image`
 - 外部知识/缩写/术语：优先 `search_web`
 - 聊天上下文：`search_history_context`
-- 用户要求几分钟/几小时后提醒、转告或发送消息时：`schedule_message`
+- 用户要求几分钟/几小时后提醒、转告或发送固定消息时：`schedule_message`
+- 用户要求到点后查询最新信息、搜索、选择表情包或根据当时情况处理时：`schedule_agent_task`
 - 用户情绪或关系变化明显时，调用 `update_user_impression`
 - 若用户提到"年度报告 / 个人总结 / 成分分析"，先调用 `generate_and_send_annual_report` 获取素材；
   工具返回素材后，由你根据素材生成完整报告，并调用 `reply_user` 发送
@@ -1542,10 +1866,12 @@ async def create_chat_graph(
 【工具规则】
 - 只能通过工具发消息，不要直接输出正文
 - 文本：`reply_user`
-- 表情包：先 `search_meme_image` 或 `search_similar_meme_by_id`，再 `send_meme_image`
+- 表情回复/reaction：`add_message_reaction`，用于只点一个表情表达态度；优先传 `mood`，不要直接传 `emoji`；通常不要传 `target_msg_id`，默认会给当前触发消息点表情。mood 可选：like 赞同，laugh 好笑，surprise 惊讶，speechless 无语，comfort 安慰，sad 难过，angry 生气，ok 收到，love 比心，question 疑问，awkward 尴尬，facepalm 捂脸，eat_melon 吃瓜，clap 鼓掌，cool 酷，plead 拜托，thanks 感谢，good_job 666，shock 惊恐，smirk 坏笑，tease 调侃，proud 得意，excited 开心，unhappy 不开心，continue_streak 续标识/续火，hello 打招呼，passing 路过
+- 表情包图片：先 `search_meme_image` 或 `search_similar_meme_by_id`，再 `send_meme_image`
 - 外部知识/缩写/术语：优先 `search_web`
 - 群内上下文：`search_history_context`
-- 用户要求几分钟/几小时后提醒、转告或发送消息时：`schedule_message`
+- 用户要求几分钟/几小时后提醒、转告或发送固定消息时：`schedule_message`
+- 用户要求到点后查询最新信息、搜索、选择表情包或根据当时情况处理时：`schedule_agent_task`
 - 用户情绪或关系变化明显时，调用 `update_user_impression`
 - 若用户提到"年度报告 / 个人总结 / 成分分析"，先调用 `generate_and_send_annual_report` 获取素材；
   工具返回素材后，由你根据素材生成完整报告，并调用 `reply_user` 发送
@@ -1564,8 +1890,16 @@ async def create_chat_graph(
         db_session, session_id, request_id, user_id, user_name, model
     )
 
+    send_target = Target(
+        id=session_id,
+        private=is_private,
+        self_id=bot_id,
+    )
+
     search_meme_tool = create_search_meme_tool(db_session, session_id, request_id)
-    send_meme_tool = create_send_meme_tool(db_session, session_id, request_id)
+    send_meme_tool = create_send_meme_tool(
+        db_session, session_id, request_id, send_target=send_target
+    )
     relation_tool = create_relation_tool(
         db_session, session_id, request_id, user_id, user_name
     )
@@ -1576,11 +1910,23 @@ async def create_chat_graph(
     schedule_tool = create_schedule_message_tool(
         session_id, request_id, is_private=is_private, bot_id=bot_id
     )
+    schedule_agent_tool = create_schedule_agent_task_tool(
+        session_id, request_id, is_private=is_private, bot_id=bot_id
+    )
+    reaction_tool = create_reaction_tool(
+        db_session, session_id, request_id, user_id, bot, event
+    )
     
     tools = [
         search_web,
         search_history_context,
-        create_reply_tool(db_session, session_id, request_id, interface),
+        create_reply_tool(
+            db_session,
+            session_id,
+            request_id,
+            interface,
+            send_target=send_target,
+        ),
         search_meme_tool,
         similar_meme_tool,
         send_meme_tool,
@@ -1589,8 +1935,11 @@ async def create_chat_graph(
         report_tool,
         mute_tool,
         schedule_tool,
+        schedule_agent_tool,
         finish,
     ]
+    if bot is not None and event is not None:
+        tools.insert(3, reaction_tool)
 
     dynamic_context_parts = (
         [relation_context]
@@ -1641,6 +1990,124 @@ def get_image_data_uri(file_name: str) -> str | None:
     except Exception as e:
         logger.error(f"读取图片失败 {file_name}: {e}")
         return None
+
+
+def _fallback_qq_avatar_url(user_id: str | None) -> str | None:
+    if not user_id:
+        return None
+    uid = str(user_id).strip()
+    if not uid.isdigit():
+        return None
+    return f"https://q1.qlogo.cn/g?b=qq&nk={uid}&s=100"
+
+
+def _user_display_name_from_history(history: list[ChatHistorySchema], user_id: str) -> str:
+    for msg in reversed(history):
+        if msg.user_id == user_id and msg.user_name:
+            return msg.user_name
+    return user_id
+
+
+async def _build_avatar_context_messages(
+    history: list[ChatHistorySchema],
+    *,
+    interface: QryItrface | None,
+    session_id: str,
+    current_user_id: str | None,
+    current_user_name: str | None,
+    max_users: int = 4,
+) -> list[BaseMessage]:
+    user_ids: list[str] = []
+    if current_user_id:
+        user_ids.append(str(current_user_id))
+    for msg in reversed(history):
+        if msg.content_type == "bot":
+            continue
+        uid = str(msg.user_id)
+        if uid and uid not in user_ids:
+            user_ids.append(uid)
+        if len(user_ids) >= max_users:
+            break
+
+    if not user_ids:
+        return []
+
+    avatar_by_id: dict[str, str] = {}
+    name_by_id: dict[str, str] = {}
+
+    if interface is not None:
+        try:
+            members = await interface.get_members(SceneType.GROUP, session_id)
+            wanted = set(user_ids)
+            for member in members:
+                uid = str(member.id)
+                if uid not in wanted:
+                    continue
+                user = getattr(member, "user", None)
+                avatar = getattr(user, "avatar", None)
+                if avatar:
+                    avatar_by_id[uid] = str(avatar)
+                member_name = (
+                    getattr(member, "nick", None)
+                    or getattr(user, "nick", None)
+                    or getattr(user, "name", None)
+                )
+                if member_name:
+                    name_by_id[uid] = str(member_name)
+        except Exception as e:
+            logger.warning(f"获取群友头像信息失败，降级使用可推导头像: {e}")
+
+    content_parts: list[Any] = [
+        {
+            "type": "text",
+            "text": (
+                "【群友头像上下文】下面是最近发言者的头像，仅用于识别群友形象、头像梗和轻度玩笑。"
+                "不要根据头像推断敏感身份、年龄、性别、种族、健康等属性。"
+            ),
+        }
+    ]
+    added = 0
+    for uid in user_ids:
+        avatar_url = avatar_by_id.get(uid) or _fallback_qq_avatar_url(uid)
+        if not avatar_url:
+            continue
+        if uid == str(current_user_id) and current_user_name:
+            display_name = current_user_name
+        else:
+            display_name = name_by_id.get(uid) or _user_display_name_from_history(history, uid)
+        content_parts.append({"type": "text", "text": f"\n{display_name}({uid}) 的头像："})
+        content_parts.append({"type": "image_url", "image_url": {"url": avatar_url}})
+        added += 1
+
+    if added == 0:
+        return []
+    return [HumanMessage(content_parts)]  # type: ignore[arg-type]
+
+
+def _should_include_avatar_context(history: list[ChatHistorySchema], limit: int = 4) -> bool:
+    avatar_keywords = (
+        "头像",
+        "头图",
+        "头像框",
+        "看我头",
+        "看下我头",
+        "看看我头",
+        "你看我头",
+        "avatar",
+        "pfp",
+    )
+    checked = 0
+    for msg in reversed(history):
+        if msg.content_type == "bot":
+            continue
+        _, _, body = _parse_msg_meta(msg.content)
+        text = body.lower()
+        if any(keyword in text for keyword in avatar_keywords):
+            return True
+        checked += 1
+        if checked >= limit:
+            break
+    return False
 
 
 def _parse_msg_meta(content: str) -> tuple[str | None, str | None, str]:
@@ -2010,6 +2477,8 @@ async def choice_response_strategy(
     role_map: dict[str, str] | None = None,
     bot_id: str | None = None,
     reply_to_id: str | None = None,
+    bot: Bot | None = None,
+    event: Event | None = None,
     is_private: bool = False,
 ) -> ResponseMessage:
     """
@@ -2017,7 +2486,17 @@ async def choice_response_strategy(
     """
     try:
         graph, _ = await create_chat_graph(
-            db_session, session_id, request_id, user_id, user_name, history, interface, bot_id, is_private=is_private
+            db_session,
+            session_id,
+            request_id,
+            user_id,
+            user_name,
+            history,
+            interface,
+            bot_id,
+            bot,
+            event,
+            is_private=is_private,
         )
 
         # 1. 获取多模态格式的历史消息列表 (List[BaseMessage])
@@ -2127,7 +2606,23 @@ async def choice_response_strategy(
             else:
                 final_prompt_content.append({"type": "text", "text": text_block})
 
-        final_messages = chat_history_messages + [HumanMessage(content=final_prompt_content)]
+        avatar_context_messages: list[BaseMessage] = []
+        if not is_private and _should_include_avatar_context(history):
+            avatar_context_messages = await _build_avatar_context_messages(
+                history,
+                interface=interface,
+                session_id=session_id,
+                current_user_id=user_id,
+                current_user_name=user_name,
+            )
+            if avatar_context_messages:
+                logger.info(f"本轮触发头像上下文注入 session={session_id}")
+
+        final_messages = (
+            chat_history_messages
+            + avatar_context_messages
+            + [HumanMessage(content=final_prompt_content)]
+        )
 
         invoke_state: dict[str, Any] = {
             "messages": list(final_messages),

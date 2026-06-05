@@ -196,7 +196,7 @@ def _make_tool_node(tools_by_name: dict[str, BaseTool]):
                 results.append(ToolMessage(content="请求已过期，已取消执行", tool_call_id=tool_call_id))
                 continue
 
-            if name == "reply_user":
+            if name in {"reply_user", "add_message_reaction"}:
                 if reply_this_round >= MAX_REPLY_PER_ROUND:
                     results.append(ToolMessage(
                         content="本轮已经发送过消息了。如果你想发送更多，请等待下一轮。",

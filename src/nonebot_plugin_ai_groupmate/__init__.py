@@ -76,6 +76,8 @@ class ReplyRequest:
     request_id: str
     session: Uninfo
     interface: QryItrface
+    bot: Bot
+    event: Event
     bot_name: str
     user_id: str
     user_name: str | None
@@ -194,6 +196,8 @@ async def _run_group_reply_worker(group_id: str):
                     request.request_id,
                     request.session,
                     request.interface,
+                    request.bot,
+                    request.event,
                     request.bot_name,
                     request.user_id,
                     request.user_name,
@@ -369,6 +373,8 @@ async def handle_message(
             request_id=f"{group_id}:{datetime.datetime.now().timestamp()}:{random.random()}",
             session=session,
             interface=interface,
+            bot=bot,
+            event=event,
             bot_name=bot_name,
             user_id=user_id,
             user_name=user_name,
@@ -526,6 +532,8 @@ async def handle_reply_logic(
     request_id: str,
     session: Uninfo,
     interface: QryItrface,
+    bot: Bot,
+    event: Event,
     bot_name: str,
     user_id: str,
     user_name: str | None,
@@ -612,6 +620,8 @@ async def handle_reply_logic(
                     role_map,
                     session.self_id,  # 传递bot的ID
                     reply_to_id,
+                    bot,
+                    event,
                     is_private=is_private,
                 ),
                 timeout=240.0,
