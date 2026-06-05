@@ -958,14 +958,14 @@ def create_reaction_tool(
         ):
             return "请求已过期，已取消表情回复。"
 
-        mood = str(mood).strip()
-        mood_emojis = REACTION_EMOJI_MAP.get(mood)
+        mood_key = str(mood).strip()
+        mood_emojis = REACTION_EMOJI_MAP.get(mood_key)
         reaction_emoji = str(emoji).strip() if emoji else (
             random.choice(mood_emojis) if mood_emojis else None
         )
         if not reaction_emoji:
             supported = ", ".join(REACTION_EMOJI_MAP)
-            return f"表情回复失败: 未知 mood {mood!r}，可选值: {supported}"
+            return f"表情回复失败: 未知 mood {mood_key!r}，可选值: {supported}"
 
         if bot is None or event is None:
             return "表情回复失败: 缺少 bot/event 上下文，无法调用 alconna message_reaction。"
@@ -1016,12 +1016,12 @@ def create_reaction_tool(
                 session_id=session_id,
                 user_id=plugin_config.bot_name,
                 content_type="bot",
-                content=f"id: system\n已对{reacted_message_desc} {action}表情回复: mood={mood}, emoji={reaction_emoji}",
+                content=f"id: system\n已对{reacted_message_desc} {action}表情回复: mood={mood_key}, emoji={reaction_emoji}",
                 user_name=plugin_config.bot_name,
             )
             db_session.add(chat_history)
-            logger.info(f"已对{reacted_message_desc} {action}表情回复 mood={mood}, emoji={reaction_emoji}")
-            return f"已对{reacted_message_desc} {action}表情回复 mood={mood}, emoji={reaction_emoji}"
+            logger.info(f"已对{reacted_message_desc} {action}表情回复 mood={mood_key}, emoji={reaction_emoji}")
+            return f"已对{reacted_message_desc} {action}表情回复 mood={mood_key}, emoji={reaction_emoji}"
         except Exception as e:
             logger.error(f"表情回复工具执行失败: {e}")
             return f"表情回复失败: {e}"
