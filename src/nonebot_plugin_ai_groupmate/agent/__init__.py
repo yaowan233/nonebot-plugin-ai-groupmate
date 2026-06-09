@@ -56,19 +56,13 @@ ReactionMood = Literal[
     "like",
     "laugh",
     "surprise",
-    "speechless",
-    "comfort",
     "sad",
     "angry",
     "ok",
     "love",
     "question",
     "awkward",
-    "sweat",
-    "facepalm",
-    "eat_melon",
     "clap",
-    "cool",
     "plead",
     "thanks",
     "good_job",
@@ -78,40 +72,28 @@ ReactionMood = Literal[
     "proud",
     "excited",
     "unhappy",
-    "continue_streak",
-    "hello",
-    "passing",
 ]
 
 REACTION_EMOJI_MAP: dict[str, tuple[str, ...]] = {
-    "like": ("76", "201", "364", "389"),
-    "laugh": ("178", "182", "193", "283", "387", "378"),
-    "surprise": ("0", "180", "325"),
-    "speechless": ("38", "10", "271"),
-    "comfort": ("49", "111", "353"),
-    "sad": ("5", "9", "15", "107", "194", "379", "382"),
+    "like": ("76", "201", "389", "424"),
+    "laugh": ("178", "182", "193", "387", "378"),
+    "surprise": ("0", "180", "424"),
+    "sad": ("5", "9", "15", "38", "49", "107", "194", "379", "382"),
     "angry": ("11", "326", "365"),
-    "ok": ("124", "398"),
-    "love": ("66", "319", "383"),
+    "ok": ("124", "377", "381", "398"),
+    "love": ("66", "305", "319", "383"),
     "question": ("32", "367"),
-    "awkward": ("10", "27"),
-    "sweat": ("27",),
-    "facepalm": ("264",),
-    "eat_melon": ("271",),
+    "awkward": ("10", "27", "264"),
     "clap": ("99", "375"),
-    "cool": ("16",),
-    "plead": ("106", "111", "353"),
+    "plead": ("106", "111"),
     "thanks": ("118", "63", "78", "409"),
-    "good_job": ("356", "299", "306", "380"),
+    "good_job": ("356", "299", "306", "353", "380", "424"),
     "shock": ("26", "325"),
-    "smirk": ("20", "101", "178", "286"),
-    "tease": ("102", "103", "178"),
-    "proud": ("4", "306"),
-    "excited": ("180", "290", "412", "400", "401"),
+    "smirk": ("20", "101", "178"),
+    "tease": ("102", "103", "178", "271"),
+    "proud": ("4", "16", "306"),
+    "excited": ("180", "400", "401"),
     "unhappy": ("15", "194"),
-    "continue_streak": ("424",),
-    "hello": ("377",),
-    "passing": ("381",),
 }
 SCHEDULED_AGENT_HISTORY_LIMIT = 20
 
@@ -969,6 +951,7 @@ def create_reaction_tool(
         target_msg_id: str | None = None,
         delete: bool = False,
         emoji: str | None = None,
+        count: int = 1,
     ) -> str:
         """
         给某条消息添加或取消表情回复。
@@ -977,10 +960,11 @@ def create_reaction_tool(
         不要再调用 reply_user 发送重复文本。
 
         Args:
-            mood: 表情回复表达的态度。基础 mood: like/laugh/surprise/speechless/comfort/sad/angry/ok。扩展 mood: love/question/awkward/sweat/facepalm/eat_melon/clap/cool/plead/thanks/good_job/shock/smirk/tease/proud/excited/unhappy/continue_streak/hello/passing。
+            mood: 表情回复表达的态度。基础 mood: like/laugh/surprise/sad/angry/ok。扩展 mood: love/question/awkward/clap/plead/thanks/good_job/shock/smirk/tease/proud/excited/unhappy。
             target_msg_id: 目标消息 id，来自聊天记录里的 "id: xxxxx"。通常不要传；不传时默认给当前触发 bot 回复的这条消息添加。
             delete: 是否取消这个表情回复，默认 False。
             emoji: 可选的适配器原始表情 ID/名称覆盖值。通常不要传，除非明确知道平台支持的表情 ID。
+            count: 同一 mood 下连续添加几个不同表情，范围 1-3。传了 emoji 时只添加该 emoji。
         """
         if request_id is not None and not await is_request_active(
             session_id, request_id
@@ -989,10 +973,18 @@ def create_reaction_tool(
 
         mood_key = str(mood).strip()
         mood_emojis = REACTION_EMOJI_MAP.get(mood_key)
-        reaction_emoji = str(emoji).strip() if emoji else (
-            random.choice(mood_emojis) if mood_emojis else None
-        )
-        if not reaction_emoji:
+        reaction_count = max(1, min(int(count or 1), 3))
+        if emoji:
+            reaction_emojis = [str(emoji).strip()]
+        elif mood_emojis:
+            reaction_emojis = random.sample(
+                list(mood_emojis), k=min(reaction_count, len(mood_emojis))
+            )
+        else:
+            reaction_emojis = []
+        reaction_emojis = [item for item in reaction_emojis if item]
+
+        if not reaction_emojis:
             supported = ", ".join(REACTION_EMOJI_MAP)
             return f"表情回复失败: 未知 mood {mood_key!r}，可选值: {supported}"
 
@@ -1008,7 +1000,7 @@ def create_reaction_tool(
         ):
             return "请求已过期，已取消表情回复。"
 
-        async def _apply_reaction(target_message_id: str | None) -> None:
+        async def _apply_reaction(reaction_emoji: str, target_message_id: str | None) -> None:
             await message_reaction(
                 reaction_emoji,
                 message_id=target_message_id,
@@ -1018,29 +1010,31 @@ def create_reaction_tool(
             )
 
         try:
-            try:
-                await _apply_reaction(message_id)
-            except Exception as e:
-                if message_id and "msg not found" in str(e).lower():
-                    logger.warning(
-                        f"表情回复目标消息 {message_id} 不存在，回退到当前触发事件消息"
-                    )
-                    await _apply_reaction(None)
-                    message_id = None
-                else:
-                    raise
+            for reaction_emoji in reaction_emojis:
+                try:
+                    await _apply_reaction(reaction_emoji, message_id)
+                except Exception as e:
+                    if message_id and "msg not found" in str(e).lower():
+                        logger.warning(
+                            f"表情回复目标消息 {message_id} 不存在，回退到当前触发事件消息"
+                        )
+                        message_id = None
+                        await _apply_reaction(reaction_emoji, None)
+                    else:
+                        raise
             action = "取消" if delete else "添加"
             reacted_message_desc = f"消息 {message_id}" if message_id else "当前触发消息"
+            reaction_emoji_text = ",".join(reaction_emojis)
             chat_history = ChatHistory(
                 session_id=session_id,
                 user_id=plugin_config.bot_name,
                 content_type="bot",
-                content=f"id: system\n已对{reacted_message_desc} {action}表情回复: mood={mood_key}, emoji={reaction_emoji}",
+                content=f"id: system\n已对{reacted_message_desc} {action}表情回复: mood={mood_key}, emoji={reaction_emoji_text}",
                 user_name=plugin_config.bot_name,
             )
             db_session.add(chat_history)
-            logger.info(f"已对{reacted_message_desc} {action}表情回复 mood={mood_key}, emoji={reaction_emoji}")
-            return f"已对{reacted_message_desc} {action}表情回复 mood={mood_key}, emoji={reaction_emoji}"
+            logger.info(f"已对{reacted_message_desc} {action}表情回复 mood={mood_key}, emoji={reaction_emoji_text}")
+            return f"已对{reacted_message_desc} {action}表情回复 mood={mood_key}, emoji={reaction_emoji_text}"
         except Exception as e:
             logger.error(f"表情回复工具执行失败: {e}")
             return f"表情回复失败: {e}"
@@ -1847,7 +1841,7 @@ async def create_chat_graph(
 【工具规则】
 - 只能通过工具发消息，不要直接输出正文
 - 文本：`reply_user`
-- 表情回复/reaction：`add_message_reaction`，适合轻量表达态度，也可以和 `reply_user` 搭配；可以连续点 1-3 个不同 mood，但不要刷屏；如果用户在提问、求助或需要文字回应，不要只点表情。优先传 `mood`，不要直接传 `emoji`；通常不要传 `target_msg_id`，默认会给当前触发消息点表情。mood 可选：like 赞同，laugh 好笑，surprise 惊讶，speechless 无语，comfort 安慰，sad 难过，angry 生气，ok 收到，love 比心，question 疑问，awkward 尴尬，facepalm 捂脸，eat_melon 吃瓜，clap 鼓掌，cool 酷，plead 拜托，thanks 感谢，good_job 666，shock 惊恐，smirk 坏笑，tease 调侃，proud 得意，excited 开心，unhappy 不开心，continue_streak 续标识/续火，hello 打招呼，passing 路过
+- 表情回复/reaction：`add_message_reaction`，适合轻量表达态度，也可以和 `reply_user` 搭配；情绪明显时可传 `count=2` 或 `count=3` 连续点同一 mood 下的多个表情，但不要刷屏；如果用户在提问、求助或需要文字回应，不要只点表情。优先传 `mood`，不要直接传 `emoji`；通常不要传 `target_msg_id`，默认会给当前触发消息点表情。mood 可选：like 赞同，laugh 好笑，surprise 惊讶，sad 难过/安慰，angry 生气，ok 收到/打招呼/路过，love 比心，question 疑问，awkward 尴尬/流汗/捂脸，clap 鼓掌，plead 拜托/无辜，thanks 感谢，good_job 666/佩服/对面很强，shock 惊恐/害怕，smirk 坏笑，tease 调侃/吃瓜，proud 得意/酷，excited 开心，unhappy 不开心
 - 表情包图片：先 `search_meme_image` 或 `search_similar_meme_by_id`，再 `send_meme_image`
 - 外部知识/缩写/术语：优先 `search_web`
 - 聊天上下文：`search_history_context`
@@ -1886,7 +1880,7 @@ async def create_chat_graph(
 【工具规则】
 - 只能通过工具发消息，不要直接输出正文
 - 文本：`reply_user`
-- 表情回复/reaction：`add_message_reaction`，适合轻量表达态度，也可以和 `reply_user` 搭配；可以连续点 1-3 个不同 mood，但不要刷屏；如果用户在提问、求助或需要文字回应，不要只点表情。优先传 `mood`，不要直接传 `emoji`；通常不要传 `target_msg_id`，默认会给当前触发消息点表情。mood 可选：like 赞同，laugh 好笑，surprise 惊讶，speechless 无语，comfort 安慰，sad 难过，angry 生气，ok 收到，love 比心，question 疑问，awkward 尴尬，facepalm 捂脸，eat_melon 吃瓜，clap 鼓掌，cool 酷，plead 拜托，thanks 感谢，good_job 666，shock 惊恐，smirk 坏笑，tease 调侃，proud 得意，excited 开心，unhappy 不开心，continue_streak 续标识/续火，hello 打招呼，passing 路过
+- 表情回复/reaction：`add_message_reaction`，适合轻量表达态度，也可以和 `reply_user` 搭配；情绪明显时可传 `count=2` 或 `count=3` 连续点同一 mood 下的多个表情，但不要刷屏；如果用户在提问、求助或需要文字回应，不要只点表情。优先传 `mood`，不要直接传 `emoji`；通常不要传 `target_msg_id`，默认会给当前触发消息点表情。mood 可选：like 赞同，laugh 好笑，surprise 惊讶，sad 难过/安慰，angry 生气，ok 收到/打招呼/路过，love 比心，question 疑问，awkward 尴尬/流汗/捂脸，clap 鼓掌，plead 拜托/无辜，thanks 感谢，good_job 666/佩服/对面很强，shock 惊恐/害怕，smirk 坏笑，tease 调侃/吃瓜，proud 得意/酷，excited 开心，unhappy 不开心
 - 表情包图片：先 `search_meme_image` 或 `search_similar_meme_by_id`，再 `send_meme_image`
 - 外部知识/缩写/术语：优先 `search_web`
 - 群内上下文：`search_history_context`
