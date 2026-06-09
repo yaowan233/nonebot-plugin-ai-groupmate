@@ -1,6 +1,5 @@
 import asyncio
 
-
 _lock = asyncio.Lock()
 _latest_request_ids: dict[str, str] = {}
 

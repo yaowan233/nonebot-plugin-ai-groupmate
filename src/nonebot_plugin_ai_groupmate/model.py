@@ -1,7 +1,7 @@
 from datetime import datetime
 
 from pydantic import BaseModel
-from sqlalchemy import JSON, String, Boolean, Index
+from sqlalchemy import JSON, Index, String, Boolean
 from sqlalchemy.orm import Mapped, mapped_column
 from nonebot_plugin_orm import Model
 

@@ -1,5 +1,5 @@
-import json
 import re
+import json
 import base64
 import random
 import asyncio
@@ -9,7 +9,6 @@ from io import BytesIO
 from pathlib import Path
 from functools import lru_cache
 from dataclasses import dataclass
-
 
 import jieba
 from nonebot import logger, require, on_command, on_message, get_plugin_config
@@ -34,8 +33,7 @@ from nonebot_plugin_apscheduler import scheduler
 from nonebot_plugin_alconna.uniseg import UniMsg
 
 from .agent import check_if_should_reply, choice_response_strategy
-from .model import ChatHistory, MediaStorage, ChatHistorySchema, GroupMemory
-from .reply_guard import set_latest_request_id
+from .model import ChatHistory, GroupMemory, MediaStorage, ChatHistorySchema
 from .utils import (
     generate_file_hash,
     check_and_compress_image_bytes,
@@ -43,6 +41,7 @@ from .utils import (
 )
 from .config import Config, create_chat_openai, create_tagging_llm
 from .memory import DB
+from .reply_guard import set_latest_request_id
 
 __plugin_meta__ = PluginMetadata(
     name="nonebot-plugin-ai-groupmate",
@@ -312,7 +311,7 @@ async def handle_message(
                     )
                 )
                 if existing.scalar_one_or_none():
-                    logger.debug(f"消息已存在，跳过重复记录")
+                    logger.debug("消息已存在，跳过重复记录")
                     do_insert = False
 
             if do_insert:
@@ -483,7 +482,7 @@ async def process_image_message(
             async with _get_dedup_lock(session.scene.id):
                 # 确保 flush 拿到 media_id (如果是新插入的对象)
                 await db_session.flush()
-                
+
                 # 刷新对象以确保它在当前 session 中
                 await db_session.refresh(media_obj)
 
@@ -497,7 +496,7 @@ async def process_image_message(
                     )
                 )
                 if existing_img.scalar_one_or_none():
-                    logger.debug(f"图片记录已存在，跳过重复")
+                    logger.debug("图片记录已存在，跳过重复")
                 else:
                     chat_history = ChatHistory(
                         session_id=session.scene.id,
@@ -928,7 +927,7 @@ async def clear_cache_pic():
         if medias:
             # 批量删除文件，减少线程切换
             media_files = [Path(pic_dir / media.file_path) for media in medias]
-            
+
             def _batch_delete_media_files(files: list):
                 deleted = 0
                 for file_path in files:
@@ -939,13 +938,13 @@ async def clear_cache_pic():
                     except Exception as e:
                         logger.error(f"删除文件失败 {file_path}: {e}")
                 return deleted
-            
+
             deleted_files = await asyncio.to_thread(_batch_delete_media_files, media_files)
-            
+
             # 批量删除数据库记录
             for media in medias:
                 await db_session.delete(media)
-            
+
             try:
                 await db_session.commit()
                 logger.info(f"成功清理 {len(medias)} 个过期媒体记录（{deleted_files} 个文件）")
@@ -981,7 +980,7 @@ async def _call_summary_model(existing_summary: str, chat_text: str) -> str | No
     """调用 LLM 更新群体认知档案。
     若触发内容违规（data_inspection_failed），会对聊天记录做二分截断后最多重试 3 次。
     """
-    from langchain_core.messages import SystemMessage, HumanMessage as LCHumanMessage
+    from langchain_core.messages import HumanMessage as LCHumanMessage, SystemMessage
 
     system = """你是一个群文化分析师。你的任务是维护一份关于QQ群的认知档案。
 档案包含：群内常见话题、活跃成员特征、内部梗/黑话、群文化氛围。

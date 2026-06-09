@@ -22,6 +22,7 @@
 - **群体认知档案**：每 6 小时自动归纳群内话题、活跃成员特征、内部梗等，让 bot 对群文化有持续感知。
 - **长记忆**（需配置 Qdrant）：RAG 自动存储聊天历史，学习群友发言习惯，使 bot 更像真人。
 - **表情包学习**（需配置 Qdrant）：使用 `qwen-vl-max` 理解图片内容，自动从群内偷学表情包并存入向量库，回复时按语义匹配发出。
+- **自定义 Agent Tools**：可以注册自己的 LangChain tools 扩展 agent 能力，详见 [自定义 Agent Tools](./docs/custom-agent-tools.md)。
 
 对于主模型选择：推荐使用支持 Function Calling 的通义千问系列模型（如 `qwen-plus`、`qwen-max`）。图片理解固定使用 `qwen-vl-max`，群档案摘要固定使用 `qwen-flash`。
 
@@ -153,6 +154,10 @@ AI_GROUPMATE__CHAT_MODEL=qwen3.7-plus
 ## 🎉 使用
 
 @bot 即可触发回复，也会以 `reply_probability` 的概率主动发言。
+
+### 自定义 Agent Tools
+
+如果你想给 agent 增加自己的工具（例如查询业务系统、控制设备、调用自定义 API），可以参考 [自定义 Agent Tools](./docs/custom-agent-tools.md)。
 
 内置了好感度系统，增加了趣味性。
 ![Screenshot_20251201_134157](https://github.com/user-attachments/assets/68b8d563-7ad5-4d83-be4b-0a05f16df09a)
