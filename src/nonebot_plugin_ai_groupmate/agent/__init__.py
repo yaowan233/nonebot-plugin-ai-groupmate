@@ -904,6 +904,32 @@ def create_send_meme_tool(
     return send_meme_image
 
 
+def _is_onebot_context(bot: Bot | None, event: Event | None) -> bool:
+    candidates: list[str] = []
+    for obj in (bot, event):
+        if obj is None:
+            continue
+        candidates.extend(
+            [
+                type(obj).__module__,
+                type(obj).__qualname__,
+                str(getattr(obj, "type", "")),
+            ]
+        )
+
+    adapter = getattr(bot, "adapter", None) if bot is not None else None
+    if adapter is not None:
+        candidates.extend([type(adapter).__module__, type(adapter).__qualname__])
+        get_name = getattr(adapter, "get_name", None)
+        if callable(get_name):
+            try:
+                candidates.append(str(get_name()))
+            except Exception:
+                pass
+
+    return any("onebot" in candidate.lower() for candidate in candidates)
+
+
 def create_reaction_tool(
     db_session,
     session_id: str,
@@ -990,6 +1016,8 @@ def create_reaction_tool(
 
         if bot is None or event is None:
             return "表情回复失败: 缺少 bot/event 上下文，无法调用 alconna message_reaction。"
+        if not _is_onebot_context(bot, event):
+            return "表情回复失败: 当前适配器不是 OneBot，不支持消息表情回复。"
 
         message_id = _normalize_reaction_message_id(target_msg_id)
         if not message_id:
@@ -1952,7 +1980,7 @@ async def create_chat_graph(
         schedule_agent_tool,
         finish,
     ]
-    if bot is not None and event is not None:
+    if _is_onebot_context(bot, event):
         tools.insert(3, reaction_tool)
 
     dynamic_context_parts = (
