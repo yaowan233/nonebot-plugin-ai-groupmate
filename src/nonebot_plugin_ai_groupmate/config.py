@@ -15,7 +15,7 @@ class ScopedConfig(BaseModel):
     llm_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 
     # === 聊天主模型（对话、工具调用） ===
-    chat_model: str = "qwen3.5-plus"
+    chat_model: str = "qwen3.7-plus"
     chat_api_key: str = ""
     chat_base_url: str = ""
     chat_temperature: float = 0.7
