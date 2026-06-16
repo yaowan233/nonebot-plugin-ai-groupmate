@@ -7,7 +7,7 @@ from nonebot.log import logger
 from langchain.tools import ToolRuntime
 from langgraph.graph import END, START, StateGraph
 from langchain_core.tools import BaseTool
-from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 from langgraph.graph.message import add_messages
 from langchain_core.runnables import RunnableConfig
 
@@ -18,6 +18,8 @@ MAX_REPLY_COUNT = 5
 MAX_TOOL_COUNT = 20
 MAX_REPLY_PER_ROUND = 1  # 每轮只发1条，强制模型逐条思考，上下文连续
 MAX_REACTION_PER_ROUND = 3
+
+ContentBlock = str | dict[str, Any]
 
 
 class AgentState(TypedDict):
@@ -149,6 +151,20 @@ def _tool_accepts_runtime(tool: BaseTool) -> bool:
     return isinstance(fields, dict) and "runtime" in fields
 
 
+def _normalize_tool_result(result: Any) -> tuple[str, list[ContentBlock] | None]:
+    if isinstance(result, str):
+        return result, None
+    if isinstance(result, list) and all(isinstance(item, dict) for item in result):
+        content_blocks: list[ContentBlock] = [item for item in result]
+        text_parts = [
+            item.get("text", "")
+            for item in content_blocks
+            if isinstance(item, dict) and item.get("type") == "text" and isinstance(item.get("text"), str)
+        ]
+        return "\n".join(text_parts) or "工具已返回多模态内容", content_blocks
+    return str(result), None
+
+
 def _make_agent_node(model: Any, tools: list[BaseTool], system_prompt: str | Sequence[BaseMessage]) -> Any:
     bound_model = model.bind_tools(tools)
     system_messages = normalize_system_messages(system_prompt)
@@ -174,7 +190,7 @@ def _make_tool_node(tools_by_name: dict[str, BaseTool]):
             return {}
 
         tool_calls = last_message.tool_calls
-        results: list[ToolMessage] = []
+        results: list[BaseMessage] = []
         reply_count = state.get("reply_count", 0)
         tool_count = state.get("tool_count", 0)
         reply_this_round = state.get("reply_this_round", 0)
@@ -228,7 +244,10 @@ def _make_tool_node(tools_by_name: dict[str, BaseTool]):
                 runtime = _build_tool_runtime(agent_ctx, tool_call_id, args)
                 tool_input = {**args, "runtime": runtime} if _tool_accepts_runtime(tool) else args
                 result = await tool.ainvoke(tool_input, runtime=runtime)
-                results.append(ToolMessage(content=str(result), tool_call_id=tool_call_id))
+                tool_content, extra_content = _normalize_tool_result(result)
+                results.append(ToolMessage(content=tool_content, tool_call_id=tool_call_id))
+                if extra_content is not None:
+                    results.append(HumanMessage(content=extra_content))
             except Exception as e:
                 logger.error(f"[Agent] 工具执行失败 {name}: {e}")
                 results.append(ToolMessage(content=f"工具执行出错: {e}", tool_call_id=tool_call_id))
