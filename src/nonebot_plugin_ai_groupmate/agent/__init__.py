@@ -47,10 +47,13 @@ from .conversation import (
     build_append_only_history,
 )
 from .custom_tools import (
+    AgentSkill,
     AgentToolBundle,
     AgentToolContext,
     register_agent_tool,
-    build_registered_agent_tools,
+    build_agent_skill_index,
+    create_agent_skill_loader_tool,
+    build_registered_agent_extensions,
 )
 from .prompt_cache import build_system_messages
 from .profile_tools import create_report_tool, create_relation_tool
@@ -73,6 +76,7 @@ from .moderation_tools import create_mute_tool
 __all__ = [
     "AgentToolBundle",
     "AgentToolContext",
+    "AgentSkill",
     "register_agent_tool",
     "check_if_should_reply",
     "choice_response_strategy",
@@ -254,6 +258,92 @@ async def _run_scheduled_agent_task(
 tools = [search_web, search_history_context, calculate_expression]
 
 
+def _build_builtin_agent_skills(
+    *,
+    is_private: bool,
+    has_admin_permission: bool,
+    reaction_tool_instruction: str,
+    mute_tool_instruction: str,
+) -> list[AgentSkill]:
+    context_name = "聊天上下文" if is_private else "群内上下文"
+    skills = [
+        AgentSkill(
+            name="core_reply_tools",
+            description="发送文字回复和结束本轮对话的基础规则。",
+            prompt=(
+                "基础回复规则：\n"
+                "- 只能通过工具发消息，不要直接输出正文。\n"
+                "- 文本回复使用 `reply_user`。\n"
+                "- 回复完成后调用 `finish`。\n"
+                "- 不要发送重复或高度相似内容；多条回复必须信息递进。"
+            ),
+        ),
+        AgentSkill(
+            name="meme_tools",
+            description="搜索、选择和发送表情包图片。",
+            prompt=(
+                "表情包工具规则：\n"
+                "- 普通表情包需求：先调用 `search_meme_image(description)` 搜索合适图片。\n"
+                "- 用户引用图片或要求“找一张类似这张的”：调用 `search_similar_meme_by_id(target_msg_id)`；没有明确 id 时可不传，工具会优先找当前用户最近图片。\n"
+                "- 搜索工具只返回候选图片和 pic_id，不会发送。\n"
+                "- 判断候选描述合适后，调用 `send_meme_image(pic_id)` 发送。\n"
+                "- 发图完成后调用 `finish`；不要再发送同义文字。"
+            ),
+        ),
+        AgentSkill(
+            name="search_context_tools",
+            description="联网搜索、历史聊天检索和数学计算。",
+            prompt=(
+                "搜索、上下文和计算工具规则：\n"
+                "- 外部知识、缩写、术语、最新信息、新闻、天气等实时事实：调用 `search_web`。\n"
+                f"- {context_name}：需要补充过去聊天记录、群内旧话题或用户提到“之前/上次/以前”时调用 `search_history_context`。\n"
+                "- RAG 检索中禁止相对时间词：昨天、前天、本周、上周、这个月、上个月、最近等；使用明确日期时间或关键词检索。\n"
+                "- 精确数学计算：调用 `calculate_expression`，不要心算复杂表达式。"
+            ),
+        ),
+        AgentSkill(
+            name="schedule_tools",
+            description="安排延迟提醒、转告、固定消息或到点后执行复杂 agent 任务。",
+            prompt=(
+                "定时工具规则：\n"
+                "- 用户要求几分钟/几小时后提醒、转告或发送固定消息时：调用 `schedule_message`。\n"
+                "- 用户要求到点后查询最新信息、联网搜索、选择表情包或根据当时情况处理时：调用 `schedule_agent_task`。\n"
+                "- 如果任务只是提醒/转告，优先固定消息；如果任务需要未来环境判断，使用 agent task。\n"
+                "- 安排成功后简短告知用户，并调用 `finish`。"
+            ),
+        ),
+        AgentSkill(
+            name="profile_memory_tools",
+            description="更新用户印象、好感度，以及生成年度报告/个人总结/成分分析。",
+            prompt=(
+                "用户画像和年度报告工具规则：\n"
+                "- 用户情绪或你们的关系变化明显时，调用 `update_user_impression` 更新好感度和标签；普通闲聊不要频繁更新。\n"
+                "- `score_change` 表示好感变化，正数增加、负数降低；`reason` 简短说明触发原因。\n"
+                "- 标签用简短稳定的人设或印象词，不要加入一次性事件。\n"
+                "- 若用户提到“年度报告 / 个人总结 / 成分分析”，先调用 `generate_and_send_annual_report` 获取素材。\n"
+                "- 年度报告工具返回素材后，由你根据素材生成完整报告，并调用 `reply_user` 发送；不要直接结束，也不要重复调用年度报告工具。"
+            ),
+        ),
+    ]
+    if reaction_tool_instruction.strip():
+        skills.append(
+            AgentSkill(
+                name="reaction_tools",
+                description="给消息点 reaction，用表情轻量表达态度。",
+                prompt=reaction_tool_instruction.strip(),
+            )
+        )
+    if has_admin_permission and mute_tool_instruction.strip():
+        skills.append(
+            AgentSkill(
+                name="moderation_tools",
+                description="群管理禁言规则，仅在 bot 有管理员/群主权限时可用。",
+                prompt=mute_tool_instruction.strip(),
+            )
+        )
+    return skills
+
+
 def get_image_data_uri(file_name: str) -> str | None:
     return _get_image_data_uri(file_name, pic_dir=pic_dir)
 
@@ -417,7 +507,7 @@ async def create_chat_graph(
     reaction_tool = create_reaction_tool(
         db_session, session_id, request_id, plugin_config.bot_name, bot, event
     )
-    custom_agent_tools, custom_tool_instructions = await build_registered_agent_tools(
+    custom_agent_tools, custom_tool_instructions, custom_agent_skills = await build_registered_agent_extensions(
         AgentToolContext(
             db_session=db_session,
             session_id=session_id,
@@ -435,6 +525,35 @@ async def create_chat_graph(
     )
     if custom_tool_instructions:
         system_prompt += "\n【自定义工具】\n" + "\n".join(custom_tool_instructions) + "\n"
+    agent_skills = [
+        *_build_builtin_agent_skills(
+            is_private=is_private,
+            has_admin_permission=has_admin_permission,
+            reaction_tool_instruction=reaction_tool_instruction,
+            mute_tool_instruction=mute_tool_instruction,
+        ),
+        *custom_agent_skills,
+    ]
+    skill_index = build_agent_skill_index(agent_skills)
+    if skill_index:
+        system_prompt += "\n" + skill_index
+    skill_loader_tool = create_agent_skill_loader_tool(
+        agent_skills,
+        AgentToolContext(
+            db_session=db_session,
+            session_id=session_id,
+            request_id=request_id,
+            user_id=str(user_id) if user_id is not None else None,
+            user_name=user_name,
+            interface=interface,
+            send_target=send_target,
+            is_private=is_private,
+            bot_id=bot_id,
+            bot=bot,
+            event=event,
+            model=model,
+        ),
+    )
 
     agent_tools = [
         search_web,
@@ -457,6 +576,7 @@ async def create_chat_graph(
         mute_tool,
         schedule_tool,
         schedule_agent_tool,
+        *([skill_loader_tool] if skill_loader_tool is not None else []),
         *custom_agent_tools,
         finish,
     ]

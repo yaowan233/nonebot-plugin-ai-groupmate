@@ -165,6 +165,21 @@ def _normalize_tool_result(result: Any) -> tuple[str, list[ContentBlock] | None]
     return str(result), None
 
 
+def _message_text_content(message: AIMessage) -> str:
+    content = message.content
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict) and isinstance(item.get("text"), str):
+                parts.append(item["text"])
+        return "\n".join(part.strip() for part in parts if part.strip())
+    return ""
+
+
 def _make_agent_node(model: Any, tools: list[BaseTool], system_prompt: str | Sequence[BaseMessage]) -> Any:
     bound_model = model.bind_tools(tools)
     system_messages = normalize_system_messages(system_prompt)
@@ -186,10 +201,10 @@ def _make_tool_node(tools_by_name: dict[str, BaseTool]):
     async def tool_node(state: AgentState) -> dict:
         messages = state["messages"]
         last_message = messages[-1]
-        if not isinstance(last_message, AIMessage) or not last_message.tool_calls:
+        if not isinstance(last_message, AIMessage):
             return {}
 
-        tool_calls = last_message.tool_calls
+        tool_calls = last_message.tool_calls or []
         results: list[BaseMessage] = []
         reply_count = state.get("reply_count", 0)
         tool_count = state.get("tool_count", 0)
@@ -200,6 +215,30 @@ def _make_tool_node(tools_by_name: dict[str, BaseTool]):
         request_id = state["request_id"]
 
         agent_ctx = _AgentContext(session_id=session_id, request_id=request_id)
+
+        if not tool_calls:
+            direct_reply = _message_text_content(last_message)
+            if direct_reply:
+                reply_tool = tools_by_name.get("reply_user")
+                if reply_tool is None:
+                    logger.warning("[Agent] 模型直接返回文本，但 reply_user 工具不存在，无法发送")
+                elif request_id and not await is_request_active(session_id, request_id):
+                    logger.info("[Agent] 模型直接返回文本，但请求已过期，跳过发送")
+                else:
+                    try:
+                        result = await reply_tool.ainvoke({"content": direct_reply})
+                        logger.info(f"[Agent] 已兜底发送模型直接回复: {result}")
+                        reply_count += 1
+                    except Exception as e:
+                        logger.error(f"[Agent] 兜底发送模型直接回复失败: {e}")
+            return {
+                "messages": results,
+                "reply_count": reply_count,
+                "tool_count": tool_count,
+                "reply_this_round": reply_this_round,
+                "reaction_this_round": reaction_this_round,
+                "called_finish": 1,
+            }
 
         for tc in tool_calls:
             name: str = tc["name"]
@@ -267,6 +306,8 @@ def _make_tool_node(tools_by_name: dict[str, BaseTool]):
 def _should_call_tools(state: AgentState) -> str:
     last = state["messages"][-1]
     if isinstance(last, AIMessage) and last.tool_calls:
+        return "tools"
+    if isinstance(last, AIMessage) and _message_text_content(last):
         return "tools"
     return "end"
 

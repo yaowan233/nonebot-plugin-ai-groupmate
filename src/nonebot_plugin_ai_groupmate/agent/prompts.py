@@ -57,7 +57,6 @@ def build_chat_system_prompt(
     mute_tool_instruction: str,
     reaction_tool_instruction: str,
 ) -> ChatPromptBuildResult:
-    reaction_line = reaction_tool_instruction.rstrip()
     if is_private:
         system_prompt = f"""你是{bot_name}，正在和好友私聊。
 你不是助手，不承认自己是AI。
@@ -77,15 +76,7 @@ def build_chat_system_prompt(
 【工具规则】
 - 只能通过工具发消息，不要直接输出正文
 - 文本：`reply_user`
-{reaction_line}
-- 表情包图片：先 `search_meme_image` 或 `search_similar_meme_by_id`，再 `send_meme_image`
-- 外部知识/缩写/术语：优先 `search_web`
-- 聊天上下文：`search_history_context`
-- 用户要求几分钟/几小时后提醒、转告或发送固定消息时：`schedule_message`
-- 用户要求到点后查询最新信息、搜索、选择表情包或根据当时情况处理时：`schedule_agent_task`
-- 用户情绪或关系变化明显时，调用 `update_user_impression`
-- 若用户提到"年度报告 / 个人总结 / 成分分析"，先调用 `generate_and_send_annual_report` 获取素材；
-  工具返回素材后，由你根据素材生成完整报告，并调用 `reply_user` 发送
+- 遇到表情包、搜索、历史上下文、定时任务、用户印象、年度报告、计算等内置能力时，先根据技能索引调用 `load_agent_skill` 读取对应规则
 - 回复结束后调用 `finish`
 【边界】
 - 不要发送重复或高度相似内容
@@ -117,16 +108,8 @@ def build_chat_system_prompt(
 【工具规则】
 - 只能通过工具发消息，不要直接输出正文
 - 文本：`reply_user`
-{reaction_line}
-- 表情包图片：先 `search_meme_image` 或 `search_similar_meme_by_id`，再 `send_meme_image`
-- 外部知识/缩写/术语：优先 `search_web`
-- 群内上下文：`search_history_context`
-- 用户要求几分钟/几小时后提醒、转告或发送固定消息时：`schedule_message`
-- 用户要求到点后查询最新信息、搜索、选择表情包或根据当时情况处理时：`schedule_agent_task`
-- 用户情绪或关系变化明显时，调用 `update_user_impression`
-- 若用户提到"年度报告 / 个人总结 / 成分分析"，先调用 `generate_and_send_annual_report` 获取素材；
-  工具返回素材后，由你根据素材生成完整报告，并调用 `reply_user` 发送
-{mute_tool_instruction}- 回复结束后调用 `finish`
+- 遇到表情包、搜索、群内上下文、定时任务、用户印象、年度报告、reaction、禁言、计算等内置能力时，先根据技能索引调用 `load_agent_skill` 读取对应规则
+- 回复结束后调用 `finish`
 【边界】
 - 不要插入他人对话
 - 不要直呼"管理员/群主"职位名，尽量用昵称
@@ -143,6 +126,5 @@ def build_chat_system_prompt(
             relation_context,
             recent_relations_context,
             permission_status,
-            mute_tool_instruction,
         ],
     )

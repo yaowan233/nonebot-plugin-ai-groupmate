@@ -30,6 +30,46 @@ def build_my_tools(ctx: AgentToolContext) -> AgentToolBundle:
 
 只要这段代码所在模块被 NoneBot 加载，工具就会注册到 agent。
 
+## 按需 Skill Prompt
+
+如果外部插件很多，或者每个插件都有较长的使用说明，不建议把长文本都放进 `instructions`。可以注册 `AgentSkill`，agent 初始 prompt 里只会看到技能名称和简短描述；只有当前任务需要时，模型才会调用内置 `load_agent_skill` 读取完整 prompt。
+
+```python
+from nonebot_plugin_ai_groupmate.agent import (
+    AgentSkill,
+    AgentToolBundle,
+    AgentToolContext,
+    register_agent_tool,
+)
+
+
+@register_agent_tool
+def build_my_skills(ctx: AgentToolContext) -> AgentToolBundle:
+    return AgentToolBundle(
+        skills=[
+            AgentSkill(
+                name="score_report",
+                description="查询、解读和发送成绩报告相关能力。",
+                prompt="""
+当用户要查询成绩、生成成绩图、分析成绩走势时使用这个技能。
+- 如果只是查询文字结果，直接说明需要查询的字段。
+- 如果需要发图，先调用成绩插件提供的发送能力。
+- 如果用户要求评价发挥，结合返回的数据给出简短分析。
+""",
+            )
+        ]
+    )
+```
+
+`description` 应该短，只用于路由；`prompt` 可以写完整规则。`prompt` 也可以是同步或异步函数，用于按当前群、用户或权限动态生成说明：
+
+```python
+async def build_score_prompt(ctx: AgentToolContext) -> str:
+    return f"当前会话 ID 是 {ctx.session_id}，只允许查询本群成绩。"
+```
+
+如果插件确实需要让模型调用函数，仍然返回 `tools=[...]`；如果只是让模型掌握一段专用流程、格式或业务规则，优先用 `skills=[...]`。
+
 ## AgentToolContext
 
 自定义工具 factory 会收到 `AgentToolContext`：
@@ -57,10 +97,11 @@ factory 可以返回：
 tool_object
 [tool_object_1, tool_object_2]
 AgentToolBundle(tools=[...], instructions=[...])
+AgentToolBundle(skills=[...])
 None
 ```
 
-推荐返回 `AgentToolBundle`，并提供简短 `instructions`，这样模型会知道什么时候调用你的工具。
+推荐返回 `AgentToolBundle`。短规则放在 `instructions`，长规则放在 `AgentSkill.prompt`，避免每次对话都消耗大量 token。
 
 ## Tool 返回多模态内容
 
