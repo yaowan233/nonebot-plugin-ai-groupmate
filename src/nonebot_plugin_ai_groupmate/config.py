@@ -7,6 +7,8 @@ from langchain_openai import ChatOpenAI
 class ScopedConfig(BaseModel):
     bot_name: str = "bot"
     reply_probability: float = 0.01
+    proactive_private_message: bool = True
+    continuous_conversation_minutes: float = 5.0
     personality_setting: str = ""
     tavily_api_key: str = ""
 

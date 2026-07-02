@@ -122,6 +122,18 @@ def create_reaction_tool(
         logger.debug(f"忽略不像消息 id 的表情回复目标: {candidate[:80]}")
         return None
 
+    def _get_event_message_id() -> str | None:
+        if event is None:
+            return None
+        message_id = getattr(event, "message_id", None)
+        if message_id is None:
+            return None
+        message_id = str(message_id).strip()
+        return message_id or None
+
+    def _is_supported_onebot_reaction_message_id(message_id: str | None) -> bool:
+        return bool(message_id and message_id.isdigit())
+
     @tool("add_message_reaction")
     async def add_message_reaction(
         mood: ReactionMood,
@@ -170,6 +182,18 @@ def create_reaction_tool(
             return "表情回复失败: 当前适配器不是 OneBot，不支持消息表情回复。"
 
         message_id = _normalize_reaction_message_id(target_msg_id)
+        if message_id and not _is_supported_onebot_reaction_message_id(message_id):
+            logger.info(
+                f"跳过表情回复：当前 OneBot reaction 接口不支持非数字消息 ID {message_id!r}"
+            )
+            return "表情回复跳过: 目标消息 ID 不是数字，底层 OneBot reaction 接口不支持。"
+        if not message_id:
+            event_message_id = _get_event_message_id()
+            if not _is_supported_onebot_reaction_message_id(event_message_id):
+                logger.info(
+                    f"跳过表情回复：当前 OneBot reaction 接口不支持非数字消息 ID {event_message_id!r}"
+                )
+                return "表情回复跳过: 当前平台的消息 ID 不是数字，底层 OneBot reaction 接口不支持。"
         if not message_id:
             logger.debug("未指定表情回复目标消息，使用当前触发事件的消息 id")
 

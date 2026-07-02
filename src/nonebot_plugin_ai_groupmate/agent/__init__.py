@@ -56,6 +56,8 @@ from .custom_tools import (
     build_registered_agent_extensions,
 )
 from .prompt_cache import build_system_messages
+from .recall_tools import create_recall_message_tool
+from .private_tools import create_private_message_tool
 from .profile_tools import create_report_tool, create_relation_tool
 from .history_format import (
     parse_msg_meta,
@@ -72,6 +74,27 @@ from .schedule_tools import (
     create_schedule_agent_task_tool,
 )
 from .moderation_tools import create_mute_tool
+
+
+async def _finish_db_operation(coro):
+    task = asyncio.create_task(coro)
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        try:
+            await task
+        except Exception:
+            logger.exception("取消期间数据库事务收尾失败")
+        raise
+
+
+async def _safe_rollback(db_session: AsyncSession) -> None:
+    try:
+        await _finish_db_operation(db_session.rollback())
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("数据库回滚失败")
 
 __all__ = [
     "AgentToolBundle",
@@ -431,6 +454,12 @@ async def create_chat_graph(
     reaction_tool_instruction = build_reaction_tool_instruction(
         is_onebot_context(bot, event)
     )
+    private_message_enabled = (
+        plugin_config.proactive_private_message
+        and not is_private
+        and interface is not None
+    )
+    recall_message_enabled = not is_private and bot is not None and event is not None
     prompt_result = build_chat_system_prompt(
         bot_name=plugin_config.bot_name,
         is_private=is_private,
@@ -442,6 +471,32 @@ async def create_chat_graph(
         reaction_tool_instruction=reaction_tool_instruction,
     )
     system_prompt = prompt_result.system_prompt
+    if private_message_enabled:
+        system_prompt += """
+【主动私聊】
+- 可使用 `send_private_message` 主动私聊当前群内成员。
+- 只在不适合公开说、涉及隐私、避免让对方尴尬、或用户明确希望私下继续时使用。
+- 不要群发，不要骚扰，不要用私聊绕过对方拒绝，也不要发送营销/诱导内容。
+- 能在群内自然说清的内容优先用 `reply_user`。
+"""
+    if recall_message_enabled:
+        if has_admin_permission:
+            system_prompt += """
+【消息撤回】
+- 你当前拥有管理员/群主权限，可使用 `recall_message` 撤回当前群历史中的消息，包括他人消息。
+- 只在有明确原因时撤回，例如违规、刷屏、隐私泄露、用户明确要求撤回、误发敏感内容。
+- 不要因为观点不同、普通玩笑或轻微跑题撤回他人消息。
+- 对 bot 自己误发、重复发、格式错乱的消息，也可以用 `recall_message` 撤回。
+- target_msg_id 必须来自聊天历史里的 `id: xxx`，不要编造消息 ID。
+"""
+        else:
+            system_prompt += """
+【消息撤回】
+- 你当前没有管理员/群主权限，但可使用 `recall_message` 撤回 bot 自己发送且 5 分钟内的消息。
+- 只能用于 bot 自己误发、重复发、格式错乱、发错对象、内容不合适等情况。
+- 不能撤回用户或其他成员的消息；遇到他人违规消息时只能提醒、吐槽或请求管理员处理。
+- target_msg_id 必须来自聊天历史里 bot 自己消息的 `id: xxx`，不要编造消息 ID。
+"""
     model = get_chat_model()
     report_tool = create_report_tool(
         db_session,
@@ -506,6 +561,31 @@ async def create_chat_graph(
     )
     reaction_tool = create_reaction_tool(
         db_session, session_id, request_id, plugin_config.bot_name, bot, event
+    )
+    recall_tool = (
+        create_recall_message_tool(
+            db_session,
+            session_id,
+            request_id,
+            bot_name=plugin_config.bot_name,
+            has_admin_permission=has_admin_permission,
+            bot=bot,
+            event=event,
+        )
+        if recall_message_enabled
+        else None
+    )
+    private_message_tool = (
+        create_private_message_tool(
+            db_session,
+            session_id,
+            request_id,
+            interface,
+            bot_id=bot_id,
+            bot_name=plugin_config.bot_name,
+        )
+        if private_message_enabled
+        else None
     )
     custom_agent_tools, custom_tool_instructions, custom_agent_skills = await build_registered_agent_extensions(
         AgentToolContext(
@@ -574,8 +654,10 @@ async def create_chat_graph(
         relation_tool,
         report_tool,
         mute_tool,
+        *([recall_tool] if recall_tool is not None else []),
         schedule_tool,
         schedule_agent_tool,
+        *([private_message_tool] if private_message_tool is not None else []),
         *([skill_loader_tool] if skill_loader_tool is not None else []),
         *custom_agent_tools,
         finish,
@@ -791,7 +873,7 @@ async def choice_response_strategy(
             format_history=format_chat_history,
         )
 
-        await db_session.commit()
+        await _finish_db_operation(db_session.commit())
 
         return ResponseMessage(need_reply=False, text=None)
 
@@ -801,10 +883,10 @@ async def choice_response_strategy(
             "Error code: 400" in err_str and "inappropriate" in err_str
         ):
             logger.warning("消息内容触发阿里云内容审核，本轮跳过回复")
-            await db_session.rollback()
+            await _safe_rollback(db_session)
             return ResponseMessage(need_reply=False, text=None)
         logger.exception("Agent 决策过程发生异常")
-        await db_session.rollback()
+        await _safe_rollback(db_session)
         return ResponseMessage(need_reply=False, text=None)
 
 

@@ -43,6 +43,14 @@ from .config import Config, create_chat_openai, create_tagging_llm
 from .memory import DB
 from .reply_guard import set_latest_request_id
 
+
+async def _safe_rollback(db_session) -> None:
+    try:
+        await db_session.rollback()
+    except Exception:
+        logger.exception("数据库回滚失败")
+
+
 __plugin_meta__ = PluginMetadata(
     name="nonebot-plugin-ai-groupmate",
     description="AI虚拟群友",
@@ -57,6 +65,7 @@ plugin_data_dir: Path = store.get_plugin_data_dir()
 pic_dir = plugin_data_dir / "pics"
 pic_dir.mkdir(parents=True, exist_ok=True)
 plugin_config = get_plugin_config(Config).ai_groupmate
+MAX_WORDCLOUD_DAYS = 3650
 with open(Path(__file__).parent / "stop_words.txt", encoding="utf-8") as f:
     stop_words = f.read().splitlines() + ["id", "回复"]
 
@@ -81,6 +90,7 @@ class ReplyRequest:
     user_id: str
     user_name: str | None
     is_tome: bool
+    is_continuous: bool
     reply_to_id: str | None
 
 
@@ -94,6 +104,7 @@ class GroupReplyState:
 # 每个群只保留"最新一条"待处理回复请求，避免高峰期堆积后刷屏。
 _group_reply_states: dict[str, GroupReplyState] = {}
 _group_reply_state_lock = asyncio.Lock()
+_continuous_conversation_until: dict[tuple[str, str], datetime.datetime] = {}
 
 # 多bot去重锁: 每个群串行化消息记录,防止并发SELECT查不到对方未提交数据
 _dedup_locks: dict[str, asyncio.Lock] = {}
@@ -102,6 +113,30 @@ AGENT_HISTORY_LIMIT = 20
 AGENT_RECENT_HISTORY_HOURS = 1
 AGENT_EXTENDED_HISTORY_HOURS = 6
 AGENT_MIN_RECENT_HISTORY = 6
+
+
+def _continuous_conversation_ttl() -> datetime.timedelta:
+    minutes = max(float(plugin_config.continuous_conversation_minutes or 0), 0)
+    return datetime.timedelta(minutes=minutes)
+
+
+def _is_continuous_conversation(session_id: str, user_id: str) -> bool:
+    expires_at = _continuous_conversation_until.get((session_id, user_id))
+    if not expires_at:
+        return False
+    if datetime.datetime.now() > expires_at:
+        _continuous_conversation_until.pop((session_id, user_id), None)
+        return False
+    return True
+
+
+def _refresh_continuous_conversation(session_id: str, user_id: str) -> None:
+    ttl = _continuous_conversation_ttl()
+    if ttl <= datetime.timedelta(0):
+        return
+    _continuous_conversation_until[(session_id, user_id)] = (
+        datetime.datetime.now() + ttl
+    )
 
 
 def _get_dedup_lock(session_id: str) -> asyncio.Lock:
@@ -201,6 +236,7 @@ async def _run_group_reply_worker(group_id: str):
                     request.user_id,
                     request.user_name,
                     request.is_tome,
+                    request.is_continuous,
                     request.reply_to_id,
                 )
     finally:
@@ -306,11 +342,13 @@ async def handle_message(
                     Select(ChatHistory).where(
                         ChatHistory.session_id == session.scene.id,
                         ChatHistory.user_id == session.user.id,
-                        ChatHistory.content.endswith(body),
                         ChatHistory.created_at >= time_window,
                     )
                 )
-                if existing.scalar_one_or_none():
+                if any(
+                    history.content.endswith(body)
+                    for history in existing.scalars().all()
+                ):
                     logger.debug("消息已存在，跳过重复记录")
                     do_insert = False
 
@@ -332,14 +370,35 @@ async def handle_message(
             await db_session.rollback()
 
     # ========== 步骤2: 决定是否回复（在图片处理前判断） ==========
-    if msg.extract_plain_text().strip().lower().startswith(plugin_config.bot_name):
+    plain_text = event.get_plaintext()
+    stripped_plain_text = msg.extract_plain_text().strip()
+    command_like = plain_text.startswith(("!", "！", "/", "#", "?", "\\"))
+    if stripped_plain_text.lower().startswith(plugin_config.bot_name):
         to_me = True
-    should_reply = to_me or (random.random() < plugin_config.reply_probability)
-    if not event.get_plaintext() and not imgs:
+    explicit_to_me = to_me
+    continuous_to_me = (
+        not explicit_to_me
+        and not command_like
+        and bool(plain_text or imgs)
+        and session.scene.type == SceneType.GROUP
+        and _is_continuous_conversation(session.scene.id, session.user.id)
+    )
+    if continuous_to_me:
+        logger.debug(
+            f"群 {session.scene.id} 用户 {session.user.id} 命中连续对话窗口"
+        )
+    should_reply = (
+        to_me
+        or continuous_to_me
+        or (random.random() < plugin_config.reply_probability)
+    )
+    if explicit_to_me or continuous_to_me:
+        _refresh_continuous_conversation(session.scene.id, session.user.id)
+    if not plain_text and not imgs:
         should_reply = False
-    if event.get_plaintext().startswith(("!", "！", "/", "#", "?", "\\")):
+    if command_like:
         should_reply = False
-    if not event.get_plaintext() and not to_me:
+    if not plain_text and not (to_me or continuous_to_me):
         should_reply = False
 
     # ========== 步骤3: 处理图片消息 ==========
@@ -360,7 +419,7 @@ async def handle_message(
                 )
 
     # ========== 步骤4: 处理回复 ==========
-    if to_me:
+    if to_me or continuous_to_me:
         user_id = session.user.id
         user_name = session.user.name or session.user.nick
     else:
@@ -378,6 +437,7 @@ async def handle_message(
             user_id=user_id,
             user_name=user_name,
             is_tome=to_me,
+            is_continuous=continuous_to_me,
             reply_to_id=reply_id,
         )
         await set_latest_request_id(group_id, request.request_id)
@@ -537,6 +597,7 @@ async def handle_reply_logic(
     user_id: str,
     user_name: str | None,
     is_tome: bool,
+    is_continuous: bool,
     reply_to_id: str | None,
 ):
     """处理回复逻辑"""
@@ -577,11 +638,19 @@ async def handle_reply_logic(
             if recent_msgs[-1].content_type == "text"
             else "[图片]"
         )
+        gatekeeper_msg_text = current_msg_text
+        if is_continuous:
+            gatekeeper_msg_text = (
+                "这是用户在刚才主动呼叫 bot 后的连续对话消息。"
+                "如果像追问、补充、回应 bot 或继续话题，应倾向回复；"
+                "如果只是“嗯”“哈哈”“行”等无需回应的短反馈，可以不回复。\n"
+                f"{current_msg_text}"
+            )
 
         # === Gatekeeper 判断 ===
         if not is_tome:
             should_reply = await check_if_should_reply(
-                history_summary, current_msg_text, bot_name, is_private=is_private
+                history_summary, gatekeeper_msg_text, bot_name, is_private=is_private
             )
             if not should_reply:
                 return
@@ -631,7 +700,6 @@ async def handle_reply_logic(
 
         except asyncio.CancelledError:
             logger.info(f"群 {session.scene.id} 回复任务被取消（切换到更新请求）")
-            await db_session.rollback()
             raise
 
         logger.info(f"Agent决策结果: {strategy}")
@@ -639,7 +707,7 @@ async def handle_reply_logic(
     except Exception as e:
         logger.error(f"回复逻辑执行失败: {e}")
         print(traceback.format_exc())
-        await db_session.rollback()
+        await _safe_rollback(db_session)
 
 
 def _build_wordcloud_image(words: str) -> BytesIO:
@@ -663,6 +731,8 @@ async def _collect_words_from_db(
     db_session, session_id: str, days: int = 1, user_id: str | None = None
 ) -> str:
     """Query chat history and return a cleaned space-joined word string for wordcloud."""
+    if not 1 <= days <= MAX_WORDCLOUD_DAYS:
+        raise ValueError(f"days must be between 1 and {MAX_WORDCLOUD_DAYS}")
     cutoff = datetime.datetime.now() - datetime.timedelta(days=days)
     where = [
         ChatHistory.session_id == session_id,
@@ -682,6 +752,17 @@ async def _collect_words_from_db(
     return words
 
 
+def _parse_wordcloud_days(arg_text: str) -> int:
+    if not arg_text:
+        return 1
+    if not arg_text.isdigit():
+        raise ValueError("统计范围应为纯数字")
+    days = int(arg_text)
+    if not 1 <= days <= MAX_WORDCLOUD_DAYS:
+        raise ValueError(f"统计范围应为 1-{MAX_WORDCLOUD_DAYS} 天")
+    return days
+
+
 frequency = on_command("词频")
 
 
@@ -691,11 +772,10 @@ async def _(
 ):
     session_id = session.scene.id
     arg_text = arg.extract_plain_text().strip()
-    if not arg_text:
-        arg_text = "1"
-    if not arg_text.isdigit():
-        await frequency.finish("统计范围应为纯数字")
-    days = int(arg_text)
+    try:
+        days = _parse_wordcloud_days(arg_text)
+    except ValueError as e:
+        await frequency.finish(str(e))
 
     words = await _collect_words_from_db(
         db_session, session_id, days=days, user_id=session.user.id
@@ -716,11 +796,10 @@ async def _(
 ):
     session_id = session.scene.id
     arg_text = arg.extract_plain_text().strip()
-    if not arg_text:
-        arg_text = "1"
-    if not arg_text.isdigit():
-        await group_frequency.finish("统计范围应为纯数字")
-    days = int(arg_text)
+    try:
+        days = _parse_wordcloud_days(arg_text)
+    except ValueError as e:
+        await group_frequency.finish(str(e))
 
     words = await _collect_words_from_db(
         db_session, session_id, days=days, user_id=None
