@@ -1,5 +1,6 @@
 import datetime
 from typing import Any
+from collections.abc import Sequence
 
 from sqlalchemy import Select, func
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -148,7 +149,7 @@ def estimate_usage_row_cost(row: TokenUsage, config: ScopedConfig) -> float:
     )
 
 
-def _aggregate_rows(rows: list[TokenUsage], key_fn) -> list[dict[str, Any]]:
+def _aggregate_rows(rows: Sequence[TokenUsage], key_fn) -> list[dict[str, Any]]:
     grouped: dict[tuple, dict[str, Any]] = {}
     for row in rows:
         key, labels = key_fn(row)
