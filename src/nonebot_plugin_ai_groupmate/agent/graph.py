@@ -7,7 +7,7 @@ from nonebot.log import logger
 from langchain.tools import ToolRuntime
 from langgraph.graph import END, START, StateGraph
 from langchain_core.tools import BaseTool
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, BaseMessage, ToolMessage, HumanMessage
 from langgraph.graph.message import add_messages
 from langchain_core.runnables import RunnableConfig
 
@@ -31,6 +31,7 @@ class AgentState(TypedDict):
     reply_this_round: int
     reaction_this_round: int
     called_finish: int
+    llm_cached_tokens: int
 
 
 @dataclass
@@ -58,7 +59,7 @@ def _first_int(data: Any, paths: Sequence[tuple[str, ...]]) -> int | None:
     return None
 
 
-def _log_llm_cache_usage(response: AIMessage) -> None:
+def _log_llm_cache_usage(response: AIMessage) -> dict[str, int]:
     usage = response.usage_metadata or {}
     metadata = response.response_metadata or {}
     token_usage = metadata.get("token_usage") if isinstance(metadata, dict) else {}
@@ -124,6 +125,12 @@ def _log_llm_cache_usage(response: AIMessage) -> None:
         )
     logger.debug(f"[LLM usage_metadata] {usage}")
     logger.debug(f"[LLM response_metadata] {metadata}")
+    return {
+        "input_tokens": input_tokens or 0,
+        "output_tokens": output_tokens or 0,
+        "total_tokens": total_tokens or 0,
+        "cached_tokens": cached_tokens or 0,
+    }
 
 
 def _build_tool_runtime(ctx: _AgentContext, tool_call_id: str, args: dict) -> Any:
@@ -155,7 +162,7 @@ def _normalize_tool_result(result: Any) -> tuple[str, list[ContentBlock] | None]
     if isinstance(result, str):
         return result, None
     if isinstance(result, list) and all(isinstance(item, dict) for item in result):
-        content_blocks: list[ContentBlock] = [item for item in result]
+        content_blocks: list[ContentBlock] = list(result)
         text_parts = [
             item.get("text", "")
             for item in content_blocks
@@ -187,11 +194,12 @@ def _make_agent_node(model: Any, tools: list[BaseTool], system_prompt: str | Seq
     async def agent_node(state: AgentState) -> dict:
         full: list[BaseMessage] = system_messages + list(state["messages"])
         response: AIMessage = await bound_model.ainvoke(full)
-        _log_llm_cache_usage(response)
+        usage = _log_llm_cache_usage(response)
         return {
             "messages": [response],
             "reply_this_round": 0,
             "called_finish": 0,
+            "llm_cached_tokens": state.get("llm_cached_tokens", 0) + usage["cached_tokens"],
         }
 
     return agent_node

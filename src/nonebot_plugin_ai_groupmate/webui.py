@@ -11,7 +11,7 @@ from .config import ScopedConfig
 
 
 def _money(value: float) -> str:
-    return f"${value:.6f}"
+    return f"¥{value:.6f}"
 
 
 def _fmt_int(value: int) -> str:
@@ -196,6 +196,7 @@ def register_usage_webui(config: ScopedConfig) -> None:
         async with get_session() as db_session:
             return await get_usage_dashboard_data(
                 db_session,
+                config=config,
                 days=days,
                 session_id=session_id.strip() or None,
                 user_id=user_id.strip() or None,

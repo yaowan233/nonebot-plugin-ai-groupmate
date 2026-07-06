@@ -12,9 +12,13 @@ class ScopedConfig(BaseModel):
     usage_webui_enabled: bool = True
     usage_webui_path: str = "/ai-groupmate/usage"
     usage_webui_token: str = ""
-    chat_input_cost_per_million: float = 0.0
-    chat_output_cost_per_million: float = 0.0
-    chat_cached_input_cost_per_million: float = 0.0
+    chat_input_cost_per_million: float = 2.0
+    chat_output_cost_per_million: float = 8.0
+    chat_cached_input_cost_per_million: float = 0.4
+    chat_long_context_threshold_tokens: int = 256000
+    chat_long_input_cost_per_million: float = 6.0
+    chat_long_output_cost_per_million: float = 24.0
+    chat_long_cached_input_cost_per_million: float = 1.2
     personality_setting: str = ""
     tavily_api_key: str = ""
 

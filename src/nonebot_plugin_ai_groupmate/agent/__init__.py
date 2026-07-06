@@ -272,6 +272,7 @@ async def _run_scheduled_agent_task(
                 "reply_this_round": 0,
                 "reaction_this_round": 0,
                 "called_finish": 0,
+                "llm_cached_tokens": 0,
             })
             await db_session.commit()
         logger.info(f"[定时Agent任务] 已执行 {session_id}: {task}")
@@ -853,18 +854,22 @@ async def choice_response_strategy(
             "reply_this_round": 0,
             "reaction_this_round": 0,
             "called_finish": 0,
+            "llm_cached_tokens": 0,
         }
 
         # 4. 调用 Agent
         from langchain_community.callbacks import get_openai_callback
 
         with get_openai_callback() as cb:
-            await graph.ainvoke(invoke_state, config={"callbacks": [cb]})
+            graph_result = await graph.ainvoke(invoke_state, config={"callbacks": [cb]})
         logger.info(
             f"[Token用量] 输入={cb.prompt_tokens} 输出={cb.completion_tokens} "
             f"总计={cb.total_tokens} 费用≈${cb.total_cost:.4f}"
         )
-        cached_tokens = extract_cached_tokens(cb)
+        cached_tokens = max(
+            extract_cached_tokens(cb),
+            int(graph_result.get("llm_cached_tokens", 0) or 0),
+        )
         estimated_cost = estimate_cost(
             prompt_tokens=int(cb.prompt_tokens or 0),
             completion_tokens=int(cb.completion_tokens or 0),
@@ -873,6 +878,10 @@ async def choice_response_strategy(
             input_cost_per_million=plugin_config.chat_input_cost_per_million,
             output_cost_per_million=plugin_config.chat_output_cost_per_million,
             cached_input_cost_per_million=plugin_config.chat_cached_input_cost_per_million,
+            long_context_threshold_tokens=plugin_config.chat_long_context_threshold_tokens,
+            long_input_cost_per_million=plugin_config.chat_long_input_cost_per_million,
+            long_output_cost_per_million=plugin_config.chat_long_output_cost_per_million,
+            long_cached_input_cost_per_million=plugin_config.chat_long_cached_input_cost_per_million,
         )
         await record_token_usage(
             db_session,

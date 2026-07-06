@@ -5,6 +5,7 @@ from sqlalchemy import Select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .model import TokenUsage
+from .config import ScopedConfig
 
 
 def _as_int(value: Any) -> int:
@@ -36,9 +37,30 @@ def estimate_cost(
     input_cost_per_million: float,
     output_cost_per_million: float,
     cached_input_cost_per_million: float,
+    long_context_threshold_tokens: int = 256000,
+    long_input_cost_per_million: float | None = None,
+    long_output_cost_per_million: float | None = None,
+    long_cached_input_cost_per_million: float | None = None,
 ) -> float:
     if callback_cost > 0:
         return float(callback_cost)
+
+    if prompt_tokens > long_context_threshold_tokens:
+        input_cost_per_million = (
+            long_input_cost_per_million
+            if long_input_cost_per_million is not None
+            else input_cost_per_million
+        )
+        output_cost_per_million = (
+            long_output_cost_per_million
+            if long_output_cost_per_million is not None
+            else output_cost_per_million
+        )
+        cached_input_cost_per_million = (
+            long_cached_input_cost_per_million
+            if long_cached_input_cost_per_million is not None
+            else cached_input_cost_per_million
+        )
 
     billed_prompt_tokens = max(prompt_tokens - cached_tokens, 0)
     return (
@@ -108,9 +130,53 @@ def _row_metrics(row: Any) -> dict[str, Any]:
     }
 
 
+def estimate_usage_row_cost(row: TokenUsage, config: ScopedConfig) -> float:
+    if row.estimated_cost > 0:
+        return row.estimated_cost
+    return estimate_cost(
+        prompt_tokens=row.prompt_tokens,
+        completion_tokens=row.completion_tokens,
+        cached_tokens=row.cached_tokens,
+        callback_cost=0.0,
+        input_cost_per_million=config.chat_input_cost_per_million,
+        output_cost_per_million=config.chat_output_cost_per_million,
+        cached_input_cost_per_million=config.chat_cached_input_cost_per_million,
+        long_context_threshold_tokens=config.chat_long_context_threshold_tokens,
+        long_input_cost_per_million=config.chat_long_input_cost_per_million,
+        long_output_cost_per_million=config.chat_long_output_cost_per_million,
+        long_cached_input_cost_per_million=config.chat_long_cached_input_cost_per_million,
+    )
+
+
+def _aggregate_rows(rows: list[TokenUsage], key_fn) -> list[dict[str, Any]]:
+    grouped: dict[tuple, dict[str, Any]] = {}
+    for row in rows:
+        key, labels = key_fn(row)
+        item = grouped.setdefault(
+            key,
+            {
+                **labels,
+                "requests": 0,
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "cached_tokens": 0,
+                "total_tokens": 0,
+                "estimated_cost": 0.0,
+            },
+        )
+        item["requests"] += 1
+        item["prompt_tokens"] += row.prompt_tokens
+        item["completion_tokens"] += row.completion_tokens
+        item["cached_tokens"] += row.cached_tokens
+        item["total_tokens"] += row.total_tokens
+        item["estimated_cost"] += getattr(row, "_display_cost", row.estimated_cost)
+    return sorted(grouped.values(), key=lambda item: item["total_tokens"], reverse=True)
+
+
 async def get_usage_dashboard_data(
     db_session: AsyncSession,
     *,
+    config: ScopedConfig,
     days: int = 7,
     session_id: str | None = None,
     user_id: str | None = None,
@@ -122,40 +188,45 @@ async def get_usage_dashboard_data(
     if user_id:
         filters.append(TokenUsage.user_id == user_id)
 
-    total_row = (
-        await db_session.execute(Select(*_summary_columns()).where(*filters))
-    ).one()
-
-    by_session_rows = (
+    rows = (
         await db_session.execute(
-            Select(TokenUsage.session_id, TokenUsage.session_type, *_summary_columns())
+            Select(TokenUsage)
             .where(*filters)
-            .group_by(TokenUsage.session_id, TokenUsage.session_type)
-            .order_by(func.sum(TokenUsage.total_tokens).desc())
-            .limit(50)
+            .order_by(TokenUsage.created_at.desc())
         )
-    ).all()
+    ).scalars().all()
+    for row in rows:
+        row._display_cost = estimate_usage_row_cost(row, config)  # type: ignore[attr-defined]
 
-    by_user_rows = (
-        await db_session.execute(
-            Select(TokenUsage.user_id, func.max(TokenUsage.user_name).label("user_name"), *_summary_columns())
-            .where(*filters)
-            .group_by(TokenUsage.user_id)
-            .order_by(func.sum(TokenUsage.total_tokens).desc())
-            .limit(50)
-        )
-    ).all()
-
-    by_model_rows = (
-        await db_session.execute(
-            Select(TokenUsage.model, *_summary_columns())
-            .where(*filters)
-            .group_by(TokenUsage.model)
-            .order_by(func.sum(TokenUsage.total_tokens).desc())
-            .limit(30)
-        )
-    ).all()
-
+    total = {
+        "requests": len(rows),
+        "prompt_tokens": sum(row.prompt_tokens for row in rows),
+        "completion_tokens": sum(row.completion_tokens for row in rows),
+        "cached_tokens": sum(row.cached_tokens for row in rows),
+        "total_tokens": sum(row.total_tokens for row in rows),
+        "estimated_cost": sum(getattr(row, "_display_cost", row.estimated_cost) for row in rows),
+    }
+    by_session_rows = _aggregate_rows(
+        rows,
+        lambda row: (
+            (row.session_id, row.session_type),
+            {"session_id": row.session_id, "session_type": row.session_type},
+        ),
+    )[:50]
+    by_user_rows = _aggregate_rows(
+        rows,
+        lambda row: (
+            (row.user_id,),
+            {"user_id": row.user_id, "user_name": row.user_name},
+        ),
+    )[:50]
+    by_model_rows = _aggregate_rows(
+        rows,
+        lambda row: (
+            (row.model,),
+            {"model": row.model or "unknown"},
+        ),
+    )[:30]
     recent_rows = (
         await db_session.execute(
             Select(TokenUsage)
@@ -164,35 +235,17 @@ async def get_usage_dashboard_data(
             .limit(100)
         )
     ).scalars().all()
+    for row in recent_rows:
+        row._display_cost = estimate_usage_row_cost(row, config)  # type: ignore[attr-defined]
 
     return {
         "days": days,
         "since": since.isoformat(),
         "filters": {"session_id": session_id or "", "user_id": user_id or ""},
-        "total": _row_metrics(total_row),
-        "by_session": [
-            {
-                "session_id": row.session_id,
-                "session_type": row.session_type,
-                **_row_metrics(row),
-            }
-            for row in by_session_rows
-        ],
-        "by_user": [
-            {
-                "user_id": row.user_id,
-                "user_name": row.user_name or "",
-                **_row_metrics(row),
-            }
-            for row in by_user_rows
-        ],
-        "by_model": [
-            {
-                "model": row.model or "unknown",
-                **_row_metrics(row),
-            }
-            for row in by_model_rows
-        ],
+        "total": total,
+        "by_session": by_session_rows,
+        "by_user": by_user_rows,
+        "by_model": by_model_rows,
         "recent": [
             {
                 "created_at": row.created_at.isoformat(),
@@ -205,7 +258,7 @@ async def get_usage_dashboard_data(
                 "completion_tokens": row.completion_tokens,
                 "cached_tokens": row.cached_tokens,
                 "total_tokens": row.total_tokens,
-                "estimated_cost": row.estimated_cost,
+                "estimated_cost": getattr(row, "_display_cost", row.estimated_cost),
             }
             for row in recent_rows
         ],
