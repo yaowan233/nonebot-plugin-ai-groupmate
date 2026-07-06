@@ -230,7 +230,7 @@ async def _run_scheduled_agent_task(
             )
             history = [ChatHistorySchema.model_validate(row) for row in rows[::-1]]
 
-            graph, _ = await create_chat_graph(
+            graph, _, dynamic_context = await create_chat_graph(
                 db_session,
                 session_id,
                 None,
@@ -259,6 +259,8 @@ async def _run_scheduled_agent_task(
 - 定时任务没有可用的原始消息事件，不要调用 `add_message_reaction`。
 - 任务完成后调用 `finish`。
 """
+            if dynamic_context:
+                prompt = f"{prompt}\n\n【动态上下文】\n{dynamic_context}"
 
             final_messages = format_chat_history(history, max_inline_images=0) + [
                 HumanMessage(content=prompt)
@@ -422,7 +424,7 @@ async def create_chat_graph(
     bot: Bot | None = None,
     event: Event | None = None,
     is_private: bool = False,
-):
+) -> tuple[Any, list[Any], str]:
     """创建 LangGraph 聊天图"""
     relation_context = await get_user_relation_context(db_session, user_id, user_name)
     group_context = ""
@@ -676,14 +678,14 @@ async def create_chat_graph(
         stable_system_prompt = stable_system_prompt.replace(context_part, "", 1)
         kept_dynamic_context_parts.append(context_part.strip())
 
+    dynamic_context = "\n\n".join(kept_dynamic_context_parts)
     system_messages = build_system_messages(
         stable_system_prompt,
-        "\n\n".join(kept_dynamic_context_parts),
         use_cache_control=plugin_config.chat_api_format == "anthropic",
     )
 
     graph = build_chat_graph(model, agent_tools, system_messages)
-    return graph, agent_tools
+    return graph, agent_tools, dynamic_context
 
 
 async def choice_response_strategy(
@@ -706,7 +708,7 @@ async def choice_response_strategy(
     使用LangGraph Agent决定回复策略
     """
     try:
-        graph, _ = await create_chat_graph(
+        graph, _, dynamic_context = await create_chat_graph(
             db_session,
             session_id,
             request_id,
@@ -754,11 +756,15 @@ async def choice_response_strategy(
             "星期六",
             "星期日",
         ]
+        dynamic_context_block = (
+            f"动态上下文:\n{dynamic_context}" if dynamic_context else ""
+        )
 
         prompt_text = f"""
 【当前环境】
 时间: {today.strftime("%Y-%m-%d %H:%M:%S")} {weekdays[today.weekday()]}
 {f"额外设置: {setting}" if setting else ""}
+{dynamic_context_block}
 
 【任务】
 请根据上述对话历史，判断是否需要回复。如果需要，请调用相应工具。
