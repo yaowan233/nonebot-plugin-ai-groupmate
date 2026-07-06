@@ -381,7 +381,7 @@ async def handle_message(
     continuous_to_me = (
         not explicit_to_me
         and not command_like
-        and bool(plain_text or imgs)
+        and bool(stripped_plain_text)
         and session.scene.type == SceneType.GROUP
         and _is_continuous_conversation(session.scene.id, session.user.id)
     )
@@ -631,14 +631,14 @@ async def handle_reply_logic(
         history_summary = ""
         for m in recent_msgs:
             if m.content_type == "image":
-                history_summary += f"{m.user_name}: [发送了一张图片]\n"
+                history_summary += f"{m.user_name}: [发送了一张图片/表情包，可能只是随手发的]\n"
             else:
                 history_summary += f"{m.user_name}: {m.content}\n"
 
         current_msg_text = (
             recent_msgs[-1].content
             if recent_msgs[-1].content_type == "text"
-            else "[图片]"
+            else "[图片/表情包。除非用户明确在问这张图、@bot、回复bot或正在延续图片话题，否则通常不需要回应]"
         )
         gatekeeper_msg_text = current_msg_text
         if is_continuous:
