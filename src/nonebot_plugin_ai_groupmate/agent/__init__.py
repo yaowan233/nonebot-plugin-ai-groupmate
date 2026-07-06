@@ -17,6 +17,7 @@ from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 
 from .graph import build_chat_graph
 from ..model import ChatHistory, ChatHistorySchema
+from ..usage import estimate_cost, record_token_usage, extract_cached_tokens
 from ..config import Config, create_chat_llm, create_chat_openai
 from .context import (
     get_group_context,
@@ -862,6 +863,30 @@ async def choice_response_strategy(
         logger.info(
             f"[Token用量] 输入={cb.prompt_tokens} 输出={cb.completion_tokens} "
             f"总计={cb.total_tokens} 费用≈${cb.total_cost:.4f}"
+        )
+        cached_tokens = extract_cached_tokens(cb)
+        estimated_cost = estimate_cost(
+            prompt_tokens=int(cb.prompt_tokens or 0),
+            completion_tokens=int(cb.completion_tokens or 0),
+            cached_tokens=cached_tokens,
+            callback_cost=float(cb.total_cost or 0.0),
+            input_cost_per_million=plugin_config.chat_input_cost_per_million,
+            output_cost_per_million=plugin_config.chat_output_cost_per_million,
+            cached_input_cost_per_million=plugin_config.chat_cached_input_cost_per_million,
+        )
+        await record_token_usage(
+            db_session,
+            session_id=session_id,
+            session_type="private" if is_private else "group",
+            user_id=user_id,
+            user_name=user_name,
+            model=plugin_config.chat_model or plugin_config.base_model,
+            request_id=request_id,
+            prompt_tokens=int(cb.prompt_tokens or 0),
+            completion_tokens=int(cb.completion_tokens or 0),
+            cached_tokens=cached_tokens,
+            total_tokens=int(cb.total_tokens or 0),
+            estimated_cost=estimated_cost,
         )
 
         # 5. 统一提交 db_session（reply_user / send_meme_image 只 add 不 commit）

@@ -9,6 +9,12 @@ class ScopedConfig(BaseModel):
     reply_probability: float = 0.01
     proactive_private_message: bool = True
     continuous_conversation_minutes: float = 5.0
+    usage_webui_enabled: bool = True
+    usage_webui_path: str = "/ai-groupmate/usage"
+    usage_webui_token: str = ""
+    chat_input_cost_per_million: float = 0.0
+    chat_output_cost_per_million: float = 0.0
+    chat_cached_input_cost_per_million: float = 0.0
     personality_setting: str = ""
     tavily_api_key: str = ""
 

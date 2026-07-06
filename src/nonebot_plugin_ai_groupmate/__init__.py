@@ -39,6 +39,7 @@ from .utils import (
     check_and_compress_image_bytes,
     process_and_vectorize_session_chats,
 )
+from .webui import register_usage_webui
 from .config import Config, create_chat_openai, create_tagging_llm
 from .memory import DB
 from .reply_guard import set_latest_request_id
@@ -65,6 +66,7 @@ plugin_data_dir: Path = store.get_plugin_data_dir()
 pic_dir = plugin_data_dir / "pics"
 pic_dir.mkdir(parents=True, exist_ok=True)
 plugin_config = get_plugin_config(Config).ai_groupmate
+register_usage_webui(plugin_config)
 MAX_WORDCLOUD_DAYS = 3650
 with open(Path(__file__).parent / "stop_words.txt", encoding="utf-8") as f:
     stop_words = f.read().splitlines() + ["id", "回复"]

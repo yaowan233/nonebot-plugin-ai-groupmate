@@ -1,7 +1,7 @@
 from datetime import datetime
 
 from pydantic import BaseModel
-from sqlalchemy import JSON, Index, String, Boolean
+from sqlalchemy import JSON, Float, Index, String, Boolean
 from sqlalchemy.orm import Mapped, mapped_column
 from nonebot_plugin_orm import Model
 
@@ -79,6 +79,27 @@ class GroupMemory(Model):
     summary: Mapped[str] = mapped_column(default="")
     msg_count_at_last_update: Mapped[int] = mapped_column(default=0)
     updated_at: Mapped[datetime] = mapped_column(default=datetime.now, onupdate=datetime.now, index=True)
+
+
+class TokenUsage(Model):
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    session_id: Mapped[str] = mapped_column(index=True)
+    session_type: Mapped[str] = mapped_column(String(16), default="group", index=True)
+    user_id: Mapped[str] = mapped_column(index=True)
+    user_name: Mapped[str] = mapped_column(default="")
+    model: Mapped[str] = mapped_column(default="", index=True)
+    request_id: Mapped[str] = mapped_column(default="", index=True)
+    prompt_tokens: Mapped[int] = mapped_column(default=0)
+    completion_tokens: Mapped[int] = mapped_column(default=0)
+    cached_tokens: Mapped[int] = mapped_column(default=0)
+    total_tokens: Mapped[int] = mapped_column(default=0)
+    estimated_cost: Mapped[float] = mapped_column(Float, default=0.0)
+    created_at: Mapped[datetime] = mapped_column(default=datetime.now, index=True)
+
+    __table_args__ = (
+        Index("ix_token_usage_session_time", "session_id", "created_at"),
+        Index("ix_token_usage_user_time", "user_id", "created_at"),
+    )
 
 
 class ChatHistorySchema(BaseModel):
