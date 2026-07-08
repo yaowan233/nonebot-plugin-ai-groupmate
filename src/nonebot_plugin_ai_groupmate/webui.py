@@ -49,6 +49,7 @@ def _render_dashboard(data: dict, *, path: str, token: str | None, config: Scope
             _fmt_int(row["requests"]),
             _fmt_int(row["total_tokens"]),
             _fmt_int(row["cached_tokens"]),
+            _fmt_int(row["cache_creation_tokens"]),
             _money(row["estimated_cost"]),
         ]
         for row in data["by_session"]
@@ -60,6 +61,7 @@ def _render_dashboard(data: dict, *, path: str, token: str | None, config: Scope
             _fmt_int(row["requests"]),
             _fmt_int(row["total_tokens"]),
             _fmt_int(row["cached_tokens"]),
+            _fmt_int(row["cache_creation_tokens"]),
             _money(row["estimated_cost"]),
         ]
         for row in data["by_user"]
@@ -71,6 +73,7 @@ def _render_dashboard(data: dict, *, path: str, token: str | None, config: Scope
             _fmt_int(row["prompt_tokens"]),
             _fmt_int(row["completion_tokens"]),
             _fmt_int(row["cached_tokens"]),
+            _fmt_int(row["cache_creation_tokens"]),
             _fmt_int(row["total_tokens"]),
             _money(row["estimated_cost"]),
         ]
@@ -84,6 +87,8 @@ def _render_dashboard(data: dict, *, path: str, token: str | None, config: Scope
             escape(row["user_name"]),
             escape(row["model"]),
             _fmt_int(row["total_tokens"]),
+            _fmt_int(row["cached_tokens"]),
+            _fmt_int(row["cache_creation_tokens"]),
             _money(row["estimated_cost"]),
         ]
         for row in data["recent"]
@@ -115,7 +120,7 @@ def _render_dashboard(data: dict, *, path: str, token: str | None, config: Scope
     label {{ display: grid; gap: 5px; font-size: 12px; color: var(--muted); }}
     input, select, button {{ height: 34px; border: 1px solid var(--line); border-radius: 6px; padding: 0 10px; background: white; color: var(--text); }}
     button {{ background: var(--accent); color: white; border-color: var(--accent); cursor: pointer; font-weight: 600; }}
-    .metrics {{ display: grid; grid-template-columns: repeat(6, minmax(130px, 1fr)); gap: 12px; margin: 18px 0 22px; }}
+    .metrics {{ display: grid; grid-template-columns: repeat(7, minmax(130px, 1fr)); gap: 12px; margin: 18px 0 22px; }}
     .metric {{ background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px; }}
     .metric span {{ display: block; color: var(--muted); font-size: 12px; margin-bottom: 8px; }}
     .metric strong {{ font-size: 22px; font-weight: 680; }}
@@ -159,14 +164,15 @@ def _render_dashboard(data: dict, *, path: str, token: str | None, config: Scope
       <div class="metric"><span>输入 Tokens</span><strong>{_fmt_int(total["prompt_tokens"])}</strong></div>
       <div class="metric"><span>输出 Tokens</span><strong>{_fmt_int(total["completion_tokens"])}</strong></div>
       <div class="metric"><span>缓存命中</span><strong>{_fmt_int(total["cached_tokens"])}</strong></div>
+      <div class="metric"><span>缓存创建</span><strong>{_fmt_int(total["cache_creation_tokens"])}</strong></div>
       <div class="metric"><span>估算费用</span><strong>{_money(total["estimated_cost"])}</strong></div>
     </div>
     <div class="grid">
-      <section><h2>按群/会话</h2><div class="table-wrap">{_render_table(["会话 ID", "类型", "请求", "Tokens", "缓存", "费用"], session_rows)}</div></section>
-      <section><h2>按用户</h2><div class="table-wrap">{_render_table(["用户 ID", "名称", "请求", "Tokens", "缓存", "费用"], user_rows)}</div></section>
+      <section><h2>按群/会话</h2><div class="table-wrap">{_render_table(["会话 ID", "类型", "请求", "Tokens", "缓存", "创建", "费用"], session_rows)}</div></section>
+      <section><h2>按用户</h2><div class="table-wrap">{_render_table(["用户 ID", "名称", "请求", "Tokens", "缓存", "创建", "费用"], user_rows)}</div></section>
     </div>
-    <section><h2>按模型</h2><div class="table-wrap">{_render_table(["模型", "请求", "输入", "输出", "缓存", "总计", "费用"], model_rows)}</div></section>
-    <section><h2>最近请求</h2><div class="table-wrap">{_render_table(["时间", "会话", "用户", "名称", "模型", "Tokens", "费用"], recent_rows)}</div></section>
+    <section><h2>按模型</h2><div class="table-wrap">{_render_table(["模型", "请求", "输入", "输出", "缓存", "创建", "总计", "费用"], model_rows)}</div></section>
+    <section><h2>最近请求</h2><div class="table-wrap">{_render_table(["时间", "会话", "用户", "名称", "模型", "Tokens", "缓存", "创建", "费用"], recent_rows)}</div></section>
   </main>
 </body>
 </html>"""

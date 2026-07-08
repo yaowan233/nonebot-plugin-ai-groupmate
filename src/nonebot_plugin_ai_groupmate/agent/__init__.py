@@ -17,7 +17,12 @@ from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 
 from .graph import build_chat_graph
 from ..model import ChatHistory, ChatHistorySchema
-from ..usage import estimate_cost, record_token_usage, extract_cached_tokens
+from ..usage import (
+    estimate_cost,
+    record_token_usage,
+    extract_cached_tokens,
+    extract_cache_creation_tokens,
+)
 from ..config import Config, create_chat_llm, create_chat_openai
 from .context import (
     get_group_context,
@@ -56,7 +61,7 @@ from .custom_tools import (
     create_agent_skill_loader_tool,
     build_registered_agent_extensions,
 )
-from .prompt_cache import build_system_messages
+from .prompt_cache import build_system_messages, add_ephemeral_cache_marker
 from .recall_tools import create_recall_message_tool
 from .private_tools import create_private_message_tool
 from .profile_tools import create_report_tool, create_relation_tool
@@ -118,6 +123,15 @@ with open(plugin_path / "上升.jpg", "rb") as f:
 with open(plugin_path / "下降.jpg", "rb") as f:
     down_pic = f.read()
 plugin_config = get_plugin_config(Config).ai_groupmate
+
+
+def _use_explicit_prompt_cache() -> bool:
+    if not plugin_config.chat_explicit_prompt_cache:
+        return False
+    if plugin_config.chat_api_format == "anthropic":
+        return True
+    base_url = plugin_config.chat_base_url or plugin_config.llm_base_url
+    return "dashscope.aliyuncs.com" in base_url
 with open(Path(__file__).parent.parent / "stop_words.txt", encoding="utf-8") as f:
     stop_words = f.read().splitlines() + ["id", "回复"]
 
@@ -262,7 +276,10 @@ async def _run_scheduled_agent_task(
             if dynamic_context:
                 prompt = f"{prompt}\n\n【动态上下文】\n{dynamic_context}"
 
-            final_messages = format_chat_history(history, max_inline_images=0) + [
+            history_messages = format_chat_history(history, max_inline_images=0)
+            if _use_explicit_prompt_cache():
+                history_messages = add_ephemeral_cache_marker(history_messages)
+            final_messages = history_messages + [
                 HumanMessage(content=prompt)
             ]
             await graph.ainvoke({
@@ -275,6 +292,7 @@ async def _run_scheduled_agent_task(
                 "reaction_this_round": 0,
                 "called_finish": 0,
                 "llm_cached_tokens": 0,
+                "llm_cache_creation_tokens": 0,
             })
             await db_session.commit()
         logger.info(f"[定时Agent任务] 已执行 {session_id}: {task}")
@@ -681,7 +699,7 @@ async def create_chat_graph(
     dynamic_context = "\n\n".join(kept_dynamic_context_parts)
     system_messages = build_system_messages(
         stable_system_prompt,
-        use_cache_control=plugin_config.chat_api_format == "anthropic",
+        use_cache_control=_use_explicit_prompt_cache(),
     )
 
     graph = build_chat_graph(model, agent_tools, system_messages)
@@ -744,6 +762,8 @@ async def choice_response_strategy(
             logger.info(
                 f"[Prompt缓存] 复用群 {session_id} 的连续对话线程，新增历史 {len(appended_history)} 条"
             )
+        if _use_explicit_prompt_cache():
+            chat_history_messages = add_ephemeral_cache_marker(chat_history_messages)
 
         # 2. 构建当前环境信息的 Prompt (纯文本)
         today = datetime.datetime.now()
@@ -864,6 +884,7 @@ async def choice_response_strategy(
             "reaction_this_round": 0,
             "called_finish": 0,
             "llm_cached_tokens": 0,
+            "llm_cache_creation_tokens": 0,
         }
 
         # 4. 调用 Agent
@@ -879,18 +900,35 @@ async def choice_response_strategy(
             extract_cached_tokens(cb),
             int(graph_result.get("llm_cached_tokens", 0) or 0),
         )
+        cache_creation_tokens = max(
+            extract_cache_creation_tokens(cb),
+            int(graph_result.get("llm_cache_creation_tokens", 0) or 0),
+        )
+        cached_input_cost = (
+            plugin_config.chat_explicit_cached_input_cost_per_million
+            if _use_explicit_prompt_cache()
+            else plugin_config.chat_cached_input_cost_per_million
+        )
+        long_cached_input_cost = (
+            plugin_config.chat_long_explicit_cached_input_cost_per_million
+            if _use_explicit_prompt_cache()
+            else plugin_config.chat_long_cached_input_cost_per_million
+        )
         estimated_cost = estimate_cost(
             prompt_tokens=int(cb.prompt_tokens or 0),
             completion_tokens=int(cb.completion_tokens or 0),
             cached_tokens=cached_tokens,
+            cache_creation_tokens=cache_creation_tokens,
             callback_cost=float(cb.total_cost or 0.0),
             input_cost_per_million=plugin_config.chat_input_cost_per_million,
             output_cost_per_million=plugin_config.chat_output_cost_per_million,
-            cached_input_cost_per_million=plugin_config.chat_cached_input_cost_per_million,
+            cached_input_cost_per_million=cached_input_cost,
+            cache_creation_input_cost_per_million=plugin_config.chat_cache_creation_input_cost_per_million,
             long_context_threshold_tokens=plugin_config.chat_long_context_threshold_tokens,
             long_input_cost_per_million=plugin_config.chat_long_input_cost_per_million,
             long_output_cost_per_million=plugin_config.chat_long_output_cost_per_million,
-            long_cached_input_cost_per_million=plugin_config.chat_long_cached_input_cost_per_million,
+            long_cached_input_cost_per_million=long_cached_input_cost,
+            long_cache_creation_input_cost_per_million=plugin_config.chat_long_cache_creation_input_cost_per_million,
         )
         await record_token_usage(
             db_session,
@@ -903,6 +941,7 @@ async def choice_response_strategy(
             prompt_tokens=int(cb.prompt_tokens or 0),
             completion_tokens=int(cb.completion_tokens or 0),
             cached_tokens=cached_tokens,
+            cache_creation_tokens=cache_creation_tokens,
             total_tokens=int(cb.total_tokens or 0),
             estimated_cost=estimated_cost,
         )
@@ -946,6 +985,8 @@ if __name__ == "__main__":
             "reply_this_round": 0,
             "reaction_this_round": 0,
             "called_finish": 0,
+            "llm_cached_tokens": 0,
+            "llm_cache_creation_tokens": 0,
         })
     )
     print(result)

@@ -15,10 +15,15 @@ class ScopedConfig(BaseModel):
     chat_input_cost_per_million: float = 2.0
     chat_output_cost_per_million: float = 8.0
     chat_cached_input_cost_per_million: float = 0.4
+    chat_explicit_cached_input_cost_per_million: float = 0.2
+    chat_cache_creation_input_cost_per_million: float = 2.5
+    chat_explicit_prompt_cache: bool = True
     chat_long_context_threshold_tokens: int = 256000
     chat_long_input_cost_per_million: float = 6.0
     chat_long_output_cost_per_million: float = 24.0
     chat_long_cached_input_cost_per_million: float = 1.2
+    chat_long_explicit_cached_input_cost_per_million: float = 0.6
+    chat_long_cache_creation_input_cost_per_million: float = 7.5
     personality_setting: str = ""
     tavily_api_key: str = ""
 

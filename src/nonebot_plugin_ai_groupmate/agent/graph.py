@@ -32,6 +32,7 @@ class AgentState(TypedDict):
     reaction_this_round: int
     called_finish: int
     llm_cached_tokens: int
+    llm_cache_creation_tokens: int
 
 
 @dataclass
@@ -111,17 +112,34 @@ def _log_llm_cache_usage(response: AIMessage) -> dict[str, int]:
             ("token_usage", "cache_read_input_tokens"),
         ),
     )
+    cache_creation_tokens = _first_int(
+        combined,
+        (
+            ("usage_metadata", "input_token_details", "cache_creation"),
+            ("usage_metadata", "input_token_details", "cache_creation_input_tokens"),
+            ("usage_metadata", "input_tokens_details", "cache_creation_input_tokens"),
+            ("response_metadata", "token_usage", "prompt_tokens_details", "cache_creation_input_tokens"),
+            ("response_metadata", "token_usage", "input_tokens_details", "cache_creation_input_tokens"),
+            ("response_metadata", "token_usage", "cache_creation_input_tokens"),
+            ("response_metadata", "token_usage", "cache_write_input_tokens"),
+            ("token_usage", "prompt_tokens_details", "cache_creation_input_tokens"),
+            ("token_usage", "input_tokens_details", "cache_creation_input_tokens"),
+            ("token_usage", "cache_creation_input_tokens"),
+            ("token_usage", "cache_write_input_tokens"),
+        ),
+    )
 
     if cached_tokens is None:
         logger.info(
             f"[LLM缓存] 输入={input_tokens or 0} 输出={output_tokens or 0} "
-            f"总计={total_tokens or 0} 缓存命中=未返回"
+            f"总计={total_tokens or 0} 缓存命中=未返回 缓存创建={cache_creation_tokens or 0}"
         )
     else:
         hit_rate = cached_tokens / input_tokens * 100 if input_tokens else 0
         logger.info(
             f"[LLM缓存] 输入={input_tokens or 0} 缓存命中={cached_tokens} "
-            f"命中率={hit_rate:.1f}% 输出={output_tokens or 0} 总计={total_tokens or 0}"
+            f"命中率={hit_rate:.1f}% 缓存创建={cache_creation_tokens or 0} "
+            f"输出={output_tokens or 0} 总计={total_tokens or 0}"
         )
     logger.debug(f"[LLM usage_metadata] {usage}")
     logger.debug(f"[LLM response_metadata] {metadata}")
@@ -130,6 +148,7 @@ def _log_llm_cache_usage(response: AIMessage) -> dict[str, int]:
         "output_tokens": output_tokens or 0,
         "total_tokens": total_tokens or 0,
         "cached_tokens": cached_tokens or 0,
+        "cache_creation_tokens": cache_creation_tokens or 0,
     }
 
 
@@ -200,6 +219,8 @@ def _make_agent_node(model: Any, tools: list[BaseTool], system_prompt: str | Seq
             "reply_this_round": 0,
             "called_finish": 0,
             "llm_cached_tokens": state.get("llm_cached_tokens", 0) + usage["cached_tokens"],
+            "llm_cache_creation_tokens": state.get("llm_cache_creation_tokens", 0)
+            + usage["cache_creation_tokens"],
         }
 
     return agent_node
