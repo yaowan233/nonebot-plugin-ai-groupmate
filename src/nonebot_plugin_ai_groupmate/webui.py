@@ -18,6 +18,12 @@ def _fmt_int(value: int) -> str:
     return f"{value:,}"
 
 
+def _fmt_ms(value: int) -> str:
+    if value < 1_000:
+        return f"{value} ms"
+    return f"{value / 1_000:.2f} s"
+
+
 def _token_ok(config: ScopedConfig, token: str | None) -> bool:
     return not config.usage_webui_token or token == config.usage_webui_token
 
@@ -39,6 +45,7 @@ def _render_table(headers: list[str], rows: list[list[str]]) -> str:
 
 def _render_dashboard(data: dict, *, path: str, token: str | None, config: ScopedConfig) -> str:
     total = data["total"]
+    agent = data["agent"]
     auth_query = _auth_query(config, token)
     auth_suffix = f"&{auth_query}" if auth_query else ""
 
@@ -93,6 +100,32 @@ def _render_dashboard(data: dict, *, path: str, token: str | None, config: Scope
         ]
         for row in data["recent"]
     ]
+    agent_session_rows = [
+        [
+            f"<code>{escape(row['session_id'])}</code>",
+            _fmt_int(row["requests"]),
+            _fmt_int(row["agent_llm_calls"]),
+            _fmt_int(row["agent_tool_calls"]),
+            _fmt_ms(row["agent_avg_duration_ms"]),
+            _fmt_int(row["agent_tool_timeouts"]),
+            _fmt_int(row["agent_result_truncations"]),
+            _fmt_int(row["agent_side_effect_deduplications"]),
+        ]
+        for row in data["agent_by_session"]
+    ]
+    agent_recent_rows = [
+        [
+            escape(row["created_at"][:19].replace("T", " ")),
+            f"<code>{escape(row['session_id'])}</code>",
+            _fmt_int(row["agent_llm_calls"]),
+            _fmt_int(row["agent_tool_calls"]),
+            _fmt_ms(row["agent_duration_ms"]),
+            _fmt_int(row["agent_tool_timeouts"]),
+            _fmt_int(row["agent_result_truncations"]),
+            _fmt_int(row["agent_side_effect_deduplications"]),
+        ]
+        for row in data["recent"]
+    ]
 
     return f"""<!doctype html>
 <html lang="zh-CN">
@@ -121,6 +154,7 @@ def _render_dashboard(data: dict, *, path: str, token: str | None, config: Scope
     input, select, button {{ height: 34px; border: 1px solid var(--line); border-radius: 6px; padding: 0 10px; background: white; color: var(--text); }}
     button {{ background: var(--accent); color: white; border-color: var(--accent); cursor: pointer; font-weight: 600; }}
     .metrics {{ display: grid; grid-template-columns: repeat(7, minmax(130px, 1fr)); gap: 12px; margin: 18px 0 22px; }}
+    .agent-metrics {{ grid-template-columns: repeat(6, minmax(130px, 1fr)); margin: 0; padding: 16px; }}
     .metric {{ background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px; }}
     .metric span {{ display: block; color: var(--muted); font-size: 12px; margin-bottom: 8px; }}
     .metric strong {{ font-size: 22px; font-weight: 680; }}
@@ -171,7 +205,20 @@ def _render_dashboard(data: dict, *, path: str, token: str | None, config: Scope
       <section><h2>按群/会话</h2><div class="table-wrap">{_render_table(["会话 ID", "类型", "请求", "Tokens", "缓存", "创建", "费用"], session_rows)}</div></section>
       <section><h2>按用户</h2><div class="table-wrap">{_render_table(["用户 ID", "名称", "请求", "Tokens", "缓存", "创建", "费用"], user_rows)}</div></section>
     </div>
+    <section>
+      <h2>Agent 运行</h2>
+      <div class="metrics agent-metrics">
+        <div class="metric"><span>运行次数</span><strong>{_fmt_int(agent["runs"])}</strong></div>
+        <div class="metric"><span>LLM 调用</span><strong>{_fmt_int(agent["llm_calls"])}</strong></div>
+        <div class="metric"><span>工具调用</span><strong>{_fmt_int(agent["tool_calls"])}</strong></div>
+        <div class="metric"><span>平均耗时</span><strong>{_fmt_ms(agent["avg_duration_ms"])}</strong></div>
+        <div class="metric"><span>工具超时</span><strong>{_fmt_int(agent["tool_timeouts"])}</strong></div>
+        <div class="metric"><span>结果截断 / 去重</span><strong>{_fmt_int(agent["result_truncations"])} / {_fmt_int(agent["side_effect_deduplications"])}</strong></div>
+      </div>
+      <div class="table-wrap">{_render_table(["会话 ID", "运行", "LLM", "工具", "平均耗时", "超时", "截断", "去重"], agent_session_rows)}</div>
+    </section>
     <section><h2>按模型</h2><div class="table-wrap">{_render_table(["模型", "请求", "输入", "输出", "缓存", "创建", "总计", "费用"], model_rows)}</div></section>
+    <section><h2>最近 Agent 运行</h2><div class="table-wrap">{_render_table(["时间", "会话", "LLM", "工具", "耗时", "超时", "截断", "去重"], agent_recent_rows)}</div></section>
     <section><h2>最近请求</h2><div class="table-wrap">{_render_table(["时间", "会话", "用户", "名称", "模型", "Tokens", "缓存", "创建", "费用"], recent_rows)}</div></section>
   </main>
 </body>

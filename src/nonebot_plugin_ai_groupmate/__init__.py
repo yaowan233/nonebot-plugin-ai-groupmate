@@ -6,6 +6,7 @@ import asyncio
 import datetime
 import traceback
 from io import BytesIO
+from typing import Any
 from pathlib import Path
 from functools import lru_cache
 from dataclasses import dataclass
@@ -665,10 +666,13 @@ async def handle_reply_logic(
             return
 
         role_map: dict[str, str] = {}
+        group_members: list[Any] | None = None
         if not is_private:
             try:
-                members = await interface.get_members(SceneType.GROUP, session.scene.id)
-                for member in members:
+                group_members = list(
+                    await interface.get_members(SceneType.GROUP, session.scene.id)
+                )
+                for member in group_members:
                     role_name = getattr(getattr(member, "role", None), "name", None)
                     if role_name in {"owner", "admin"}:
                         role_map[str(member.id)] = role_name
@@ -693,8 +697,9 @@ async def handle_reply_logic(
                     bot,
                     event,
                     is_private=is_private,
+                    group_members=group_members,
                 ),
-                timeout=240.0,
+                timeout=plugin_config.agent_timeout_seconds,
             )
         except asyncio.TimeoutError:
             logger.warning(f"Agent 思考超时 - session: {session.scene.id}")

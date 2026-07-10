@@ -1,6 +1,8 @@
 import re
+import json
 import difflib
 import datetime
+from typing import Any, Literal
 from collections.abc import Callable
 
 import jieba
@@ -23,6 +25,7 @@ def create_reply_tool(
     send_target: Target | None = None,
     bot_name: str,
     parse_msg_meta: Callable[[str], tuple[str | None, str | None, str]],
+    group_members: list[Any] | None = None,
 ):
     """
     核心工具：用于发送消息。
@@ -61,21 +64,32 @@ def create_reply_tool(
             deduped.append(line)
         return "\n".join(deduped)
 
+    def _result(status: Literal["sent", "skipped", "failed"], message: str) -> str:
+        return json.dumps(
+            {"status": status, "message": message},
+            ensure_ascii=False,
+        )
+
     @tool("reply_user")
-    async def reply_user(content: str) -> str:
+    async def reply_user(
+        content: str,
+        next_step: Literal["end", "continue"],
+    ) -> str:
         """
         向当前群聊发送文本回复。
         注意：如果你想对用户说话，必须调用这个工具。不要直接返回文本。
         Args:
             content: 你想发送的内容。
+            next_step: 发送后是否还需要继续思考并发送下一条。单条回复填 end；
+                只有下一条会提供新信息时填 continue，最后一条必须填 end。
         """
         if request_id is not None and not await is_request_active(
             session_id, request_id
         ):
-            return "请求已过期，已取消发送。"
+            return _result("skipped", "请求已过期，已取消发送。")
 
         if not content or not content.strip():
-            return "内容为空，未发送。"
+            return _result("failed", "内容为空，未发送。")
 
         try:
             content = _dedupe_consecutive_lines(content.strip())
@@ -110,25 +124,28 @@ def create_reply_tool(
                     logger.info(
                         f"检测到近义重复回复(相似度={similarity:.2f})，已自动跳过"
                     )
-                    return "检测到重复回复，已跳过发送。"
+                    return _result("skipped", "检测到重复回复，已跳过发送。")
 
             name_to_id: dict[str, str] = {}
-            if interface is not None:
+            members = group_members
+            if members is None and interface is not None:
                 try:
                     members = await interface.get_members(SceneType.GROUP, session_id)
-                    for member in members:
-                        target_id = str(member.id)
-                        aliases = {
-                            getattr(member, "name", None),
-                            getattr(member, "nick", None),
-                            getattr(getattr(member, "user", None), "name", None),
-                            getattr(getattr(member, "user", None), "nick", None),
-                        }
-                        for alias in aliases:
-                            if alias:
-                                name_to_id[str(alias)] = target_id
                 except Exception as e:
                     logger.warning(f"获取群成员失败，降级为纯文本发送: {e}")
+                    members = None
+            if members is not None:
+                for member in members:
+                    target_id = str(member.id)
+                    aliases = {
+                        getattr(member, "name", None),
+                        getattr(member, "nick", None),
+                        getattr(getattr(member, "user", None), "name", None),
+                        getattr(getattr(member, "user", None), "nick", None),
+                    }
+                    for alias in aliases:
+                        if alias:
+                            name_to_id[str(alias)] = target_id
 
             at_pattern = re.compile(r"@([^\s@]+)")
             punctuation = "，。,.!！?？:：;；、)）]\"'”’"
@@ -179,7 +196,7 @@ def create_reply_tool(
             if request_id is not None and not await is_request_active(
                 session_id, request_id
             ):
-                return "请求已过期，已取消发送。"
+                return _result("skipped", "请求已过期，已取消发送。")
 
             outgoing = message or UniMessage.text(content)
             res = await (
@@ -197,10 +214,10 @@ def create_reply_tool(
             )
             db_session.add(chat_history)
             logger.info(f"Bot已回复: {content}")
-            return f"消息已发送，你刚才发送的内容是：\n{content}"
+            return _result("sent", "消息已发送。")
         except Exception as e:
             logger.error(f"发送消息异常: {e}")
             await db_session.rollback()
-            return f"发送失败: {e}"
+            return _result("failed", f"发送失败: {e}")
 
     return reply_user

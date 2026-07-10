@@ -1,4 +1,5 @@
-﻿import asyncio
+﻿import time
+import asyncio
 import datetime
 from typing import Any
 from pathlib import Path
@@ -15,7 +16,7 @@ from nonebot_plugin_alconna import Target
 from sqlalchemy.ext.asyncio import AsyncSession
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 
-from .graph import build_chat_graph
+from .graph import AgentRunLimits, build_chat_graph
 from ..model import ChatHistory, ChatHistorySchema
 from ..usage import (
     estimate_cost,
@@ -132,6 +133,30 @@ def _use_explicit_prompt_cache() -> bool:
         return True
     base_url = plugin_config.chat_base_url or plugin_config.llm_base_url
     return "dashscope.aliyuncs.com" in base_url
+
+
+def _agent_run_limits() -> AgentRunLimits:
+    return AgentRunLimits(
+        max_llm_calls=plugin_config.agent_max_llm_calls,
+        max_total_tokens=plugin_config.agent_max_total_tokens,
+        llm_timeout_seconds=plugin_config.agent_llm_timeout_seconds,
+        tool_timeout_seconds=plugin_config.agent_tool_timeout_seconds,
+        tool_result_max_chars=plugin_config.agent_tool_result_max_chars,
+    )
+
+
+def _log_agent_run_summary(session_id: str, result: dict[str, Any]) -> None:
+    logger.info(
+        f"[AgentTrace] 汇总 session={session_id} "
+        f"llm_calls={result.get('llm_call_count', 0)} "
+        f"tool_calls={result.get('tool_count', 0)} "
+        f"tokens={result.get('llm_total_tokens', 0)} "
+        f"tool_timeouts={result.get('tool_timeout_count', 0)} "
+        f"truncated_results={result.get('tool_result_truncation_count', 0)} "
+        f"deduplicated_side_effects={result.get('side_effect_duplicate_count', 0)}"
+    )
+
+
 with open(Path(__file__).parent.parent / "stop_words.txt", encoding="utf-8") as f:
     stop_words = f.read().splitlines() + ["id", "回复"]
 
@@ -267,11 +292,11 @@ async def _run_scheduled_agent_task(
 
 【执行要求】
 - 你必须通过工具完成任务，不要直接输出正文。
-- 如果任务只是提醒/转告，调用 `reply_user`。
-- 如果任务要求查最新信息，先调用 `search_web`，再调用 `reply_user`。
+- 如果任务只是提醒/转告，调用 `reply_user`，并传 `next_step="end"`。
+- 如果任务要求查最新信息，先调用 `search_web`，再调用 `reply_user` 并传 `next_step="end"`。
 - 如果任务要求发送表情包图片，先调用 `search_meme_image` 或 `search_similar_meme_by_id`，再调用 `send_meme_image`。
 - 定时任务没有可用的原始消息事件，不要调用 `add_message_reaction`。
-- 任务完成后调用 `finish`。
+- 最后一条文本回复使用 `next_step="end"` 会自动结束；只有未发送文本且无后续操作时才调用 `finish`。
 """
             if dynamic_context:
                 prompt = f"{prompt}\n\n【动态上下文】\n{dynamic_context}"
@@ -282,20 +307,34 @@ async def _run_scheduled_agent_task(
             final_messages = history_messages + [
                 HumanMessage(content=prompt)
             ]
-            await graph.ainvoke({
-                "messages": final_messages,
-                "session_id": session_id,
-                "request_id": None,
-                "reply_count": 0,
-                "tool_count": 0,
-                "reply_this_round": 0,
-                "reaction_this_round": 0,
-                "called_finish": 0,
-                "llm_cached_tokens": 0,
-                "llm_cache_creation_tokens": 0,
-            })
+            graph_result = await asyncio.wait_for(
+                graph.ainvoke({
+                    "messages": final_messages,
+                    "session_id": session_id,
+                    "request_id": None,
+                    "reply_count": 0,
+                    "tool_count": 0,
+                    "reply_this_round": 0,
+                    "reply_requires_continuation": False,
+                    "reaction_this_round": 0,
+                    "called_finish": 0,
+                    "llm_cached_tokens": 0,
+                    "llm_cache_creation_tokens": 0,
+                    "llm_call_count": 0,
+                    "llm_total_tokens": 0,
+                    "tool_timeout_count": 0,
+                    "tool_result_truncation_count": 0,
+                    "side_effect_duplicate_count": 0,
+                    "completed_side_effect_keys": [],
+                    "active_skills": [],
+                }),
+                timeout=plugin_config.agent_timeout_seconds,
+            )
+            _log_agent_run_summary(session_id, graph_result)
             await db_session.commit()
         logger.info(f"[定时Agent任务] 已执行 {session_id}: {task}")
+    except asyncio.TimeoutError:
+        logger.warning(f"[定时Agent任务] 执行超时 session={session_id}: {task}")
     except Exception as e:
         logger.exception(f"[定时Agent任务] 执行失败 {session_id}: {e}")
 
@@ -318,8 +357,9 @@ def _build_builtin_agent_skills(
             prompt=(
                 "基础回复规则：\n"
                 "- 只能通过工具发消息，不要直接输出正文。\n"
-                "- 文本回复使用 `reply_user`。\n"
-                "- 回复完成后调用 `finish`。\n"
+                "- 文本回复使用 `reply_user`，且必须传 `next_step`。\n"
+                '- 单条回复传 `next_step="end"`，发送后会自动结束，不要再调用 `finish`。\n'
+                '- 确实需要拆成多条且下一条会提供新信息时，当前条传 `next_step="continue"`；最后一条必须传 `next_step="end"`。\n'
                 "- 不要重复 bot 自己刚发过的内容；多条回复必须信息递进。"
                 "- 群聊里可以偶尔复读群友短句、关键词或队形来参与，但不要刷屏。"
             ),
@@ -355,7 +395,7 @@ def _build_builtin_agent_skills(
                 "- 用户要求几分钟/几小时后提醒、转告或发送固定消息时：调用 `schedule_message`。\n"
                 "- 用户要求到点后查询最新信息、联网搜索、选择表情包或根据当时情况处理时：调用 `schedule_agent_task`。\n"
                 "- 如果任务只是提醒/转告，优先固定消息；如果任务需要未来环境判断，使用 agent task。\n"
-                "- 安排成功后简短告知用户，并调用 `finish`。"
+                '- 安排成功后简短告知用户，使用 `reply_user(next_step="end")` 自动结束。'
             ),
         ),
         AgentSkill(
@@ -367,7 +407,7 @@ def _build_builtin_agent_skills(
                 "- `score_change` 表示好感变化，正数增加、负数降低；`reason` 简短说明触发原因。\n"
                 "- 标签用简短稳定的人设或印象词，不要加入一次性事件。\n"
                 "- 若用户提到“年度报告 / 个人总结 / 成分分析”，先调用 `generate_and_send_annual_report` 获取素材。\n"
-                "- 年度报告工具返回素材后，由你根据素材生成完整报告，并调用 `reply_user` 发送；不要直接结束，也不要重复调用年度报告工具。"
+                '- 年度报告工具返回素材后，由你根据素材生成完整报告，并调用 `reply_user(next_step="end")` 发送；不要重复调用年度报告工具。'
             ),
         ),
     ]
@@ -442,6 +482,7 @@ async def create_chat_graph(
     bot: Bot | None = None,
     event: Event | None = None,
     is_private: bool = False,
+    group_members: list[Any] | None = None,
 ) -> tuple[Any, list[Any], str]:
     """创建 LangGraph 聊天图"""
     relation_context = await get_user_relation_context(db_session, user_id, user_name)
@@ -453,11 +494,17 @@ async def create_chat_graph(
             db_session, history or []
         )
 
-    has_admin_permission = False
-    if not is_private and interface and bot_id:
+    member_snapshot = group_members
+    if not is_private and interface and member_snapshot is None:
         try:
-            members = await interface.get_members(SceneType.GROUP, session_id)
-            for member in members:
+            member_snapshot = list(await interface.get_members(SceneType.GROUP, session_id))
+        except Exception as e:
+            logger.warning(f"获取群成员信息失败: {e}")
+
+    has_admin_permission = False
+    if not is_private and member_snapshot is not None and bot_id:
+        try:
+            for member in member_snapshot:
                 if str(member.id) == str(bot_id):
                     bot_role = getattr(getattr(member, "role", None), "name", None)
                     if bot_role in {"owner", "admin"}:
@@ -567,6 +614,7 @@ async def create_chat_graph(
         interface,
         bot_id,
         bot_name=plugin_config.bot_name,
+        group_members=member_snapshot,
     )
     schedule_tool = create_schedule_message_tool(
         session_id,
@@ -606,6 +654,7 @@ async def create_chat_graph(
             interface,
             bot_id=bot_id,
             bot_name=plugin_config.bot_name,
+            group_members=member_snapshot,
         )
         if private_message_enabled
         else None
@@ -658,35 +707,42 @@ async def create_chat_graph(
         ),
     )
 
-    agent_tools = [
-        search_web,
-        search_history_context,
-        create_reply_tool(
-            db_session,
-            session_id,
-            request_id,
-            interface,
-            send_target=send_target,
-            bot_name=plugin_config.bot_name,
-            parse_msg_meta=_parse_msg_meta,
-        ),
-        search_meme_tool,
-        similar_meme_tool,
-        send_meme_tool,
-        calculate_expression,
-        relation_tool,
-        report_tool,
-        mute_tool,
+    reply_tool = create_reply_tool(
+        db_session,
+        session_id,
+        request_id,
+        interface,
+        send_target=send_target,
+        bot_name=plugin_config.bot_name,
+        parse_msg_meta=_parse_msg_meta,
+        group_members=member_snapshot,
+    )
+    base_agent_tools = [
+        reply_tool,
         *([recall_tool] if recall_tool is not None else []),
-        schedule_tool,
-        schedule_agent_tool,
         *([private_message_tool] if private_message_tool is not None else []),
         *([skill_loader_tool] if skill_loader_tool is not None else []),
         *custom_agent_tools,
         finish,
     ]
+    tools_by_skill: dict[str, list[Any]] = {
+        "meme_tools": [search_meme_tool, similar_meme_tool, send_meme_tool],
+        "search_context_tools": [search_web, search_history_context, calculate_expression],
+        "schedule_tools": [schedule_tool, schedule_agent_tool],
+        "profile_memory_tools": [relation_tool, report_tool],
+    }
     if is_onebot_context(bot, event):
-        agent_tools.insert(3, reaction_tool)
+        tools_by_skill["reaction_tools"] = [reaction_tool]
+    if has_admin_permission:
+        tools_by_skill["moderation_tools"] = [mute_tool]
+
+    agent_tools = list(base_agent_tools)
+    known_tool_names = {tool.name for tool in agent_tools}
+    for skill_tools in tools_by_skill.values():
+        for agent_tool in skill_tools:
+            if agent_tool.name not in known_tool_names:
+                agent_tools.append(agent_tool)
+                known_tool_names.add(agent_tool.name)
 
     stable_system_prompt = system_prompt
     kept_dynamic_context_parts: list[str] = []
@@ -702,7 +758,14 @@ async def create_chat_graph(
         use_cache_control=_use_explicit_prompt_cache(),
     )
 
-    graph = build_chat_graph(model, agent_tools, system_messages)
+    graph = build_chat_graph(
+        model,
+        agent_tools,
+        system_messages,
+        base_tools=base_agent_tools,
+        tools_by_skill=tools_by_skill,
+        limits=_agent_run_limits(),
+    )
     return graph, agent_tools, dynamic_context
 
 
@@ -721,11 +784,21 @@ async def choice_response_strategy(
     bot: Bot | None = None,
     event: Event | None = None,
     is_private: bool = False,
+    group_members: list[Any] | None = None,
 ) -> ResponseMessage:
     """
     使用LangGraph Agent决定回复策略
     """
     try:
+        member_snapshot = group_members
+        if not is_private and interface is not None and member_snapshot is None:
+            try:
+                member_snapshot = list(
+                    await interface.get_members(SceneType.GROUP, session_id)
+                )
+            except Exception as e:
+                logger.warning(f"获取群成员信息失败: {e}")
+
         graph, _, dynamic_context = await create_chat_graph(
             db_session,
             session_id,
@@ -738,6 +811,7 @@ async def choice_response_strategy(
             bot,
             event,
             is_private=is_private,
+            group_members=member_snapshot,
         )
 
         # 1. 获取多模态格式的历史消息列表 (List[BaseMessage])
@@ -864,6 +938,7 @@ async def choice_response_strategy(
                 session_id=session_id,
                 current_user_id=user_id,
                 current_user_name=user_name,
+                group_members=member_snapshot,
             )
             if avatar_context_messages:
                 logger.info(f"本轮触发头像上下文注入 session={session_id}")
@@ -881,17 +956,28 @@ async def choice_response_strategy(
             "reply_count": 0,
             "tool_count": 0,
             "reply_this_round": 0,
+            "reply_requires_continuation": False,
             "reaction_this_round": 0,
             "called_finish": 0,
             "llm_cached_tokens": 0,
             "llm_cache_creation_tokens": 0,
+            "llm_call_count": 0,
+            "llm_total_tokens": 0,
+            "tool_timeout_count": 0,
+            "tool_result_truncation_count": 0,
+            "side_effect_duplicate_count": 0,
+            "completed_side_effect_keys": [],
+            "active_skills": [],
         }
 
         # 4. 调用 Agent
         from langchain_community.callbacks import get_openai_callback
 
+        agent_started_at = time.perf_counter()
         with get_openai_callback() as cb:
             graph_result = await graph.ainvoke(invoke_state, config={"callbacks": [cb]})
+        agent_duration_ms = round((time.perf_counter() - agent_started_at) * 1000)
+        _log_agent_run_summary(session_id, graph_result)
         logger.info(
             f"[Token用量] 输入={cb.prompt_tokens} 输出={cb.completion_tokens} "
             f"总计={cb.total_tokens} 费用≈${cb.total_cost:.4f}"
@@ -944,6 +1030,12 @@ async def choice_response_strategy(
             cache_creation_tokens=cache_creation_tokens,
             total_tokens=int(cb.total_tokens or 0),
             estimated_cost=estimated_cost,
+            agent_llm_calls=int(graph_result.get("llm_call_count", 0) or 0),
+            agent_tool_calls=int(graph_result.get("tool_count", 0) or 0),
+            agent_duration_ms=agent_duration_ms,
+            agent_tool_timeouts=int(graph_result.get("tool_timeout_count", 0) or 0),
+            agent_result_truncations=int(graph_result.get("tool_result_truncation_count", 0) or 0),
+            agent_side_effect_deduplications=int(graph_result.get("side_effect_duplicate_count", 0) or 0),
         )
 
         # 5. 统一提交 db_session（reply_user / send_meme_image 只 add 不 commit）
@@ -983,10 +1075,17 @@ if __name__ == "__main__":
             "reply_count": 0,
             "tool_count": 0,
             "reply_this_round": 0,
+            "reply_requires_continuation": False,
             "reaction_this_round": 0,
             "called_finish": 0,
             "llm_cached_tokens": 0,
             "llm_cache_creation_tokens": 0,
+            "llm_call_count": 0,
+            "llm_total_tokens": 0,
+            "tool_timeout_count": 0,
+            "tool_result_truncation_count": 0,
+            "side_effect_duplicate_count": 0,
+            "completed_side_effect_keys": [],
         })
     )
     print(result)

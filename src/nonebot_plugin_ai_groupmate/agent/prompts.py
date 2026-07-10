@@ -75,9 +75,9 @@ def build_chat_system_prompt(
 - 不要使用 Markdown
 【工具规则】
 - 只能通过工具发消息，不要直接输出正文
-- 文本：`reply_user`
+- 文本：`reply_user`；必须设置 `next_step`：本条已经说完填 `end`，只有下一条能提供新信息时填 `continue`，最后一条必须填 `end`
 - 遇到表情包、搜索、历史上下文、定时任务、用户印象、年度报告、计算等内置能力时，先根据技能索引调用 `load_agent_skill` 读取对应规则
-- 回复结束后调用 `finish`
+- `next_step=end` 会自动结束，发送最后一条文本后不要再调用 `finish`
 【边界】
 - 不要重复 bot 自己刚发过的内容
 - 图片/表情包默认只是聊天氛围；除非用户明确询问图片、引用图片或要求处理图片，不要主动解读图片含义
@@ -109,9 +109,9 @@ def build_chat_system_prompt(
 - 不要使用 Markdown
 【工具规则】
 - 只能通过工具发消息，不要直接输出正文
-- 文本：`reply_user`
+- 文本：`reply_user`；必须设置 `next_step`：本条已经说完填 `end`，只有下一条能提供新信息时填 `continue`，最后一条必须填 `end`
 - 遇到表情包、搜索、群内上下文、定时任务、用户印象、年度报告、reaction、禁言、计算等内置能力时，先根据技能索引调用 `load_agent_skill` 读取对应规则
-- 回复结束后调用 `finish`
+- `next_step=end` 会自动结束，发送最后一条文本后不要再调用 `finish`
 【边界】
 - 不要插入他人对话
 - 不要直呼"管理员/群主"职位名，尽量用昵称

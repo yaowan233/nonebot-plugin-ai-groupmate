@@ -111,6 +111,12 @@
 | ai_groupmate__chat_base_url | 否 | 无 | 主聊天模型专用 Base URL，留空则使用 `llm_base_url` |
 | ai_groupmate__chat_temperature | 否 | `0.7` | 主聊天模型温度 |
 | ai_groupmate__chat_api_format | 否 | `openai` | 主聊天接口格式，可选 `openai` / `anthropic` |
+| ai_groupmate__agent_timeout_seconds | 否 | `180` | 单次 agent 总运行超时（秒） |
+| ai_groupmate__agent_llm_timeout_seconds | 否 | `60` | 每次主模型调用超时（秒） |
+| ai_groupmate__agent_tool_timeout_seconds | 否 | `30` | 每次工具调用超时（秒） |
+| ai_groupmate__agent_max_llm_calls | 否 | `8` | 单次 agent 最多调用主模型次数 |
+| ai_groupmate__agent_max_total_tokens | 否 | `64000` | 单次 agent 最多累计模型 token 数 |
+| ai_groupmate__agent_tool_result_max_chars | 否 | `6000` | 写回后续上下文的单次工具结果最大字符数 |
 | ai_groupmate__flash_model | 否 | `qwen-flash` | 快速判断是否需要回复的模型 |
 | ai_groupmate__flash_api_key | 否 | 无 | 快速判断模型专用 API Key |
 | ai_groupmate__flash_base_url | 否 | 无 | 快速判断模型专用 Base URL |
@@ -134,6 +140,8 @@
 | ai_groupmate__embedding_base_url | 否 | 无 | Embedding Base URL，启用 Qdrant 时必填（推荐硅基流动，免费） |
 | ai_groupmate__rerank_api_url | 否 | 无 | Rerank API URL，启用 Qdrant 时使用（推荐硅基流动，免费） |
 | ai_groupmate__rerank_api_key | 否 | 无 | Rerank API Key，启用 Qdrant 时使用（推荐硅基流动，免费） |
+
+用量 WebUI 默认地址为 `/ai-groupmate/usage`。升级数据库后，页面会额外展示每轮 agent 的 LLM/工具调用次数、平均耗时、工具超时、结果截断与副作用去重情况；旧记录会以 0 显示这些新增指标。
 
 最小配置示例：
 

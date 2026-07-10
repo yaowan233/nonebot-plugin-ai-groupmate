@@ -66,7 +66,8 @@ async def search_history_context(query: str, runtime: ToolRuntime[Context]) -> s
 @tool("finish", return_direct=True)
 def finish() -> str:
     """
-    结束本次对话。当你已经完成所有回复（发送文字或图片）后，必须调用此工具。
+    结束本次对话。当未发送文本且没有后续操作，或已完成发图等非文本操作后使用。
+    最后一条文本回复应在 reply_user 中设置 next_step="end"，无需再调用此工具。
     调用后对话立即结束，不能再发送任何内容。
     """
     return ""

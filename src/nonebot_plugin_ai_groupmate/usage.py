@@ -112,6 +112,12 @@ async def record_token_usage(
     cache_creation_tokens: int,
     total_tokens: int,
     estimated_cost: float,
+    agent_llm_calls: int = 0,
+    agent_tool_calls: int = 0,
+    agent_duration_ms: int = 0,
+    agent_tool_timeouts: int = 0,
+    agent_result_truncations: int = 0,
+    agent_side_effect_deduplications: int = 0,
 ) -> None:
     db_session.add(
         TokenUsage(
@@ -127,6 +133,12 @@ async def record_token_usage(
             cache_creation_tokens=cache_creation_tokens,
             total_tokens=total_tokens,
             estimated_cost=estimated_cost,
+            agent_llm_calls=agent_llm_calls,
+            agent_tool_calls=agent_tool_calls,
+            agent_duration_ms=agent_duration_ms,
+            agent_tool_timeouts=agent_tool_timeouts,
+            agent_result_truncations=agent_result_truncations,
+            agent_side_effect_deduplications=agent_side_effect_deduplications,
         )
     )
 
@@ -207,6 +219,12 @@ def _aggregate_rows(rows: Sequence[TokenUsage], key_fn) -> list[dict[str, Any]]:
                 "cache_creation_tokens": 0,
                 "total_tokens": 0,
                 "estimated_cost": 0.0,
+                "agent_llm_calls": 0,
+                "agent_tool_calls": 0,
+                "agent_duration_ms": 0,
+                "agent_tool_timeouts": 0,
+                "agent_result_truncations": 0,
+                "agent_side_effect_deduplications": 0,
             },
         )
         item["requests"] += 1
@@ -216,6 +234,16 @@ def _aggregate_rows(rows: Sequence[TokenUsage], key_fn) -> list[dict[str, Any]]:
         item["cache_creation_tokens"] += row.cache_creation_tokens
         item["total_tokens"] += row.total_tokens
         item["estimated_cost"] += getattr(row, "_display_cost", row.estimated_cost)
+        item["agent_llm_calls"] += row.agent_llm_calls
+        item["agent_tool_calls"] += row.agent_tool_calls
+        item["agent_duration_ms"] += row.agent_duration_ms
+        item["agent_tool_timeouts"] += row.agent_tool_timeouts
+        item["agent_result_truncations"] += row.agent_result_truncations
+        item["agent_side_effect_deduplications"] += row.agent_side_effect_deduplications
+    for item in grouped.values():
+        item["agent_avg_duration_ms"] = round(
+            item["agent_duration_ms"] / item["requests"]
+        ) if item["requests"] else 0
     return sorted(grouped.values(), key=lambda item: item["total_tokens"], reverse=True)
 
 
@@ -253,13 +281,27 @@ async def get_usage_dashboard_data(
         "total_tokens": sum(row.total_tokens for row in rows),
         "estimated_cost": sum(getattr(row, "_display_cost", row.estimated_cost) for row in rows),
     }
-    by_session_rows = _aggregate_rows(
+    agent_total_duration_ms = sum(row.agent_duration_ms for row in rows)
+    agent = {
+        "runs": len(rows),
+        "llm_calls": sum(row.agent_llm_calls for row in rows),
+        "tool_calls": sum(row.agent_tool_calls for row in rows),
+        "duration_ms": agent_total_duration_ms,
+        "avg_duration_ms": round(agent_total_duration_ms / len(rows)) if rows else 0,
+        "tool_timeouts": sum(row.agent_tool_timeouts for row in rows),
+        "result_truncations": sum(row.agent_result_truncations for row in rows),
+        "side_effect_deduplications": sum(
+            row.agent_side_effect_deduplications for row in rows
+        ),
+    }
+    all_session_rows = _aggregate_rows(
         rows,
         lambda row: (
             (row.session_id, row.session_type),
             {"session_id": row.session_id, "session_type": row.session_type},
         ),
-    )[:50]
+    )
+    by_session_rows = all_session_rows[:50]
     by_user_rows = _aggregate_rows(
         rows,
         lambda row: (
@@ -274,6 +316,15 @@ async def get_usage_dashboard_data(
             {"model": row.model or "unknown"},
         ),
     )[:30]
+    agent_by_session_rows = sorted(
+        all_session_rows,
+        key=lambda row: (
+            row["agent_duration_ms"],
+            row["agent_tool_calls"],
+            row["agent_llm_calls"],
+        ),
+        reverse=True,
+    )[:50]
     recent_rows = (
         await db_session.execute(
             Select(TokenUsage)
@@ -290,6 +341,8 @@ async def get_usage_dashboard_data(
         "since": since.isoformat(),
         "filters": {"session_id": session_id or "", "user_id": user_id or ""},
         "total": total,
+        "agent": agent,
+        "agent_by_session": agent_by_session_rows,
         "by_session": by_session_rows,
         "by_user": by_user_rows,
         "by_model": by_model_rows,
@@ -307,6 +360,12 @@ async def get_usage_dashboard_data(
                 "cache_creation_tokens": row.cache_creation_tokens,
                 "total_tokens": row.total_tokens,
                 "estimated_cost": getattr(row, "_display_cost", row.estimated_cost),
+                "agent_llm_calls": row.agent_llm_calls,
+                "agent_tool_calls": row.agent_tool_calls,
+                "agent_duration_ms": row.agent_duration_ms,
+                "agent_tool_timeouts": row.agent_tool_timeouts,
+                "agent_result_truncations": row.agent_result_truncations,
+                "agent_side_effect_deduplications": row.agent_side_effect_deduplications,
             }
             for row in recent_rows
         ],

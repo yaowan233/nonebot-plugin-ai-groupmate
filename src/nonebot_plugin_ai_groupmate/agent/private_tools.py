@@ -1,3 +1,5 @@
+from typing import Any
+
 from sqlalchemy import Select
 from nonebot.log import logger
 from langchain.tools import tool
@@ -16,6 +18,7 @@ def create_private_message_tool(
     *,
     bot_id: str | None,
     bot_name: str,
+    group_members: list[Any] | None = None,
 ):
     async def _resolve_group_member(
         target_user_id: str | None, target_name: str | None
@@ -28,11 +31,13 @@ def create_private_message_tool(
         if not target_user_id and not target_name:
             return None, "缺少私聊目标，请提供 target_user_id 或 target_name。"
 
-        try:
-            members = await interface.get_members(SceneType.GROUP, session_id)
-        except Exception as e:
-            logger.warning(f"获取群成员失败，无法主动私聊: {e}")
-            return None, "获取群成员失败，无法确认私聊目标。"
+        members = group_members
+        if members is None:
+            try:
+                members = await interface.get_members(SceneType.GROUP, session_id)
+            except Exception as e:
+                logger.warning(f"获取群成员失败，无法主动私聊: {e}")
+                return None, "获取群成员失败，无法确认私聊目标。"
 
         name_to_id: dict[str, str] = {}
         member_ids: set[str] = set()

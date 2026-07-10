@@ -18,6 +18,12 @@ class ScopedConfig(BaseModel):
     chat_explicit_cached_input_cost_per_million: float = 0.2
     chat_cache_creation_input_cost_per_million: float = 2.5
     chat_explicit_prompt_cache: bool = True
+    agent_timeout_seconds: float = Field(default=180.0, gt=0)
+    agent_llm_timeout_seconds: float = Field(default=60.0, gt=0)
+    agent_tool_timeout_seconds: float = Field(default=30.0, gt=0)
+    agent_max_llm_calls: int = Field(default=8, ge=1)
+    agent_max_total_tokens: int = Field(default=64000, ge=1)
+    agent_tool_result_max_chars: int = Field(default=6000, ge=256)
     chat_long_context_threshold_tokens: int = 256000
     chat_long_input_cost_per_million: float = 6.0
     chat_long_output_cost_per_million: float = 24.0

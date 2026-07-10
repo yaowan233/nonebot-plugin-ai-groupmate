@@ -56,6 +56,7 @@ async def build_avatar_context_messages(
     current_user_id: str | None,
     current_user_name: str | None,
     max_users: int = 4,
+    group_members: list[Any] | None = None,
 ) -> list[BaseMessage]:
     user_ids: list[str] = []
     if current_user_id:
@@ -75,27 +76,30 @@ async def build_avatar_context_messages(
     avatar_by_id: dict[str, str] = {}
     name_by_id: dict[str, str] = {}
 
-    if interface is not None:
+    members = group_members
+    if members is None and interface is not None:
         try:
             members = await interface.get_members(SceneType.GROUP, session_id)
-            wanted = set(user_ids)
-            for member in members:
-                uid = str(member.id)
-                if uid not in wanted:
-                    continue
-                user = getattr(member, "user", None)
-                avatar = getattr(user, "avatar", None)
-                if avatar:
-                    avatar_by_id[uid] = str(avatar)
-                member_name = (
-                    getattr(member, "nick", None)
-                    or getattr(user, "nick", None)
-                    or getattr(user, "name", None)
-                )
-                if member_name:
-                    name_by_id[uid] = str(member_name)
         except Exception as e:
             logger.warning(f"获取群友头像信息失败，降级使用可推导头像: {e}")
+            members = None
+    if members is not None:
+        wanted = set(user_ids)
+        for member in members:
+            uid = str(member.id)
+            if uid not in wanted:
+                continue
+            user = getattr(member, "user", None)
+            avatar = getattr(user, "avatar", None)
+            if avatar:
+                avatar_by_id[uid] = str(avatar)
+            member_name = (
+                getattr(member, "nick", None)
+                or getattr(user, "nick", None)
+                or getattr(user, "name", None)
+            )
+            if member_name:
+                name_by_id[uid] = str(member_name)
 
     content_parts: list[Any] = [
         {

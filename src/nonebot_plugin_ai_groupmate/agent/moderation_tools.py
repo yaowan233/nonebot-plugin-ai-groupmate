@@ -1,4 +1,5 @@
 import traceback
+from typing import Any
 
 from nonebot.log import logger
 from langchain.tools import tool
@@ -16,6 +17,7 @@ def create_mute_tool(
     bot_id: str | None,
     *,
     bot_name: str,
+    group_members: list[Any] | None = None,
 ):
     """
     创建禁言工具（仅在bot是管理员时可用）
@@ -48,7 +50,9 @@ def create_mute_tool(
             if duration_seconds < 0 or duration_seconds > 2592000:
                 return "禁言时长必须在0-2592000秒(30天)之间。"
 
-            members = await interface.get_members(SceneType.GROUP, session_id)
+            members = group_members
+            if members is None:
+                members = await interface.get_members(SceneType.GROUP, session_id)
 
             bot_member = None
             target_member = None

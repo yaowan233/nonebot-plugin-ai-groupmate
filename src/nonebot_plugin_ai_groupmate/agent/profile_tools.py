@@ -151,7 +151,7 @@ def create_report_tool(
             relation_desc = f"好感度: {favorability} (满分100), 印象标签: {', '.join(impression_tags)}"
             samples_text = "\n".join(samples)
             return f"""【年度报告素材】
-请根据以下素材生成完整年度报告，并调用 `reply_user` 发送给用户；不要直接结束，也不要再调用年度报告工具。
+请根据以下素材生成完整年度报告，并调用 `reply_user(next_step="end")` 发送给用户；不要再调用年度报告工具。
 
 【写作要求】
 1. 不要使用 Markdown 标题、粗体或列表符号。
