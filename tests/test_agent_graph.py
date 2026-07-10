@@ -396,3 +396,24 @@ def test_token_budget_ends_the_loop():
     state["llm_total_tokens"] = 10
 
     assert _should_continue(state, AgentRunLimits(max_total_tokens=10)) == "end"
+
+
+@pytest.mark.asyncio
+async def test_partial_rollback_session_is_recovered_before_tool_execution():
+    from nonebot_plugin_ai_groupmate.agent.graph import _recover_db_session
+
+    class _Session:
+        is_active = False
+
+        def __init__(self):
+            self.rollback_count = 0
+
+        async def rollback(self):
+            self.rollback_count += 1
+            self.is_active = True
+
+    session = _Session()
+    await _recover_db_session(session)
+
+    assert session.rollback_count == 1
+    assert session.is_active is True

@@ -765,6 +765,7 @@ async def create_chat_graph(
         base_tools=base_agent_tools,
         tools_by_skill=tools_by_skill,
         limits=_agent_run_limits(),
+        db_session=db_session,
     )
     return graph, agent_tools, dynamic_context
 
@@ -977,6 +978,9 @@ async def choice_response_strategy(
         with get_openai_callback() as cb:
             graph_result = await graph.ainvoke(invoke_state, config={"callbacks": [cb]})
         agent_duration_ms = round((time.perf_counter() - agent_started_at) * 1000)
+        if not db_session.is_active:
+            logger.warning("Agent 完成后发现数据库事务未回滚，先恢复 session 再提交本轮结果")
+            await _safe_rollback(db_session)
         _log_agent_run_summary(session_id, graph_result)
         logger.info(
             f"[Token用量] 输入={cb.prompt_tokens} 输出={cb.completion_tokens} "

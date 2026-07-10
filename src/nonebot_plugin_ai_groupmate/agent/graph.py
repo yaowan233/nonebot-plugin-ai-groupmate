@@ -251,6 +251,23 @@ def _side_effect_key(name: str, args: dict[str, Any]) -> str:
     return f"{name}:{digest}"
 
 
+async def _rollback_after_tool_failure(db_session: Any | None) -> None:
+    if db_session is None:
+        return
+    try:
+        await db_session.rollback()
+    except Exception as rollback_error:
+        logger.error(f"[Agent] 工具失败后的数据库回滚失败: {rollback_error}")
+
+
+async def _recover_db_session(db_session: Any | None) -> None:
+    """Recover an AsyncSession left in SQLAlchemy's partial-rollback state."""
+    if db_session is None or getattr(db_session, "is_active", True):
+        return
+    logger.warning("[Agent] 检测到数据库事务处于 partial rollback，先执行回滚恢复")
+    await _rollback_after_tool_failure(db_session)
+
+
 def _estimate_content_tokens(content: Any) -> int:
     if isinstance(content, str):
         return max(1, len(content) // 4)
@@ -364,6 +381,7 @@ def _make_tool_node(
     base_tools: list[BaseTool],
     tools_by_skill: dict[str, list[BaseTool]],
     limits: AgentRunLimits,
+    db_session: Any | None = None,
 ):
     async def tool_node(state: AgentState) -> dict:
         messages = state["messages"]
@@ -392,6 +410,7 @@ def _make_tool_node(
         if not tool_calls:
             direct_reply = _message_text_content(last_message)
             if direct_reply:
+                await _recover_db_session(db_session)
                 reply_tool = tools_by_name.get("reply_user")
                 if reply_tool is None:
                     logger.warning("[Agent] 模型直接返回文本，但 reply_user 工具不存在，无法发送")
@@ -424,6 +443,8 @@ def _make_tool_node(
             name: str = tc["name"]
             tool_call_id = tc.get("id") or ""
             args: dict[str, Any] = tc.get("args", {})
+
+            await _recover_db_session(db_session)
 
             if tool_count >= MAX_TOOL_COUNT:
                 results.append(ToolMessage(
@@ -507,6 +528,7 @@ def _make_tool_node(
                     )
                 except asyncio.TimeoutError:
                     tool_timeout_count += 1
+                    await _rollback_after_tool_failure(db_session)
                     logger.warning(
                         f"[AgentTrace] 工具超时 session={session_id} tool={name} "
                         f"timeout={limits.tool_timeout_seconds:.1f}s"
@@ -547,6 +569,7 @@ def _make_tool_node(
                 )
             except Exception as e:
                 logger.error(f"[Agent] 工具执行失败 {name}: {e}")
+                await _rollback_after_tool_failure(db_session)
                 results.append(ToolMessage(content=f"工具执行出错: {e}", tool_call_id=tool_call_id))
 
         return {
@@ -614,6 +637,7 @@ def build_chat_graph(
     base_tools: list[BaseTool] | None = None,
     tools_by_skill: dict[str, list[BaseTool]] | None = None,
     limits: AgentRunLimits | None = None,
+    db_session: Any | None = None,
 ) -> Any:
     tools_by_name: dict[str, BaseTool] = {t.name: t for t in tools}
     base_tools = list(base_tools) if base_tools is not None else list(tools)
@@ -622,7 +646,10 @@ def build_chat_graph(
 
     builder = StateGraph(AgentState)
     builder.add_node("agent", _make_agent_node(model, base_tools, system_prompt, tools_by_skill, limits))
-    builder.add_node("tools", _make_tool_node(tools_by_name, base_tools, tools_by_skill, limits))
+    builder.add_node(
+        "tools",
+        _make_tool_node(tools_by_name, base_tools, tools_by_skill, limits, db_session),
+    )
     builder.add_edge(START, "agent")
     builder.add_conditional_edges("agent", _should_call_tools, {"tools": "tools", "end": END})
     builder.add_conditional_edges(
