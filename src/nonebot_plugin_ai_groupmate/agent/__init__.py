@@ -1055,6 +1055,13 @@ async def choice_response_strategy(
 
         return ResponseMessage(need_reply=False, text=None)
 
+    except asyncio.TimeoutError:
+        # A per-call LLM timeout is an expected, recoverable upstream failure.
+        # The graph node has logged the call details already, so avoid reporting
+        # it as an unhandled Agent exception to error monitoring.
+        logger.warning(f"Agent LLM 调用超时，已跳过本轮回复 - session: {session_id}")
+        await _safe_rollback(db_session)
+        return ResponseMessage(need_reply=False, text=None)
     except Exception as e:
         err_str = str(e)
         if "data_inspection_failed" in err_str or (

@@ -269,6 +269,10 @@ async def handle_message(
     interface: QryItrface,
 ):
     """处理消息的主函数"""
+    if str(session.user.id) == str(bot.self_id):
+        logger.debug(f"忽略机器人自身消息 - session: {session.scene.id}")
+        return
+
     bot_name = plugin_config.bot_name
     imgs = msg.include(Image)
     # 第1行固定是本条消息的平台 ID 元数据，格式 "id: {id}"
@@ -336,6 +340,7 @@ async def handle_message(
 
     # ========== 步骤1: 处理文本消息（快速） ==========
     # 用锁保证多bot并发安全: SELECT + INSERT + COMMIT 原子化
+    is_new_text_message = True
     async with _get_dedup_lock(session.scene.id):
         if is_text:
             do_insert = True
@@ -355,6 +360,8 @@ async def handle_message(
                     logger.debug("消息已存在，跳过重复记录")
                     do_insert = False
 
+            is_new_text_message = do_insert
+
             if do_insert:
                 chat_history = ChatHistory(
                     session_id=session.scene.id,
@@ -371,6 +378,10 @@ async def handle_message(
         except Exception as e:
             logger.error(f"保存文本消息失败: {e}")
             await db_session.rollback()
+
+    if is_text and not is_new_text_message:
+        logger.info(f"检测到重复入站消息，跳过回复 - session: {session.scene.id}")
+        return
 
     # ========== 步骤2: 决定是否回复（在图片处理前判断） ==========
     plain_text = event.get_plaintext()

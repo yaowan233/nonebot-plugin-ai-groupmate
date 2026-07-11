@@ -24,6 +24,31 @@ def _fmt_ms(value: int) -> str:
     return f"{value / 1_000:.2f} s"
 
 
+def _fmt_ratio(numerator: int, denominator: int) -> str:
+    if denominator <= 0:
+        return "—"
+    return f"{numerator / denominator:.1%}"
+
+
+def _fmt_average(total: int, count: int) -> str:
+    if count <= 0:
+        return "—"
+    return f"{total / count:.2f}"
+
+
+def _agent_issue_summary(row: dict) -> str:
+    issues: list[str] = []
+    if row["agent_tool_timeouts"]:
+        issues.append(f"工具超时 {row['agent_tool_timeouts']}")
+    if row["agent_result_truncations"]:
+        issues.append(f"截断 {row['agent_result_truncations']}")
+    if row["agent_side_effect_deduplications"]:
+        issues.append(f"去重 {row['agent_side_effect_deduplications']}")
+    if not issues:
+        return '<span class="status ok">无工具异常</span>'
+    return f'<span class="status warn">{" · ".join(issues)}</span>'
+
+
 def _token_ok(config: ScopedConfig, token: str | None) -> bool:
     return not config.usage_webui_token or token == config.usage_webui_token
 
@@ -48,6 +73,15 @@ def _render_dashboard(data: dict, *, path: str, token: str | None, config: Scope
     agent = data["agent"]
     auth_query = _auth_query(config, token)
     auth_suffix = f"&{auth_query}" if auth_query else ""
+    cache_rate = _fmt_ratio(total["cached_tokens"], total["prompt_tokens"])
+    llm_per_run = _fmt_average(agent["llm_calls"], agent["runs"])
+    tools_per_run = _fmt_average(agent["tool_calls"], agent["runs"])
+    agent_avg_duration = _fmt_ms(agent["avg_duration_ms"]) if agent["runs"] else "—"
+    agent_health = (
+        '<span class="status ok">工具无超时</span>'
+        if not agent["tool_timeouts"]
+        else '<span class="status warn">存在工具超时</span>'
+    )
 
     session_rows = [
         [
@@ -104,12 +138,9 @@ def _render_dashboard(data: dict, *, path: str, token: str | None, config: Scope
         [
             f"<code>{escape(row['session_id'])}</code>",
             _fmt_int(row["requests"]),
-            _fmt_int(row["agent_llm_calls"]),
-            _fmt_int(row["agent_tool_calls"]),
             _fmt_ms(row["agent_avg_duration_ms"]),
-            _fmt_int(row["agent_tool_timeouts"]),
-            _fmt_int(row["agent_result_truncations"]),
-            _fmt_int(row["agent_side_effect_deduplications"]),
+            f"{_fmt_int(row['agent_llm_calls'])} / {_fmt_int(row['agent_tool_calls'])}",
+            _agent_issue_summary(row),
         ]
         for row in data["agent_by_session"]
     ]
@@ -117,14 +148,11 @@ def _render_dashboard(data: dict, *, path: str, token: str | None, config: Scope
         [
             escape(row["created_at"][:19].replace("T", " ")),
             f"<code>{escape(row['session_id'])}</code>",
-            _fmt_int(row["agent_llm_calls"]),
-            _fmt_int(row["agent_tool_calls"]),
             _fmt_ms(row["agent_duration_ms"]),
-            _fmt_int(row["agent_tool_timeouts"]),
-            _fmt_int(row["agent_result_truncations"]),
-            _fmt_int(row["agent_side_effect_deduplications"]),
+            f"{_fmt_int(row['agent_llm_calls'])} / {_fmt_int(row['agent_tool_calls'])}",
+            _agent_issue_summary(row),
         ]
-        for row in data["recent"]
+        for row in data["agent_recent"]
     ]
 
     return f"""<!doctype html>
@@ -132,94 +160,153 @@ def _render_dashboard(data: dict, *, path: str, token: str | None, config: Scope
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>AI Groupmate Usage</title>
+  <title>AI Groupmate · 运行概览</title>
   <style>
     :root {{
       color-scheme: light;
-      --bg: #f7f8fa;
+      --bg: #f5f7fb;
       --panel: #ffffff;
-      --text: #1f2937;
-      --muted: #667085;
-      --line: #d8dee8;
+      --text: #152238;
+      --muted: #64748b;
+      --line: #dce3ee;
       --accent: #0f766e;
-      --accent2: #9a3412;
+      --accent-soft: #ecfdf5;
+      --blue: #2563eb;
+      --blue-soft: #eff6ff;
+      --warn: #b45309;
+      --warn-soft: #fff7ed;
     }}
     * {{ box-sizing: border-box; }}
     body {{ margin: 0; font-family: Inter, "Segoe UI", Arial, sans-serif; background: var(--bg); color: var(--text); }}
-    header {{ padding: 22px 28px 14px; border-bottom: 1px solid var(--line); background: var(--panel); }}
-    h1 {{ margin: 0 0 12px; font-size: 22px; font-weight: 650; letter-spacing: 0; }}
-    main {{ padding: 22px 28px 36px; max-width: 1440px; margin: 0 auto; }}
-    form {{ display: flex; flex-wrap: wrap; gap: 10px; align-items: end; }}
-    label {{ display: grid; gap: 5px; font-size: 12px; color: var(--muted); }}
-    input, select, button {{ height: 34px; border: 1px solid var(--line); border-radius: 6px; padding: 0 10px; background: white; color: var(--text); }}
-    button {{ background: var(--accent); color: white; border-color: var(--accent); cursor: pointer; font-weight: 600; }}
-    .metrics {{ display: grid; grid-template-columns: repeat(7, minmax(130px, 1fr)); gap: 12px; margin: 18px 0 22px; }}
-    .agent-metrics {{ grid-template-columns: repeat(6, minmax(130px, 1fr)); margin: 0; padding: 16px; }}
-    .metric {{ background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px; }}
-    .metric span {{ display: block; color: var(--muted); font-size: 12px; margin-bottom: 8px; }}
-    .metric strong {{ font-size: 22px; font-weight: 680; }}
-    section {{ background: var(--panel); border: 1px solid var(--line); border-radius: 8px; margin: 16px 0; overflow: hidden; }}
-    h2 {{ margin: 0; padding: 14px 16px; font-size: 15px; border-bottom: 1px solid var(--line); background: #fbfcfd; }}
+    .page-header {{ background: var(--panel); border-bottom: 1px solid var(--line); }}
+    .header-inner, main {{ max-width: 1440px; margin: 0 auto; padding-left: 28px; padding-right: 28px; }}
+    .header-top {{ display: flex; justify-content: space-between; gap: 20px; padding-top: 26px; align-items: start; }}
+    .eyebrow {{ margin: 0 0 6px; color: var(--accent); font-size: 12px; font-weight: 750; letter-spacing: .08em; text-transform: uppercase; }}
+    h1 {{ margin: 0; font-size: 27px; letter-spacing: -.03em; }}
+    .subtitle {{ margin: 8px 0 0; color: var(--muted); font-size: 14px; }}
+    .period {{ padding: 7px 10px; border-radius: 999px; background: var(--blue-soft); color: var(--blue); font-size: 13px; font-weight: 700; white-space: nowrap; }}
+    .filter-panel {{ display: flex; flex-wrap: wrap; gap: 10px; align-items: end; margin-top: 22px; padding: 14px 0 18px; }}
+    label {{ display: grid; gap: 5px; color: var(--muted); font-size: 12px; }}
+    input, select, button {{ height: 36px; border: 1px solid var(--line); border-radius: 7px; padding: 0 10px; background: var(--panel); color: var(--text); }}
+    input {{ min-width: 160px; }}
+    button {{ padding: 0 16px; border-color: var(--accent); background: var(--accent); color: white; cursor: pointer; font-weight: 700; }}
+    .links {{ margin-left: auto; color: var(--muted); font-size: 12px; }}
+    .links a {{ color: var(--accent); text-decoration: none; }}
+    main {{ padding-top: 22px; padding-bottom: 42px; }}
+    section {{ margin: 16px 0; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); overflow: hidden; }}
+    .section-head {{ display: flex; justify-content: space-between; align-items: start; gap: 16px; padding: 17px 18px 0; }}
+    .section-head h2 {{ margin: 0; font-size: 17px; letter-spacing: -.01em; }}
+    .section-copy {{ margin: 6px 18px 16px; color: var(--muted); font-size: 13px; line-height: 1.5; }}
+    .metric-grid {{ display: grid; grid-template-columns: repeat(4, minmax(150px, 1fr)); gap: 12px; }}
+    .metric-grid.agent {{ grid-template-columns: repeat(6, minmax(130px, 1fr)); padding: 0 18px 18px; }}
+    .metric {{ min-height: 114px; padding: 15px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); }}
+    .metric.primary {{ border-color: #bfdbfe; background: var(--blue-soft); }}
+    .metric.accent {{ border-color: #a7f3d0; background: var(--accent-soft); }}
+    .metric-label {{ display: block; color: var(--muted); font-size: 12px; font-weight: 650; }}
+    .metric strong {{ display: block; margin-top: 9px; font-size: 24px; letter-spacing: -.03em; }}
+    .metric-hint {{ display: block; margin-top: 6px; color: var(--muted); font-size: 12px; }}
+    .overview {{ border: 0; background: transparent; overflow: visible; }}
+    .status {{ display: inline-flex; align-items: center; min-height: 24px; padding: 3px 8px; border-radius: 999px; font-size: 12px; font-weight: 700; }}
+    .status.ok {{ color: #047857; background: var(--accent-soft); }}
+    .status.warn {{ color: var(--warn); background: var(--warn-soft); }}
+    .agent-panel {{ border-color: #b7ead5; }}
     .table-wrap {{ overflow-x: auto; }}
     table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
-    th, td {{ text-align: left; padding: 10px 12px; border-bottom: 1px solid #edf0f5; white-space: nowrap; }}
-    th {{ color: var(--muted); font-weight: 650; background: #fbfcfd; }}
-    code {{ background: #eef6f4; color: #115e59; padding: 2px 5px; border-radius: 4px; }}
-    .grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }}
+    th, td {{ padding: 11px 14px; border-top: 1px solid #edf1f6; text-align: left; white-space: nowrap; }}
+    th {{ color: var(--muted); font-size: 12px; font-weight: 700; background: #fbfcfe; }}
+    code {{ padding: 2px 5px; border-radius: 4px; background: #edf6f5; color: #0f5f58; }}
     .empty {{ color: var(--muted); text-align: center; }}
-    .links {{ margin-top: 10px; color: var(--muted); font-size: 13px; }}
-    .links a {{ color: var(--accent2); text-decoration: none; }}
-    @media (max-width: 900px) {{
-      header, main {{ padding-left: 14px; padding-right: 14px; }}
-      .metrics, .grid {{ grid-template-columns: 1fr; }}
+    .grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }}
+    .table-card {{ min-width: 0; }}
+    .table-card h3 {{ margin: 0; padding: 15px 16px 9px; font-size: 14px; }}
+    details {{ margin-top: 16px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); }}
+    summary {{ display: flex; justify-content: space-between; gap: 16px; padding: 16px 18px; cursor: pointer; font-size: 15px; font-weight: 750; }}
+    summary span {{ color: var(--muted); font-size: 12px; font-weight: 400; }}
+    .details-content {{ padding: 0 16px 16px; }}
+    @media (max-width: 1080px) {{
+      .metric-grid.agent {{ grid-template-columns: repeat(3, minmax(150px, 1fr)); }}
+    }}
+    @media (max-width: 760px) {{
+      .header-inner, main {{ padding-left: 14px; padding-right: 14px; }}
+      .header-top, .section-head {{ display: block; }}
+      .period {{ display: inline-flex; margin-top: 12px; }}
+      .filter-panel {{ align-items: stretch; }}
+      .filter-panel label, input, select, button {{ width: 100%; }}
+      .links {{ margin-left: 0; }}
+      .metric-grid, .metric-grid.agent, .grid {{ grid-template-columns: 1fr; }}
+      summary {{ display: block; }}
+      summary span {{ display: block; margin-top: 5px; }}
     }}
   </style>
 </head>
 <body>
-  <header>
-    <h1>AI Groupmate Token Usage</h1>
-    <form method="get" action="{escape(path)}">
-      <label>时间范围
-        <select name="days">
-          {"".join(f'<option value="{d}" {"selected" if int(data["days"]) == d else ""}>近 {d} 天</option>' for d in (1, 7, 30, 90))}
-        </select>
-      </label>
-      <label>群/会话 ID <input name="session_id" value="{escape(data["filters"]["session_id"])}" placeholder="可选" /></label>
-      <label>用户 ID <input name="user_id" value="{escape(data["filters"]["user_id"])}" placeholder="可选" /></label>
-      {f'<input type="hidden" name="token" value="{escape(token or "")}" />' if config.usage_webui_token else ""}
-      <button type="submit">筛选</button>
-    </form>
-    <div class="links">JSON API: <a href="{escape(path)}/api?days={int(data["days"])}{auth_suffix}">{escape(path)}/api</a></div>
+  <header class="page-header">
+    <div class="header-inner">
+      <div class="header-top">
+        <div>
+          <p class="eyebrow">AI Groupmate</p>
+          <h1>运行与用量概览</h1>
+          <p class="subtitle">先看 Agent 是否健康，再按会话追踪耗时与调用情况。</p>
+        </div>
+        <span class="period">近 {int(data["days"])} 天</span>
+      </div>
+      <form class="filter-panel" method="get" action="{escape(path)}">
+        <label>时间范围
+          <select name="days">
+            {"".join(f'<option value="{d}" {"selected" if int(data["days"]) == d else ""}>近 {d} 天</option>' for d in (1, 7, 30, 90))}
+          </select>
+        </label>
+        <label>群/会话 ID <input name="session_id" value="{escape(data["filters"]["session_id"])}" placeholder="可选" /></label>
+        <label>用户 ID <input name="user_id" value="{escape(data["filters"]["user_id"])}" placeholder="可选" /></label>
+        {f'<input type="hidden" name="token" value="{escape(token or "")}" />' if config.usage_webui_token else ""}
+        <button type="submit">更新数据</button>
+        <div class="links">JSON：<a href="{escape(path)}/api?days={int(data["days"])}{auth_suffix}">{escape(path)}/api</a></div>
+      </form>
+    </div>
   </header>
   <main>
-    <div class="metrics">
-      <div class="metric"><span>请求数</span><strong>{_fmt_int(total["requests"])}</strong></div>
-      <div class="metric"><span>总 Tokens</span><strong>{_fmt_int(total["total_tokens"])}</strong></div>
-      <div class="metric"><span>输入 Tokens</span><strong>{_fmt_int(total["prompt_tokens"])}</strong></div>
-      <div class="metric"><span>输出 Tokens</span><strong>{_fmt_int(total["completion_tokens"])}</strong></div>
-      <div class="metric"><span>缓存命中</span><strong>{_fmt_int(total["cached_tokens"])}</strong></div>
-      <div class="metric"><span>缓存创建</span><strong>{_fmt_int(total["cache_creation_tokens"])}</strong></div>
-      <div class="metric"><span>估算费用</span><strong>{_money(total["estimated_cost"])}</strong></div>
-    </div>
-    <div class="grid">
-      <section><h2>按群/会话</h2><div class="table-wrap">{_render_table(["会话 ID", "类型", "请求", "Tokens", "缓存", "创建", "费用"], session_rows)}</div></section>
-      <section><h2>按用户</h2><div class="table-wrap">{_render_table(["用户 ID", "名称", "请求", "Tokens", "缓存", "创建", "费用"], user_rows)}</div></section>
-    </div>
-    <section>
-      <h2>Agent 运行</h2>
-      <div class="metrics agent-metrics">
-        <div class="metric"><span>运行次数</span><strong>{_fmt_int(agent["runs"])}</strong></div>
-        <div class="metric"><span>LLM 调用</span><strong>{_fmt_int(agent["llm_calls"])}</strong></div>
-        <div class="metric"><span>工具调用</span><strong>{_fmt_int(agent["tool_calls"])}</strong></div>
-        <div class="metric"><span>平均耗时</span><strong>{_fmt_ms(agent["avg_duration_ms"])}</strong></div>
-        <div class="metric"><span>工具超时</span><strong>{_fmt_int(agent["tool_timeouts"])}</strong></div>
-        <div class="metric"><span>结果截断 / 去重</span><strong>{_fmt_int(agent["result_truncations"])} / {_fmt_int(agent["side_effect_deduplications"])}</strong></div>
+    <section class="overview">
+      <div class="section-head"><h2>用量概览</h2></div>
+      <p class="section-copy">所有已落库的模型请求；缓存占比按输入 Tokens 计算。</p>
+      <div class="metric-grid">
+        <div class="metric primary"><span class="metric-label">请求记录</span><strong>{_fmt_int(total["requests"])}</strong><span class="metric-hint">当前筛选范围内</span></div>
+        <div class="metric"><span class="metric-label">总 Tokens</span><strong>{_fmt_int(total["total_tokens"])}</strong><span class="metric-hint">输入 {_fmt_int(total["prompt_tokens"])} · 输出 {_fmt_int(total["completion_tokens"])} </span></div>
+        <div class="metric"><span class="metric-label">缓存占比</span><strong>{cache_rate}</strong><span class="metric-hint">缓存 {_fmt_int(total["cached_tokens"])} Tokens</span></div>
+        <div class="metric accent"><span class="metric-label">估算费用</span><strong>{_money(total["estimated_cost"])}</strong><span class="metric-hint">按当前价格配置估算</span></div>
       </div>
-      <div class="table-wrap">{_render_table(["会话 ID", "运行", "LLM", "工具", "平均耗时", "超时", "截断", "去重"], agent_session_rows)}</div>
     </section>
-    <section><h2>按模型</h2><div class="table-wrap">{_render_table(["模型", "请求", "输入", "输出", "缓存", "创建", "总计", "费用"], model_rows)}</div></section>
-    <section><h2>最近 Agent 运行</h2><div class="table-wrap">{_render_table(["时间", "会话", "LLM", "工具", "耗时", "超时", "截断", "去重"], agent_recent_rows)}</div></section>
-    <section><h2>最近请求</h2><div class="table-wrap">{_render_table(["时间", "会话", "用户", "名称", "模型", "Tokens", "缓存", "创建", "费用"], recent_rows)}</div></section>
+
+    <section class="agent-panel">
+      <div class="section-head"><h2>Agent 运行</h2>{agent_health}</div>
+      <p class="section-copy">仅统计启用 Agent 指标后成功完成的运行；旧用量记录仍保留在下方明细中，不会影响此处平均耗时。</p>
+      <div class="metric-grid agent">
+        <div class="metric primary"><span class="metric-label">已观测运行</span><strong>{_fmt_int(agent["runs"])}</strong><span class="metric-hint">可用于性能分析</span></div>
+        <div class="metric"><span class="metric-label">平均耗时</span><strong>{agent_avg_duration}</strong><span class="metric-hint">每次完整 Agent 运行</span></div>
+        <div class="metric"><span class="metric-label">LLM / 运行</span><strong>{llm_per_run}</strong><span class="metric-hint">共 {_fmt_int(agent["llm_calls"])} 次调用</span></div>
+        <div class="metric"><span class="metric-label">工具 / 运行</span><strong>{tools_per_run}</strong><span class="metric-hint">共 {_fmt_int(agent["tool_calls"])} 次调用</span></div>
+        <div class="metric"><span class="metric-label">工具超时</span><strong>{_fmt_int(agent["tool_timeouts"])}</strong><span class="metric-hint">超时会标记为需关注</span></div>
+        <div class="metric"><span class="metric-label">结果控制</span><strong>{_fmt_int(agent["result_truncations"])} / {_fmt_int(agent["side_effect_deduplications"])}</strong><span class="metric-hint">截断 / 去重</span></div>
+      </div>
+      <div class="table-wrap">{_render_table(["会话 ID", "运行", "平均耗时", "LLM / 工具", "状态"], agent_session_rows)}</div>
+    </section>
+
+    <section>
+      <div class="section-head"><h2>最近 Agent 运行</h2><span class="status ok">按时间倒序</span></div>
+      <p class="section-copy">重点查看耗时突增或“需关注”的状态。</p>
+      <div class="table-wrap">{_render_table(["时间", "会话", "耗时", "LLM / 工具", "状态"], agent_recent_rows)}</div>
+    </section>
+
+    <details>
+      <summary>Token 用量明细 <span>按模型、会话、用户与最近请求展开查看</span></summary>
+      <div class="details-content">
+        <div class="grid">
+          <div class="table-card"><h3>按模型</h3><div class="table-wrap">{_render_table(["模型", "请求", "输入", "输出", "缓存", "创建", "总计", "费用"], model_rows)}</div></div>
+          <div class="table-card"><h3>按会话</h3><div class="table-wrap">{_render_table(["会话 ID", "类型", "请求", "Tokens", "缓存", "创建", "费用"], session_rows)}</div></div>
+          <div class="table-card"><h3>按用户</h3><div class="table-wrap">{_render_table(["用户 ID", "名称", "请求", "Tokens", "缓存", "创建", "费用"], user_rows)}</div></div>
+          <div class="table-card"><h3>最近请求</h3><div class="table-wrap">{_render_table(["时间", "会话", "用户", "名称", "模型", "Tokens", "缓存", "创建", "费用"], recent_rows)}</div></div>
+        </div>
+      </div>
+    </details>
   </main>
 </body>
 </html>"""

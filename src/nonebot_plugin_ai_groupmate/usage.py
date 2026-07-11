@@ -247,6 +247,20 @@ def _aggregate_rows(rows: Sequence[TokenUsage], key_fn) -> list[dict[str, Any]]:
     return sorted(grouped.values(), key=lambda item: item["total_tokens"], reverse=True)
 
 
+def _has_agent_metrics(row: TokenUsage) -> bool:
+    """Whether this row was recorded after Agent metrics became available."""
+    return any(
+        (
+            row.agent_llm_calls,
+            row.agent_tool_calls,
+            row.agent_duration_ms,
+            row.agent_tool_timeouts,
+            row.agent_result_truncations,
+            row.agent_side_effect_deduplications,
+        )
+    )
+
+
 async def get_usage_dashboard_data(
     db_session: AsyncSession,
     *,
@@ -281,17 +295,20 @@ async def get_usage_dashboard_data(
         "total_tokens": sum(row.total_tokens for row in rows),
         "estimated_cost": sum(getattr(row, "_display_cost", row.estimated_cost) for row in rows),
     }
-    agent_total_duration_ms = sum(row.agent_duration_ms for row in rows)
+    # Rows created before the Agent-metrics migration contain zero defaults.
+    # Keep them in token-usage reports, but do not let them distort Agent stats.
+    agent_rows = [row for row in rows if _has_agent_metrics(row)]
+    agent_total_duration_ms = sum(row.agent_duration_ms for row in agent_rows)
     agent = {
-        "runs": len(rows),
-        "llm_calls": sum(row.agent_llm_calls for row in rows),
-        "tool_calls": sum(row.agent_tool_calls for row in rows),
+        "runs": len(agent_rows),
+        "llm_calls": sum(row.agent_llm_calls for row in agent_rows),
+        "tool_calls": sum(row.agent_tool_calls for row in agent_rows),
         "duration_ms": agent_total_duration_ms,
-        "avg_duration_ms": round(agent_total_duration_ms / len(rows)) if rows else 0,
-        "tool_timeouts": sum(row.agent_tool_timeouts for row in rows),
-        "result_truncations": sum(row.agent_result_truncations for row in rows),
+        "avg_duration_ms": round(agent_total_duration_ms / len(agent_rows)) if agent_rows else 0,
+        "tool_timeouts": sum(row.agent_tool_timeouts for row in agent_rows),
+        "result_truncations": sum(row.agent_result_truncations for row in agent_rows),
         "side_effect_deduplications": sum(
-            row.agent_side_effect_deduplications for row in rows
+            row.agent_side_effect_deduplications for row in agent_rows
         ),
     }
     all_session_rows = _aggregate_rows(
@@ -317,7 +334,13 @@ async def get_usage_dashboard_data(
         ),
     )[:30]
     agent_by_session_rows = sorted(
-        all_session_rows,
+        _aggregate_rows(
+            agent_rows,
+            lambda row: (
+                (row.session_id, row.session_type),
+                {"session_id": row.session_id, "session_type": row.session_type},
+            ),
+        ),
         key=lambda row: (
             row["agent_duration_ms"],
             row["agent_tool_calls"],
@@ -343,6 +366,19 @@ async def get_usage_dashboard_data(
         "total": total,
         "agent": agent,
         "agent_by_session": agent_by_session_rows,
+        "agent_recent": [
+            {
+                "created_at": row.created_at.isoformat(),
+                "session_id": row.session_id,
+                "agent_llm_calls": row.agent_llm_calls,
+                "agent_tool_calls": row.agent_tool_calls,
+                "agent_duration_ms": row.agent_duration_ms,
+                "agent_tool_timeouts": row.agent_tool_timeouts,
+                "agent_result_truncations": row.agent_result_truncations,
+                "agent_side_effect_deduplications": row.agent_side_effect_deduplications,
+            }
+            for row in agent_rows[:100]
+        ],
         "by_session": by_session_rows,
         "by_user": by_user_rows,
         "by_model": by_model_rows,
