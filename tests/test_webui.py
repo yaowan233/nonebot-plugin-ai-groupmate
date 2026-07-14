@@ -30,7 +30,19 @@ def test_dashboard_renders_agent_metrics():
             "result_truncations": 2,
             "side_effect_deduplications": 1,
         },
-        "by_session": [],
+        "by_session": [
+            {
+                "session_id": "group-1",
+                "session_type": "group",
+                "requests": 2,
+                "prompt_tokens": 200,
+                "completion_tokens": 100,
+                "cached_tokens": 50,
+                "cache_creation_tokens": 0,
+                "total_tokens": 300,
+                "estimated_cost": 0.001,
+            }
+        ],
         "agent_by_session": [
             {
                 "session_id": "group-1",
@@ -89,7 +101,14 @@ def test_dashboard_renders_agent_metrics():
     assert "Agent 运行" in html
     assert "已观测运行" in html
     assert "1.50 s" in html
-    assert "Token 用量明细" in html
+    assert "分群对比" in html
+    assert "分群效果对比" in html
+    assert 'data-tab="groups"' in html
+    assert 'data-tab="overview"' in html
+    assert 'data-tab="recent"' in html
+    assert 'data-tab="usage"' in html
+    assert "LLM / 工具显示每次运行的平均调用数" in html
+    assert "1.50 / 2.00" in html
     assert "group-1" in html
 
 

@@ -260,6 +260,13 @@ async def _rollback_after_tool_failure(db_session: Any | None) -> None:
         logger.error(f"[Agent] 工具失败后的数据库回滚失败: {rollback_error}")
 
 
+async def _commit_after_tool_success(db_session: Any | None) -> None:
+    """Persist tool writes and release the connection before the next LLM turn."""
+    if db_session is None:
+        return
+    await db_session.commit()
+
+
 async def _recover_db_session(db_session: Any | None) -> None:
     """Recover an AsyncSession left in SQLAlchemy's partial-rollback state."""
     if db_session is None or getattr(db_session, "is_active", True):
@@ -526,6 +533,10 @@ def _make_tool_node(
                         tool.ainvoke(tool_input, runtime=runtime),
                         timeout=limits.tool_timeout_seconds,
                     )
+                    # A tool may have started a transaction.  The following
+                    # model call can take minutes, so do not keep that
+                    # transaction (and its pooled connection) checked out.
+                    await _commit_after_tool_success(db_session)
                 except asyncio.TimeoutError:
                     tool_timeout_count += 1
                     await _rollback_after_tool_failure(db_session)

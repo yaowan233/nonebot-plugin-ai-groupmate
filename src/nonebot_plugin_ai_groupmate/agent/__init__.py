@@ -494,6 +494,11 @@ async def create_chat_graph(
             db_session, history or []
         )
 
+    # The member lookup below is an adapter/network operation.  End the
+    # read-only transaction first so a slow adapter cannot occupy a pooled
+    # database connection.
+    await _finish_db_operation(db_session.commit())
+
     member_snapshot = group_members
     if not is_private and interface and member_snapshot is None:
         try:
@@ -822,6 +827,9 @@ async def choice_response_strategy(
             session_id,
             reply_to_id,
         )
+        # Everything below may perform adapter I/O or wait for the LLM.  The
+        # history rows are already materialized, so release the connection.
+        await _finish_db_operation(db_session.commit())
         chat_history_messages, appended_history, reused_thread = build_append_only_history(
             session_id,
             history,

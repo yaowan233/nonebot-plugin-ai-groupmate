@@ -417,3 +417,42 @@ async def test_partial_rollback_session_is_recovered_before_tool_execution():
 
     assert session.rollback_count == 1
     assert session.is_active is True
+
+
+@pytest.mark.asyncio
+async def test_successful_tool_commits_before_returning_to_model():
+    from nonebot_plugin_ai_groupmate.agent.graph import AgentRunLimits, _make_tool_node
+
+    class _Session:
+        def __init__(self):
+            self.commit_count = 0
+
+        async def commit(self):
+            self.commit_count += 1
+
+    @tool("database_tool")
+    async def database_tool() -> str:
+        """Pretend to write through the shared database session."""
+        return "done"
+
+    session = _Session()
+    tool_node = _make_tool_node(
+        {database_tool.name: database_tool},
+        [database_tool],
+        {},
+        AgentRunLimits(),
+        db_session=session,
+    )
+
+    await tool_node(
+        _state(
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {"name": "database_tool", "args": {}, "id": "tool-1"}
+                ],
+            )
+        )
+    )
+
+    assert session.commit_count == 1

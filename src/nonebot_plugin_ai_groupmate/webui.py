@@ -154,6 +154,33 @@ def _render_dashboard(data: dict, *, path: str, token: str | None, config: Scope
         ]
         for row in data["agent_recent"]
     ]
+    agent_sessions = {
+        row["session_id"]: row for row in data["agent_by_session"]
+    }
+    group_rows = []
+    for row in data["by_session"]:
+        agent_row = agent_sessions.get(row["session_id"])
+        agent_runs = agent_row["requests"] if agent_row else 0
+        group_rows.append(
+            [
+                f"<code>{escape(row['session_id'])}</code>",
+                escape(row["session_type"]),
+                _fmt_int(row["requests"]),
+                _fmt_int(row["total_tokens"]),
+                _money(row["estimated_cost"]),
+                _fmt_int(agent_runs),
+                _fmt_ms(agent_row["agent_avg_duration_ms"]) if agent_row else "—",
+                (
+                    f"{_fmt_average(agent_row['agent_llm_calls'], agent_runs)} / "
+                    f"{_fmt_average(agent_row['agent_tool_calls'], agent_runs)}"
+                    if agent_row
+                    else "—"
+                ),
+                _agent_issue_summary(agent_row)
+                if agent_row
+                else '<span class="status neutral">暂无指标</span>',
+            ]
+        )
 
     return f"""<!doctype html>
 <html lang="zh-CN">
@@ -193,7 +220,14 @@ def _render_dashboard(data: dict, *, path: str, token: str | None, config: Scope
     .links {{ margin-left: auto; color: var(--muted); font-size: 12px; }}
     .links a {{ color: var(--accent); text-decoration: none; }}
     main {{ padding-top: 22px; padding-bottom: 42px; }}
+    .tabs {{ display: flex; gap: 6px; margin-bottom: 16px; padding: 5px; border: 1px solid var(--line); border-radius: 11px; background: var(--panel); overflow-x: auto; }}
+    .tab-button {{ flex: 0 0 auto; height: 38px; padding: 0 17px; border: 0; border-radius: 7px; background: transparent; color: var(--muted); font-weight: 750; }}
+    .tab-button:hover {{ background: #f1f5f9; color: var(--text); }}
+    .tab-button.active {{ background: var(--accent); color: white; }}
+    .tab-panel {{ display: none; }}
+    .tab-panel.active {{ display: block; }}
     section {{ margin: 16px 0; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); overflow: hidden; }}
+    .tab-panel > section:first-child {{ margin-top: 0; }}
     .section-head {{ display: flex; justify-content: space-between; align-items: start; gap: 16px; padding: 17px 18px 0; }}
     .section-head h2 {{ margin: 0; font-size: 17px; letter-spacing: -.01em; }}
     .section-copy {{ margin: 6px 18px 16px; color: var(--muted); font-size: 13px; line-height: 1.5; }}
@@ -209,11 +243,14 @@ def _render_dashboard(data: dict, *, path: str, token: str | None, config: Scope
     .status {{ display: inline-flex; align-items: center; min-height: 24px; padding: 3px 8px; border-radius: 999px; font-size: 12px; font-weight: 700; }}
     .status.ok {{ color: #047857; background: var(--accent-soft); }}
     .status.warn {{ color: var(--warn); background: var(--warn-soft); }}
+    .status.neutral {{ color: var(--muted); background: #f1f5f9; }}
     .agent-panel {{ border-color: #b7ead5; }}
     .table-wrap {{ overflow-x: auto; }}
+    .table-scroll {{ max-height: calc(100vh - 300px); overflow: auto; }}
     table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
     th, td {{ padding: 11px 14px; border-top: 1px solid #edf1f6; text-align: left; white-space: nowrap; }}
     th {{ color: var(--muted); font-size: 12px; font-weight: 700; background: #fbfcfe; }}
+    .table-scroll th {{ position: sticky; top: 0; z-index: 1; box-shadow: 0 1px 0 #edf1f6; }}
     code {{ padding: 2px 5px; border-radius: 4px; background: #edf6f5; color: #0f5f58; }}
     .empty {{ color: var(--muted); text-align: center; }}
     .grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }}
@@ -234,6 +271,8 @@ def _render_dashboard(data: dict, *, path: str, token: str | None, config: Scope
       .filter-panel label, input, select, button {{ width: 100%; }}
       .links {{ margin-left: 0; }}
       .metric-grid, .metric-grid.agent, .grid {{ grid-template-columns: 1fr; }}
+      .tabs {{ margin-left: -14px; margin-right: -14px; border-left: 0; border-right: 0; border-radius: 0; }}
+      .table-scroll {{ max-height: calc(100vh - 260px); }}
       summary {{ display: block; }}
       summary span {{ display: block; margin-top: 5px; }}
     }}
@@ -265,49 +304,85 @@ def _render_dashboard(data: dict, *, path: str, token: str | None, config: Scope
     </div>
   </header>
   <main>
-    <section class="overview">
-      <div class="section-head"><h2>用量概览</h2></div>
-      <p class="section-copy">所有已落库的模型请求；缓存占比按输入 Tokens 计算。</p>
-      <div class="metric-grid">
-        <div class="metric primary"><span class="metric-label">请求记录</span><strong>{_fmt_int(total["requests"])}</strong><span class="metric-hint">当前筛选范围内</span></div>
-        <div class="metric"><span class="metric-label">总 Tokens</span><strong>{_fmt_int(total["total_tokens"])}</strong><span class="metric-hint">输入 {_fmt_int(total["prompt_tokens"])} · 输出 {_fmt_int(total["completion_tokens"])} </span></div>
-        <div class="metric"><span class="metric-label">缓存占比</span><strong>{cache_rate}</strong><span class="metric-hint">缓存 {_fmt_int(total["cached_tokens"])} Tokens</span></div>
-        <div class="metric accent"><span class="metric-label">估算费用</span><strong>{_money(total["estimated_cost"])}</strong><span class="metric-hint">按当前价格配置估算</span></div>
-      </div>
-    </section>
+    <nav class="tabs" role="tablist" aria-label="统计视图">
+      <button class="tab-button active" type="button" role="tab" aria-selected="true" aria-controls="panel-groups" data-tab="groups">分群对比</button>
+      <button class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="panel-overview" data-tab="overview">整体概览</button>
+      <button class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="panel-recent" data-tab="recent">最近运行</button>
+      <button class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="panel-usage" data-tab="usage">用量明细</button>
+    </nav>
 
-    <section class="agent-panel">
-      <div class="section-head"><h2>Agent 运行</h2>{agent_health}</div>
-      <p class="section-copy">仅统计启用 Agent 指标后成功完成的运行；旧用量记录仍保留在下方明细中，不会影响此处平均耗时。</p>
-      <div class="metric-grid agent">
-        <div class="metric primary"><span class="metric-label">已观测运行</span><strong>{_fmt_int(agent["runs"])}</strong><span class="metric-hint">可用于性能分析</span></div>
-        <div class="metric"><span class="metric-label">平均耗时</span><strong>{agent_avg_duration}</strong><span class="metric-hint">每次完整 Agent 运行</span></div>
-        <div class="metric"><span class="metric-label">LLM / 运行</span><strong>{llm_per_run}</strong><span class="metric-hint">共 {_fmt_int(agent["llm_calls"])} 次调用</span></div>
-        <div class="metric"><span class="metric-label">工具 / 运行</span><strong>{tools_per_run}</strong><span class="metric-hint">共 {_fmt_int(agent["tool_calls"])} 次调用</span></div>
-        <div class="metric"><span class="metric-label">工具超时</span><strong>{_fmt_int(agent["tool_timeouts"])}</strong><span class="metric-hint">超时会标记为需关注</span></div>
-        <div class="metric"><span class="metric-label">结果控制</span><strong>{_fmt_int(agent["result_truncations"])} / {_fmt_int(agent["side_effect_deduplications"])}</strong><span class="metric-hint">截断 / 去重</span></div>
-      </div>
-      <div class="table-wrap">{_render_table(["会话 ID", "运行", "平均耗时", "LLM / 工具", "状态"], agent_session_rows)}</div>
-    </section>
+    <div class="tab-panel active" id="panel-groups" role="tabpanel" data-panel="groups">
+      <section>
+        <div class="section-head"><h2>分群效果对比</h2><span class="status ok">{_fmt_int(len(group_rows))} 个会话</span></div>
+        <p class="section-copy">在同一行比较各群的消耗与 Agent 表现；LLM / 工具显示每次运行的平均调用数。</p>
+        <div class="table-wrap table-scroll">{_render_table(["群/会话 ID", "类型", "请求", "Tokens", "费用", "Agent 运行", "平均耗时", "LLM / 工具", "状态"], group_rows)}</div>
+      </section>
+    </div>
 
-    <section>
-      <div class="section-head"><h2>最近 Agent 运行</h2><span class="status ok">按时间倒序</span></div>
-      <p class="section-copy">重点查看耗时突增或“需关注”的状态。</p>
-      <div class="table-wrap">{_render_table(["时间", "会话", "耗时", "LLM / 工具", "状态"], agent_recent_rows)}</div>
-    </section>
-
-    <details>
-      <summary>Token 用量明细 <span>按模型、会话、用户与最近请求展开查看</span></summary>
-      <div class="details-content">
-        <div class="grid">
-          <div class="table-card"><h3>按模型</h3><div class="table-wrap">{_render_table(["模型", "请求", "输入", "输出", "缓存", "创建", "总计", "费用"], model_rows)}</div></div>
-          <div class="table-card"><h3>按会话</h3><div class="table-wrap">{_render_table(["会话 ID", "类型", "请求", "Tokens", "缓存", "创建", "费用"], session_rows)}</div></div>
-          <div class="table-card"><h3>按用户</h3><div class="table-wrap">{_render_table(["用户 ID", "名称", "请求", "Tokens", "缓存", "创建", "费用"], user_rows)}</div></div>
-          <div class="table-card"><h3>最近请求</h3><div class="table-wrap">{_render_table(["时间", "会话", "用户", "名称", "模型", "Tokens", "缓存", "创建", "费用"], recent_rows)}</div></div>
+    <div class="tab-panel" id="panel-overview" role="tabpanel" data-panel="overview" hidden>
+      <section class="overview">
+        <div class="section-head"><h2>用量概览</h2></div>
+        <p class="section-copy">所有已落库的模型请求；缓存占比按输入 Tokens 计算。</p>
+        <div class="metric-grid">
+          <div class="metric primary"><span class="metric-label">请求记录</span><strong>{_fmt_int(total["requests"])}</strong><span class="metric-hint">当前筛选范围内</span></div>
+          <div class="metric"><span class="metric-label">总 Tokens</span><strong>{_fmt_int(total["total_tokens"])}</strong><span class="metric-hint">输入 {_fmt_int(total["prompt_tokens"])} · 输出 {_fmt_int(total["completion_tokens"])} </span></div>
+          <div class="metric"><span class="metric-label">缓存占比</span><strong>{cache_rate}</strong><span class="metric-hint">缓存 {_fmt_int(total["cached_tokens"])} Tokens</span></div>
+          <div class="metric accent"><span class="metric-label">估算费用</span><strong>{_money(total["estimated_cost"])}</strong><span class="metric-hint">按当前价格配置估算</span></div>
         </div>
+      </section>
+      <section class="agent-panel">
+        <div class="section-head"><h2>Agent 整体运行</h2>{agent_health}</div>
+        <p class="section-copy">仅统计启用 Agent 指标后成功完成的运行。</p>
+        <div class="metric-grid agent">
+          <div class="metric primary"><span class="metric-label">已观测运行</span><strong>{_fmt_int(agent["runs"])}</strong><span class="metric-hint">可用于性能分析</span></div>
+          <div class="metric"><span class="metric-label">平均耗时</span><strong>{agent_avg_duration}</strong><span class="metric-hint">每次完整 Agent 运行</span></div>
+          <div class="metric"><span class="metric-label">LLM / 运行</span><strong>{llm_per_run}</strong><span class="metric-hint">共 {_fmt_int(agent["llm_calls"])} 次调用</span></div>
+          <div class="metric"><span class="metric-label">工具 / 运行</span><strong>{tools_per_run}</strong><span class="metric-hint">共 {_fmt_int(agent["tool_calls"])} 次调用</span></div>
+          <div class="metric"><span class="metric-label">工具超时</span><strong>{_fmt_int(agent["tool_timeouts"])}</strong><span class="metric-hint">超时会标记为需关注</span></div>
+          <div class="metric"><span class="metric-label">结果控制</span><strong>{_fmt_int(agent["result_truncations"])} / {_fmt_int(agent["side_effect_deduplications"])}</strong><span class="metric-hint">截断 / 去重</span></div>
+        </div>
+      </section>
+    </div>
+
+    <div class="tab-panel" id="panel-recent" role="tabpanel" data-panel="recent" hidden>
+      <div class="grid">
+        <section class="table-card"><h3>最近 Agent 运行</h3><div class="table-wrap table-scroll">{_render_table(["时间", "会话", "耗时", "LLM / 工具", "状态"], agent_recent_rows)}</div></section>
+        <section class="table-card"><h3>最近模型请求</h3><div class="table-wrap table-scroll">{_render_table(["时间", "会话", "用户", "名称", "模型", "Tokens", "缓存", "创建", "费用"], recent_rows)}</div></section>
       </div>
-    </details>
+    </div>
+
+    <div class="tab-panel" id="panel-usage" role="tabpanel" data-panel="usage" hidden>
+      <div class="grid">
+        <section class="table-card"><h3>按模型</h3><div class="table-wrap table-scroll">{_render_table(["模型", "请求", "输入", "输出", "缓存", "创建", "总计", "费用"], model_rows)}</div></section>
+        <section class="table-card"><h3>按会话</h3><div class="table-wrap table-scroll">{_render_table(["会话 ID", "类型", "请求", "Tokens", "缓存", "创建", "费用"], session_rows)}</div></section>
+        <section class="table-card"><h3>按用户</h3><div class="table-wrap table-scroll">{_render_table(["用户 ID", "名称", "请求", "Tokens", "缓存", "创建", "费用"], user_rows)}</div></section>
+        <section class="table-card"><h3>Agent 分群指标</h3><div class="table-wrap table-scroll">{_render_table(["会话 ID", "运行", "平均耗时", "LLM / 工具", "状态"], agent_session_rows)}</div></section>
+      </div>
+    </div>
   </main>
+  <script>
+    (() => {{
+      const buttons = [...document.querySelectorAll("[data-tab]")];
+      const panels = [...document.querySelectorAll("[data-panel]")];
+      const validTabs = new Set(buttons.map((button) => button.dataset.tab));
+      const activate = (name, updateHash = true) => {{
+        if (!validTabs.has(name)) name = "groups";
+        buttons.forEach((button) => {{
+          const active = button.dataset.tab === name;
+          button.classList.toggle("active", active);
+          button.setAttribute("aria-selected", String(active));
+        }});
+        panels.forEach((panel) => {{
+          const active = panel.dataset.panel === name;
+          panel.classList.toggle("active", active);
+          panel.hidden = !active;
+        }});
+        if (updateHash) history.replaceState(null, "", `#${{name}}`);
+      }};
+      buttons.forEach((button) => button.addEventListener("click", () => activate(button.dataset.tab)));
+      activate(location.hash.slice(1) || "groups", false);
+    }})();
+  </script>
 </body>
 </html>"""
 

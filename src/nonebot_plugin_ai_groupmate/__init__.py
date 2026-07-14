@@ -652,6 +652,9 @@ async def handle_reply_logic(
             if recent_msgs[-1].content_type == "text"
             else "[图片/表情包。除非用户明确在问这张图、@bot、回复bot或正在延续图片话题，否则通常不需要回应]"
         )
+        # The gatekeeper is an external model call.  The query result is fully
+        # materialized, so release the connection before waiting for it.
+        await db_session.commit()
         gatekeeper_msg_text = current_msg_text
         if is_continuous:
             gatekeeper_msg_text = (
@@ -675,6 +678,10 @@ async def handle_reply_logic(
         if not last_msg:
             logger.info("没有历史消息，跳过回复")
             return
+
+        # Do not retain the history query's connection while asking the
+        # adapter for group members.
+        await db_session.commit()
 
         role_map: dict[str, str] = {}
         group_members: list[Any] | None = None
@@ -1205,6 +1212,9 @@ async def _update_single_group_memory(db_session, session_id: str):
     chat_text = "\n".join(_format_msg_for_summary(m) for m in recent_msgs)
 
     existing_summary = record.summary if record else ""
+    # Summary generation is slow external I/O.  Release the read transaction
+    # and re-load the target row only when the result is ready to be written.
+    await db_session.commit()
     new_summary = await _call_summary_model(existing_summary, chat_text)
     if not new_summary:
         return
@@ -1233,6 +1243,7 @@ async def _update_single_group_memory(db_session, session_id: str):
     if not new_summary.strip():
         return
 
+    record = (await db_session.execute(stmt)).scalar_one_or_none()
     if not record:
         record = GroupMemory(
             session_id=session_id,
