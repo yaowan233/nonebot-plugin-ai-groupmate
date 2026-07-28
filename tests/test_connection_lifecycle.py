@@ -1,8 +1,10 @@
 import json
 import datetime
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
+from sqlalchemy.ext.asyncio import AsyncSession
 
 
 @pytest.mark.asyncio
@@ -89,7 +91,9 @@ async def test_chat_vectorization_releases_connection_before_qdrant(monkeypatch)
     monkeypatch.setattr(utils, "insert_vectors_with_retry", fake_insert)
     monkeypatch.setattr(utils, "update_messages_in_batches", fake_update)
 
-    result = await utils.process_and_vectorize_session_chats(_Session(), "group-1")
+    result = await utils.process_and_vectorize_session_chats(
+        cast(AsyncSession, _Session()), "group-1"
+    )
 
     assert result is not None
     assert events[:3] == ["query", "commit", "qdrant"]
