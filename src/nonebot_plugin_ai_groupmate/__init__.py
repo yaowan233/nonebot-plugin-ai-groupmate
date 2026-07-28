@@ -12,7 +12,7 @@ from functools import lru_cache
 from dataclasses import dataclass
 
 import jieba
-from nonebot import logger, require, on_command, on_message, get_plugin_config
+from nonebot import logger, require, get_bots, on_command, on_message, get_plugin_config
 from wordcloud import WordCloud
 from nonebot.params import CommandArg
 from nonebot.plugin import PluginMetadata, inherit_supported_adapters
@@ -148,6 +148,41 @@ def _get_dedup_lock(session_id: str) -> asyncio.Lock:
     return _dedup_locks[session_id]
 
 
+def _select_addressed_bot_id(
+    event: Any,
+    connected_bot_ids: set[str],
+) -> str | None:
+    """Select the one connected Bot explicitly addressed by the raw message."""
+    original_message = getattr(event, "original_message", None)
+    if original_message is not None:
+        for segment in original_message:
+            if getattr(segment, "type", None) != "at":
+                continue
+            data = getattr(segment, "data", {})
+            if not isinstance(data, dict):
+                continue
+            target = data.get("qq") or data.get("target") or data.get("user_id")
+            if target is not None and str(target) in connected_bot_ids:
+                return str(target)
+
+    reply = getattr(event, "reply", None)
+    sender = getattr(reply, "sender", None)
+    reply_user_id = getattr(sender, "user_id", None)
+    if reply_user_id is not None and str(reply_user_id) in connected_bot_ids:
+        return str(reply_user_id)
+    return None
+
+
+def _matches_inbound_message(
+    history_content: str,
+    content_prefix: str,
+    body: str,
+) -> bool:
+    return history_content.startswith(content_prefix) or (
+        bool(body) and history_content.endswith(body)
+    )
+
+
 async def _load_agent_history(db_session, session_id: str) -> list[ChatHistorySchema]:
     now = datetime.datetime.now()
 
@@ -273,17 +308,28 @@ async def handle_message(
         logger.debug(f"忽略机器人自身消息 - session: {session.scene.id}")
         return
 
+    connected_bot_ids = {str(bot_id) for bot_id in get_bots()}
+    connected_bot_ids.add(str(bot.self_id))
+    addressed_bot_id = _select_addressed_bot_id(event, connected_bot_ids)
+    if addressed_bot_id is not None and addressed_bot_id != str(bot.self_id):
+        logger.debug(
+            f"消息明确发给其他 Bot {addressed_bot_id}，当前 Bot {bot.self_id} 跳过处理"
+        )
+        return
+
     bot_name = plugin_config.bot_name
     imgs = msg.include(Image)
     # 第1行固定是本条消息的平台 ID 元数据，格式 "id: {id}"
-    content = f"id: {get_message_id()}\n"
-    to_me = False
+    incoming_message_id = str(get_message_id())
+    content_prefix = f"id: {incoming_message_id}\n"
+    content = content_prefix
+    to_me = addressed_bot_id == str(bot.self_id) or (
+        addressed_bot_id is None and event.is_tome()
+    )
     is_text = False
     reply_id: str | None = None  # 记录回复 ID，稍后单独成行插入
     body = ""  # 正文部分单独拼接
     has_at_mention = False
-    if event.is_tome():
-        to_me = True
     for i in msg:
         if i.type == "at":
             has_at_mention = True
@@ -344,21 +390,20 @@ async def handle_message(
     async with _get_dedup_lock(session.scene.id):
         if is_text:
             do_insert = True
-            if body:
-                time_window = datetime.datetime.now() - datetime.timedelta(seconds=3)
-                existing = await db_session.execute(
-                    Select(ChatHistory).where(
-                        ChatHistory.session_id == session.scene.id,
-                        ChatHistory.user_id == session.user.id,
-                        ChatHistory.created_at >= time_window,
-                    )
+            time_window = datetime.datetime.now() - datetime.timedelta(seconds=3)
+            existing = await db_session.execute(
+                Select(ChatHistory).where(
+                    ChatHistory.session_id == session.scene.id,
+                    ChatHistory.user_id == session.user.id,
+                    ChatHistory.created_at >= time_window,
                 )
-                if any(
-                    history.content.endswith(body)
-                    for history in existing.scalars().all()
-                ):
-                    logger.debug("消息已存在，跳过重复记录")
-                    do_insert = False
+            )
+            if any(
+                _matches_inbound_message(history.content, content_prefix, body)
+                for history in existing.scalars().all()
+            ):
+                logger.debug("消息已存在，跳过重复记录")
+                do_insert = False
 
             is_new_text_message = do_insert
 
@@ -417,7 +462,6 @@ async def handle_message(
 
     # ========== 步骤3: 处理图片消息 ==========
     # 如果要回复则同步等待图片处理完成,否则后台异步
-    content_prefix = f"id: {get_message_id()}\n"
     if imgs:
         if should_reply:
             for img in imgs:

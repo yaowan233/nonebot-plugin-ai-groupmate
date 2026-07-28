@@ -291,6 +291,81 @@ async def test_duplicate_side_effect_is_executed_once():
 
 
 @pytest.mark.asyncio
+async def test_timed_out_side_effect_can_be_retried():
+    from nonebot_plugin_ai_groupmate.agent.graph import AgentRunLimits, build_chat_graph
+
+    calls: list[str] = []
+
+    @tool("send_meme_image")
+    async def send_meme_image(pic_id: str) -> str:
+        """Time out once, then complete the same side effect."""
+        calls.append(pic_id)
+        if len(calls) == 1:
+            await asyncio.sleep(0.05)
+        return "sent"
+
+    @tool("finish")
+    def finish() -> str:
+        """End this test graph."""
+        return ""
+
+    repeated_call = {"name": "send_meme_image", "args": {"pic_id": "42"}}
+    model = _ToolSpyModel(
+        [
+            AIMessage(content="", tool_calls=[{**repeated_call, "id": "send-1"}]),
+            AIMessage(content="", tool_calls=[{**repeated_call, "id": "send-2"}]),
+            AIMessage(content="", tool_calls=[{"name": "finish", "args": {}, "id": "finish-1"}]),
+        ]
+    )
+    graph = build_chat_graph(
+        model,
+        [send_meme_image, finish],
+        "system",
+        limits=AgentRunLimits(tool_timeout_seconds=0.01),
+    )
+
+    result = await graph.ainvoke(_state(AIMessage(content="placeholder")))
+
+    assert calls == ["42", "42"]
+    assert result["tool_timeout_count"] == 1
+    assert result["side_effect_duplicate_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_failed_side_effect_can_be_retried():
+    from nonebot_plugin_ai_groupmate.agent.graph import build_chat_graph
+
+    calls: list[str] = []
+
+    @tool("send_meme_image")
+    async def send_meme_image(pic_id: str) -> str:
+        """Report one failure, then complete the same side effect."""
+        calls.append(pic_id)
+        status = "failed" if len(calls) == 1 else "sent"
+        return json.dumps({"status": status})
+
+    @tool("finish")
+    def finish() -> str:
+        """End this test graph."""
+        return ""
+
+    repeated_call = {"name": "send_meme_image", "args": {"pic_id": "42"}}
+    model = _ToolSpyModel(
+        [
+            AIMessage(content="", tool_calls=[{**repeated_call, "id": "send-1"}]),
+            AIMessage(content="", tool_calls=[{**repeated_call, "id": "send-2"}]),
+            AIMessage(content="", tool_calls=[{"name": "finish", "args": {}, "id": "finish-1"}]),
+        ]
+    )
+    graph = build_chat_graph(model, [send_meme_image, finish], "system")
+
+    result = await graph.ainvoke(_state(AIMessage(content="placeholder")))
+
+    assert calls == ["42", "42"]
+    assert result["side_effect_duplicate_count"] == 0
+
+
+@pytest.mark.asyncio
 async def test_long_tool_results_are_truncated_before_the_next_model_call():
     from nonebot_plugin_ai_groupmate.agent.graph import AgentRunLimits, build_chat_graph
 

@@ -508,6 +508,7 @@ def _make_tool_node(
                 results.append(ToolMessage(content=f"未知工具: {name}", tool_call_id=tool_call_id))
                 continue
 
+            effect_key: str | None = None
             if name in SIDE_EFFECT_TOOL_NAMES:
                 effect_key = _side_effect_key(name, args)
                 if effect_key in completed_side_effect_keys:
@@ -522,7 +523,6 @@ def _make_tool_node(
                         f"[AgentTrace] 工具去重 session={session_id} tool={name}"
                     )
                     continue
-                completed_side_effect_keys.append(effect_key)
 
             try:
                 runtime = _build_tool_runtime(agent_ctx, tool_call_id, args)
@@ -552,6 +552,8 @@ def _make_tool_node(
                 elapsed_ms = (time.perf_counter() - started_at) * 1000
                 tool_content, extra_content = _normalize_tool_result(result)
                 tool_status = _tool_result_status(tool_content)
+                if effect_key is not None and tool_status not in {"failed", "skipped"}:
+                    completed_side_effect_keys.append(effect_key)
                 tool_content, truncated = _truncate_tool_content(
                     tool_content,
                     limits.tool_result_max_chars,
