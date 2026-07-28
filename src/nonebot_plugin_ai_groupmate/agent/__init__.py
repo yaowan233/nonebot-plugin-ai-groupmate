@@ -538,6 +538,7 @@ async def create_chat_graph(
     prompt_result = build_chat_system_prompt(
         bot_name=plugin_config.bot_name,
         is_private=is_private,
+        personality_setting=plugin_config.personality_setting,
         relation_context=relation_context,
         group_context=group_context,
         recent_relations_context=recent_relations_context,

@@ -119,6 +119,9 @@ def create_private_message_tool(
             return "检测到重复私聊内容，已跳过发送。"
 
         try:
+            # Do not retain the duplicate-check transaction while waiting for
+            # the adapter to send the private message.
+            await db_session.commit()
             target = Target(id=target_id, private=True, self_id=bot_id)
             result = await UniMessage.text(content).send(target=target)
             msg_id = "unknown"

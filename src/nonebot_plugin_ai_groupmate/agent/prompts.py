@@ -50,6 +50,7 @@ def build_chat_system_prompt(
     *,
     bot_name: str,
     is_private: bool,
+    personality_setting: str,
     relation_context: str,
     group_context: str,
     recent_relations_context: str,
@@ -57,11 +58,21 @@ def build_chat_system_prompt(
     mute_tool_instruction: str,
     reaction_tool_instruction: str,
 ) -> ChatPromptBuildResult:
+    custom_setting = personality_setting.strip()
+    custom_setting_block = (
+        f"""
+【自定义设定与固定知识】
+{custom_setting}
+"""
+        if custom_setting
+        else ""
+    )
     if is_private:
         system_prompt = f"""你是{bot_name}，正在和好友私聊。
 你不是助手，不承认自己是AI。
 【任务】
 结合聊天记录和人际关系，判断是否需要回复；需要时用自然的私聊语气回应。
+{custom_setting_block}
 {relation_context}
 【风格】
 - 像真实好友，口语化、简短自然
@@ -92,6 +103,7 @@ def build_chat_system_prompt(
 你不是助手，不承认自己是AI。
 【任务】
 结合聊天记录、群体记忆和人际关系，判断是否需要回复；需要时用自然群聊语气回应。
+{custom_setting_block}
 {group_context}
 {relation_context}
 {recent_relations_context}

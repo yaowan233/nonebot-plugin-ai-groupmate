@@ -126,6 +126,10 @@ def create_reply_tool(
                     )
                     return _result("skipped", "检测到重复回复，已跳过发送。")
 
+            # The duplicate-check query has finished.  Sending through the
+            # adapter can block, so release its pooled connection first.
+            await db_session.commit()
+
             name_to_id: dict[str, str] = {}
             members = group_members
             if members is None and interface is not None:

@@ -267,6 +267,12 @@ async def process_and_vectorize_session_chats(
         max_token_count=max_token_count,
     )
 
+    # split_chat_into_context_groups() has converted every row to a Pydantic
+    # model, so the SQL transaction is no longer needed.  Qdrant/embedding
+    # calls below may take a long time and must not keep a pooled connection
+    # checked out while they run.
+    await db_session.commit()
+
     if not context_groups:
         return None
 

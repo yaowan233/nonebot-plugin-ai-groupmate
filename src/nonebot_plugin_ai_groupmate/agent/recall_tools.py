@@ -87,6 +87,9 @@ def create_recall_message_tool(
                 return "撤回失败: bot 不是管理员，只能撤回自己 5 分钟内发送的消息。"
 
         try:
+            # The history lookup is complete.  Recalling through OneBot is
+            # external I/O and must not occupy a database connection.
+            await db_session.commit()
             await message_recall(message_id=target_msg_id, event=event, bot=bot)
         except ValueError as e:
             logger.warning(f"撤回消息失败，消息 ID 不被当前适配器支持: {target_msg_id} {e}")

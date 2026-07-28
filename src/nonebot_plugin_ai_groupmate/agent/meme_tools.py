@@ -70,10 +70,14 @@ def create_similar_meme_tool(
             if not media_obj or not media_obj.file_path:
                 return "无法找到原图文件，无法进行分析。"
 
-            pic_ids = await DB.search_similar_meme(str(pic_dir / media_obj.file_path))
+            source_media_id = msg.media_id
+            source_file_path = media_obj.file_path
+            await db_session.commit()
+
+            pic_ids = await DB.search_similar_meme(str(pic_dir / source_file_path))
 
             if not pic_ids:
-                logger.info(f"未找到相似图片, source_id: {msg.media_id}")
+                logger.info(f"未找到相似图片, source_id: {source_media_id}")
                 return "没有搜索到相似图片"
 
             images_info = []
@@ -94,7 +98,7 @@ def create_similar_meme_tool(
             return json.dumps(
                 {
                     "success": True,
-                    "source_media_id": msg.media_id,
+                    "source_media_id": source_media_id,
                     "images": images_info,
                     "count": len(images_info),
                     "note": "请根据 pic_id 调用 send_meme_image 发送",
@@ -232,12 +236,17 @@ def create_send_meme_tool(
 
             pic_data = pic_path.read_bytes()
             description = pic.description
+            media_id = pic.media_id
+            media_file_path = pic.file_path
 
             if request_id is not None and not await is_request_active(
                 session_id, request_id
             ):
                 return "请求已过期，已取消发送。"
 
+            # All ORM values needed after the send have been copied above.
+            # Release the read transaction before waiting on the adapter.
+            await db_session.commit()
             message = UniMessage.image(raw=pic_data)
             res = await (
                 message.send(target=send_target)
@@ -251,10 +260,10 @@ def create_send_meme_tool(
                 content=(
                     f"id: {res.msg_ids[-1]['message_id']}\n"
                     f"发送了图片，图片描述是: {description}\n"
-                    f"图片文件: {pic.file_path}"
+                    f"图片文件: {media_file_path}"
                 ),
                 user_name=bot_name,
-                media_id=pic.media_id,
+                media_id=media_id,
             )
             db_session.add(chat_history)
             logger.info(f"id:{res.msg_ids}\n发送表情包: {description}")

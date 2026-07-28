@@ -805,6 +805,7 @@ async def _(
     words = await _collect_words_from_db(
         db_session, session_id, days=days, user_id=session.user.id
     )
+    await db_session.commit()
     if not words:
         await frequency.finish("在指定时间内，没有说过话呢")
 
@@ -829,6 +830,7 @@ async def _(
     words = await _collect_words_from_db(
         db_session, session_id, days=days, user_id=None
     )
+    await db_session.commit()
     # Even if no words, return an empty wordcloud (original group_frequency didn't check emptiness)
     if not words:
         await group_frequency.finish("在指定时间内，没有消息可统计")
@@ -846,6 +848,9 @@ async def vectorize_message_history():
             Select(ChatHistory.session_id.distinct())
         )
         session_ids = session_ids.scalars().all()
+        # Each session is vectorized through slow external embedding/Qdrant
+        # calls.  The list is materialized, so release the discovery query.
+        await db_session.commit()
         logger.info("开始向量化会话")
         for session_id in session_ids:
             try:
@@ -873,27 +878,43 @@ async def vectorize_media():
     3. 写入 SQL (描述) 和 Qdrant (向量)
     """
     async with get_session() as db_session:
+        async def mark_vectorized(media_id: int, description: str | None = None) -> bool:
+            media = await db_session.get(MediaStorage, media_id)
+            if media is None:
+                await db_session.commit()
+                return False
+            if description is not None:
+                media.description = description
+            media.vectorized = True
+            db_session.add(media)
+            await db_session.commit()
+            return True
+
         # 只处理引用次数 >= 3 且未向量化的图片
         medias_res = await db_session.execute(
-            Select(MediaStorage).where(
+            Select(MediaStorage.media_id).where(
                 MediaStorage.references >= 3, MediaStorage.vectorized.is_(False)
             )
         )
-        medias = medias_res.scalars().all()
-        media_ids = [m.media_id for m in medias]
+        media_ids = list(medias_res.scalars().all())
+        await db_session.commit()
         logger.info(f"待处理高频图片数量: {len(media_ids)}")
 
         for media_id in media_ids:
             media = await db_session.get(MediaStorage, media_id)
             if media is None:
+                await db_session.commit()
                 continue
+            media_file_path = media.file_path
+            # Keep only scalar values while calling the vision model and
+            # Qdrant.  Accessing a detached/expired ORM object later could
+            # silently start another long-lived transaction.
+            await db_session.commit()
             try:
-                file_path = pic_dir / media.file_path
+                file_path = pic_dir / media_file_path
                 if not file_path.exists():
                     logger.warning(f"文件不存在: {file_path}")
-                    media.vectorized = True
-                    db_session.add(media)
-                    await db_session.commit()
+                    await mark_vectorized(media_id)
                     continue
 
                 # 1. 读取文件并转 Base64 (Qwen VL 需要)
@@ -903,7 +924,7 @@ async def vectorize_media():
                         encoded_string = base64.b64encode(file_data).decode("utf-8")
 
                         # 构造 Data URI
-                        ext = media.file_path.split(".")[-1].lower()
+                        ext = media_file_path.split(".")[-1].lower()
                         mime = "image/png" if ext == "png" else "image/jpeg"
                         if ext == "gif":
                             mime = "image/gif"  # Qwen-VL 支持 GIF
@@ -969,9 +990,7 @@ async def vectorize_media():
                             logger.warning(
                                 f"图片 {media_id} 请求非法（400），跳过向量化: {e}"
                             )
-                        media.vectorized = True
-                        db_session.add(media)
-                        await db_session.commit()
+                        await mark_vectorized(media_id)
                     else:
                         logger.error(f"模型识别图片失败 {media_id}: {e}")
                     continue
@@ -979,23 +998,16 @@ async def vectorize_media():
                 # 3. 结果处理
                 if not is_meme:
                     logger.info(f"图片 {media_id} 被判定为非表情包(杂图)，跳过入库")
-                    media.vectorized = True
-                    db_session.add(media)
-                    await db_session.commit()
+                    await mark_vectorized(media_id)
                     continue
 
                 # 4. 是表情包 -> 入库
                 try:
-                    # A. 存描述到 SQL
-                    media.description = description
-
-                    # B. 存向量到 Qdrant (传带 MIME 头的 data URI，避免 PNG/GIF 被误判为 JPEG)
+                    # A. 存向量到 Qdrant (传带 MIME 头的 data URI，避免 PNG/GIF 被误判为 JPEG)
                     await DB.insert_media(media_id, img_data_uri, description)
 
-                    # C. 标记完成
-                    media.vectorized = True
-                    db_session.add(media)
-                    await db_session.commit()
+                    # B. Qdrant 完成后才短暂签出 SQL 连接，保存描述并标记完成。
+                    await mark_vectorized(media_id, description)
                     logger.info(f"表情包入库成功 {media_id}: {description}")
 
                 except Exception as e:
@@ -1009,7 +1021,7 @@ async def vectorize_media():
                 continue
 
         await db_session.commit()
-        if len(medias) > 0:
+        if media_ids:
             logger.info("本轮图片处理完成")
 
 

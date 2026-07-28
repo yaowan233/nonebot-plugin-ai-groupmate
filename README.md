@@ -102,7 +102,7 @@
 |:-----:|:----:|:----:|:----:|
 | ai_groupmate__bot_name | 否 | `"bot"` | bot 名 |
 | ai_groupmate__reply_probability | 否 | `0.01` | 群内主动发言概率 |
-| ai_groupmate__personality_setting | 否 | 无 | 自定义人设 prompt |
+| ai_groupmate__personality_setting | 否 | 无 | 自定义人设和固定业务知识 prompt |
 | ai_groupmate__tavily_api_key | 否 | 无 | Tavily 搜索 API 密钥（联网搜索功能） |
 | ai_groupmate__llm_api_key | 推荐 | 无 | 通用 LLM API Key，未单独配置各角色 key 时使用 |
 | ai_groupmate__llm_base_url | 否 | `https://dashscope.aliyuncs.com/compatible-mode/v1` | 通用 OpenAI 兼容接口地址 |
@@ -150,6 +150,14 @@ AI_GROUPMATE__BOT_NAME=bot
 AI_GROUPMATE__LLM_API_KEY=sk-xxxx
 AI_GROUPMATE__CHAT_MODEL=qwen3.5-plus
 ```
+
+固定知识示例（将群号和入群方式替换为自己的信息）：
+
+```dotenv
+AI_GROUPMATE__PERSONALITY_SETTING="【固定知识】当用户询问加群、群号、入群方式或请求拉群时，明确告诉对方：请搜索 QQ 群 123456789 申请加入，验证信息填写‘来自 Bot’。不要编造其他群号或链接。"
+```
+
+修改该配置后需要重启 Bot。固定知识会同时用于群聊和私聊；涉及口令、密钥等敏感内容时不要放在这里。
 
 如果想使用更强的主聊天模型：
 
