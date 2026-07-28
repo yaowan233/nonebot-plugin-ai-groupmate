@@ -26,6 +26,7 @@ def _state(message: AIMessage, *, tool_count: int = 0) -> "AgentState":
         "llm_call_count": 0,
         "llm_total_tokens": 0,
         "tool_timeout_count": 0,
+        "tool_timeout_names": [],
         "tool_result_truncation_count": 0,
         "side_effect_duplicate_count": 0,
         "completed_side_effect_keys": [],
@@ -328,6 +329,7 @@ async def test_timed_out_side_effect_can_be_retried():
 
     assert calls == ["42", "42"]
     assert result["tool_timeout_count"] == 1
+    assert result["tool_timeout_names"] == ["send_meme_image"]
     assert result["side_effect_duplicate_count"] == 0
 
 
@@ -429,6 +431,7 @@ async def test_timed_out_tool_returns_control_to_the_model():
 
     assert model.invoke_count == 2
     assert result["tool_timeout_count"] == 1
+    assert result["tool_timeout_names"] == ["search_web"]
 
 
 @pytest.mark.asyncio

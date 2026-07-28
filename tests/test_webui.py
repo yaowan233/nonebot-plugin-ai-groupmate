@@ -27,6 +27,7 @@ def test_dashboard_renders_agent_metrics():
             "duration_ms": 3000,
             "avg_duration_ms": 1500,
             "tool_timeouts": 1,
+            "tool_timeout_tools": {"search_web": 1},
             "result_truncations": 2,
             "side_effect_deduplications": 1,
         },
@@ -51,6 +52,7 @@ def test_dashboard_renders_agent_metrics():
                 "agent_tool_calls": 4,
                 "agent_avg_duration_ms": 1500,
                 "agent_tool_timeouts": 1,
+                "agent_tool_timeout_tools": {"search_web": 1},
                 "agent_result_truncations": 2,
                 "agent_side_effect_deduplications": 1,
             }
@@ -63,6 +65,7 @@ def test_dashboard_renders_agent_metrics():
                 "agent_tool_calls": 4,
                 "agent_duration_ms": 1500,
                 "agent_tool_timeouts": 1,
+                "agent_tool_timeout_tools": {"search_web": 1},
                 "agent_result_truncations": 2,
                 "agent_side_effect_deduplications": 1,
             }
@@ -84,6 +87,7 @@ def test_dashboard_renders_agent_metrics():
                 "agent_tool_calls": 4,
                 "agent_duration_ms": 1500,
                 "agent_tool_timeouts": 1,
+                "agent_tool_timeout_tools": {"search_web": 1},
                 "agent_result_truncations": 2,
                 "agent_side_effect_deduplications": 1,
             }
@@ -110,6 +114,9 @@ def test_dashboard_renders_agent_metrics():
     assert "LLM / 工具显示每次运行的平均调用数" in html
     assert "1.50 / 2.00" in html
     assert "group-1" in html
+    assert "search_web×1" in html
+    assert "localStorage.setItem" in html
+    assert 'filterForm?.addEventListener("submit"' in html
 
 
 @pytest.mark.asyncio
@@ -142,6 +149,7 @@ async def test_record_token_usage_stores_agent_metrics():
         agent_tool_calls=3,
         agent_duration_ms=1500,
         agent_tool_timeouts=1,
+        agent_tool_timeout_tools=["search_web"],
         agent_result_truncations=2,
         agent_side_effect_deduplications=1,
     )
@@ -151,6 +159,7 @@ async def test_record_token_usage_stores_agent_metrics():
     assert row.agent_tool_calls == 3
     assert row.agent_duration_ms == 1500
     assert row.agent_tool_timeouts == 1
+    assert row.agent_tool_timeout_tools == ["search_web"]
     assert row.agent_result_truncations == 2
     assert row.agent_side_effect_deduplications == 1
 
@@ -196,7 +205,8 @@ async def test_dashboard_excludes_pre_metrics_rows_from_agent_statistics():
         agent_llm_calls=1,
         agent_tool_calls=1,
         agent_duration_ms=1_500,
-        agent_tool_timeouts=0,
+        agent_tool_timeouts=2,
+        agent_tool_timeout_tools=["search_web", "search_web"],
         agent_result_truncations=0,
         agent_side_effect_deduplications=0,
     )
@@ -223,5 +233,9 @@ async def test_dashboard_excludes_pre_metrics_rows_from_agent_statistics():
     assert data["total"]["requests"] == 2
     assert data["agent"]["runs"] == 1
     assert data["agent"]["avg_duration_ms"] == 1_500
+    assert data["agent"]["tool_timeout_tools"] == {"search_web": 2}
     assert data["agent_by_session"][0]["session_id"] == "agent-group"
+    assert data["agent_by_session"][0]["agent_tool_timeout_tools"] == {
+        "search_web": 2
+    }
     assert [row["session_id"] for row in data["agent_recent"]] == ["agent-group"]

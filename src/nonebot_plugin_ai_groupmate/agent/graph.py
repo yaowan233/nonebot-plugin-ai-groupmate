@@ -62,6 +62,7 @@ class AgentState(TypedDict):
     llm_call_count: int
     llm_total_tokens: int
     tool_timeout_count: int
+    tool_timeout_names: list[str]
     tool_result_truncation_count: int
     side_effect_duplicate_count: int
     completed_side_effect_keys: list[str]
@@ -406,6 +407,7 @@ def _make_tool_node(
         called_finish = 0
         active_skills = list(state.get("active_skills", []))
         tool_timeout_count = state.get("tool_timeout_count", 0)
+        tool_timeout_names = list(state.get("tool_timeout_names", []))
         tool_result_truncation_count = state.get("tool_result_truncation_count", 0)
         side_effect_duplicate_count = state.get("side_effect_duplicate_count", 0)
         completed_side_effect_keys = list(state.get("completed_side_effect_keys", []))
@@ -441,6 +443,7 @@ def _make_tool_node(
                 "reaction_this_round": reaction_this_round,
                 "called_finish": 1,
                 "tool_timeout_count": tool_timeout_count,
+                "tool_timeout_names": tool_timeout_names,
                 "tool_result_truncation_count": tool_result_truncation_count,
                 "side_effect_duplicate_count": side_effect_duplicate_count,
                 "completed_side_effect_keys": completed_side_effect_keys,
@@ -539,6 +542,7 @@ def _make_tool_node(
                     await _commit_after_tool_success(db_session)
                 except asyncio.TimeoutError:
                     tool_timeout_count += 1
+                    tool_timeout_names.append(name)
                     await _rollback_after_tool_failure(db_session)
                     logger.warning(
                         f"[AgentTrace] 工具超时 session={session_id} tool={name} "
@@ -594,6 +598,7 @@ def _make_tool_node(
             "reaction_this_round": reaction_this_round,
             "called_finish": called_finish,
             "tool_timeout_count": tool_timeout_count,
+            "tool_timeout_names": tool_timeout_names,
             "tool_result_truncation_count": tool_result_truncation_count,
             "side_effect_duplicate_count": side_effect_duplicate_count,
             "completed_side_effect_keys": completed_side_effect_keys,

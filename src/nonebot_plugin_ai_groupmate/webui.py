@@ -36,10 +36,31 @@ def _fmt_average(total: int, count: int) -> str:
     return f"{total / count:.2f}"
 
 
+def _tool_timeout_summary(counts: dict) -> str:
+    if not isinstance(counts, dict):
+        return ""
+    items = sorted(
+        (
+            (str(name), int(count))
+            for name, count in counts.items()
+            if isinstance(count, int) and count > 0
+        ),
+        key=lambda item: (-item[1], item[0]),
+    )
+    return "、".join(
+        f"{escape(name)}×{_fmt_int(count)}"
+        for name, count in items
+    )
+
+
 def _agent_issue_summary(row: dict) -> str:
     issues: list[str] = []
     if row["agent_tool_timeouts"]:
-        issues.append(f"工具超时 {row['agent_tool_timeouts']}")
+        timeout_summary = _tool_timeout_summary(
+            row.get("agent_tool_timeout_tools", {})
+        )
+        timeout_detail = f"（{timeout_summary}）" if timeout_summary else ""
+        issues.append(f"工具超时 {row['agent_tool_timeouts']}{timeout_detail}")
     if row["agent_result_truncations"]:
         issues.append(f"截断 {row['agent_result_truncations']}")
     if row["agent_side_effect_deduplications"]:
@@ -82,6 +103,10 @@ def _render_dashboard(data: dict, *, path: str, token: str | None, config: Scope
         if not agent["tool_timeouts"]
         else '<span class="status warn">存在工具超时</span>'
     )
+    agent_timeout_summary = _tool_timeout_summary(
+        agent.get("tool_timeout_tools", {})
+    )
+    agent_timeout_hint = agent_timeout_summary or "超时会标记为需关注"
 
     session_rows = [
         [
@@ -338,7 +363,7 @@ def _render_dashboard(data: dict, *, path: str, token: str | None, config: Scope
           <div class="metric"><span class="metric-label">平均耗时</span><strong>{agent_avg_duration}</strong><span class="metric-hint">每次完整 Agent 运行</span></div>
           <div class="metric"><span class="metric-label">LLM / 运行</span><strong>{llm_per_run}</strong><span class="metric-hint">共 {_fmt_int(agent["llm_calls"])} 次调用</span></div>
           <div class="metric"><span class="metric-label">工具 / 运行</span><strong>{tools_per_run}</strong><span class="metric-hint">共 {_fmt_int(agent["tool_calls"])} 次调用</span></div>
-          <div class="metric"><span class="metric-label">工具超时</span><strong>{_fmt_int(agent["tool_timeouts"])}</strong><span class="metric-hint">超时会标记为需关注</span></div>
+          <div class="metric"><span class="metric-label">工具超时</span><strong>{_fmt_int(agent["tool_timeouts"])}</strong><span class="metric-hint">{agent_timeout_hint}</span></div>
           <div class="metric"><span class="metric-label">结果控制</span><strong>{_fmt_int(agent["result_truncations"])} / {_fmt_int(agent["side_effect_deduplications"])}</strong><span class="metric-hint">截断 / 去重</span></div>
         </div>
       </section>
@@ -365,6 +390,13 @@ def _render_dashboard(data: dict, *, path: str, token: str | None, config: Scope
       const buttons = [...document.querySelectorAll("[data-tab]")];
       const panels = [...document.querySelectorAll("[data-panel]")];
       const validTabs = new Set(buttons.map((button) => button.dataset.tab));
+      const storageKey = `ai-groupmate:usage-tab:${{location.pathname}}`;
+      const readStoredTab = () => {{
+        try {{ return localStorage.getItem(storageKey) || ""; }} catch {{ return ""; }}
+      }};
+      const storeTab = (name) => {{
+        try {{ localStorage.setItem(storageKey, name); }} catch {{}}
+      }};
       const activate = (name, updateHash = true) => {{
         if (!validTabs.has(name)) name = "groups";
         buttons.forEach((button) => {{
@@ -377,10 +409,19 @@ def _render_dashboard(data: dict, *, path: str, token: str | None, config: Scope
           panel.classList.toggle("active", active);
           panel.hidden = !active;
         }});
+        storeTab(name);
         if (updateHash) history.replaceState(null, "", `#${{name}}`);
       }};
       buttons.forEach((button) => button.addEventListener("click", () => activate(button.dataset.tab)));
-      activate(location.hash.slice(1) || "groups", false);
+      const filterForm = document.querySelector(".filter-panel");
+      filterForm?.addEventListener("submit", () => {{
+        const activeButton = document.querySelector("[data-tab].active");
+        if (activeButton?.dataset.tab) {{
+          storeTab(activeButton.dataset.tab);
+          filterForm.action = `${{location.pathname}}#${{activeButton.dataset.tab}}`;
+        }}
+      }});
+      activate(location.hash.slice(1) || readStoredTab() || "groups", false);
     }})();
   </script>
 </body>

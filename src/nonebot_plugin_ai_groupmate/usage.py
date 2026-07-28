@@ -1,5 +1,6 @@
 import datetime
 from typing import Any
+from collections import Counter
 from collections.abc import Sequence
 
 from sqlalchemy import Select, func
@@ -15,6 +16,22 @@ def _as_int(value: Any) -> int:
     if isinstance(value, float):
         return int(value)
     return 0
+
+
+def _tool_timeout_names(row: Any) -> list[str]:
+    value = getattr(row, "agent_tool_timeout_tools", [])
+    if not isinstance(value, list):
+        return []
+    return [str(name) for name in value if str(name).strip()]
+
+
+def _tool_timeout_counts(names: Sequence[str]) -> dict[str, int]:
+    return dict(
+        sorted(
+            Counter(names).items(),
+            key=lambda item: (-item[1], item[0]),
+        )
+    )
 
 
 def extract_cached_tokens(callback: Any) -> int:
@@ -116,6 +133,7 @@ async def record_token_usage(
     agent_tool_calls: int = 0,
     agent_duration_ms: int = 0,
     agent_tool_timeouts: int = 0,
+    agent_tool_timeout_tools: Sequence[str] = (),
     agent_result_truncations: int = 0,
     agent_side_effect_deduplications: int = 0,
 ) -> None:
@@ -137,6 +155,7 @@ async def record_token_usage(
             agent_tool_calls=agent_tool_calls,
             agent_duration_ms=agent_duration_ms,
             agent_tool_timeouts=agent_tool_timeouts,
+            agent_tool_timeout_tools=list(agent_tool_timeout_tools),
             agent_result_truncations=agent_result_truncations,
             agent_side_effect_deduplications=agent_side_effect_deduplications,
         )
@@ -223,6 +242,7 @@ def _aggregate_rows(rows: Sequence[TokenUsage], key_fn) -> list[dict[str, Any]]:
                 "agent_tool_calls": 0,
                 "agent_duration_ms": 0,
                 "agent_tool_timeouts": 0,
+                "agent_tool_timeout_tools": {},
                 "agent_result_truncations": 0,
                 "agent_side_effect_deduplications": 0,
             },
@@ -238,6 +258,9 @@ def _aggregate_rows(rows: Sequence[TokenUsage], key_fn) -> list[dict[str, Any]]:
         item["agent_tool_calls"] += row.agent_tool_calls
         item["agent_duration_ms"] += row.agent_duration_ms
         item["agent_tool_timeouts"] += row.agent_tool_timeouts
+        for tool_name in _tool_timeout_names(row):
+            tool_counts = item["agent_tool_timeout_tools"]
+            tool_counts[tool_name] = tool_counts.get(tool_name, 0) + 1
         item["agent_result_truncations"] += row.agent_result_truncations
         item["agent_side_effect_deduplications"] += row.agent_side_effect_deduplications
     for item in grouped.values():
@@ -255,6 +278,7 @@ def _has_agent_metrics(row: TokenUsage) -> bool:
             row.agent_tool_calls,
             row.agent_duration_ms,
             row.agent_tool_timeouts,
+            bool(_tool_timeout_names(row)),
             row.agent_result_truncations,
             row.agent_side_effect_deduplications,
         )
@@ -306,6 +330,11 @@ async def get_usage_dashboard_data(
         "duration_ms": agent_total_duration_ms,
         "avg_duration_ms": round(agent_total_duration_ms / len(agent_rows)) if agent_rows else 0,
         "tool_timeouts": sum(row.agent_tool_timeouts for row in agent_rows),
+        "tool_timeout_tools": _tool_timeout_counts([
+            tool_name
+            for row in agent_rows
+            for tool_name in _tool_timeout_names(row)
+        ]),
         "result_truncations": sum(row.agent_result_truncations for row in agent_rows),
         "side_effect_deduplications": sum(
             row.agent_side_effect_deduplications for row in agent_rows
@@ -374,6 +403,9 @@ async def get_usage_dashboard_data(
                 "agent_tool_calls": row.agent_tool_calls,
                 "agent_duration_ms": row.agent_duration_ms,
                 "agent_tool_timeouts": row.agent_tool_timeouts,
+                "agent_tool_timeout_tools": _tool_timeout_counts(
+                    _tool_timeout_names(row)
+                ),
                 "agent_result_truncations": row.agent_result_truncations,
                 "agent_side_effect_deduplications": row.agent_side_effect_deduplications,
             }
@@ -400,6 +432,9 @@ async def get_usage_dashboard_data(
                 "agent_tool_calls": row.agent_tool_calls,
                 "agent_duration_ms": row.agent_duration_ms,
                 "agent_tool_timeouts": row.agent_tool_timeouts,
+                "agent_tool_timeout_tools": _tool_timeout_counts(
+                    _tool_timeout_names(row)
+                ),
                 "agent_result_truncations": row.agent_result_truncations,
                 "agent_side_effect_deduplications": row.agent_side_effect_deduplications,
             }

@@ -152,6 +152,7 @@ def _log_agent_run_summary(session_id: str, result: dict[str, Any]) -> None:
         f"tool_calls={result.get('tool_count', 0)} "
         f"tokens={result.get('llm_total_tokens', 0)} "
         f"tool_timeouts={result.get('tool_timeout_count', 0)} "
+        f"timeout_tools={result.get('tool_timeout_names', [])} "
         f"truncated_results={result.get('tool_result_truncation_count', 0)} "
         f"deduplicated_side_effects={result.get('side_effect_duplicate_count', 0)}"
     )
@@ -323,6 +324,7 @@ async def _run_scheduled_agent_task(
                     "llm_call_count": 0,
                     "llm_total_tokens": 0,
                     "tool_timeout_count": 0,
+                    "tool_timeout_names": [],
                     "tool_result_truncation_count": 0,
                     "side_effect_duplicate_count": 0,
                     "completed_side_effect_keys": [],
@@ -974,6 +976,7 @@ async def choice_response_strategy(
             "llm_call_count": 0,
             "llm_total_tokens": 0,
             "tool_timeout_count": 0,
+            "tool_timeout_names": [],
             "tool_result_truncation_count": 0,
             "side_effect_duplicate_count": 0,
             "completed_side_effect_keys": [],
@@ -1047,6 +1050,7 @@ async def choice_response_strategy(
             agent_tool_calls=int(graph_result.get("tool_count", 0) or 0),
             agent_duration_ms=agent_duration_ms,
             agent_tool_timeouts=int(graph_result.get("tool_timeout_count", 0) or 0),
+            agent_tool_timeout_tools=list(graph_result.get("tool_timeout_names", [])),
             agent_result_truncations=int(graph_result.get("tool_result_truncation_count", 0) or 0),
             agent_side_effect_deduplications=int(graph_result.get("side_effect_duplicate_count", 0) or 0),
         )
@@ -1103,6 +1107,7 @@ if __name__ == "__main__":
             "llm_call_count": 0,
             "llm_total_tokens": 0,
             "tool_timeout_count": 0,
+            "tool_timeout_names": [],
             "tool_result_truncation_count": 0,
             "side_effect_duplicate_count": 0,
             "completed_side_effect_keys": [],

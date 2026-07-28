@@ -99,6 +99,7 @@ class TokenUsage(Model):
     agent_tool_calls: Mapped[int] = mapped_column(default=0)
     agent_duration_ms: Mapped[int] = mapped_column(default=0)
     agent_tool_timeouts: Mapped[int] = mapped_column(default=0)
+    agent_tool_timeout_tools: Mapped[list[str]] = mapped_column(JSON, default=list)
     agent_result_truncations: Mapped[int] = mapped_column(default=0)
     agent_side_effect_deduplications: Mapped[int] = mapped_column(default=0)
     created_at: Mapped[datetime] = mapped_column(default=datetime.now, index=True)
