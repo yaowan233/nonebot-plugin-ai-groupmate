@@ -183,6 +183,10 @@ def _matches_inbound_message(
     )
 
 
+def _is_connected_bot_sender(user_id: Any, connected_bot_ids: set[str]) -> bool:
+    return str(user_id) in connected_bot_ids
+
+
 async def _load_agent_history(db_session, session_id: str) -> list[ChatHistorySchema]:
     now = datetime.datetime.now()
 
@@ -304,12 +308,14 @@ async def handle_message(
     interface: QryItrface,
 ):
     """处理消息的主函数"""
-    if str(session.user.id) == str(bot.self_id):
-        logger.debug(f"忽略机器人自身消息 - session: {session.scene.id}")
-        return
-
     connected_bot_ids = {str(bot_id) for bot_id in get_bots()}
     connected_bot_ids.add(str(bot.self_id))
+    if _is_connected_bot_sender(session.user.id, connected_bot_ids):
+        logger.debug(
+            f"忽略已连接 Bot {session.user.id} 发送的消息 - session: {session.scene.id}"
+        )
+        return
+
     addressed_bot_id = _select_addressed_bot_id(event, connected_bot_ids)
     if addressed_bot_id is not None and addressed_bot_id != str(bot.self_id):
         logger.debug(

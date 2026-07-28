@@ -59,3 +59,13 @@ def test_platform_message_id_deduplicates_different_processed_bodies():
         "id: 42\n",
         "hello",
     )
+
+
+def test_message_from_another_connected_bot_is_ignored():
+    from nonebot_plugin_ai_groupmate import _is_connected_bot_sender
+
+    connected_bot_ids = {"bot-1", "bot-2"}
+
+    assert _is_connected_bot_sender("bot-1", connected_bot_ids)
+    assert _is_connected_bot_sender("bot-2", connected_bot_ids)
+    assert not _is_connected_bot_sender("member-1", connected_bot_ids)
