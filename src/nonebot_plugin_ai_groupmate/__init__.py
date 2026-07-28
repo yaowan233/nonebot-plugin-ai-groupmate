@@ -177,10 +177,12 @@ def _matches_inbound_message(
     history_content: str,
     content_prefix: str,
     body: str,
+    *,
+    exact_id_only: bool = False,
 ) -> bool:
-    return history_content.startswith(content_prefix) or (
-        bool(body) and history_content.endswith(body)
-    )
+    if history_content.startswith(content_prefix):
+        return True
+    return not exact_id_only and bool(body) and history_content.endswith(body)
 
 
 def _is_connected_bot_sender(user_id: Any, connected_bot_ids: set[str]) -> bool:
@@ -310,12 +312,10 @@ async def handle_message(
     """处理消息的主函数"""
     connected_bot_ids = {str(bot_id) for bot_id in get_bots()}
     connected_bot_ids.add(str(bot.self_id))
-    if _is_connected_bot_sender(session.user.id, connected_bot_ids):
-        logger.debug(
-            f"忽略已连接 Bot {session.user.id} 发送的消息 - session: {session.scene.id}"
-        )
-        return
-
+    sender_is_connected_bot = _is_connected_bot_sender(
+        session.user.id,
+        connected_bot_ids,
+    )
     addressed_bot_id = _select_addressed_bot_id(event, connected_bot_ids)
     if addressed_bot_id is not None and addressed_bot_id != str(bot.self_id):
         logger.debug(
@@ -392,20 +392,31 @@ async def handle_message(
 
     # ========== 步骤1: 处理文本消息（快速） ==========
     # 用锁保证多bot并发安全: SELECT + INSERT + COMMIT 原子化
+    if is_text and sender_is_connected_bot:
+        # 本插件的发送工具会主动写入 bot 消息。给发送侧事务一个很短的提交窗口，
+        # 再按平台消息 ID 判断是否已经入库；其他插件发出的消息仍会继续记录。
+        await asyncio.sleep(0.25)
     is_new_text_message = True
     async with _get_dedup_lock(session.scene.id):
         if is_text:
             do_insert = True
             time_window = datetime.datetime.now() - datetime.timedelta(seconds=3)
-            existing = await db_session.execute(
-                Select(ChatHistory).where(
-                    ChatHistory.session_id == session.scene.id,
-                    ChatHistory.user_id == session.user.id,
-                    ChatHistory.created_at >= time_window,
-                )
+            existing_query = Select(ChatHistory).where(
+                ChatHistory.session_id == session.scene.id,
+                ChatHistory.created_at >= time_window,
             )
+            if not sender_is_connected_bot:
+                existing_query = existing_query.where(
+                    ChatHistory.user_id == session.user.id
+                )
+            existing = await db_session.execute(existing_query)
             if any(
-                _matches_inbound_message(history.content, content_prefix, body)
+                _matches_inbound_message(
+                    history.content,
+                    content_prefix,
+                    body,
+                    exact_id_only=sender_is_connected_bot,
+                )
                 for history in existing.scalars().all()
             ):
                 logger.debug("消息已存在，跳过重复记录")

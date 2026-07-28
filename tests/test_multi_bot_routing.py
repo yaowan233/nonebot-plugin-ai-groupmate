@@ -61,11 +61,26 @@ def test_platform_message_id_deduplicates_different_processed_bodies():
     )
 
 
-def test_message_from_another_connected_bot_is_ignored():
-    from nonebot_plugin_ai_groupmate import _is_connected_bot_sender
+def test_connected_bot_sender_only_deduplicates_an_exact_message_id():
+    from nonebot_plugin_ai_groupmate import (
+        _is_connected_bot_sender,
+        _matches_inbound_message,
+    )
 
     connected_bot_ids = {"bot-1", "bot-2"}
 
     assert _is_connected_bot_sender("bot-1", connected_bot_ids)
     assert _is_connected_bot_sender("bot-2", connected_bot_ids)
     assert not _is_connected_bot_sender("member-1", connected_bot_ids)
+    assert _matches_inbound_message(
+        "id: 42\nreply recorded by this plugin",
+        "id: 42\n",
+        "same text",
+        exact_id_only=True,
+    )
+    assert not _matches_inbound_message(
+        "id: 41\nsame text",
+        "id: 42\n",
+        "same text",
+        exact_id_only=True,
+    )
