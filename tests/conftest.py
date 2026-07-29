@@ -6,6 +6,11 @@ from pytest_asyncio import is_async_test
 from nonebot.adapters.onebot.v11 import Adapter as OnebotV11Adapter
 
 os.environ["ENVIRONMENT"] = "test"
+os.environ["DRIVER"] = "~none"
+os.environ["SQLALCHEMY_DATABASE_URL"] = (
+    "sqlite+aiosqlite:///file::memory:?uri=true&cache=shared"
+)
+os.environ["ALEMBIC_STARTUP_CHECK"] = "false"
 
 
 def pytest_collection_modifyitems(items: list[pytest.Item]):
@@ -17,9 +22,18 @@ def pytest_collection_modifyitems(items: list[pytest.Item]):
 
 @pytest.fixture(scope="session", autouse=True)
 async def after_nonebot_init(after_nonebot_init: None):
-    # 加载适配器
     driver = nonebot.get_driver()
     driver.register_adapter(OnebotV11Adapter)
+    nonebot.load_plugin("nonebot_plugin_ai_groupmate")
 
-    # 加载插件
-    nonebot.load_from_toml("pyproject.toml")
+    from nonebot_plugin_orm import init_orm
+
+    await init_orm()
+
+    import nonebot_plugin_orm
+
+    for bind, engine in nonebot_plugin_orm._engines.items():
+        metadata = nonebot_plugin_orm._metadatas.get(bind)
+        if metadata is not None:
+            async with engine.begin() as conn:
+                await conn.run_sync(metadata.create_all)

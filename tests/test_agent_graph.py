@@ -139,6 +139,137 @@ async def test_skill_only_exposes_its_tools_after_loading():
 
 
 @pytest.mark.asyncio
+async def test_empty_model_response_is_corrected_once():
+    from nonebot_plugin_ai_groupmate.agent.graph import build_chat_graph
+
+    sent: list[str] = []
+
+    @tool("reply_user")
+    async def reply_user(content: str, next_step: str) -> str:
+        """Send a corrected reply for testing."""
+        sent.append(content)
+        return "sent"
+
+    @tool("finish")
+    def finish() -> str:
+        """End this test graph."""
+        return ""
+
+    model = _ToolSpyModel(
+        [
+            AIMessage(content=""),
+            AIMessage(
+                content="",
+                tool_calls=[{
+                    "name": "reply_user",
+                    "args": {"content": "corrected", "next_step": "end"},
+                    "id": "reply-1",
+                }],
+            ),
+        ]
+    )
+    graph = build_chat_graph(model, [reply_user, finish], "system")
+
+    result = await graph.ainvoke(_state(AIMessage(content="placeholder")))
+
+    assert sent == ["corrected"]
+    assert model.invoke_count == 2
+    assert result["llm_call_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_repeated_empty_model_response_does_not_loop_forever():
+    from nonebot_plugin_ai_groupmate.agent.graph import build_chat_graph
+
+    @tool("finish")
+    def finish() -> str:
+        """End this test graph."""
+        return ""
+
+    model = _ToolSpyModel([AIMessage(content=""), AIMessage(content="")])
+    graph = build_chat_graph(model, [finish], "system")
+
+    result = await graph.ainvoke(_state(AIMessage(content="placeholder")))
+
+    assert model.invoke_count == 2
+    assert result["llm_call_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_reply_is_deferred_until_other_tool_work_finishes():
+    from nonebot_plugin_ai_groupmate.agent.graph import build_chat_graph
+
+    events: list[str] = []
+
+    @tool("reply_user")
+    async def reply_user(content: str, next_step: str) -> str:
+        """Send a reply for testing."""
+        events.append(f"reply:{content}")
+        return "sent"
+
+    @tool("load_agent_skill")
+    async def load_agent_skill(skill_name: str) -> str:
+        """Load a skill for testing."""
+        events.append(f"load:{skill_name}")
+        return f"loaded {skill_name}"
+
+    @tool("save_preference")
+    async def save_preference() -> str:
+        """Persist a preference for testing."""
+        events.append("save")
+        return "saved"
+
+    model = _ToolSpyModel(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "reply_user",
+                        "args": {"content": "premature", "next_step": "end"},
+                        "id": "reply-early",
+                    },
+                    {
+                        "name": "load_agent_skill",
+                        "args": {"skill_name": "memory"},
+                        "id": "load-1",
+                    },
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[{
+                    "name": "save_preference",
+                    "args": {},
+                    "id": "save-1",
+                }],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[{
+                    "name": "reply_user",
+                    "args": {"content": "saved", "next_step": "end"},
+                    "id": "reply-final",
+                }],
+            ),
+        ]
+    )
+    graph = build_chat_graph(
+        model,
+        [reply_user, load_agent_skill, save_preference],
+        "system",
+        base_tools=[reply_user, load_agent_skill],
+        tools_by_skill={"memory": [save_preference]},
+    )
+
+    result = await graph.ainvoke(_state(AIMessage(content="placeholder")))
+
+    assert events == ["load:memory", "save", "reply:saved"]
+    assert result["reply_count"] == 1
+    assert result["active_skills"] == ["memory"]
+
+
+@pytest.mark.asyncio
 async def test_reply_with_end_stops_without_an_extra_model_call():
     from nonebot_plugin_ai_groupmate.agent.graph import build_chat_graph
 
@@ -292,14 +423,14 @@ async def test_duplicate_side_effect_is_executed_once():
 
 
 @pytest.mark.asyncio
-async def test_timed_out_side_effect_can_be_retried():
+async def test_timed_out_side_effect_ends_run_without_retry():
     from nonebot_plugin_ai_groupmate.agent.graph import AgentRunLimits, build_chat_graph
 
     calls: list[str] = []
 
     @tool("send_meme_image")
     async def send_meme_image(pic_id: str) -> str:
-        """Time out once, then complete the same side effect."""
+        """Time out after the side effect may have been dispatched."""
         calls.append(pic_id)
         if len(calls) == 1:
             await asyncio.sleep(0.05)
@@ -327,10 +458,13 @@ async def test_timed_out_side_effect_can_be_retried():
 
     result = await graph.ainvoke(_state(AIMessage(content="placeholder")))
 
-    assert calls == ["42", "42"]
+    assert calls == ["42"]
+    assert model.invoke_count == 1
     assert result["tool_timeout_count"] == 1
     assert result["tool_timeout_names"] == ["send_meme_image"]
     assert result["side_effect_duplicate_count"] == 0
+    assert result["called_finish"] == 1
+    assert len(result["completed_side_effect_keys"]) == 1
 
 
 @pytest.mark.asyncio

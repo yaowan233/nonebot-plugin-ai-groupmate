@@ -18,6 +18,7 @@ from nonebot.params import CommandArg
 from nonebot.plugin import PluginMetadata, inherit_supported_adapters
 from nonebot.typing import T_State
 from nonebot.adapters import Bot, Event, Message
+from nonebot.permission import SUPERUSER
 from langchain_core.messages import HumanMessage
 
 require("nonebot_plugin_alconna")
@@ -44,6 +45,7 @@ from .webui import register_usage_webui
 from .config import Config, create_chat_openai, create_tagging_llm
 from .memory import DB
 from .reply_guard import set_latest_request_id
+from .relation_maintenance import count_negative_relations, reset_negative_relations
 
 
 async def _safe_rollback(db_session) -> None:
@@ -66,6 +68,7 @@ __plugin_meta__ = PluginMetadata(
 plugin_data_dir: Path = store.get_plugin_data_dir()
 pic_dir = plugin_data_dir / "pics"
 pic_dir.mkdir(parents=True, exist_ok=True)
+relation_backup_dir = plugin_data_dir / "relation_backups"
 plugin_config = get_plugin_config(Config).ai_groupmate
 register_usage_webui(plugin_config)
 MAX_WORDCLOUD_DAYS = 3650
@@ -847,6 +850,50 @@ def _parse_wordcloud_days(arg_text: str) -> int:
     if not 1 <= days <= MAX_WORDCLOUD_DAYS:
         raise ValueError(f"统计范围应为 1-{MAX_WORDCLOUD_DAYS} 天")
     return days
+
+
+reset_negative_relation = on_command(
+    "重置负面关系",
+    aliases={"清理负面关系"},
+    permission=SUPERUSER,
+    priority=1,
+    block=True,
+)
+
+
+@reset_negative_relation.handle()
+async def _(db_session: async_scoped_session, arg: Message = CommandArg()):
+    confirmation = arg.extract_plain_text().strip()
+    try:
+        affected_count = await count_negative_relations(db_session)
+    except Exception:
+        await _safe_rollback(db_session)
+        logger.exception("读取负面关系数量失败")
+        await reset_negative_relation.finish("读取失败，数据库未修改，请查看日志。")
+
+    if confirmation != "确认":
+        await _safe_rollback(db_session)
+        if affected_count == 0:
+            await reset_negative_relation.finish("没有需要重置的负好感度关系。")
+        await reset_negative_relation.finish(
+            f"检测到 {affected_count} 条负好感度关系。\n"
+            "本操作会先备份，再将这些用户的好感度归零并清空旧标签。\n"
+            "确认执行请发送：/重置负面关系 确认"
+        )
+
+    try:
+        result = await reset_negative_relations(db_session, relation_backup_dir)
+    except Exception:
+        await _safe_rollback(db_session)
+        logger.exception("重置负面关系失败")
+        await reset_negative_relation.finish("重置失败，数据库未修改，请查看日志。")
+
+    if result.affected_count == 0:
+        await reset_negative_relation.finish("没有需要重置的负好感度关系。")
+    await reset_negative_relation.finish(
+        f"已重置 {result.affected_count} 条负好感度关系。\n"
+        f"备份文件：{result.backup_path}"
+    )
 
 
 frequency = on_command("词频")

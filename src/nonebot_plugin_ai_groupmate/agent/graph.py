@@ -22,6 +22,10 @@ MAX_REPLY_COUNT = 5
 MAX_TOOL_COUNT = 20
 MAX_REPLY_PER_ROUND = 1  # 每轮只发1条，强制模型逐条思考，上下文连续
 MAX_REACTION_PER_ROUND = 3
+EMPTY_RESPONSE_RETRY_PROMPT = (
+    "你刚才返回了空响应，这是无效输出。请重新选择下一步：需要回应时调用对应工具；"
+    "确实不需要回应时必须调用 finish。不要再次返回空内容。"
+)
 SIDE_EFFECT_TOOL_NAMES = frozenset({
     "add_message_reaction",
     "generate_and_send_annual_report",
@@ -348,37 +352,70 @@ def _make_agent_node(
             bound_model = model.bind_tools(visible_tools)
             bound_models[tool_names] = bound_model
         full: list[BaseMessage] = system_messages + list(state["messages"])
-        call_number = state.get("llm_call_count", 0) + 1
-        started_at = time.perf_counter()
-        try:
-            response: AIMessage = await asyncio.wait_for(
-                bound_model.ainvoke(full),
-                timeout=limits.llm_timeout_seconds,
+        call_messages = full
+        call_number = state.get("llm_call_count", 0)
+        total_tokens = state.get("llm_total_tokens", 0)
+        cached_tokens = state.get("llm_cached_tokens", 0)
+        cache_creation_tokens = state.get("llm_cache_creation_tokens", 0)
+        retried_empty_response = False
+
+        while True:
+            call_number += 1
+            started_at = time.perf_counter()
+            try:
+                response: AIMessage = await asyncio.wait_for(
+                    bound_model.ainvoke(call_messages),
+                    timeout=limits.llm_timeout_seconds,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"[AgentTrace] LLM 超时 session={state['session_id']} "
+                    f"call={call_number} timeout={limits.llm_timeout_seconds:.1f}s"
+                )
+                raise
+            elapsed_ms = (time.perf_counter() - started_at) * 1000
+            usage = _log_llm_cache_usage(response)
+            budget_tokens = usage["total_tokens"] or _estimate_message_tokens(
+                [*call_messages, response]
             )
-        except asyncio.TimeoutError:
+            total_tokens += budget_tokens
+            cached_tokens += usage["cached_tokens"]
+            cache_creation_tokens += usage["cache_creation_tokens"]
+            logger.info(
+                f"[AgentTrace] LLM session={state['session_id']} call={call_number} "
+                f"duration_ms={elapsed_ms:.0f} visible_tools={len(visible_tools)} "
+                f"tokens={budget_tokens}{' (估算)' if not usage['total_tokens'] else ''}"
+            )
+
+            has_output = bool(response.tool_calls or _message_text_content(response))
+            can_retry = (
+                not retried_empty_response
+                and call_number < limits.max_llm_calls
+                and total_tokens < limits.max_total_tokens
+            )
+            if has_output or not can_retry:
+                break
+
+            retried_empty_response = True
             logger.warning(
-                f"[AgentTrace] LLM 超时 session={state['session_id']} call={call_number} "
-                f"timeout={limits.llm_timeout_seconds:.1f}s"
+                f"[AgentTrace] LLM 返回空响应 session={state['session_id']} "
+                f"call={call_number}，自动纠正一次"
             )
-            raise
-        elapsed_ms = (time.perf_counter() - started_at) * 1000
-        usage = _log_llm_cache_usage(response)
-        budget_tokens = usage["total_tokens"] or _estimate_message_tokens([*full, response])
-        logger.info(
-            f"[AgentTrace] LLM session={state['session_id']} call={call_number} "
-            f"duration_ms={elapsed_ms:.0f} visible_tools={len(visible_tools)} "
-            f"tokens={budget_tokens}{' (估算)' if not usage['total_tokens'] else ''}"
-        )
+            call_messages = [
+                *full,
+                response,
+                HumanMessage(content=EMPTY_RESPONSE_RETRY_PROMPT),
+            ]
+
         return {
             "messages": [response],
             "reply_this_round": 0,
             "reply_requires_continuation": False,
             "called_finish": 0,
-            "llm_cached_tokens": state.get("llm_cached_tokens", 0) + usage["cached_tokens"],
-            "llm_cache_creation_tokens": state.get("llm_cache_creation_tokens", 0)
-            + usage["cache_creation_tokens"],
+            "llm_cached_tokens": cached_tokens,
+            "llm_cache_creation_tokens": cache_creation_tokens,
             "llm_call_count": call_number,
-            "llm_total_tokens": state.get("llm_total_tokens", 0) + budget_tokens,
+            "llm_total_tokens": total_tokens,
         }
 
     return agent_node
@@ -415,6 +452,10 @@ def _make_tool_node(
         request_id = state["request_id"]
 
         agent_ctx = _AgentContext(session_id=session_id, request_id=request_id)
+        has_pending_tool_work = any(
+            tc.get("name") not in {"reply_user", "finish"}
+            for tc in tool_calls
+        )
 
         if not tool_calls:
             direct_reply = _message_text_content(last_message)
@@ -465,6 +506,12 @@ def _make_tool_node(
             tool_count += 1
 
             if name == "finish":
+                if has_pending_tool_work:
+                    results.append(ToolMessage(
+                        content="本轮还有工具工作未完成，已忽略提前结束；请先检查工具结果。",
+                        tool_call_id=tool_call_id,
+                    ))
+                    continue
                 called_finish += 1
                 results.append(ToolMessage(content="", tool_call_id=tool_call_id))
                 break
@@ -474,6 +521,18 @@ def _make_tool_node(
                 continue
 
             if name == "reply_user":
+                if has_pending_tool_work:
+                    results.append(ToolMessage(
+                        content=(
+                            "本轮还有工具工作未完成，未发送这条提前确认。"
+                            "请先完成操作并检查结果，再在下一轮回复用户。"
+                        ),
+                        tool_call_id=tool_call_id,
+                    ))
+                    logger.info(
+                        f"[AgentTrace] 延后提前回复 session={session_id}"
+                    )
+                    continue
                 if reply_this_round >= MAX_REPLY_PER_ROUND:
                     results.append(ToolMessage(
                         content="本轮已经发送过消息了。如果你想发送更多，请等待下一轮。",
@@ -544,14 +603,31 @@ def _make_tool_node(
                     tool_timeout_count += 1
                     tool_timeout_names.append(name)
                     await _rollback_after_tool_failure(db_session)
+                    delivery_unknown = effect_key is not None
+                    if effect_key is not None:
+                        # A timed-out side-effect may already have reached the platform.
+                        # Retrying it can duplicate messages or moderation actions, so
+                        # conservatively mark the operation as consumed and end this run.
+                        completed_side_effect_keys.append(effect_key)
+                        called_finish += 1
+                        if name == "reply_user":
+                            reply_requires_continuation = False
                     logger.warning(
                         f"[AgentTrace] 工具超时 session={session_id} tool={name} "
-                        f"timeout={limits.tool_timeout_seconds:.1f}s"
+                        f"timeout={limits.tool_timeout_seconds:.1f}s "
+                        f"delivery_unknown={delivery_unknown}"
                     )
                     results.append(ToolMessage(
-                        content="工具执行超时，请根据已有信息决定是否重试或换一种方式。",
+                        content=(
+                            "副作用工具执行超时，投递结果未知；为避免重复操作，"
+                            "本轮必须停止且不得重试。"
+                            if delivery_unknown
+                            else "工具执行超时，请根据已有信息决定是否重试或换一种方式。"
+                        ),
                         tool_call_id=tool_call_id,
                     ))
+                    if delivery_unknown:
+                        break
                     continue
                 elapsed_ms = (time.perf_counter() - started_at) * 1000
                 tool_content, extra_content = _normalize_tool_result(result)

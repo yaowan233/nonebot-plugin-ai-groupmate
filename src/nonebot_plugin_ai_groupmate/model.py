@@ -58,17 +58,23 @@ class UserRelation(Model):
     def get_status_desc(self) -> str:
         """根据分数返回关系描述"""
         score = self.favorability
-        if score <= -30:
-            return "厌恶/仇视"
-        if score <= -10:
-            return "冷淡/防备"
-        if score <= 10:
+        if score < -70:
+            return "明显疏远"
+        if score < -40:
+            return "保持距离"
+        if score < -15:
+            return "稍显克制"
+        if score < 5:
             return "陌生/普通"
-        if score <= 40:
-            return "友善/熟人"
-        if score <= 70:
-            return "亲密/死党"
-        return "恋人/依赖"
+        if score < 25:
+            return "有点熟"
+        if score < 50:
+            return "朋友/熟人"
+        if score < 70:
+            return "亲近/好友"
+        if score < 90:
+            return "非常亲近"
+        return "最亲近的人"
 
 
 class GroupMemory(Model):

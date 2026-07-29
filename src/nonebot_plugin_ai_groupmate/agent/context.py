@@ -6,6 +6,41 @@ from nonebot.log import logger
 from ..model import ChatHistory, GroupMemory, UserRelation, ChatHistorySchema
 
 
+def _get_relation_response_strategy(favorability: int) -> str:
+    """只用好感度调节亲疏感，不让历史关系降低正常回复质量。"""
+    if favorability < -70:
+        return (
+            "策略：保持中性、简洁和清晰的边界，不主动亲近或延伸闲聊；"
+            "对对方明确提出的正常请求仍要礼貌、公平并尽力完整回应。"
+        )
+    if favorability < -40:
+        return (
+            "策略：语气克制，少开玩笑，保持适当距离；"
+            "对正常提问和任务仍要礼貌、认真回应。"
+        )
+    if favorability < -15:
+        return (
+            "策略：稍显克制，不主动表现亲密，但保持正常礼貌和可靠的回应质量。"
+        )
+    if favorability < 5:
+        return "策略：普通陌生人，正常礼貌对话，不特别亲近也不排斥。"
+    if favorability < 25:
+        return "策略：有点印象了，偶尔可以开个小玩笑，稍微愿意多聊几句。"
+    if favorability < 50:
+        return "策略：朋友关系，聊天比较随意自然，会主动回应，偶尔关心一下。"
+    if favorability < 70:
+        return "策略：好朋友，说话轻松亲近，会记住对方说过的事，偶尔开玩笑。"
+    if favorability < 90:
+        return (
+            "策略：非常亲近，愿意多聊、关心对方，对他的事比较上心；"
+            "即使关系很好也要保持合理边界。"
+        )
+    return (
+        "策略：这是你非常亲近和重视的人，会更主动地关心和回应；"
+        "即使关系很好也要保持合理边界。"
+    )
+
+
 async def get_user_relation_context(
     db_session, user_id: str, user_name: str | None
 ) -> str:
@@ -24,37 +59,23 @@ async def get_user_relation_context(
 策略：保持礼貌，通过对话了解对方。
 """
 
-        if relation.favorability < -70:
-            strategy = "策略：你把他当死敌，几乎不想和他说话。回复极其敷衍或直接无视，除非他有非常诚恳的道歉和实质性补偿，否则不会软化。"
-        elif relation.favorability < -40:
-            strategy = "策略：你很讨厌他，语气带刺，回复简短冷漠。不主动搭话，被问也尽量敷衍了事。如果他**诚恳道歉**或**做出补偿**，可以考虑给一点机会。"
-        elif relation.favorability < -15:
-            strategy = "策略：你对他有些防备，保持距离。礼貌但疏冷，不想深聊，话不多。"
-        elif relation.favorability < 5:
-            strategy = "策略：普通陌生人，正常礼貌对话，不特别亲近也不排斥。"
-        elif relation.favorability < 25:
-            strategy = "策略：有点印象了，偶尔可以开个小玩笑，稍微愿意多聊几句。"
-        elif relation.favorability < 50:
-            strategy = "策略：朋友关系，聊天比较随意自然，会主动回应，偶尔关心一下。"
-        elif relation.favorability < 70:
-            strategy = (
-                "策略：好朋友，说话轻松亲近，会记住对方说过的事，偶尔撒娇或开玩笑。"
-            )
-        elif relation.favorability < 90:
-            strategy = "策略：非常亲密，话多、关心对方，会主动分享心情，对他的事很上心。不过即使关系再好也不会无底线纵容。"
-        else:
-            strategy = "策略：他是你最喜欢的人，会主动找他聊天，对他的一切都很在意，说话带着明显的依赖和喜欢。不过即使关系再好也不会无底线纵容。"
+        strategy = _get_relation_response_strategy(relation.favorability)
 
         return f"""【人际关系档案】
 当前对象：{relation.user_name}
 当前好感度：{relation.favorability} ({relation.get_status_desc()})
-当前印象标签：{str(relation.tags)}
+画像维护专用历史标签（可能片面或过时，不得用于决定回复态度）：{str(relation.tags)}
+
+【关系使用边界】
+1. 当前消息的实际内容优先于历史好感度和标签。对方这次正常、友善或诚恳时，应按本次表现回应。
+2. 好感度只影响语气亲疏、主动性和玩笑尺度，不得影响事实判断、正常请求的回答质量、工具使用或安全规则。
+3. 不得因为负好感度或负面标签讽刺、羞辱、敌视、故意敷衍、无视对方，也不得要求对方道歉或补偿后才正常回应。
+4. 标签不是确定事实，不得据此给用户定性；涉及具体事实时以当前消息和可靠证据为准。
 
 【画像维护指南】
-1. 如果对方的表现符合现有标签，无需操作。
-2. 如果对方表现出了**新特征**，放入 add_tags。
-3. 如果对方的表现与**旧标签冲突**（例如以前标签是'内向'，今天他突然'话痨'），请将'内向'放入 remove_tags，并将'话痨'放入 add_tags。
-4. **关于好感度评分**：请基于**本次对话内容的质量**评分。即使当前好感度是-100，如果用户这次说了让你很开心的话，也必须给出正向分（例如 +10），不要受过去分数影响而吝啬给分。
+1. 只有多次表现稳定一致时才新增人格或印象标签，不要把一次性事件、短暂情绪或争执写成标签。
+2. 如果当前表现与旧标签持续冲突，应移除或修正旧标签；不要为了维护旧印象而曲解当前消息。
+3. **关于好感度评分**：只根据本次互动质量评分，不受过去分数和标签影响。即使当前好感度是 -100，本次互动良好也必须给出合理正向分。
 {strategy}
 """
     except Exception as e:
@@ -118,21 +139,19 @@ async def get_recent_relations_context(
         )
         relation_map = {str(r.user_id): r for r in rows}
 
-        lines: list[str] = ["【群内他人关系速览】"]
+        lines: list[str] = ["【群内他人关系速览（弱参考）】"]
         for uid in recent_ids:
             name = id_to_name.get(uid, uid)
             relation = relation_map.get(uid)
             if not relation:
-                lines.append(f"- {name}: 好感度 0（陌生/普通）")
+                lines.append(f"- {name}: 陌生/普通")
                 continue
 
-            tags = relation.tags[:3] if relation.tags else []
-            tag_text = f"，标签: {tags}" if tags else ""
-            lines.append(
-                f"- {name}: 好感度 {relation.favorability} ({relation.get_status_desc()}){tag_text}"
-            )
+            lines.append(f"- {name}: {relation.get_status_desc()}")
 
-        lines.append("- 回复时结合在场人员关系，避免前后态度割裂。")
+        lines.append(
+            "- 仅用于调整亲疏感和主动性；当前发言优先，不得据此敌视、忽视或降低回应质量。"
+        )
         return "\n".join(lines)
     except Exception as e:
         logger.error(f"获取群内他人关系速览失败: {e}")

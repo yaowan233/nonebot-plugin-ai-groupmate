@@ -3,3 +3,5 @@ CLAUDE.md
 .python-version
 .vscode/
 .idea/
+evals/results/
+evals/batch-runs/

@@ -81,6 +81,7 @@ pythonPlatform = "All"
 defineConstant = { PYDANTIC_V2 = true }
 executionEnvironments = [
   { root = "./tests", extraPaths = [
+    ".",
     "./src",
   ] },
   { root = "./src" },
