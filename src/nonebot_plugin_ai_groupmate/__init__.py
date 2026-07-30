@@ -497,12 +497,10 @@ async def handle_message(
                 )
 
     # ========== 步骤4: 处理回复 ==========
-    if to_me or continuous_to_me:
-        user_id = session.user.id
-        user_name = session.user.name or session.user.nick
-    else:
-        user_id = ""
-        user_name = ""
+    # Whether to reply is independent from who sent the triggering message.
+    # Always keep the real sender identity so bound custom tools can resolve
+    # requests such as "查询我的成绩" without asking the model for an ID.
+    user_id = session.user.id
     if should_reply:
         group_id = session.scene.id
         request = ReplyRequest(
