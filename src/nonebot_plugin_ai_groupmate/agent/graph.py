@@ -229,6 +229,40 @@ def _normalize_tool_result(result: Any) -> tuple[str, list[ContentBlock] | None]
     return str(result), None
 
 
+def _extra_content_has_image(extra_content: list[ContentBlock]) -> bool:
+    return any(
+        isinstance(item, dict) and item.get("type") == "image_url"
+        for item in extra_content
+    )
+
+
+async def _build_extra_content_message(
+    extra_content: list[ContentBlock],
+    *,
+    supports_images: bool,
+    image_summarizer: Any | None,
+) -> BaseMessage:
+    if supports_images or not _extra_content_has_image(extra_content):
+        return HumanMessage(content=extra_content)
+
+    if image_summarizer is not None:
+        summary = await image_summarizer(extra_content)
+        if summary:
+            return HumanMessage(
+                content=(
+                    "【图片回读】工具返回了图片，已由辅助视觉模型总结图片内容：\n"
+                    f"{summary}"
+                )
+            )
+
+    return HumanMessage(
+        content=(
+            "【图片回读】工具返回了图片，但当前模型不支持图片输入，"
+            "无法查看图片内容，请不要臆测图片信息，必要时告知用户无法查看图片。"
+        )
+    )
+
+
 def _tool_result_status(content: str) -> str | None:
     try:
         parsed = json.loads(content)
@@ -427,6 +461,9 @@ def _make_tool_node(
     tools_by_skill: dict[str, list[BaseTool]],
     limits: AgentRunLimits,
     db_session: Any | None = None,
+    *,
+    supports_images: bool = True,
+    image_summarizer: Any | None = None,
 ):
     async def tool_node(state: AgentState) -> dict:
         messages = state["messages"]
@@ -654,7 +691,13 @@ def _make_tool_node(
                     if skill_name in tools_by_skill and skill_name not in active_skills:
                         active_skills.append(skill_name)
                 if extra_content is not None:
-                    results.append(HumanMessage(content=extra_content))
+                    results.append(
+                        await _build_extra_content_message(
+                            extra_content,
+                            supports_images=supports_images,
+                            image_summarizer=image_summarizer,
+                        )
+                    )
                 logger.info(
                     f"[AgentTrace] 工具 session={session_id} tool={name} "
                     f"duration_ms={elapsed_ms:.0f} status={tool_status or 'unknown'} "
@@ -732,6 +775,8 @@ def build_chat_graph(
     tools_by_skill: dict[str, list[BaseTool]] | None = None,
     limits: AgentRunLimits | None = None,
     db_session: Any | None = None,
+    supports_images: bool = True,
+    image_summarizer: Any | None = None,
 ) -> Any:
     tools_by_name: dict[str, BaseTool] = {t.name: t for t in tools}
     base_tools = list(base_tools) if base_tools is not None else list(tools)
@@ -742,7 +787,15 @@ def build_chat_graph(
     builder.add_node("agent", _make_agent_node(model, base_tools, system_prompt, tools_by_skill, limits))
     builder.add_node(
         "tools",
-        _make_tool_node(tools_by_name, base_tools, tools_by_skill, limits, db_session),
+        _make_tool_node(
+            tools_by_name,
+            base_tools,
+            tools_by_skill,
+            limits,
+            db_session,
+            supports_images=supports_images,
+            image_summarizer=image_summarizer,
+        ),
     )
     builder.add_edge(START, "agent")
     builder.add_conditional_edges("agent", _should_call_tools, {"tools": "tools", "end": END})

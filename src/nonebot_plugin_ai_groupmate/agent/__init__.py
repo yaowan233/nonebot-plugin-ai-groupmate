@@ -24,7 +24,7 @@ from ..usage import (
     extract_cached_tokens,
     extract_cache_creation_tokens,
 )
-from ..config import Config, create_chat_llm, create_chat_openai
+from ..config import Config, create_chat_llm, create_vision_llm, create_chat_openai
 from .context import (
     get_group_context,
     get_user_relation_context,
@@ -135,6 +135,10 @@ def _use_explicit_prompt_cache() -> bool:
     return "dashscope.aliyuncs.com" in base_url
 
 
+def _chat_supports_images() -> bool:
+    return plugin_config.chat_multimodal
+
+
 def _agent_run_limits() -> AgentRunLimits:
     return AgentRunLimits(
         max_llm_calls=plugin_config.agent_max_llm_calls,
@@ -193,6 +197,13 @@ def get_flash_model() -> Any:
 @lru_cache
 def get_chat_model() -> Any:
     return create_chat_llm(plugin_config)
+
+
+@lru_cache
+def get_vision_model() -> Any | None:
+    if not plugin_config.vision_model:
+        return None
+    return create_vision_llm(plugin_config)
 
 
 async def check_if_should_reply(
@@ -472,6 +483,8 @@ def format_chat_history(
     user_roles: dict[str, str] | None = None,
     extra_inline_images: list[ChatHistorySchema] | None = None,
 ) -> list[BaseMessage]:
+    if not _chat_supports_images():
+        max_inline_images = 0
     return _format_chat_history(
         history,
         pic_dir=pic_dir,
@@ -480,6 +493,59 @@ def format_chat_history(
         user_roles=user_roles,
         extra_inline_images=extra_inline_images,
     )
+
+
+async def _summarize_image_content(
+    content_blocks: list[Any],
+) -> str:
+    """用辅助视觉模型总结工具返回的图片内容，返回纯文本描述。"""
+    vision_model = get_vision_model()
+    if vision_model is None:
+        return ""
+    image_parts = [
+        item
+        for item in content_blocks
+        if isinstance(item, dict) and item.get("type") == "image_url"
+    ]
+    if not image_parts:
+        return ""
+    try:
+        resp = await asyncio.wait_for(
+            vision_model.ainvoke(
+                [
+                    HumanMessage(
+                        content=[
+                            {
+                                "type": "text",
+                                "text": (
+                                    "请用简洁的中文总结这张图片中的关键信息，"
+                                    "尤其是其中的文字、数据、数值、排行、成绩等内容。"
+                                    "只描述图片中确实存在的内容，不要臆测，不要评价图片美观度。"
+                                ),
+                            },
+                            *image_parts,
+                        ]
+                    )
+                ]
+            ),
+            timeout=plugin_config.agent_llm_timeout_seconds,
+        )
+        if isinstance(resp.content, str):
+            return resp.content.strip()
+        if isinstance(resp.content, list):
+            text_parts = [
+                part.get("text", "")
+                for part in resp.content
+                if isinstance(part, dict) and isinstance(part.get("text"), str)
+            ]
+            return "\n".join(text_parts).strip()
+        return str(resp.content).strip()
+    except asyncio.TimeoutError:
+        logger.warning("[图片回读] 辅助视觉模型总结图片超时，跳过图片内容")
+        return ""
+    except Exception as e:
+        logger.warning(f"[图片回读] 辅助视觉模型总结图片失败: {e}")
+        return ""
 
 
 async def create_chat_graph(
@@ -786,6 +852,8 @@ async def create_chat_graph(
         tools_by_skill=tools_by_skill,
         limits=_agent_run_limits(),
         db_session=db_session,
+        supports_images=_chat_supports_images(),
+        image_summarizer=_summarize_image_content if not _chat_supports_images() else None,
     )
     return graph, agent_tools, dynamic_context
 
@@ -900,45 +968,52 @@ async def choice_response_strategy(
         replied_texts = [m for m in replied_extra if m.content_type == "text"]
 
         if replied_images:
-            content_parts: list[Any] = [
-                {
-                    "type": "text",
-                    "text": (
-                        f"{prompt_text}\n\n"
-                        "【本轮回复引用的图片】下面图片是当前用户回复消息指向的图片，"
-                        "回答图片相关问题时必须优先分析这些图片，不要把其他历史图片当成当前问题对象。"
-                    ),
-                }
-            ]
-            bound_msg_ids: list[str] = []
-            failed_files: list[str] = []
-            for index, replied_image in enumerate(replied_images, 1):
-                file_name = _image_file_name_from_history(replied_image)
-                image_data = get_image_data_uri(file_name)
-                if image_data:
-                    content_parts.append(
-                        {"type": "text", "text": f"\n引用图{index}："}
-                    )
-                    content_parts.append(
-                        {"type": "image_url", "image_url": {"url": image_data}}
-                    )
-                    bound_msg_ids.append(str(replied_image.msg_id))
-                else:
-                    failed_files.append(file_name)
-
-            if bound_msg_ids:
-                final_prompt_content = content_parts
-                logger.info(
-                    f"已将被回复图片绑定到本轮任务提示 msg_ids={','.join(bound_msg_ids)}"
-                )
-                if failed_files:
-                    logger.warning(f"部分被回复图片文件无法加载 files={failed_files}")
-            else:
+            if not _chat_supports_images():
                 final_prompt_content = (
                     f"{prompt_text}\n\n"
-                    "【本轮回复引用的图片】已命中被回复图片记录，但本地图片文件无法加载。"
+                    "【本轮回复引用的图片】当前模型不支持图片输入，"
+                    f"已跳过 {len(replied_images)} 张图片，仅保留文字内容。"
                 )
-                logger.warning(f"被回复图片文件无法加载 files={failed_files}")
+            else:
+                content_parts: list[Any] = [
+                    {
+                        "type": "text",
+                        "text": (
+                            f"{prompt_text}\n\n"
+                            "【本轮回复引用的图片】下面图片是当前用户回复消息指向的图片，"
+                            "回答图片相关问题时必须优先分析这些图片，不要把其他历史图片当成当前问题对象。"
+                        ),
+                    }
+                ]
+                bound_msg_ids: list[str] = []
+                failed_files: list[str] = []
+                for index, replied_image in enumerate(replied_images, 1):
+                    file_name = _image_file_name_from_history(replied_image)
+                    image_data = get_image_data_uri(file_name)
+                    if image_data:
+                        content_parts.append(
+                            {"type": "text", "text": f"\n引用图{index}："}
+                        )
+                        content_parts.append(
+                            {"type": "image_url", "image_url": {"url": image_data}}
+                        )
+                        bound_msg_ids.append(str(replied_image.msg_id))
+                    else:
+                        failed_files.append(file_name)
+
+                if bound_msg_ids:
+                    final_prompt_content = content_parts
+                    logger.info(
+                        f"已将被回复图片绑定到本轮任务提示 msg_ids={','.join(bound_msg_ids)}"
+                    )
+                    if failed_files:
+                        logger.warning(f"部分被回复图片文件无法加载 files={failed_files}")
+                else:
+                    final_prompt_content = (
+                        f"{prompt_text}\n\n"
+                        "【本轮回复引用的图片】已命中被回复图片记录，但本地图片文件无法加载。"
+                    )
+                    logger.warning(f"被回复图片文件无法加载 files={failed_files}")
 
         if replied_texts:
             text_lines: list[str] = [
@@ -955,7 +1030,11 @@ async def choice_response_strategy(
                 final_prompt_content.append({"type": "text", "text": text_block})
 
         avatar_context_messages: list[BaseMessage] = []
-        if not is_private and should_include_avatar_context(history):
+        if (
+            not is_private
+            and _chat_supports_images()
+            and should_include_avatar_context(history)
+        ):
             avatar_context_messages = await build_avatar_context_messages(
                 history,
                 interface=interface,
