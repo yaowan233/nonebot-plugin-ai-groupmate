@@ -71,6 +71,7 @@ from .history_format import (
     is_image_history,
     get_image_data_uri as _get_image_data_uri,
     format_chat_history as _format_chat_history,
+    current_message_images,
     image_file_name_from_history,
     build_avatar_context_messages,
     should_include_avatar_context,
@@ -518,9 +519,9 @@ async def _summarize_image_content(
                             {
                                 "type": "text",
                                 "text": (
-                                    "请用简洁的中文总结这张图片中的关键信息，"
+                                    "请用简洁的中文总结这些图片中的关键信息，"
                                     "尤其是其中的文字、数据、数值、排行、成绩等内容。"
-                                    "只描述图片中确实存在的内容，不要臆测，不要评价图片美观度。"
+                                    "逐张说明，只描述图片中确实存在的内容，不要臆测，不要评价图片美观度。"
                                 ),
                             },
                             *image_parts,
@@ -967,53 +968,90 @@ async def choice_response_strategy(
         replied_images = [m for m in replied_extra if _is_image_history(m)]
         replied_texts = [m for m in replied_extra if m.content_type == "text"]
 
-        if replied_images:
-            if not _chat_supports_images():
-                final_prompt_content = (
-                    f"{prompt_text}\n\n"
-                    "【本轮回复引用的图片】当前模型不支持图片输入，"
-                    f"已跳过 {len(replied_images)} 张图片，仅保留文字内容。"
-                )
-            else:
-                content_parts: list[Any] = [
-                    {
-                        "type": "text",
-                        "text": (
-                            f"{prompt_text}\n\n"
-                            "【本轮回复引用的图片】下面图片是当前用户回复消息指向的图片，"
-                            "回答图片相关问题时必须优先分析这些图片，不要把其他历史图片当成当前问题对象。"
-                        ),
-                    }
-                ]
-                bound_msg_ids: list[str] = []
+        if not _chat_supports_images():
+            summary_images: list[Any] = list(replied_images)
+            seen_ids = {m.msg_id for m in summary_images}
+            for img in current_message_images(history):
+                if img.msg_id not in seen_ids:
+                    summary_images.append(img)
+                    seen_ids.add(img.msg_id)
+            if summary_images:
+                image_blocks: list[Any] = []
                 failed_files: list[str] = []
-                for index, replied_image in enumerate(replied_images, 1):
-                    file_name = _image_file_name_from_history(replied_image)
+                for image in summary_images:
+                    file_name = _image_file_name_from_history(image)
                     image_data = get_image_data_uri(file_name)
                     if image_data:
-                        content_parts.append(
-                            {"type": "text", "text": f"\n引用图{index}："}
-                        )
-                        content_parts.append(
+                        image_blocks.append(
                             {"type": "image_url", "image_url": {"url": image_data}}
                         )
-                        bound_msg_ids.append(str(replied_image.msg_id))
                     else:
                         failed_files.append(file_name)
-
-                if bound_msg_ids:
-                    final_prompt_content = content_parts
+                summary = await _summarize_image_content(image_blocks)
+                if summary:
+                    final_prompt_content = (
+                        f"{prompt_text}\n\n"
+                        "【图片内容】图片已由辅助视觉模型总结如下，"
+                        "回答图片相关问题时以该总结为准：\n"
+                        f"{summary}"
+                    )
                     logger.info(
-                        f"已将被回复图片绑定到本轮任务提示 msg_ids={','.join(bound_msg_ids)}"
+                        f"已用辅助视觉模型总结本轮图片 msg_ids="
+                        f"{','.join(str(m.msg_id) for m in summary_images)}"
                     )
                     if failed_files:
-                        logger.warning(f"部分被回复图片文件无法加载 files={failed_files}")
+                        logger.warning(
+                            f"部分图片文件无法加载，未总结 files={failed_files}"
+                        )
                 else:
                     final_prompt_content = (
                         f"{prompt_text}\n\n"
-                        "【本轮回复引用的图片】已命中被回复图片记录，但本地图片文件无法加载。"
+                        "【图片内容】当前模型不支持图片输入，"
+                        "且无法获取图片内容总结（未配置辅助视觉模型或总结失败）。"
+                        "请不要臆测图片内容，必要时如实告知用户无法查看图片。"
                     )
-                    logger.warning(f"被回复图片文件无法加载 files={failed_files}")
+                    if failed_files:
+                        logger.warning(f"图片文件无法加载 files={failed_files}")
+        elif replied_images:
+            content_parts: list[Any] = [
+                {
+                    "type": "text",
+                    "text": (
+                        f"{prompt_text}\n\n"
+                        "【本轮回复引用的图片】下面图片是当前用户回复消息指向的图片，"
+                        "回答图片相关问题时必须优先分析这些图片，不要把其他历史图片当成当前问题对象。"
+                    ),
+                }
+            ]
+            bound_msg_ids: list[str] = []
+            failed_files: list[str] = []
+            for index, replied_image in enumerate(replied_images, 1):
+                file_name = _image_file_name_from_history(replied_image)
+                image_data = get_image_data_uri(file_name)
+                if image_data:
+                    content_parts.append(
+                        {"type": "text", "text": f"\n引用图{index}："}
+                    )
+                    content_parts.append(
+                        {"type": "image_url", "image_url": {"url": image_data}}
+                    )
+                    bound_msg_ids.append(str(replied_image.msg_id))
+                else:
+                    failed_files.append(file_name)
+
+            if bound_msg_ids:
+                final_prompt_content = content_parts
+                logger.info(
+                    f"已将被回复图片绑定到本轮任务提示 msg_ids={','.join(bound_msg_ids)}"
+                )
+                if failed_files:
+                    logger.warning(f"部分被回复图片文件无法加载 files={failed_files}")
+            else:
+                final_prompt_content = (
+                    f"{prompt_text}\n\n"
+                    "【本轮回复引用的图片】已命中被回复图片记录，但本地图片文件无法加载。"
+                )
+                logger.warning(f"被回复图片文件无法加载 files={failed_files}")
 
         if replied_texts:
             text_lines: list[str] = [
