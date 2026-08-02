@@ -1024,7 +1024,7 @@ async def choice_response_strategy(
                 }
             ]
             bound_msg_ids: list[str] = []
-            failed_files: list[str] = []
+            reply_failed_files: list[str] = []
             for index, replied_image in enumerate(replied_images, 1):
                 file_name = _image_file_name_from_history(replied_image)
                 image_data = get_image_data_uri(file_name)
@@ -1037,21 +1037,23 @@ async def choice_response_strategy(
                     )
                     bound_msg_ids.append(str(replied_image.msg_id))
                 else:
-                    failed_files.append(file_name)
+                    reply_failed_files.append(file_name)
 
             if bound_msg_ids:
                 final_prompt_content = content_parts
                 logger.info(
                     f"已将被回复图片绑定到本轮任务提示 msg_ids={','.join(bound_msg_ids)}"
                 )
-                if failed_files:
-                    logger.warning(f"部分被回复图片文件无法加载 files={failed_files}")
+                if reply_failed_files:
+                    logger.warning(
+                        f"部分被回复图片文件无法加载 files={reply_failed_files}"
+                    )
             else:
                 final_prompt_content = (
                     f"{prompt_text}\n\n"
                     "【本轮回复引用的图片】已命中被回复图片记录，但本地图片文件无法加载。"
                 )
-                logger.warning(f"被回复图片文件无法加载 files={failed_files}")
+                logger.warning(f"被回复图片文件无法加载 files={reply_failed_files}")
 
         if replied_texts:
             text_lines: list[str] = [
