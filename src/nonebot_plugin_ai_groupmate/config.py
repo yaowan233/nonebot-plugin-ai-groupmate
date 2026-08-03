@@ -43,6 +43,7 @@ class ScopedConfig(BaseModel):
     chat_base_url: str = ""
     chat_temperature: float = 0.7
     chat_api_format: str = "openai"  # "openai" 或 "anthropic"
+    chat_multimodal: bool = True  # 主聊天模型是否支持图片输入
 
     # === 快速决策模型（Gatekeeper） ===
     flash_model: str = "qwen-flash"
@@ -64,6 +65,15 @@ class ScopedConfig(BaseModel):
     tagging_base_url: str = ""
     tagging_temperature: float = 0.01
     tagging_api_format: str = "openai"  # "openai" 或 "anthropic"
+
+    # === 图片回读辅助模型（主模型不支持图片时，用它对工具返回的图片做内容总结） ===
+    vision_model: str = ""
+    vision_api_key: str = ""
+    vision_base_url: str = ""
+    vision_temperature: float = 0.01
+    vision_api_format: str = "openai"  # "openai" 或 "anthropic"
+    vision_input_cost_per_million: float = 0.0
+    vision_output_cost_per_million: float = 0.0
 
     # === 兼容旧配置 ===
     base_model: str = ""
@@ -144,3 +154,22 @@ def create_tagging_llm(cfg: ScopedConfig) -> Any:
             stop=None,
         )
     return create_chat_openai(cfg, "tagging")
+
+
+def create_vision_llm(cfg: ScopedConfig) -> Any:
+    if cfg.vision_api_format == "anthropic":
+        from langchain_anthropic import ChatAnthropic
+
+        api_key = cfg.vision_api_key or cfg.llm_api_key or cfg.qwen_token
+        base_url = cfg.vision_base_url or cfg.llm_base_url
+
+        return ChatAnthropic(
+            model_name=cfg.vision_model,
+            api_key=SecretStr(api_key),
+            base_url=base_url,
+            temperature=cfg.vision_temperature,
+            max_tokens_to_sample=1024,
+            timeout=None,
+            stop=None,
+        )
+    return create_chat_openai(cfg, "vision")

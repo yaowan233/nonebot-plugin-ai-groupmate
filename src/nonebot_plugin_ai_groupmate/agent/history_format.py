@@ -195,6 +195,26 @@ def is_image_history(msg: ChatHistorySchema) -> bool:
     )
 
 
+def current_message_images(
+    history: list[ChatHistorySchema],
+) -> list[ChatHistorySchema]:
+    """返回历史中最后一条（当前）消息携带的图片记录。"""
+    if not history:
+        return []
+    last_id, _, _ = parse_msg_meta(history[-1].content)
+    if not last_id:
+        return []
+    images: list[ChatHistorySchema] = []
+    for msg in reversed(history):
+        own_id, _, _ = parse_msg_meta(msg.content)
+        if own_id != last_id:
+            break
+        if msg.content_type == "image":
+            images.append(msg)
+    images.reverse()
+    return images
+
+
 async def load_replied_message_histories(
     db_session: AsyncSession,
     session_id: str,
