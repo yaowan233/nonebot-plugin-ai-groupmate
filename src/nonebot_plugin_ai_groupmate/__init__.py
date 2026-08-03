@@ -35,14 +35,14 @@ from nonebot_plugin_apscheduler import scheduler
 from nonebot_plugin_alconna.uniseg import UniMsg
 
 from .agent import check_if_should_reply, choice_response_strategy
-from .model import ChatHistory, GroupMemory, MediaStorage, ChatHistorySchema
+from .model import ChatHistory, MediaStorage, ChatHistorySchema
 from .utils import (
     generate_file_hash,
     check_and_compress_image_bytes,
     process_and_vectorize_session_chats,
 )
 from .webui import register_usage_webui
-from .config import Config, create_chat_openai, create_tagging_llm
+from .config import Config, create_tagging_llm
 from .memory import DB
 from .reply_guard import set_latest_request_id
 from .relation_maintenance import count_negative_relations, reset_negative_relations
@@ -74,11 +74,6 @@ register_usage_webui(plugin_config)
 MAX_WORDCLOUD_DAYS = 3650
 with open(Path(__file__).parent / "stop_words.txt", encoding="utf-8") as f:
     stop_words = f.read().splitlines() + ["id", "回复"]
-
-@lru_cache
-def get_summary_model():
-    return create_chat_openai(plugin_config, "summary")
-
 
 @lru_cache
 def get_tagging_model():
@@ -1196,211 +1191,4 @@ async def clear_cache_pic():
 
             deleted_count = await asyncio.to_thread(_batch_delete_orphaned_files, orphaned)
             logger.info(f"成功清理 {deleted_count}/{len(orphaned)} 个孤立文件")
-
-
-async def _call_summary_model(existing_summary: str, chat_text: str) -> str | None:
-    """调用 LLM 更新群体认知档案。
-    若触发内容违规（data_inspection_failed），会对聊天记录做二分截断后最多重试 3 次。
-    """
-    from langchain_core.messages import HumanMessage as LCHumanMessage, SystemMessage
-
-    system = """你是一个群文化分析师。你的任务是维护一份关于QQ群的认知档案。
-档案包含：群内常见话题、活跃成员特征、内部梗/黑话、群文化氛围。
-
-【核心原则】标注为[BOT]的消息是机器人自身的回复。档案只记录真实用户的群文化，绝对不记录机器人的行为模式或回复话术。
-
-规则：
-1. 只能基于提供的聊天记录总结，不要凭空发明内容
-2. 保留档案中仍然有效的内容，用新聊天补充或修正旧内容
-3. 如果某个内容长期（超过30天）无聊天印证，可删除
-4. 输出完整更新后的档案，不超过500字，不要输出任何其他内容
-5. 【必须执行】如果现有档案中包含BOT的回复话术（如"别得寸进尺"、"？你又来"、"行了行了"等BOT说的话），必须将其删除。内部梗/黑话只能来自真实用户的发言，不能来自BOT。
-6. 【必须执行】"活跃成员特征"部分只描述真实用户，不要把BOT列为活跃成员或描述BOT的行为模式。
-7. 【必须执行】"群文化氛围"只描述用户之间的互动氛围，不要描述用户与BOT之间的互动循环。"""
-    history_intro = (
-        "（无，这是首次建档）" if not existing_summary.strip() else existing_summary
-    )
-
-    lines = chat_text.splitlines()
-    max_retries = 3
-
-    for attempt in range(max_retries + 1):
-        current_text = "\n".join(lines)
-        if not current_text.strip():
-            logger.warning("档案更新：聊天记录经截断后已为空，放弃本次更新")
-            return None
-
-        user_msg = f"【现有档案】\n{history_intro}\n\n【最新聊天记录】\n{current_text}\n\n请输出更新后的档案："
-        try:
-            resp = await get_summary_model().ainvoke(
-                [
-                    SystemMessage(content=system),
-                    LCHumanMessage(content=user_msg),
-                ]
-            )
-            if not isinstance(resp.content, str) or not resp.content.strip():
-                return None
-            if attempt > 0:
-                logger.info(
-                    f"档案更新：截断后第 {attempt} 次重试成功（剩余 {len(lines)} 条消息）"
-                )
-            return resp.content.strip()
-        except Exception as e:
-            err_str = str(e)
-            if "data_inspection_failed" in err_str or (
-                "Error code: 400" in err_str and "inappropriate" in err_str
-            ):
-                if attempt < max_retries:
-                    # 去掉后半段消息，逐步缩小范围
-                    lines = lines[: max(1, len(lines) // 2)]
-                    logger.warning(
-                        f"档案更新：内容违规，截断至 {len(lines)} 条消息后重试（第 {attempt + 1}/{max_retries} 次）"
-                    )
-                else:
-                    logger.warning(
-                        f"档案更新：内容违规，已重试 {max_retries} 次仍失败，放弃本次更新"
-                    )
-                    return None
-            else:
-                logger.error(f"档案更新 LLM 调用失败: {e}")
-                return None
-
-    return None
-
-
-async def _update_single_group_memory(db_session, session_id: str):
-    """更新单个群的认知档案（内部函数）"""
-    from sqlalchemy import func as sqlfunc
-
-    stmt = Select(GroupMemory).where(GroupMemory.session_id == session_id)
-    record = (await db_session.execute(stmt)).scalar_one_or_none()
-
-    # 获取当前消息总量
-    total_count = (
-        await db_session.execute(
-            Select(sqlfunc.count(ChatHistory.msg_id)).where(
-                ChatHistory.session_id == session_id
-            )
-        )
-    ).scalar_one()
-
-    last_count = record.msg_count_at_last_update if record else 0
-    new_msg_count = total_count - last_count
-
-    # 双重触发条件：新增消息 >= 100 或 距上次更新 >= 6 小时
-    if record and new_msg_count < 100:
-        time_since = datetime.datetime.now() - record.updated_at
-        if time_since.total_seconds() < 6 * 3600:
-            logger.info(
-                f"群 {session_id} 无需更新档案（新增 {new_msg_count} 条，距上次更新 {time_since}）"
-            )
-            return
-
-    # 拉取自上次更新后的文本消息，最多 200 条
-    cutoff = record.updated_at if record else datetime.datetime.min
-    recent_msgs = (
-        (
-            await db_session.execute(
-                Select(ChatHistory)
-                .where(
-                    ChatHistory.session_id == session_id,
-                    ChatHistory.created_at > cutoff,
-                    ChatHistory.content_type.in_(["text", "bot"]),
-                )
-                .order_by(ChatHistory.created_at)
-                .limit(200)
-            )
-        )
-        .scalars()
-        .all()
-    )
-
-    if not recent_msgs:
-        return
-
-    def _format_msg_for_summary(m):
-        content = m.content
-        if m.content_type == "bot":
-            # 去掉 "id: XXXXX\n" 前缀，只保留实际回复内容
-            first_newline = content.find("\n")
-            if first_newline != -1:
-                content = content[first_newline + 1 :]
-        return f"[{m.created_at.strftime('%m-%d %H:%M')}] {'[BOT] ' if m.content_type == 'bot' else ''}{m.user_name}: {content[:100]}"
-
-    chat_text = "\n".join(_format_msg_for_summary(m) for m in recent_msgs)
-
-    existing_summary = record.summary if record else ""
-    # Summary generation is slow external I/O.  Release the read transaction
-    # and re-load the target row only when the result is ready to be written.
-    await db_session.commit()
-    new_summary = await _call_summary_model(existing_summary, chat_text)
-    if not new_summary:
-        return
-
-    # 后处理：过滤掉描述BOT自身行为/话术的条目
-    bot_name = plugin_config.bot_name
-    filtered_lines = []
-    for line in new_summary.splitlines():
-        stripped = line.strip().lstrip("-•* ").strip()
-        # 跳过描述bot行为模式的行
-        if bot_name and (
-            f"{bot_name}为" in stripped
-            or f"{bot_name}是" in stripped
-            or f"{bot_name}主导" in stripped
-            or f"{bot_name}维持" in stripped
-            or f"{bot_name}以" in stripped
-        ):
-            logger.info(f"档案过滤：移除BOT行为描述行: {stripped[:50]}")
-            continue
-        # 跳过将bot回复标注为"标准回应"/"模板"的行
-        if "标准回应" in stripped or "回应模板" in stripped:
-            logger.info(f"档案过滤：移除BOT模板描述行: {stripped[:50]}")
-            continue
-        filtered_lines.append(line)
-    new_summary = "\n".join(filtered_lines)
-    if not new_summary.strip():
-        return
-
-    record = (await db_session.execute(stmt)).scalar_one_or_none()
-    if not record:
-        record = GroupMemory(
-            session_id=session_id,
-            summary=new_summary,
-            msg_count_at_last_update=total_count,
-        )
-        db_session.add(record)
-    else:
-        record.summary = new_summary
-        record.msg_count_at_last_update = total_count
-
-    await db_session.commit()
-    logger.info(f"群 {session_id} 档案更新成功（{len(new_summary)} 字）")
-
-
-@scheduler.scheduled_job(
-    "interval", hours=6, max_instances=1, coalesce=True, id="update_group_memory"
-)
-async def update_group_memory():
-    async with get_session() as db_session:
-        # 只查询最近 24 小时内有新消息的群
-        time_threshold = datetime.datetime.now() - datetime.timedelta(days=1)
-        stmt = Select(ChatHistory.session_id.distinct()).where(
-            ChatHistory.created_at > time_threshold
-        )
-        session_ids = (await db_session.execute(stmt)).scalars().all()
-
-    # 如果最近没人说话，直接返回
-    if not session_ids:
-        return
-
-    sem = asyncio.Semaphore(5)  # 最多同时处理 5 个群
-
-    async def _update_one(session_id: str):
-        async with sem:
-            async with get_session() as db_session:
-                try:
-                    await _update_single_group_memory(db_session, session_id)
-                except Exception as e:
-                    logger.error(f"更新群档案失败 {session_id}: {e}")
-
-    await asyncio.gather(*[_update_one(sid) for sid in session_ids])
+# 群档案由 agent 工具按需维护，不再注册定时任务。

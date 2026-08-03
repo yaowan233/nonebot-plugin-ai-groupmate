@@ -19,7 +19,7 @@
 
 本插件主体使用 langchain 的 agent 进行决策，由 langchain 调用 tools 进行一系列任务。
 
-- **群体认知档案**：每 6 小时自动归纳群内话题、活跃成员特征、内部梗等，让 bot 对群文化有持续感知。
+- **群体认知档案**：由 bot 在发现值得长期记住的新话题、成员特征、内部梗或氛围变化时自主更新，让 bot 对群文化有持续感知。
 - **长记忆**（需配置 Qdrant）：RAG 自动存储聊天历史，学习群友发言习惯，使 bot 更像真人。
 - **表情包学习**（需配置 Qdrant）：使用 `qwen-vl-max` 理解图片内容，自动从群内偷学表情包并存入向量库，回复时按语义匹配发出。
 - **自定义 Agent Tools**：可以注册自己的 LangChain tools 扩展 agent 能力，详见 [自定义 Agent Tools](./docs/custom-agent-tools.md)。
@@ -122,6 +122,7 @@
 | ai_groupmate__agent_timeout_seconds | 否 | `180` | 单次 agent 总运行超时（秒） |
 | ai_groupmate__agent_llm_timeout_seconds | 否 | `60` | 每次主模型调用超时（秒） |
 | ai_groupmate__agent_tool_timeout_seconds | 否 | `30` | 每次工具调用超时（秒） |
+| ai_groupmate__group_memory_update_timeout_seconds | 否 | `120` | 群档案后台更新超时（秒） |
 | ai_groupmate__agent_max_llm_calls | 否 | `8` | 单次 agent 最多调用主模型次数 |
 | ai_groupmate__agent_max_total_tokens | 否 | `64000` | 单次 agent 最多累计模型 token 数 |
 | ai_groupmate__agent_tool_result_max_chars | 否 | `6000` | 写回后续上下文的单次工具结果最大字符数 |

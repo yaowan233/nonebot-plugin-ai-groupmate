@@ -21,6 +21,7 @@ class ScopedConfig(BaseModel):
     agent_timeout_seconds: float = Field(default=180.0, gt=0)
     agent_llm_timeout_seconds: float = Field(default=60.0, gt=0)
     agent_tool_timeout_seconds: float = Field(default=30.0, gt=0)
+    group_memory_update_timeout_seconds: float = Field(default=120.0, gt=0)
     agent_max_llm_calls: int = Field(default=8, ge=1)
     agent_max_total_tokens: int = Field(default=64000, ge=1)
     agent_tool_result_max_chars: int = Field(default=6000, ge=256)
