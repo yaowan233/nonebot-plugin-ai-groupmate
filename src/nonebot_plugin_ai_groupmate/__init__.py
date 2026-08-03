@@ -786,7 +786,7 @@ async def handle_reply_logic(
             return
 
         except asyncio.CancelledError:
-            logger.info(f"群 {session.scene.id} 回复任务被取消（切换到更新请求）")
+            logger.debug(f"群 {session.scene.id} 回复任务被取消（切换到更新请求）")
             raise
 
         logger.info(f"Agent决策结果: {strategy}")
