@@ -117,6 +117,8 @@
 | ai_groupmate__vision_base_url | 否 | 无 | 图片回读辅助模型专用 Base URL，留空则使用 `llm_base_url` |
 | ai_groupmate__vision_temperature | 否 | `0.01` | 图片回读辅助模型温度 |
 | ai_groupmate__vision_api_format | 否 | `openai` | 图片回读辅助接口格式，可选 `openai` / `anthropic` |
+| ai_groupmate__vision_input_cost_per_million | 否 | `0` | 图片回读辅助模型每百万输入 Token 费用，用于 WebUI 成本统计 |
+| ai_groupmate__vision_output_cost_per_million | 否 | `0` | 图片回读辅助模型每百万输出 Token 费用，用于 WebUI 成本统计 |
 | ai_groupmate__agent_timeout_seconds | 否 | `180` | 单次 agent 总运行超时（秒） |
 | ai_groupmate__agent_llm_timeout_seconds | 否 | `60` | 每次主模型调用超时（秒） |
 | ai_groupmate__agent_tool_timeout_seconds | 否 | `30` | 每次工具调用超时（秒） |

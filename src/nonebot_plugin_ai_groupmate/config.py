@@ -72,6 +72,8 @@ class ScopedConfig(BaseModel):
     vision_base_url: str = ""
     vision_temperature: float = 0.01
     vision_api_format: str = "openai"  # "openai" 或 "anthropic"
+    vision_input_cost_per_million: float = 0.0
+    vision_output_cost_per_million: float = 0.0
 
     # === 兼容旧配置 ===
     base_model: str = ""

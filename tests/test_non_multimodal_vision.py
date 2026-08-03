@@ -205,23 +205,43 @@ class _FakeVisionModel:
         self.response = response
         self.invoked = False
         self.sent_content = None
+        self.config = None
+        self.openai_callback = None
 
-    async def ainvoke(self, messages):
+    async def ainvoke(self, messages, config=None):
+        from langchain_community.callbacks.manager import openai_callback_var
+
         self.invoked = True
         self.sent_content = messages[0].content
+        self.config = config
+        self.openai_callback = openai_callback_var.get()
         return self.response
 
 
 @pytest.mark.asyncio
 async def test_summarize_image_content_calls_vision_model(monkeypatch):
+    from langchain_community.callbacks import get_openai_callback
+
     import nonebot_plugin_ai_groupmate.agent as agent_module
 
-    fake = _FakeVisionModel(_SimpleResponse("总结内容"))
+    fake = _FakeVisionModel(
+        _SimpleResponse(
+            "总结内容",
+            usage_metadata={
+                "input_tokens": 123,
+                "output_tokens": 45,
+                "total_tokens": 168,
+            },
+        )
+    )
     monkeypatch.setattr(agent_module, "get_vision_model", lambda: fake)
 
-    result = await agent_module._summarize_image_content(
-        [{"type": "image_url", "image_url": {"url": "data:image/png;base64,xx"}}]
-    )
+    metrics = agent_module.VisionRunMetrics()
+    with get_openai_callback() as outer_callback:
+        result = await agent_module._summarize_image_content(
+            [{"type": "image_url", "image_url": {"url": "data:image/png;base64,xx"}}],
+            metrics,
+        )
     assert result == "总结内容"
     assert fake.invoked is True
     sent_content = fake.sent_content or []
@@ -229,6 +249,14 @@ async def test_summarize_image_content_calls_vision_model(monkeypatch):
         isinstance(part, dict) and part.get("type") == "image_url"
         for part in sent_content
     )
+    assert fake.config == {"callbacks": []}
+    assert fake.openai_callback is None
+    assert outer_callback.successful_requests == 0
+    assert metrics.calls == 1
+    assert metrics.prompt_tokens == 123
+    assert metrics.completion_tokens == 45
+    assert metrics.total_tokens == 168
+    assert metrics.summaries == ["总结内容"]
 
 
 @pytest.mark.asyncio
@@ -262,7 +290,7 @@ async def test_summarize_image_content_on_vision_model_error(monkeypatch):
     import nonebot_plugin_ai_groupmate.agent as agent_module
 
     class _Boom:
-        async def ainvoke(self, messages):
+        async def ainvoke(self, messages, config=None):
             raise RuntimeError("boom")
 
     monkeypatch.setattr(agent_module, "get_vision_model", lambda: _Boom())
@@ -274,8 +302,48 @@ async def test_summarize_image_content_on_vision_model_error(monkeypatch):
 
 
 class _SimpleResponse:
-    def __init__(self, content):
+    def __init__(self, content, *, usage_metadata=None, response_metadata=None):
         self.content = content
+        self.usage_metadata = usage_metadata
+        self.response_metadata = response_metadata
+
+
+def test_vision_summary_is_reused_by_next_active_thread_turn():
+    from langchain_core.messages import BaseMessage, HumanMessage
+
+    import nonebot_plugin_ai_groupmate.agent as agent_module
+    from nonebot_plugin_ai_groupmate.agent.conversation import (
+        ActiveConversationThread,
+        build_append_only_history,
+        active_conversation_threads,
+    )
+
+    base_messages: list[BaseMessage] = [HumanMessage(content="第一轮用户消息")]
+    thread_messages = agent_module._build_active_thread_messages(
+        base_messages,
+        ["图片中显示玩家排名为 123。"],
+    )
+    active_conversation_threads["group-1"] = ActiveConversationThread(
+        messages=thread_messages,
+        last_msg_id=1,
+        updated_at=datetime.datetime.now(),
+    )
+
+    try:
+        messages, appended, reused = build_append_only_history(
+            "group-1",
+            [_text_msg(1, "id: 1\n看看图片"), _text_msg(2, "id: 2\n那排名是多少？")],
+            format_history=lambda history, *_args: [
+                HumanMessage(content=msg.content) for msg in history
+            ],
+        )
+    finally:
+        active_conversation_threads.pop("group-1", None)
+
+    assert reused is True
+    assert [msg.msg_id for msg in appended] == [2]
+    assert any("图片中显示玩家排名为 123" in str(msg.content) for msg in messages)
+    assert "那排名是多少" in str(messages[-1].content)
 
 
 # === _chat_supports_images (agent) ===
