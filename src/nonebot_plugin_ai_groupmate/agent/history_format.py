@@ -209,7 +209,7 @@ def current_message_images(
         own_id, _, _ = parse_msg_meta(msg.content)
         if own_id != last_id:
             break
-        if msg.content_type == "image" and msg.media_id is not None:
+        if msg.content_type == "image":
             images.append(msg)
     images.reverse()
     return images
