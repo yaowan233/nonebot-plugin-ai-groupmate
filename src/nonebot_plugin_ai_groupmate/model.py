@@ -116,6 +116,17 @@ class TokenUsage(Model):
     )
 
 
+class RuntimeConfigOverride(Model):
+    """WebUI 保存的插件配置覆盖项。"""
+
+    id: Mapped[int] = mapped_column(primary_key=True, default=1)
+    overrides: Mapped[dict[str, object]] = mapped_column(JSON, default=dict)
+    updated_at: Mapped[datetime] = mapped_column(
+        default=datetime.now,
+        onupdate=datetime.now,
+    )
+
+
 class ChatHistorySchema(BaseModel):
     msg_id: int
     session_id: str

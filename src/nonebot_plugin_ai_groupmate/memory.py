@@ -7,16 +7,18 @@ import mimetypes
 
 import httpx
 from openai import AsyncOpenAI
-from nonebot import get_plugin_config
 from nonebot.log import logger
 from qdrant_client import AsyncQdrantClient, models
 
-from .config import Config
+from .runtime_config import get_runtime_config
 
-plugin_config = get_plugin_config(Config).ai_groupmate
+plugin_config = get_runtime_config()
 
 class VectorDBOperator:
     def __init__(self):
+        self._configure()
+
+    def _configure(self) -> None:
         self.enabled = bool(plugin_config.qdrant_uri)
         if not self.enabled:
             logger.info("未配置 qdrant_uri，向量库功能已禁用")
@@ -46,6 +48,22 @@ class VectorDBOperator:
 
         self._init_lock = asyncio.Lock()
         self._collections_ready = False
+
+    async def reconfigure(self) -> None:
+        """重建连接，使启动阶段加载的 WebUI 配置真正生效。"""
+        qdrant_client = getattr(self, "client", None)
+        embedding_client = getattr(self, "emb_client", None)
+        if qdrant_client is not None:
+            try:
+                await qdrant_client.close()
+            except Exception:
+                logger.exception("关闭旧 Qdrant 客户端失败")
+        if embedding_client is not None:
+            try:
+                await embedding_client.close()
+            except Exception:
+                logger.exception("关闭旧 Embedding 客户端失败")
+        self._configure()
 
     # ================= 内部工具函数 =================
     async def _ensure_collections(self):

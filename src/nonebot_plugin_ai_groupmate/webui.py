@@ -1,13 +1,36 @@
-from __future__ import annotations
-
+import asyncio
+import secrets
 from html import escape
+from typing import Any
 from urllib.parse import urlencode
+from collections.abc import Callable
 
 from nonebot import logger, get_driver
+from pydantic import ValidationError
 from nonebot_plugin_orm import get_session
+from langchain_core.messages import HumanMessage
 
 from .usage import get_usage_dashboard_data
-from .config import ScopedConfig
+from .config import (
+    ScopedConfig,
+    create_chat_llm,
+    create_vision_llm,
+    create_chat_openai,
+    create_tagging_llm,
+)
+from .settings_ui import render_settings_page, render_settings_login
+from .runtime_config import (
+    SECRET_FIELDS,
+    get_runtime_config,
+    get_config_overrides,
+    get_environment_config,
+    get_pending_restart_fields,
+    save_runtime_config_updates,
+    reset_runtime_config_overrides,
+)
+
+SETTINGS_COOKIE_NAME = "ai_groupmate_settings"
+SETTINGS_COOKIE_MAX_AGE = 7 * 24 * 60 * 60
 
 
 def _money(value: float) -> str:
@@ -71,7 +94,53 @@ def _agent_issue_summary(row: dict) -> str:
 
 
 def _token_ok(config: ScopedConfig, token: str | None) -> bool:
-    return not config.usage_webui_token or token == config.usage_webui_token
+    if not config.usage_webui_token:
+        return True
+    return bool(token) and secrets.compare_digest(token, config.usage_webui_token)
+
+
+def _settings_token_ok(config: ScopedConfig, request: Any) -> bool:
+    expected = config.usage_webui_token
+    supplied = request.cookies.get(SETTINGS_COOKIE_NAME, "")
+    return bool(expected and supplied) and secrets.compare_digest(supplied, expected)
+
+
+def _validation_detail(error: ValidationError) -> str:
+    details: list[str] = []
+    for item in error.errors(include_input=False):
+        location = ".".join(str(part) for part in item.get("loc", ()))
+        message = str(item.get("msg", "配置值无效"))
+        details.append(f"{location}: {message}" if location else message)
+    return "；".join(details) or "配置值无效"
+
+
+async def _test_model_connection(role: str, config: ScopedConfig) -> None:
+    if role == "chat":
+        model = create_chat_llm(config)
+    elif role == "tagging":
+        model = create_tagging_llm(config)
+    elif role == "vision":
+        if not config.vision_model:
+            raise ValueError("尚未配置图片回读模型")
+        model = create_vision_llm(config)
+    elif role in {"flash", "summary"}:
+        model = create_chat_openai(config, role, max_tokens=8)
+    else:
+        raise ValueError("不支持测试这个模型角色")
+    await asyncio.wait_for(
+        model.ainvoke([HumanMessage(content="请只回复 OK")]),
+        timeout=min(config.agent_llm_timeout_seconds, 20.0),
+    )
+
+
+def _safe_connection_error(error: Exception, config: ScopedConfig) -> str:
+    message = str(error)
+    for field_name in SECRET_FIELDS:
+        secret_value = str(getattr(config, field_name, "") or "")
+        if secret_value:
+            message = message.replace(secret_value, "***")
+    message = " ".join(message.split())
+    return message[:240] or type(error).__name__
 
 
 def _auth_query(config: ScopedConfig, token: str | None) -> str:
@@ -324,7 +393,7 @@ def _render_dashboard(data: dict, *, path: str, token: str | None, config: Scope
         <label>用户 ID <input name="user_id" value="{escape(data["filters"]["user_id"])}" placeholder="可选" /></label>
         {f'<input type="hidden" name="token" value="{escape(token or "")}" />' if config.usage_webui_token else ""}
         <button type="submit">更新数据</button>
-        <div class="links">JSON：<a href="{escape(path)}/api?days={int(data["days"])}{auth_suffix}">{escape(path)}/api</a></div>
+        <div class="links">JSON：<a href="{escape(path)}/api?days={int(data["days"])}{auth_suffix}">{escape(path)}/api</a> · <a href="{escape(path)}/settings">配置中心</a></div>
       </form>
     </div>
   </header>
@@ -428,7 +497,11 @@ def _render_dashboard(data: dict, *, path: str, token: str | None, config: Scope
 </html>"""
 
 
-def register_usage_webui(config: ScopedConfig) -> None:
+def register_usage_webui(
+    config: ScopedConfig,
+    *,
+    on_config_change: Callable[[set[str]], None] | None = None,
+) -> None:
     if not config.usage_webui_enabled:
         return
 
@@ -439,7 +512,7 @@ def register_usage_webui(config: ScopedConfig) -> None:
         return
 
     try:
-        from fastapi import Query, HTTPException
+        from fastapi import Query, Request, HTTPException
         from fastapi.responses import HTMLResponse, JSONResponse
     except Exception as e:
         logger.warning(f"Token 用量 WebUI 依赖 FastAPI，导入失败，已跳过注册: {e}")
@@ -447,6 +520,8 @@ def register_usage_webui(config: ScopedConfig) -> None:
 
     path = "/" + config.usage_webui_path.strip("/")
     api_path = f"{path}/api"
+    settings_path = f"{path}/settings"
+    settings_api_path = f"{settings_path}/api"
 
     async def _load_data(days: int, session_id: str, user_id: str) -> dict:
         async with get_session() as db_session:
@@ -481,4 +556,145 @@ def register_usage_webui(config: ScopedConfig) -> None:
             raise HTTPException(status_code=401, detail="invalid token")
         return JSONResponse(await _load_data(days, session_id, user_id))
 
-    logger.info(f"Token 用量 WebUI 已注册: {path}")
+    @app.get(settings_path, response_class=HTMLResponse, include_in_schema=False)
+    async def settings_page(request: Request):
+        if not _settings_token_ok(config, request):
+            return HTMLResponse(
+                render_settings_login(
+                    settings_path,
+                    auth_configured=bool(config.usage_webui_token),
+                )
+            )
+        runtime_config = get_runtime_config()
+        return HTMLResponse(
+            render_settings_page(
+                runtime_config,
+                get_environment_config(),
+                overridden_fields=set(get_config_overrides()),
+                pending_restart_fields=get_pending_restart_fields(),
+                dashboard_path=path,
+                settings_path=settings_path,
+            )
+        )
+
+    @app.post(
+        f"{settings_path}/login",
+        response_class=JSONResponse,
+        include_in_schema=False,
+    )
+    async def settings_login(request: Request):
+        expected = config.usage_webui_token
+        if not expected:
+            raise HTTPException(status_code=503, detail="settings auth is not configured")
+        payload = await request.json()
+        supplied = str(payload.get("token", "")) if isinstance(payload, dict) else ""
+        if not supplied or not secrets.compare_digest(supplied, expected):
+            raise HTTPException(status_code=401, detail="invalid token")
+        response = JSONResponse({"ok": True})
+        response.set_cookie(
+            SETTINGS_COOKIE_NAME,
+            expected,
+            max_age=SETTINGS_COOKIE_MAX_AGE,
+            httponly=True,
+            secure=request.url.scheme == "https",
+            samesite="strict",
+            path=path,
+        )
+        return response
+
+    @app.post(
+        f"{settings_path}/logout",
+        response_class=JSONResponse,
+        include_in_schema=False,
+    )
+    async def settings_logout():
+        response = JSONResponse({"ok": True})
+        response.delete_cookie(SETTINGS_COOKIE_NAME, path=path)
+        return response
+
+    @app.post(
+        settings_api_path,
+        response_class=JSONResponse,
+        include_in_schema=False,
+    )
+    async def save_settings(request: Request):
+        if not _settings_token_ok(config, request):
+            raise HTTPException(status_code=401, detail="invalid token")
+        payload = await request.json()
+        if not isinstance(payload, dict) or not isinstance(payload.get("updates"), dict):
+            raise HTTPException(status_code=400, detail="invalid settings payload")
+        clear_secrets_value = payload.get("clear_secrets", [])
+        if not isinstance(clear_secrets_value, list) or not all(
+            isinstance(item, str) for item in clear_secrets_value
+        ):
+            raise HTTPException(status_code=400, detail="invalid clear_secrets")
+        try:
+            async with get_session() as db_session:
+                changed_fields, restart_fields = await save_runtime_config_updates(
+                    db_session,
+                    payload["updates"],
+                    clear_secrets=set(clear_secrets_value),
+                )
+        except ValidationError as error:
+            raise HTTPException(
+                status_code=422,
+                detail=_validation_detail(error),
+            ) from error
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        if on_config_change is not None:
+            on_config_change(changed_fields)
+        return JSONResponse({
+            "ok": True,
+            "changed_fields": sorted(changed_fields),
+            "restart_fields": sorted(restart_fields),
+            "restart_required": bool(restart_fields),
+        })
+
+    @app.post(
+        f"{settings_path}/test",
+        response_class=JSONResponse,
+        include_in_schema=False,
+    )
+    async def test_settings_connection(request: Request):
+        if not _settings_token_ok(config, request):
+            raise HTTPException(status_code=401, detail="invalid token")
+        payload = await request.json()
+        role = str(payload.get("role", "")) if isinstance(payload, dict) else ""
+        try:
+            await _test_model_connection(role, get_runtime_config())
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        except asyncio.TimeoutError as error:
+            raise HTTPException(status_code=504, detail="模型连接测试超时") from error
+        except Exception as error:
+            safe_error = _safe_connection_error(error, get_runtime_config())
+            logger.warning(f"模型连接测试失败 role={role}: {safe_error}")
+            raise HTTPException(
+                status_code=502,
+                detail=f"模型连接失败：{safe_error}",
+            ) from error
+        return JSONResponse({"ok": True, "role": role})
+
+    @app.post(
+        f"{settings_path}/reset",
+        response_class=JSONResponse,
+        include_in_schema=False,
+    )
+    async def reset_settings(request: Request):
+        if not _settings_token_ok(config, request):
+            raise HTTPException(status_code=401, detail="invalid token")
+        async with get_session() as db_session:
+            changed_fields, restart_fields = await reset_runtime_config_overrides(
+                db_session
+            )
+        if on_config_change is not None:
+            on_config_change(changed_fields)
+        return JSONResponse({
+            "ok": True,
+            "changed_fields": sorted(changed_fields),
+            "restart_fields": sorted(restart_fields),
+            "restart_required": bool(restart_fields),
+        })
+
+    logger.info(f"Token 用量与配置 WebUI 已注册: {path}")

@@ -12,7 +12,7 @@ from functools import lru_cache
 from dataclasses import dataclass
 
 import jieba
-from nonebot import logger, require, get_bots, on_command, on_message, get_plugin_config
+from nonebot import logger, require, get_bots, get_driver, on_command, on_message
 from wordcloud import WordCloud
 from nonebot.params import CommandArg
 from nonebot.plugin import PluginMetadata, inherit_supported_adapters
@@ -45,6 +45,12 @@ from .webui import register_usage_webui
 from .config import Config, create_tagging_llm
 from .memory import DB
 from .reply_guard import set_latest_request_id
+from .runtime_config import (
+    RESTART_REQUIRED_FIELDS,
+    get_runtime_config,
+    mark_restart_fields_applied,
+    load_runtime_config_overrides,
+)
 from .relation_maintenance import count_negative_relations, reset_negative_relations
 
 
@@ -69,8 +75,7 @@ plugin_data_dir: Path = store.get_plugin_data_dir()
 pic_dir = plugin_data_dir / "pics"
 pic_dir.mkdir(parents=True, exist_ok=True)
 relation_backup_dir = plugin_data_dir / "relation_backups"
-plugin_config = get_plugin_config(Config).ai_groupmate
-register_usage_webui(plugin_config)
+plugin_config = get_runtime_config()
 MAX_WORDCLOUD_DAYS = 3650
 with open(Path(__file__).parent / "stop_words.txt", encoding="utf-8") as f:
     stop_words = f.read().splitlines() + ["id", "回复"]
@@ -78,6 +83,40 @@ with open(Path(__file__).parent / "stop_words.txt", encoding="utf-8") as f:
 @lru_cache
 def get_tagging_model():
     return create_tagging_llm(plugin_config)
+
+
+def _refresh_runtime_resources(_changed_fields: set[str]) -> None:
+    get_tagging_model.cache_clear()
+    from .agent import refresh_runtime_resources as refresh_agent_resources
+    from .group_memory import get_summary_model
+
+    refresh_agent_resources()
+    get_summary_model.cache_clear()
+
+
+register_usage_webui(
+    plugin_config,
+    on_config_change=_refresh_runtime_resources,
+)
+
+
+@get_driver().on_startup
+async def _load_webui_runtime_config() -> None:
+    try:
+        async with get_session() as db_session:
+            changed_fields = await load_runtime_config_overrides(db_session)
+        _refresh_runtime_resources(changed_fields)
+        if changed_fields & RESTART_REQUIRED_FIELDS:
+            await DB.reconfigure()
+            mark_restart_fields_applied()
+        if changed_fields:
+            logger.info(
+                f"已加载 WebUI 配置覆盖项，变更字段数={len(changed_fields)}"
+            )
+    except Exception:
+        logger.exception(
+            "加载 WebUI 配置失败，继续使用环境变量；请确认已执行 nb orm upgrade"
+        )
 
 
 @dataclass

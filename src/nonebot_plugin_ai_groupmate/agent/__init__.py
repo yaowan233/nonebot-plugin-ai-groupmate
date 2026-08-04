@@ -6,7 +6,7 @@ from pathlib import Path
 from functools import lru_cache
 from dataclasses import field, dataclass
 
-from nonebot import require, get_plugin_config
+from nonebot import require
 from pydantic import Field, BaseModel, field_validator
 from sqlalchemy import Select
 from nonebot.log import logger
@@ -25,7 +25,7 @@ from ..usage import (
     extract_cached_tokens,
     extract_cache_creation_tokens,
 )
-from ..config import Config, create_chat_llm, create_vision_llm, create_chat_openai
+from ..config import create_chat_llm, create_vision_llm, create_chat_openai
 from .context import (
     get_group_context,
     get_user_relation_context,
@@ -82,6 +82,7 @@ from .schedule_tools import (
     create_schedule_message_tool,
     create_schedule_agent_task_tool,
 )
+from ..runtime_config import get_runtime_config
 from .moderation_tools import create_mute_tool
 from .group_memory_tools import create_group_memory_tool
 
@@ -126,7 +127,7 @@ with open(plugin_path / "上升.jpg", "rb") as f:
     up_pic = f.read()
 with open(plugin_path / "下降.jpg", "rb") as f:
     down_pic = f.read()
-plugin_config = get_plugin_config(Config).ai_groupmate
+plugin_config = get_runtime_config()
 
 
 def _use_explicit_prompt_cache() -> bool:
@@ -170,6 +171,16 @@ with open(Path(__file__).parent.parent / "stop_words.txt", encoding="utf-8") as 
 
 SCHEDULED_AGENT_HISTORY_LIMIT = 20
 search_web = create_search_web_tool(plugin_config.tavily_api_key)
+
+
+def refresh_runtime_resources() -> None:
+    """配置热更新后重建延迟模型与依赖密钥的工具。"""
+    global search_web
+
+    get_flash_model.cache_clear()
+    get_chat_model.cache_clear()
+    get_vision_model.cache_clear()
+    search_web = create_search_web_tool(plugin_config.tavily_api_key)
 
 
 class ResponseMessage(BaseModel):

@@ -1,13 +1,13 @@
 import asyncio
 from functools import lru_cache
 
-from nonebot import get_plugin_config
 from sqlalchemy import Select, func
 from nonebot.log import logger
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from .model import ChatHistory, GroupMemory
-from .config import Config, create_chat_openai
+from .config import create_chat_openai
+from .runtime_config import get_runtime_config
 
 MAX_SUMMARY_MESSAGES = 200
 _update_locks: dict[str, asyncio.Lock] = {}
@@ -23,8 +23,7 @@ def _get_update_lock(session_id: str) -> asyncio.Lock:
 
 @lru_cache
 def get_summary_model():
-    plugin_config = get_plugin_config(Config).ai_groupmate
-    return create_chat_openai(plugin_config, "summary")
+    return create_chat_openai(get_runtime_config(), "summary")
 
 
 async def _call_summary_model(existing_summary: str, chat_text: str) -> str | None:
