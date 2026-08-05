@@ -122,6 +122,10 @@
 | ai_groupmate__agent_timeout_seconds | 否 | `180` | 单次 agent 总运行超时（秒） |
 | ai_groupmate__agent_llm_timeout_seconds | 否 | `60` | 每次主模型调用超时（秒） |
 | ai_groupmate__agent_tool_timeout_seconds | 否 | `30` | 每次工具调用超时（秒） |
+| ai_groupmate__agent_max_concurrency | 否 | `4` | 全局同时运行的 Agent 上限，超出的请求在不占用数据库连接的状态下等待 |
+| ai_groupmate__background_image_max_concurrency | 否 | `2` | 后台图片下载、压缩和入库的并发上限 |
+| ai_groupmate__background_image_max_pending | 否 | `100` | 后台图片任务的最大待处理数，防止高峰期无界堆积 |
+| ai_groupmate__maintenance_max_concurrency | 否 | `1` | 向量化、媒体清理和群档案维护的共享并发上限 |
 | ai_groupmate__group_memory_update_timeout_seconds | 否 | `120` | 群档案后台更新超时（秒） |
 | ai_groupmate__agent_max_llm_calls | 否 | `8` | 单次 agent 最多调用主模型次数 |
 | ai_groupmate__agent_max_total_tokens | 否 | `64000` | 单次 agent 最多累计模型 token 数 |
@@ -149,6 +153,14 @@
 | ai_groupmate__embedding_base_url | 否 | 无 | Embedding Base URL，启用 Qdrant 时必填（推荐硅基流动，免费） |
 | ai_groupmate__rerank_api_url | 否 | 无 | Rerank API URL，启用 Qdrant 时使用（推荐硅基流动，免费） |
 | ai_groupmate__rerank_api_key | 否 | 无 | Rerank API Key，启用 Qdrant 时使用（推荐硅基流动，免费） |
+
+如果多个插件共用 `nonebot-plugin-orm`，建议同时将 SQLAlchemy 连接池设为快速失败，避免外部插件耗尽连接时每条消息卡住 30 秒：
+
+```dotenv
+SQLALCHEMY_ENGINE_OPTIONS={"pool_size":5,"max_overflow":10,"pool_timeout":5,"pool_pre_ping":true}
+```
+
+并发限制用于避免本插件耗尽连接池；`pool_timeout=5` 是其他插件或数据库异常时的快速降级保护，不建议只靠扩大连接池解决泄漏。
 
 用量 WebUI 默认地址为 `/ai-groupmate/usage`。升级数据库后，页面会额外展示每轮 agent 的 LLM/工具调用次数、平均耗时、工具超时、结果截断与副作用去重情况；旧记录会以 0 显示这些新增指标。
 

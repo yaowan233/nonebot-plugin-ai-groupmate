@@ -43,6 +43,7 @@ from .meme_tools import (
     create_similar_meme_tool,
 )
 from .reply_tools import create_reply_tool
+from ..concurrency import agent_run_gate, configure_concurrency
 from .common_tools import (
     finish,
     calculate_expression,
@@ -128,6 +129,11 @@ with open(plugin_path / "上升.jpg", "rb") as f:
 with open(plugin_path / "下降.jpg", "rb") as f:
     down_pic = f.read()
 plugin_config = get_runtime_config()
+configure_concurrency(
+    agent_limit=plugin_config.agent_max_concurrency,
+    background_image_limit=plugin_config.background_image_max_concurrency,
+    maintenance_limit=plugin_config.maintenance_max_concurrency,
+)
 
 
 def _use_explicit_prompt_cache() -> bool:
@@ -177,6 +183,11 @@ def refresh_runtime_resources() -> None:
     """配置热更新后重建延迟模型与依赖密钥的工具。"""
     global search_web
 
+    configure_concurrency(
+        agent_limit=plugin_config.agent_max_concurrency,
+        background_image_limit=plugin_config.background_image_max_concurrency,
+        maintenance_limit=plugin_config.maintenance_max_concurrency,
+    )
     get_flash_model.cache_clear()
     get_chat_model.cache_clear()
     get_vision_model.cache_clear()
@@ -329,36 +340,47 @@ async def _run_scheduled_agent_task(
     bot_id: str | None,
 ) -> None:
     try:
-        async with get_session() as db_session:
-            rows = (
-                (
-                    await db_session.execute(
-                        Select(ChatHistory)
-                        .where(ChatHistory.session_id == session_id)
-                        .order_by(ChatHistory.msg_id.desc())
-                        .limit(SCHEDULED_AGENT_HISTORY_LIMIT)
+        async with agent_run_gate.slot():
+            # Only keep the discovery session for the history query.  Scheduled
+            # agent jobs can wait on a model for minutes and must not retain
+            # the query's transaction or pooled connection during that wait.
+            async with get_session() as history_session:
+                rows = (
+                    (
+                        await history_session.execute(
+                            Select(ChatHistory)
+                            .where(ChatHistory.session_id == session_id)
+                            .order_by(ChatHistory.msg_id.desc())
+                            .limit(SCHEDULED_AGENT_HISTORY_LIMIT)
+                        )
                     )
+                    .scalars()
+                    .all()
                 )
-                .scalars()
-                .all()
-            )
-            history = [ChatHistorySchema.model_validate(row) for row in rows[::-1]]
+                history = [
+                    ChatHistorySchema.model_validate(row) for row in rows[::-1]
+                ]
+                await _finish_db_operation(history_session.commit())
 
-            graph, _, dynamic_context = await create_chat_graph(
-                db_session,
-                session_id,
-                None,
-                plugin_config.bot_name,
-                plugin_config.bot_name,
-                history,
-                None,
-                bot_id,
-                None,
-                None,
-                is_private=is_private,
-            )
+            # The graph keeps this session only for tool calls.  create_chat_graph
+            # and every tool boundary commit before returning to slow model I/O.
+            async with get_session() as tool_session:
+                graph, _, dynamic_context = await create_chat_graph(
+                    tool_session,
+                    session_id,
+                    None,
+                    plugin_config.bot_name,
+                    plugin_config.bot_name,
+                    history,
+                    None,
+                    bot_id,
+                    None,
+                    None,
+                    is_private=is_private,
+                )
+                await _finish_db_operation(tool_session.commit())
 
-            prompt = f"""
+                prompt = f"""
 【定时任务触发】
 这是之前安排的定时 agent 任务，现在已经到执行时间。
 
@@ -373,41 +395,39 @@ async def _run_scheduled_agent_task(
 - 定时任务没有可用的原始消息事件，不要调用 `add_message_reaction`。
 - 最后一条文本回复使用 `next_step="end"` 会自动结束；只有未发送文本且无后续操作时才调用 `finish`。
 """
-            if dynamic_context:
-                prompt = f"{prompt}\n\n【动态上下文】\n{dynamic_context}"
+                if dynamic_context:
+                    prompt = f"{prompt}\n\n【动态上下文】\n{dynamic_context}"
 
-            history_messages = format_chat_history(history, max_inline_images=0)
-            if _use_explicit_prompt_cache():
-                history_messages = add_ephemeral_cache_marker(history_messages)
-            final_messages = history_messages + [
-                HumanMessage(content=prompt)
-            ]
-            graph_result = await asyncio.wait_for(
-                graph.ainvoke({
-                    "messages": final_messages,
-                    "session_id": session_id,
-                    "request_id": None,
-                    "reply_count": 0,
-                    "tool_count": 0,
-                    "reply_this_round": 0,
-                    "reply_requires_continuation": False,
-                    "reaction_this_round": 0,
-                    "called_finish": 0,
-                    "llm_cached_tokens": 0,
-                    "llm_cache_creation_tokens": 0,
-                    "llm_call_count": 0,
-                    "llm_total_tokens": 0,
-                    "tool_timeout_count": 0,
-                    "tool_timeout_names": [],
-                    "tool_result_truncation_count": 0,
-                    "side_effect_duplicate_count": 0,
-                    "completed_side_effect_keys": [],
-                    "active_skills": [],
-                }),
-                timeout=plugin_config.agent_timeout_seconds,
-            )
-            _log_agent_run_summary(session_id, graph_result)
-            await db_session.commit()
+                history_messages = format_chat_history(history, max_inline_images=0)
+                if _use_explicit_prompt_cache():
+                    history_messages = add_ephemeral_cache_marker(history_messages)
+                final_messages = history_messages + [HumanMessage(content=prompt)]
+                graph_result = await asyncio.wait_for(
+                    graph.ainvoke({
+                        "messages": final_messages,
+                        "session_id": session_id,
+                        "request_id": None,
+                        "reply_count": 0,
+                        "tool_count": 0,
+                        "reply_this_round": 0,
+                        "reply_requires_continuation": False,
+                        "reaction_this_round": 0,
+                        "called_finish": 0,
+                        "llm_cached_tokens": 0,
+                        "llm_cache_creation_tokens": 0,
+                        "llm_call_count": 0,
+                        "llm_total_tokens": 0,
+                        "tool_timeout_count": 0,
+                        "tool_timeout_names": [],
+                        "tool_result_truncation_count": 0,
+                        "side_effect_duplicate_count": 0,
+                        "completed_side_effect_keys": [],
+                        "active_skills": [],
+                    }),
+                    timeout=plugin_config.agent_timeout_seconds,
+                )
+                _log_agent_run_summary(session_id, graph_result)
+                await _finish_db_operation(tool_session.commit())
         logger.info(f"[定时Agent任务] 已执行 {session_id}: {task}")
     except asyncio.TimeoutError:
         logger.warning(f"[定时Agent任务] 执行超时 session={session_id}: {task}")

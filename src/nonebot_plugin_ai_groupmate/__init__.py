@@ -1,5 +1,6 @@
 import re
 import json
+import time
 import base64
 import random
 import asyncio
@@ -44,6 +45,7 @@ from .utils import (
 from .webui import register_usage_webui
 from .config import Config, create_tagging_llm
 from .memory import DB
+from .concurrency import agent_run_gate, maintenance_gate, background_image_gate
 from .reply_guard import set_latest_request_id
 from .runtime_config import (
     RESTART_REQUIRED_FIELDS,
@@ -148,6 +150,7 @@ _continuous_conversation_until: dict[tuple[str, str], datetime.datetime] = {}
 
 # 多bot去重锁: 每个群串行化消息记录,防止并发SELECT查不到对方未提交数据
 _dedup_locks: dict[str, asyncio.Lock] = {}
+_background_image_tasks: set[asyncio.Task[None]] = set()
 
 AGENT_HISTORY_LIMIT = 20
 AGENT_RECENT_HISTORY_HOURS = 1
@@ -305,9 +308,11 @@ async def _run_group_reply_worker(group_id: str):
             if request is None:
                 break
 
-            async with get_session() as reply_session:
+            # Wait for an Agent slot before opening a database session.  This
+            # bounds cross-group concurrency without consuming pool capacity
+            # while queued.
+            async with agent_run_gate.slot():
                 await handle_reply_logic(
-                    reply_session,
                     request.request_id,
                     request.session,
                     request.interface,
@@ -524,10 +529,14 @@ async def handle_message(
                 )
         else:
             for img in imgs:
-                asyncio.create_task(
-                    _process_image_task(
-                        img, event, bot, state, session, user_name, content_prefix
-                    )
+                _start_background_image_task(
+                    img,
+                    event,
+                    bot,
+                    state,
+                    session,
+                    user_name,
+                    content_prefix,
                 )
 
     # ========== 步骤4: 处理回复 ==========
@@ -690,14 +699,51 @@ async def _process_image_task(
     img, event, bot, state, session, user_name, content_prefix
 ):
     """后台图片处理任务，使用独立的数据库会话，不阻塞主消息流程"""
-    async with get_session() as db_session:
-        await process_image_message(
-            db_session, img, event, bot, state, session, user_name, content_prefix
+    # Queueing happens before a session is opened, so an image burst cannot
+    # reserve every pooled connection while waiting for CPU/network work.
+    async with background_image_gate.slot():
+        async with get_session() as db_session:
+            await process_image_message(
+                db_session, img, event, bot, state, session, user_name, content_prefix
+            )
+
+
+def _consume_background_image_task(task: asyncio.Task[None]) -> None:
+    _background_image_tasks.discard(task)
+    try:
+        task.exception()
+    except asyncio.CancelledError:
+        pass
+
+
+def _start_background_image_task(
+    img,
+    event: Event,
+    bot: Bot,
+    state: T_State,
+    session: Uninfo,
+    user_name: str | None,
+    content_prefix: str,
+) -> bool:
+    if len(_background_image_tasks) >= plugin_config.background_image_max_pending:
+        logger.warning(
+            "后台图片任务已达上限 "
+            f"{plugin_config.background_image_max_pending}，跳过本张图片"
         )
+        return False
+
+    task = asyncio.create_task(
+        _process_image_task(
+            img, event, bot, state, session, user_name, content_prefix
+        ),
+        name=f"ai-groupmate-image:{session.scene.id}",
+    )
+    _background_image_tasks.add(task)
+    task.add_done_callback(_consume_background_image_task)
+    return True
 
 
 async def handle_reply_logic(
-    db_session,
     request_id: str,
     session: Uninfo,
     interface: QryItrface,
@@ -715,22 +761,26 @@ async def handle_reply_logic(
     try:
         # 获取最近几条用于 Flash 快速判断
         # 注意：Flash 模型是纯文本模型，它看不懂图片，所以这里我们只喂文本内容
-        recent_msgs = (
-            (
-                await db_session.execute(
-                    Select(ChatHistory)
-                    .where(
-                        ChatHistory.session_id == session.scene.id,
-                        ChatHistory.content_type != "bot",
+        async with get_session() as history_session:
+            recent_msgs = (
+                (
+                    await history_session.execute(
+                        Select(ChatHistory)
+                        .where(
+                            ChatHistory.session_id == session.scene.id,
+                            ChatHistory.content_type != "bot",
+                        )
+                        .order_by(ChatHistory.msg_id.desc())
+                        .limit(3)
                     )
-                    .order_by(ChatHistory.msg_id.desc())
-                    .limit(3)
                 )
+                .scalars()
+                .all()
             )
-            .scalars()
-            .all()
-        )
-        recent_msgs = recent_msgs[::-1]
+            recent_msgs = [
+                ChatHistorySchema.model_validate(row) for row in recent_msgs[::-1]
+            ]
+            await history_session.commit()
 
         if not recent_msgs:
             return
@@ -748,9 +798,6 @@ async def handle_reply_logic(
             if recent_msgs[-1].content_type == "text"
             else "[图片/表情包。除非用户明确在问这张图、@bot、回复bot或正在延续图片话题，否则通常不需要回应]"
         )
-        # The gatekeeper is an external model call.  The query result is fully
-        # materialized, so release the connection before waiting for it.
-        await db_session.commit()
         gatekeeper_msg_text = current_msg_text
         if is_continuous:
             gatekeeper_msg_text = (
@@ -769,15 +816,13 @@ async def handle_reply_logic(
                 return
 
         # === 获取详细历史给 Agent ===
-        last_msg = await _load_agent_history(db_session, session.scene.id)
+        async with get_session() as history_session:
+            last_msg = await _load_agent_history(history_session, session.scene.id)
+            await history_session.commit()
 
         if not last_msg:
             logger.info("没有历史消息，跳过回复")
             return
-
-        # Do not retain the history query's connection while asking the
-        # adapter for group members.
-        await db_session.commit()
 
         role_map: dict[str, str] = {}
         group_members: list[Any] | None = None
@@ -795,26 +840,27 @@ async def handle_reply_logic(
 
         logger.info("开始调用Agent决策...")
         try:
-            strategy = await asyncio.wait_for(
-                choice_response_strategy(
-                    db_session,
-                    session.scene.id,
-                    request_id,
-                    last_msg,
-                    user_id,
-                    user_name,
-                    "",
-                    interface,
-                    role_map,
-                    session.self_id,  # 传递bot的ID
-                    reply_to_id,
-                    bot,
-                    event,
-                    is_private=is_private,
-                    group_members=group_members,
-                ),
-                timeout=plugin_config.agent_timeout_seconds,
-            )
+            async with get_session() as tool_session:
+                strategy = await asyncio.wait_for(
+                    choice_response_strategy(
+                        tool_session,
+                        session.scene.id,
+                        request_id,
+                        last_msg,
+                        user_id,
+                        user_name,
+                        "",
+                        interface,
+                        role_map,
+                        session.self_id,  # 传递bot的ID
+                        reply_to_id,
+                        bot,
+                        event,
+                        is_private=is_private,
+                        group_members=group_members,
+                    ),
+                    timeout=plugin_config.agent_timeout_seconds,
+                )
         except asyncio.TimeoutError:
             logger.warning(f"Agent 思考超时 - session: {session.scene.id}")
             return
@@ -828,7 +874,6 @@ async def handle_reply_logic(
     except Exception as e:
         logger.error(f"回复逻辑执行失败: {e}")
         print(traceback.format_exc())
-        await _safe_rollback(db_session)
 
 
 def _build_wordcloud_image(words: str) -> BytesIO:
@@ -983,34 +1028,57 @@ async def _(
     "interval", minutes=60, max_instances=1, coalesce=True, id="vectorize_chat"
 )
 async def vectorize_message_history():
-    async with get_session() as db_session:
-        session_ids = await db_session.execute(
-            Select(ChatHistory.session_id.distinct())
-        )
-        session_ids = session_ids.scalars().all()
-        # Each session is vectorized through slow external embedding/Qdrant
-        # calls.  The list is materialized, so release the discovery query.
-        await db_session.commit()
-        logger.info("开始向量化会话")
-        for session_id in session_ids:
-            try:
-                res = await process_and_vectorize_session_chats(db_session, session_id)
-                if res:
-                    logger.info(
-                        f"向量化会话 {res['session_id']} 成功，共处理 {res['processed_groups']}/{res['total_groups']} 组"
-                    )
-                else:
-                    logger.info(f"{session_id} 无需向量化")
-            except Exception as e:
-                print(traceback.format_exc())
-                logger.error(f"向量化会话 {session_id} 失败: {e}")
-                continue
+    async with maintenance_gate.slot(wait=False) as admitted:
+        if not admitted:
+            logger.info("其他维护任务正在运行，跳过本轮会话向量化")
+            return
+
+        started_at = time.perf_counter()
+        try:
+            async with get_session() as discovery_session:
+                result = await discovery_session.execute(
+                    Select(ChatHistory.session_id.distinct())
+                )
+                session_ids = list(result.scalars().all())
+                await discovery_session.commit()
+
+            logger.info("开始向量化会话")
+            for session_id in session_ids:
+                try:
+                    # A failed or cancelled session cannot poison subsequent
+                    # sessions, and no session exists while this job waits for
+                    # its maintenance slot.
+                    async with get_session() as vector_session:
+                        res = await process_and_vectorize_session_chats(
+                            vector_session, session_id
+                        )
+                    if res:
+                        logger.info(
+                            f"向量化会话 {res['session_id']} 成功，共处理 {res['processed_groups']}/{res['total_groups']} 组"
+                        )
+                    else:
+                        logger.info(f"{session_id} 无需向量化")
+                except Exception as e:
+                    print(traceback.format_exc())
+                    logger.error(f"向量化会话 {session_id} 失败: {e}")
+        finally:
+            elapsed = time.perf_counter() - started_at
+            logger.info(f"会话向量化任务结束，耗时 {elapsed:.2f}s")
 
 
-@scheduler.scheduled_job(
-    "interval", minutes=30, max_instances=1, coalesce=True, id="vectorize_media"
-)
-async def vectorize_media():
+def _read_image_data_uri(file_path: Path, media_file_path: str) -> str | None:
+    if not file_path.is_file():
+        return None
+    file_data = file_path.read_bytes()
+    encoded_string = base64.b64encode(file_data).decode("utf-8")
+    ext = media_file_path.rsplit(".", 1)[-1].lower()
+    mime = "image/png" if ext == "png" else "image/jpeg"
+    if ext == "gif":
+        mime = "image/gif"
+    return f"data:{mime};base64,{encoded_string}"
+
+
+async def _vectorize_media_impl():
     """
     定期处理图片：
     1. 筛选高频图片
@@ -1052,26 +1120,19 @@ async def vectorize_media():
             await db_session.commit()
             try:
                 file_path = pic_dir / media_file_path
-                if not file_path.exists():
-                    logger.warning(f"文件不存在: {file_path}")
-                    await mark_vectorized(media_id)
-                    continue
-
                 # 1. 读取文件并转 Base64 (Qwen VL 需要)
+                # File reads and base64 conversion are synchronous/CPU work;
+                # keep them away from the NoneBot event loop.
                 try:
-                    with open(file_path, "rb") as image_file:
-                        file_data = image_file.read()
-                        encoded_string = base64.b64encode(file_data).decode("utf-8")
-
-                        # 构造 Data URI
-                        ext = media_file_path.split(".")[-1].lower()
-                        mime = "image/png" if ext == "png" else "image/jpeg"
-                        if ext == "gif":
-                            mime = "image/gif"  # Qwen-VL 支持 GIF
-
-                        img_data_uri = f"data:{mime};base64,{encoded_string}"
+                    img_data_uri = await asyncio.to_thread(
+                        _read_image_data_uri, file_path, media_file_path
+                    )
                 except Exception as e:
                     logger.error(f"读取图片失败: {e}")
+                    continue
+                if img_data_uri is None:
+                    logger.warning(f"文件不存在: {file_path}")
+                    await mark_vectorized(media_id)
                     continue
 
                 # 2. 调用 qwen-vl-max 进行【鉴别】和【描述】
@@ -1166,68 +1227,120 @@ async def vectorize_media():
 
 
 @scheduler.scheduled_job(
+    "interval", minutes=30, max_instances=1, coalesce=True, id="vectorize_media"
+)
+async def vectorize_media():
+    async with maintenance_gate.slot(wait=False) as admitted:
+        if not admitted:
+            logger.info("其他维护任务正在运行，跳过本轮媒体向量化")
+            return
+
+        started_at = time.perf_counter()
+        try:
+            await _vectorize_media_impl()
+        finally:
+            elapsed = time.perf_counter() - started_at
+            logger.info(f"媒体向量化任务结束，耗时 {elapsed:.2f}s")
+
+
+def _batch_delete_files(files: list[Path], label: str) -> int:
+    deleted = 0
+    for file_path in files:
+        try:
+            file_path.unlink(missing_ok=True)
+            deleted += 1
+            logger.debug(f"删除{label}文件: {file_path}")
+        except Exception as e:
+            logger.error(f"删除{label}文件失败 {file_path}: {e}")
+    return deleted
+
+
+def _delete_orphaned_files(
+    directory: Path,
+    known_files: set[str],
+    grace_period: datetime.timedelta,
+) -> tuple[int, int]:
+    """Scan, stat and delete orphaned files entirely outside the event loop."""
+    orphaned_count = 0
+    deleted_count = 0
+    cutoff_timestamp = time.time() - max(grace_period.total_seconds(), 0)
+
+    for file_path in directory.iterdir():
+        try:
+            if not file_path.is_file() or file_path.name in known_files:
+                continue
+            # A file is written before its MediaStorage row is committed.  The
+            # grace period prevents cleanup from racing that in-flight insert.
+            if file_path.stat().st_mtime > cutoff_timestamp:
+                continue
+            orphaned_count += 1
+            file_path.unlink(missing_ok=True)
+            deleted_count += 1
+            logger.debug(f"删除孤立文件: {file_path.name}")
+        except Exception as e:
+            logger.error(f"删除孤立文件失败 {file_path.name}: {e}")
+
+    return orphaned_count, deleted_count
+
+
+@scheduler.scheduled_job(
     "interval", minutes=35, max_instances=1, coalesce=True, id="clear_cache"
 )
 async def clear_cache_pic():
-    async with get_session() as db_session:
-        # ── 1. 删除低引用且过期的数据库记录及对应文件 ──
-        result = await db_session.execute(
-            Select(MediaStorage).where(
-                MediaStorage.references < 3,
-                MediaStorage.created_at
-                < datetime.datetime.now() - datetime.timedelta(days=30),
+    async with maintenance_gate.slot(wait=False) as admitted:
+        if not admitted:
+            logger.info("其他维护任务正在运行，跳过本轮媒体清理")
+            return
+
+        started_at = time.perf_counter()
+        logger.info("开始清理过期媒体和孤立文件")
+        try:
+            # Delete database rows in a short transaction.  Files are removed
+            # only after the connection has been returned to the pool.
+            media_files: list[Path] = []
+            async with get_session() as cleanup_session:
+                result = await cleanup_session.execute(
+                    Select(MediaStorage).where(
+                        MediaStorage.references < 3,
+                        MediaStorage.created_at
+                        < datetime.datetime.now() - datetime.timedelta(days=30),
+                    )
+                )
+                medias = list(result.scalars().all())
+                media_files = [pic_dir / media.file_path for media in medias]
+                for media in medias:
+                    await cleanup_session.delete(media)
+                await cleanup_session.commit()
+
+            if media_files:
+                deleted_files = await asyncio.to_thread(
+                    _batch_delete_files, media_files, "过期媒体"
+                )
+                logger.info(
+                    f"成功清理 {len(media_files)} 个过期媒体记录"
+                    f"（{deleted_files} 个文件）"
+                )
+
+            # Materialize the known filenames and close the database session
+            # before scanning/stat'ing the directory.
+            async with get_session() as discovery_session:
+                known_result = await discovery_session.execute(
+                    Select(MediaStorage.file_path)
+                )
+                known_files = {str(row[0]) for row in known_result.all()}
+                await discovery_session.commit()
+
+            orphaned_count, deleted_count = await asyncio.to_thread(
+                _delete_orphaned_files,
+                pic_dir,
+                known_files,
+                datetime.timedelta(minutes=10),
             )
-        )
-        medias = result.scalars().all()
-
-        if medias:
-            # 批量删除文件，减少线程切换
-            media_files = [Path(pic_dir / media.file_path) for media in medias]
-
-            def _batch_delete_media_files(files: list):
-                deleted = 0
-                for file_path in files:
-                    try:
-                        file_path.unlink(missing_ok=True)
-                        deleted += 1
-                        logger.debug(f"删除文件: {file_path}")
-                    except Exception as e:
-                        logger.error(f"删除文件失败 {file_path}: {e}")
-                return deleted
-
-            deleted_files = await asyncio.to_thread(_batch_delete_media_files, media_files)
-
-            # 批量删除数据库记录
-            for media in medias:
-                await db_session.delete(media)
-
-            try:
-                await db_session.commit()
-                logger.info(f"成功清理 {len(medias)} 个过期媒体记录（{deleted_files} 个文件）")
-            except Exception as e:
-                logger.error(f"批量删除数据库记录失败: {e}")
-                await db_session.rollback()
-
-        # ── 2. 删除磁盘上有但数据库里没有的孤立文件 ──
-        known_files_result = await db_session.execute(Select(MediaStorage.file_path))
-        known_files = {row[0] for row in known_files_result.all()}
-
-        disk_files = await asyncio.to_thread(lambda: list(pic_dir.iterdir()))
-        orphaned = [f for f in disk_files if f.is_file() and f.name not in known_files]
-
-        if orphaned:
-            # 批量删除文件，减少异步切换开销
-            def _batch_delete_orphaned_files(files: list):
-                deleted = 0
-                for f in files:
-                    try:
-                        f.unlink(missing_ok=True)
-                        deleted += 1
-                        logger.debug(f"删除孤立文件: {f.name}")
-                    except Exception as e:
-                        logger.error(f"删除孤立文件失败 {f.name}: {e}")
-                return deleted
-
-            deleted_count = await asyncio.to_thread(_batch_delete_orphaned_files, orphaned)
-            logger.info(f"成功清理 {deleted_count}/{len(orphaned)} 个孤立文件")
+            if orphaned_count:
+                logger.info(
+                    f"成功清理 {deleted_count}/{orphaned_count} 个孤立文件"
+                )
+        finally:
+            elapsed = time.perf_counter() - started_at
+            logger.info(f"媒体清理任务结束，耗时 {elapsed:.2f}s")
 # 群档案由 agent 工具按需维护，不再注册定时任务。

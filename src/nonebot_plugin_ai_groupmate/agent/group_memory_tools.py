@@ -4,6 +4,7 @@ from nonebot.log import logger
 from langchain.tools import tool
 from nonebot_plugin_orm import get_session
 
+from ..concurrency import maintenance_gate
 from ..reply_guard import is_request_active
 from ..group_memory import update_group_memory as _update_group_memory
 
@@ -18,15 +19,19 @@ async def _run_group_memory_update(
     timeout_seconds: float,
 ) -> None:
     try:
-        async with get_session() as db_session:
-            result = await asyncio.wait_for(
-                _update_group_memory(
-                    db_session,
-                    session_id,
-                    bot_name=bot_name,
-                ),
-                timeout=timeout_seconds,
-            )
+        # Wait for the shared maintenance slot before opening a session.  The
+        # autonomous update may queue behind vectorization, but it never holds
+        # a pooled connection while queued.
+        async with maintenance_gate.slot():
+            async with get_session() as db_session:
+                result = await asyncio.wait_for(
+                    _update_group_memory(
+                        db_session,
+                        session_id,
+                        bot_name=bot_name,
+                    ),
+                    timeout=timeout_seconds,
+                )
         logger.info(
             f"群 {session_id} 档案后台维护结束（理由: {reason}）: {result}"
         )

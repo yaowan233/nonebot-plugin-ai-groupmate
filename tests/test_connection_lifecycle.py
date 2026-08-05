@@ -2,6 +2,7 @@ import json
 import datetime
 from types import SimpleNamespace
 from typing import cast
+from contextlib import asynccontextmanager
 
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -97,3 +98,98 @@ async def test_chat_vectorization_releases_connection_before_qdrant(monkeypatch)
 
     assert result is not None
     assert events[:3] == ["query", "commit", "qdrant"]
+
+
+@pytest.mark.asyncio
+async def test_reply_logic_closes_history_sessions_before_agent_wait(monkeypatch):
+    from nonebot.adapters import Bot, Event
+    from nonebot_plugin_uninfo import Uninfo, SceneType, QryItrface
+
+    import nonebot_plugin_ai_groupmate as plugin
+    from nonebot_plugin_ai_groupmate.agent import ResponseMessage
+    from nonebot_plugin_ai_groupmate.model import ChatHistorySchema
+
+    events: list[str] = []
+    sessions: list[object] = []
+    history = ChatHistorySchema(
+        msg_id=1,
+        session_id="group-1",
+        user_id="user-1",
+        content_type="text",
+        content="id: 1\nhello",
+        created_at=datetime.datetime.now(),
+        user_name="tester",
+        media_id=None,
+        vectorized=False,
+    )
+
+    class _Result:
+        def scalars(self):
+            return self
+
+        def all(self):
+            return [history]
+
+    class _Session:
+        def __init__(self, index: int) -> None:
+            self.index = index
+
+        async def execute(self, statement):
+            events.append(f"query-{self.index}")
+            return _Result()
+
+        async def commit(self):
+            events.append(f"commit-{self.index}")
+
+    @asynccontextmanager
+    async def fake_get_session():
+        session = _Session(len(sessions) + 1)
+        sessions.append(session)
+        events.append(f"open-{session.index}")
+        try:
+            yield session
+        finally:
+            events.append(f"close-{session.index}")
+
+    async def fake_load_agent_history(db_session, session_id):
+        assert db_session is sessions[1]
+        return [history]
+
+    async def fake_choice_response_strategy(db_session, *args, **kwargs):
+        assert db_session is sessions[2]
+        assert events[:6] == [
+            "open-1",
+            "query-1",
+            "commit-1",
+            "close-1",
+            "open-2",
+            "commit-2",
+        ]
+        assert "close-2" in events
+        return ResponseMessage(need_reply=False, text=None)
+
+    monkeypatch.setattr(plugin, "get_session", fake_get_session)
+    monkeypatch.setattr(plugin, "_load_agent_history", fake_load_agent_history)
+    monkeypatch.setattr(
+        plugin, "choice_response_strategy", fake_choice_response_strategy
+    )
+
+    fake_session = SimpleNamespace(
+        scene=SimpleNamespace(id="group-1", type=SceneType.PRIVATE),
+        self_id="bot-1",
+    )
+    await plugin.handle_reply_logic(
+        "request-1",
+        cast(Uninfo, fake_session),
+        cast(QryItrface, SimpleNamespace()),
+        cast(Bot, SimpleNamespace()),
+        cast(Event, SimpleNamespace()),
+        "bot",
+        "user-1",
+        "tester",
+        True,
+        False,
+        None,
+    )
+
+    assert events[-1] == "close-3"
