@@ -16,6 +16,7 @@ class MediaStorage(Model):
     references: Mapped[int] = mapped_column(default=1, index=True)  # 引用计数
     description: Mapped[str]
     vectorized: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    embedding_version: Mapped[int] = mapped_column(default=0, index=True)
 
 
 class MediaStorageSchema(BaseModel):
@@ -26,6 +27,7 @@ class MediaStorageSchema(BaseModel):
     references: int
     description: str
     vectorized: bool
+    embedding_version: int = 0
 
 
 class ChatHistory(Model):

@@ -44,7 +44,7 @@ from .utils import (
 )
 from .webui import register_usage_webui
 from .config import Config, create_tagging_llm
-from .memory import DB
+from .memory import DB, MEDIA_EMBEDDING_VERSION
 from .concurrency import agent_run_gate, maintenance_gate, background_image_gate
 from .reply_guard import set_latest_request_id
 from .runtime_config import (
@@ -1085,28 +1085,55 @@ async def _vectorize_media_impl():
     2. 使用 qwen-vl-max 判断是否为表情包 + 生成描述
     3. 写入 SQL (描述) 和 Qdrant (向量)
     """
+    reindex_batch_size = 100
+
     async with get_session() as db_session:
-        async def mark_vectorized(media_id: int, description: str | None = None) -> bool:
+        async def mark_vectorized(
+            media_id: int,
+            description: str | None = None,
+            *,
+            embedding_version: int | None = None,
+        ) -> bool:
             media = await db_session.get(MediaStorage, media_id)
             if media is None:
                 await db_session.commit()
                 return False
             if description is not None:
                 media.description = description
+            if embedding_version is not None:
+                media.embedding_version = embedding_version
             media.vectorized = True
             db_session.add(media)
             await db_session.commit()
             return True
 
         # 只处理引用次数 >= 3 且未向量化的图片
-        medias_res = await db_session.execute(
+        pending_res = await db_session.execute(
             Select(MediaStorage.media_id).where(
                 MediaStorage.references >= 3, MediaStorage.vectorized.is_(False)
             )
         )
-        media_ids = list(medias_res.scalars().all())
+        pending_ids = list(pending_res.scalars().all())
+
+        # 已有描述的旧表情包无需再次调用视觉模型，只需按当前格式重建向量。
+        outdated_res = await db_session.execute(
+            Select(MediaStorage.media_id)
+            .where(
+                MediaStorage.references >= 3,
+                MediaStorage.vectorized.is_(True),
+                MediaStorage.description != "[图片]",
+                MediaStorage.embedding_version < MEDIA_EMBEDDING_VERSION,
+            )
+            .order_by(MediaStorage.media_id)
+            .limit(reindex_batch_size)
+        )
+        outdated_ids = list(outdated_res.scalars().all())
+        media_ids = pending_ids + outdated_ids
         await db_session.commit()
-        logger.info(f"待处理高频图片数量: {len(media_ids)}")
+        logger.info(
+            f"待处理高频图片数量: {len(pending_ids)}，"
+            f"待重建旧表情包向量数量: {len(outdated_ids)}"
+        )
 
         for media_id in media_ids:
             media = await db_session.get(MediaStorage, media_id)
@@ -1114,6 +1141,12 @@ async def _vectorize_media_impl():
                 await db_session.commit()
                 continue
             media_file_path = media.file_path
+            existing_description = media.description
+            needs_reindex = (
+                media.vectorized
+                and media.embedding_version < MEDIA_EMBEDDING_VERSION
+                and existing_description != "[图片]"
+            )
             # Keep only scalar values while calling the vision model and
             # Qdrant.  Accessing a detached/expired ORM object later could
             # silently start another long-lived transaction.
@@ -1133,6 +1166,26 @@ async def _vectorize_media_impl():
                 if img_data_uri is None:
                     logger.warning(f"文件不存在: {file_path}")
                     await mark_vectorized(media_id)
+                    continue
+
+                if needs_reindex:
+                    try:
+                        inserted = await DB.insert_media(
+                            media_id,
+                            img_data_uri,
+                            existing_description,
+                        )
+                        if not inserted:
+                            logger.warning(f"旧表情包向量重建失败，等待下轮重试: {media_id}")
+                            continue
+                        await mark_vectorized(
+                            media_id,
+                            embedding_version=MEDIA_EMBEDDING_VERSION,
+                        )
+                        logger.info(f"旧表情包向量重建成功 {media_id}: {existing_description}")
+                    except Exception as e:
+                        logger.error(f"旧表情包向量重建异常 {media_id}: {e}")
+                        await db_session.rollback()
                     continue
 
                 # 2. 调用 qwen-vl-max 进行【鉴别】和【描述】
@@ -1205,10 +1258,17 @@ async def _vectorize_media_impl():
                 # 4. 是表情包 -> 入库
                 try:
                     # A. 存向量到 Qdrant (传带 MIME 头的 data URI，避免 PNG/GIF 被误判为 JPEG)
-                    await DB.insert_media(media_id, img_data_uri, description)
+                    inserted = await DB.insert_media(media_id, img_data_uri, description)
+                    if not inserted:
+                        logger.warning(f"表情包向量生成失败，保留待重试状态: {media_id}")
+                        continue
 
                     # B. Qdrant 完成后才短暂签出 SQL 连接，保存描述并标记完成。
-                    await mark_vectorized(media_id, description)
+                    await mark_vectorized(
+                        media_id,
+                        description,
+                        embedding_version=MEDIA_EMBEDDING_VERSION,
+                    )
                     logger.info(f"表情包入库成功 {media_id}: {description}")
 
                 except Exception as e:

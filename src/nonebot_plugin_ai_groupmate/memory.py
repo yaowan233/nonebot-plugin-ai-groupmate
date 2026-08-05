@@ -14,6 +14,11 @@ from .runtime_config import get_runtime_config
 
 plugin_config = get_runtime_config()
 
+QWEN_VL_EMBEDDING_MODEL = "qwen3-vl-embedding"
+MEDIA_VECTOR_SIZE = 2560
+MEDIA_EMBEDDING_VERSION = 2
+
+
 class VectorDBOperator:
     def __init__(self):
         self._configure()
@@ -99,7 +104,7 @@ class VectorDBOperator:
                 await self.client.create_collection(
                     collection_name=self.media_col,
                     vectors_config=models.VectorParams(
-                        size=2560,
+                        size=MEDIA_VECTOR_SIZE,
                         distance=models.Distance.COSINE
                     ),
                 )
@@ -130,11 +135,11 @@ class VectorDBOperator:
             "Content-Type": "application/json"
         }
 
-        item = {}
+        contents: list[dict[str, str]] = []
 
         # 1. 填充文本（如果只有文本，就是纯文本搜索）
         if text:
-            item["text"] = text
+            contents.append({"text": text})
 
         # 2. 填充图片（支持本地文件路径、纯 Base64、带有 Header 的 Base64 以及 http 链接）
         if image_source:
@@ -147,34 +152,44 @@ class VectorDBOperator:
                 with open(image_source, "rb") as f:
                     base64_data = base64.b64encode(f.read()).decode("utf-8")
                     # ⚠️ 阿里要求必须拼装上 data:image/... 的头部
-                    item["image"] = f"data:{mime_type};base64,{base64_data}"
+                    image_value = f"data:{mime_type};base64,{base64_data}"
 
             # 场景 B: 传入的已经是标准的 Data URI (前端传来的 data:image/png;base64,xxx...)
             elif image_source.startswith("data:image"):
                 # ⚠️ 和 Jina 最大的不同：千万【不要】切掉头部，直接原样传给阿里
-                item["image"] = image_source
+                image_value = image_source
 
             # 场景 C: 普通网络图片
             elif image_source.startswith("http://") or image_source.startswith("https://"):
-                item["image"] = image_source
+                image_value = image_source
 
             # 场景 D: 传入的是被切掉头部的纯 Base64 字符串 (兜底处理)
             else:
                 # 假设它是纯 Base64，给它强行补上头部
-                item["image"] = f"data:image/jpeg;base64,{image_source}"
+                image_value = f"data:image/jpeg;base64,{image_source}"
 
-        if not item:
+            contents.append({"image": image_value})
+
+        if not contents:
             logger.warning("Aliyun Embedding: text 和 image_source 均为 None")
             return None
 
         # 3. 构造最终 Payload
-        # 如果 item 里同时包含了 "text" 和 "image"，阿里会自动进行多模态融合！
         payload = {
-            "model": "qwen3-vl-embedding",
+            "model": QWEN_VL_EMBEDDING_MODEL,
             "input": {
-                "contents": [item]
-            }
+                "contents": contents
+            },
+            "parameters": {
+                # 显式固定维度，避免服务端默认值变更后与 Qdrant 集合不兼容。
+                "dimension": MEDIA_VECTOR_SIZE,
+            },
         }
+        is_fusion_request = bool(text and image_source)
+        if is_fusion_request:
+            # qwen3-vl-embedding 默认返回各模态的独立表示；图文共同入库时
+            # 必须显式启用融合，才能得到唯一的图文联合向量。
+            payload["parameters"]["enable_fusion"] = True
 
         max_retries = 3  # 最多试3次
 
@@ -191,9 +206,33 @@ class VectorDBOperator:
                             return None
                         resp.raise_for_status()
 
-                    # ⚠️ 解析阿里的响应结构
-                    # 阿里的成功返回 JSON 是: {"output": {"embeddings":[{"embedding": [0.1, 0.2...], "text_index": 0}]}}
-                    return resp.json()["output"]["embeddings"][0]["embedding"]
+                    response_data = resp.json()
+                    embeddings = response_data.get("output", {}).get("embeddings", [])
+                    if len(embeddings) != 1:
+                        logger.error(
+                            "Aliyun Embedding 返回向量数量异常: "
+                            f"expected=1, actual={len(embeddings)}"
+                        )
+                        return None
+
+                    embedding_data = embeddings[0]
+                    embedding = embedding_data.get("embedding")
+                    if not isinstance(embedding, list) or len(embedding) != MEDIA_VECTOR_SIZE:
+                        actual_size = len(embedding) if isinstance(embedding, list) else None
+                        logger.error(
+                            "Aliyun Embedding 返回维度异常: "
+                            f"expected={MEDIA_VECTOR_SIZE}, actual={actual_size}"
+                        )
+                        return None
+
+                    if is_fusion_request and embedding_data.get("type") not in {"fusion", "fused"}:
+                        logger.error(
+                            "Aliyun Embedding 未返回图文融合向量: "
+                            f"type={embedding_data.get('type')!r}"
+                        )
+                        return None
+
+                    return embedding
 
                 except (httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError, httpx.PoolTimeout) as e:
                     is_last_attempt = (attempt == max_retries - 1)
@@ -319,14 +358,14 @@ class VectorDBOperator:
 
     # ================= 表情包功能 (Image Search) =================
 
-    async def insert_media(self, media_id: int, image_url: str, description: str) -> None:
+    async def insert_media(self, media_id: int, image_url: str, description: str) -> bool:
         """插入新表情包 (新图入库用)"""
         if not self.enabled:
-            return
+            return False
         await self._ensure_collections()
         vector = await self._get_qwen_vl_embedding(image_source=image_url, text=description)
         if not vector:
-            return
+            return False
 
         await self.client.upsert(
             collection_name=self.media_col,
@@ -335,11 +374,14 @@ class VectorDBOperator:
                     id=media_id,  # 保持 Int ID
                     vector=vector,
                     payload={
-                        "created_at": int(time.time())
+                        "created_at": int(time.time()),
+                        "embedding_version": MEDIA_EMBEDDING_VERSION,
                     }
                 )
-            ]
+            ],
+            wait=True,
         )
+        return True
 
     async def _get_batch_text_embeddings(self, texts: list[str]) -> list[list[float]]:
         """
