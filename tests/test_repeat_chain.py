@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import datetime
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -76,7 +76,8 @@ def test_repeat_chain_uses_an_independent_probability(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_sampled_repeat_is_sent_without_calling_the_agent(monkeypatch):
-    from nonebot_plugin_uninfo import SceneType
+    from nonebot.adapters import Bot, Event
+    from nonebot_plugin_uninfo import Uninfo, SceneType, QryItrface
 
     import nonebot_plugin_ai_groupmate as plugin
 
@@ -111,10 +112,10 @@ async def test_sampled_repeat_is_sent_without_calling_the_agent(monkeypatch):
     )
     await plugin.handle_reply_logic(
         "request-1",
-        session,
-        object(),
-        object(),
-        object(),
+        cast(Uninfo, session),
+        cast(QryItrface, object()),
+        cast(Bot, object()),
+        cast(Event, object()),
         "bot",
         "user-2",
         "Bob",
