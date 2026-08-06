@@ -31,11 +31,22 @@ import nonebot_plugin_localstore as store
 from sqlalchemy import Select
 from nonebot_plugin_orm import get_session, async_scoped_session
 from nonebot_plugin_uninfo import Uninfo, SceneType, QryItrface
-from nonebot_plugin_alconna import Image, UniMessage, image_fetch, get_message_id
+from nonebot_plugin_alconna import (
+    Image,
+    Target,
+    UniMessage,
+    image_fetch,
+    get_message_id,
+)
 from nonebot_plugin_apscheduler import scheduler
 from nonebot_plugin_alconna.uniseg import UniMsg
 
-from .agent import check_if_should_reply, choice_response_strategy
+from .agent import (
+    _parse_msg_meta,
+    _detect_repeat_chain,
+    check_if_should_reply,
+    choice_response_strategy,
+)
 from .model import ChatHistory, MediaStorage, ChatHistorySchema
 from .utils import (
     generate_file_hash,
@@ -53,6 +64,7 @@ from .runtime_config import (
     mark_restart_fields_applied,
     load_runtime_config_overrides,
 )
+from .agent.reply_tools import create_reply_tool
 from .relation_maintenance import count_negative_relations, reset_negative_relations
 
 
@@ -139,6 +151,8 @@ class ReplyRequest:
     is_tome: bool
     is_continuous: bool
     reply_to_id: str | None
+    proactive_meme_only: bool = False
+    repeat_text: str | None = None
 
 
 @dataclass
@@ -185,6 +199,78 @@ def _refresh_continuous_conversation(session_id: str, user_id: str) -> None:
     _continuous_conversation_until[(session_id, user_id)] = (
         datetime.datetime.now() + ttl
     )
+
+
+def _sample_proactive_reply_modes(
+    *,
+    addressed: bool,
+    continuous: bool,
+    command_like: bool,
+    has_text: bool,
+    is_group: bool,
+) -> tuple[bool, bool]:
+    """返回（普通随机回复，主动表情专用回复）；定向消息不参与采样。"""
+    if addressed or continuous:
+        return False, False
+    random_reply = random.random() < plugin_config.reply_probability
+    proactive_meme_only = (
+        not random_reply
+        and not command_like
+        and has_text
+        and is_group
+        and random.random() < plugin_config.proactive_meme_probability
+    )
+    return random_reply, proactive_meme_only
+
+
+def _sample_repeat_reply(
+    *,
+    repeat_text: str | None,
+    addressed: bool,
+    continuous: bool,
+    command_like: bool,
+    is_group: bool,
+) -> bool:
+    """对已识别的群聊复读队形独立采样。"""
+    if (
+        repeat_text is None
+        or addressed
+        or continuous
+        or command_like
+        or not is_group
+    ):
+        return False
+    return random.random() < plugin_config.repeat_probability
+
+
+async def _load_repeat_chain_text(
+    db_session: Any,
+    session_id: str,
+) -> str | None:
+    """读取刚入库的近期消息，并检测当前是否仍是连续复读队形。"""
+    context_minutes = plugin_config.continuous_conversation_minutes
+    if context_minutes <= 0:
+        return None
+    context_since = datetime.datetime.now() - datetime.timedelta(
+        minutes=context_minutes
+    )
+    rows = (
+        (
+            await db_session.execute(
+                Select(ChatHistory)
+                .where(
+                    ChatHistory.session_id == session_id,
+                    ChatHistory.created_at >= context_since,
+                )
+                .order_by(ChatHistory.msg_id.desc())
+                .limit(20)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    history = [ChatHistorySchema.model_validate(row) for row in rows[::-1]]
+    return _detect_repeat_chain(history)
 
 
 def _get_dedup_lock(session_id: str) -> asyncio.Lock:
@@ -329,6 +415,8 @@ async def _run_group_reply_worker(group_id: str):
                     request.is_tome,
                     request.is_continuous,
                     request.reply_to_id,
+                    getattr(request, "proactive_meme_only", False),
+                    getattr(request, "repeat_text", None),
                 )
     finally:
         async with _group_reply_state_lock:
@@ -510,10 +598,41 @@ async def handle_message(
         logger.debug(
             f"群 {session.scene.id} 用户 {session.user.id} 命中连续对话窗口"
         )
+    is_group = session.scene.type == SceneType.GROUP
+    repeat_text = None
+    if (
+        is_group
+        and not to_me
+        and not continuous_to_me
+        and not command_like
+        and bool(stripped_plain_text)
+    ):
+        repeat_text = await _load_repeat_chain_text(db_session, session.scene.id)
+    repeat_reply_sample = _sample_repeat_reply(
+        repeat_text=repeat_text,
+        addressed=to_me,
+        continuous=continuous_to_me,
+        command_like=command_like,
+        is_group=is_group,
+    )
+    if repeat_text is not None:
+        # 队形中的消息只走复读采样，不再触发普通插话或主动表情包。
+        random_reply_sample = False
+        proactive_meme_only = False
+    else:
+        random_reply_sample, proactive_meme_only = _sample_proactive_reply_modes(
+            addressed=to_me,
+            continuous=continuous_to_me,
+            command_like=command_like,
+            has_text=bool(stripped_plain_text),
+            is_group=is_group,
+        )
     should_reply = (
         to_me
         or continuous_to_me
-        or (random.random() < plugin_config.reply_probability)
+        or random_reply_sample
+        or proactive_meme_only
+        or repeat_reply_sample
     )
     if explicit_to_me or continuous_to_me:
         _refresh_continuous_conversation(session.scene.id, session.user.id)
@@ -563,6 +682,8 @@ async def handle_message(
             is_tome=to_me,
             is_continuous=continuous_to_me,
             reply_to_id=reply_id,
+            proactive_meme_only=proactive_meme_only,
+            repeat_text=repeat_text if repeat_reply_sample else None,
         )
         await set_latest_request_id(group_id, request.request_id)
         async with _group_reply_state_lock:
@@ -760,10 +881,39 @@ async def handle_reply_logic(
     is_tome: bool,
     is_continuous: bool,
     reply_to_id: str | None,
+    proactive_meme_only: bool = False,
+    repeat_text: str | None = None,
 ):
     """处理回复逻辑"""
     is_private = session.scene.type == SceneType.PRIVATE
     try:
+        if repeat_text is not None and not is_private:
+            # 复读采样已经代表“加入队形”的决定，直接发送，避免模型二次犹豫或点评。
+            async with get_session() as repeat_session:
+                reply_tool = create_reply_tool(
+                    repeat_session,
+                    session.scene.id,
+                    request_id,
+                    interface=interface,
+                    send_target=Target(
+                        id=session.scene.id,
+                        private=False,
+                        self_id=session.self_id,
+                    ),
+                    bot_name=bot_name,
+                    parse_msg_meta=_parse_msg_meta,
+                    group_members=[],
+                    repeat_text=repeat_text,
+                )
+                raw_result = await reply_tool.ainvoke(
+                    {"content": repeat_text, "next_step": "end"}
+                )
+                result = json.loads(raw_result)
+                if result.get("status") != "sent":
+                    logger.info(f"复读消息未发送: {result.get('message', raw_result)}")
+                await repeat_session.commit()
+            return
+
         # 获取最近几条用于 Flash 快速判断
         # 注意：Flash 模型是纯文本模型，它看不懂图片，所以这里我们只喂文本内容
         async with get_session() as history_session:
@@ -811,11 +961,23 @@ async def handle_reply_logic(
                 "如果只是“嗯”“哈哈”“行”等无需回应的短反馈，可以不回复。\n"
                 f"{current_msg_text}"
             )
+        elif proactive_meme_only:
+            gatekeeper_msg_text = (
+                "这条群消息命中了低概率主动表情包采样。"
+                "仅当一张表情包能作为群友式的自然接梗、吐槽或情绪反应时才回复；"
+                "认真求助、事实问题、敏感/沉重话题、真实冲突、他人之间的定向对话，"
+                "以及普通到没有反应价值的消息都应保持沉默。\n"
+                f"{current_msg_text}"
+            )
 
         # === Gatekeeper 判断 ===
-        if not is_tome:
+        if not is_tome and repeat_text is None:
             should_reply = await check_if_should_reply(
-                history_summary, gatekeeper_msg_text, bot_name, is_private=is_private
+                history_summary,
+                gatekeeper_msg_text,
+                bot_name,
+                is_private=is_private,
+                proactive_meme_only=proactive_meme_only,
             )
             if not should_reply:
                 return
@@ -863,6 +1025,8 @@ async def handle_reply_logic(
                         event,
                         is_private=is_private,
                         group_members=group_members,
+                        proactive_meme_only=proactive_meme_only,
+                        repeat_text=repeat_text,
                     ),
                     timeout=plugin_config.agent_timeout_seconds,
                 )

@@ -16,6 +16,8 @@ SETTING_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         (
             "bot_name",
             "reply_probability",
+            "repeat_probability",
+            "proactive_meme_probability",
             "proactive_private_message",
             "continuous_conversation_minutes",
             "personality_setting",
@@ -145,6 +147,8 @@ SETTING_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
 _DIRECT_LABELS = {
     "bot_name": "Bot 名称",
     "reply_probability": "随机回复概率",
+    "repeat_probability": "加入复读概率",
+    "proactive_meme_probability": "主动表情包采样概率",
     "proactive_private_message": "允许主动私聊",
     "continuous_conversation_minutes": "连续对话窗口（分钟）",
     "personality_setting": "人格设定",

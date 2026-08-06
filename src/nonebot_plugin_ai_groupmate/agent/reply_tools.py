@@ -26,6 +26,7 @@ def create_reply_tool(
     bot_name: str,
     parse_msg_meta: Callable[[str], tuple[str | None, str | None, str]],
     group_members: list[Any] | None = None,
+    repeat_text: str | None = None,
 ):
     """
     核心工具：用于发送消息。
@@ -90,6 +91,17 @@ def create_reply_tool(
 
         if not content or not content.strip():
             return _result("failed", "内容为空，未发送。")
+
+        if repeat_text is not None:
+            expected = _normalize_text(repeat_text)
+            actual = _normalize_text(content)
+            if actual != expected or next_step != "end":
+                return _result(
+                    "failed",
+                    "当前是复读队形：只能原样复读并结束，或者调用 finish 保持沉默。",
+                )
+            # 使用识别到的原文，避免模型添加不可见空白或改变换行。
+            content = repeat_text
 
         try:
             content = _dedupe_consecutive_lines(content.strip())

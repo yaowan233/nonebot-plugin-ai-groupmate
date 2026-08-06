@@ -22,6 +22,9 @@ def test_group_memory_skill_is_only_available_in_groups():
 
     assert "group_memory_tools" in {skill.name for skill in group_skills}
     assert "group_memory_tools" not in {skill.name for skill in private_skills}
+    # 群聊表情工具默认可见，不再要求额外加载；私聊仍按需加载。
+    assert "meme_tools" not in {skill.name for skill in group_skills}
+    assert "meme_tools" in {skill.name for skill in private_skills}
 
 
 @pytest.mark.asyncio

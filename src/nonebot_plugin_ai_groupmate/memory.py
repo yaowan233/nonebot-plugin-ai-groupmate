@@ -23,7 +23,11 @@ MEDIA_EMBEDDING_VERSION = 3
 MEDIA_TEXT_VECTOR = "text"
 MEDIA_IMAGE_VECTOR = "image"
 MEME_SEARCH_POOL_SIZE = 50
-MEME_SEARCH_TEMPERATURE = 0.08
+MEME_RRF_K = 60
+MEME_LEGACY_ROUTE_WEIGHT = 0.35
+MEME_GROUP_USAGE_WEIGHT = 0.35
+MEME_GROUP_USAGE_MIN_USES = 2
+MEME_SAMPLE_RANK_SCALE = 18.0
 MEME_TEXT_QUERY_INSTRUCT = (
     "Retrieve meme images matching the requested quote, emotion, reaction, "
     "character, action, and conversational intent."
@@ -553,14 +557,13 @@ class VectorDBOperator:
         candidates: Sequence[tuple[int, float]],
         limit: int,
     ) -> list[int]:
-        """按相似度加权无放回抽样，避免相同查询永远返回同一顺序。"""
+        """按融合排名衰减做无放回抽样，避免相同查询永远返回同一顺序。"""
         remaining = list(candidates)
         selected: list[int] = []
         while remaining and len(selected) < limit:
-            best_score = max(score for _, score in remaining)
             weights = [
-                math.exp(max(-20.0, (score - best_score) / MEME_SEARCH_TEMPERATURE))
-                for _, score in remaining
+                math.exp(-rank / MEME_SAMPLE_RANK_SCALE)
+                for rank in range(len(remaining))
             ]
             index = random.choices(range(len(remaining)), weights=weights, k=1)[0]
             media_id, _ = remaining.pop(index)
@@ -590,19 +593,49 @@ class VectorDBOperator:
         primary_points: Sequence[models.ScoredPoint],
         legacy_points: Sequence[models.ScoredPoint],
     ) -> list[tuple[int, float]]:
-        """合并独立向量与旧融合向量召回；独立向量优先，双路命中略加分。"""
-        merged: dict[int, float] = {
-            int(point.id): float(point.score) + 0.03
-            for point in primary_points
-        }
-        for point in legacy_points:
+        """使用加权 RRF 合并独立向量与旧融合向量召回。"""
+        merged: dict[int, float] = {}
+        for rank, point in enumerate(primary_points, start=1):
             media_id = int(point.id)
-            legacy_score = float(point.score) - 0.03
-            if media_id in merged:
-                merged[media_id] = max(merged[media_id], legacy_score) + 0.01
-            else:
-                merged[media_id] = legacy_score
+            merged[media_id] = merged.get(media_id, 0.0) + 1.0 / (MEME_RRF_K + rank)
+        for rank, point in enumerate(legacy_points, start=1):
+            media_id = int(point.id)
+            merged[media_id] = merged.get(media_id, 0.0) + (
+                MEME_LEGACY_ROUTE_WEIGHT / (MEME_RRF_K + rank)
+            )
         return sorted(merged.items(), key=lambda item: item[1], reverse=True)
+
+    @staticmethod
+    def apply_group_usage_boost(
+        candidates: Sequence[tuple[int, float]],
+        usage_counts: dict[int, int],
+    ) -> list[tuple[int, float]]:
+        """把群内人类用图频率作为一条低权重 RRF 路线参与候选重排。"""
+        if not candidates or not usage_counts:
+            return list(candidates)
+
+        scores = {
+            media_id: 1.0 / (MEME_RRF_K + rank)
+            for rank, (media_id, _) in enumerate(candidates, start=1)
+        }
+        semantic_rank = {
+            media_id: rank
+            for rank, (media_id, _) in enumerate(candidates, start=1)
+        }
+        popular_ids = sorted(
+            (
+                media_id
+                for media_id, _ in candidates
+                if usage_counts.get(media_id, 0) >= MEME_GROUP_USAGE_MIN_USES
+            ),
+            key=lambda media_id: (
+                -usage_counts[media_id],
+                semantic_rank[media_id],
+            ),
+        )
+        for rank, media_id in enumerate(popular_ids, start=1):
+            scores[media_id] += MEME_GROUP_USAGE_WEIGHT / (MEME_RRF_K + rank)
+        return sorted(scores.items(), key=lambda item: item[1], reverse=True)
 
     async def _search_media_routes(
         self,
@@ -665,12 +698,36 @@ class VectorDBOperator:
     ) -> list[int]:
         """
         根据描述搜表情包
-        Text -> Clip Vector -> Search Qdrant -> Return IDs
+        Text -> Qwen Vector -> Search Qdrant -> Return IDs
         """
         if not self.enabled:
             return []
+        query_limit = min(
+            100,
+            max(MEME_SEARCH_POOL_SIZE, limit * 8, limit + len(exclude_ids)),
+        )
+        candidates = await self.search_meme_candidates(
+            description,
+            limit=query_limit,
+        )
+        if not candidates:
+            return []
+        return self._diversify_meme_candidates(
+            candidates,
+            exclude_ids=exclude_ids,
+            limit=limit,
+        )
+
+    async def search_meme_candidates(
+        self,
+        description: str,
+        *,
+        limit: int = MEME_SEARCH_POOL_SIZE,
+    ) -> list[tuple[int, float]]:
+        """返回多路融合后的候选，供上层结合群热度再次排序。"""
+        if not self.enabled:
+            return []
         await self._ensure_collections()
-        # 1. 文本转向量
         vector = await self._get_qwen_vl_embedding(
             text=description,
             instruct=MEME_TEXT_QUERY_INSTRUCT,
@@ -678,22 +735,9 @@ class VectorDBOperator:
         if not vector:
             return []
 
-        # 2. Qdrant 搜索
-        query_limit = min(
-            100,
-            max(MEME_SEARCH_POOL_SIZE, limit * 8, limit + len(exclude_ids)),
-        )
-        candidates = await self._search_media_routes(
+        return await self._search_media_routes(
             vector,
             vector_name=MEDIA_TEXT_VECTOR,
-            limit=query_limit,
-        )
-        if not candidates:
-            return []
-        # 3. 排除近期发过的图片，并在相关候选中加权随机抽取。
-        return self._diversify_meme_candidates(
-            candidates,
-            exclude_ids=exclude_ids,
             limit=limit,
         )
 

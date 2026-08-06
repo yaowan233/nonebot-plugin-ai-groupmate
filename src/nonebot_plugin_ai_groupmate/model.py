@@ -44,6 +44,13 @@ class ChatHistory(Model):
     __table_args__ = (
         # 覆盖 group_memory 更新查询: WHERE session_id=? AND created_at>? AND content_type IN (...)
         Index("ix_chat_session_time", "session_id", "created_at"),
+        # 覆盖群内表情包热度聚合: session_id + content_type + media_id。
+        Index(
+            "ix_chat_session_type_media",
+            "session_id",
+            "content_type",
+            "media_id",
+        ),
     )
 
 

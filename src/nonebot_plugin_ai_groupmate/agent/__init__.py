@@ -281,12 +281,24 @@ def get_vision_model() -> Any | None:
 
 
 async def check_if_should_reply(
-    history_summary: str, current_msg: str, bot_name: str, is_private: bool = False
+    history_summary: str,
+    current_msg: str,
+    bot_name: str,
+    is_private: bool = False,
+    proactive_meme_only: bool = False,
 ) -> bool:
     """
     使用 qwen-flash 快速判断是否需要回复
     """
-    if is_private:
+    if proactive_meme_only and not is_private:
+        scene_desc = "群聊"
+        scene_extra = (
+            "3. 当前消息已命中低概率主动表情包采样。只有适合用一张表情包自然接梗、"
+            "吐槽、庆祝或表达明显情绪时返回 YES。\n"
+            "4. 认真求助、事实问题、敏感或沉重话题、真实冲突、他人之间的定向对话，"
+            "以及没有反应价值的普通消息，返回 NO。"
+        )
+    elif is_private:
         scene_desc = "私聊"
         scene_extra = "3. 如果是无关的闲聊或者语意不通的消息，返回 NO。"
     else:
@@ -459,7 +471,7 @@ def _build_builtin_agent_skills(
                 '- 单条回复传 `next_step="end"`，发送后会自动结束，不要再调用 `finish`。\n'
                 '- 确实需要拆成多条且下一条会提供新信息时，当前条传 `next_step="continue"`；最后一条必须传 `next_step="end"`。\n'
                 "- 不要重复 bot 自己刚发过的内容；多条回复必须信息递进。"
-                "- 群聊里可以偶尔复读群友短句、关键词或队形来参与，但不要刷屏。"
+                "- 群聊出现正常复读队形时，只能原样跟一句或保持沉默，不要评价复读行为。"
             ),
         ),
         AgentSkill(
@@ -467,9 +479,9 @@ def _build_builtin_agent_skills(
             description="搜索、选择和发送表情包图片。",
             prompt=(
                 "表情包工具规则：\n"
-                "- 普通表情包需求：先调用 `search_meme_image(description)` 搜索合适图片。\n"
+                "- 普通表情包需求：先调用 `search_meme_image(description)` 搜索合适图片；description 要写清此刻想表达的情绪、态度、对象和反应，不要只给一个宽泛关键词。\n"
                 "- 用户引用图片或要求“找一张类似这张的”：调用 `search_similar_meme_by_id(target_msg_id)`；没有明确 id 时可不传，工具会优先找当前用户最近图片。\n"
-                "- 搜索工具只返回候选图片和 pic_id，不会发送。\n"
+                "- 搜索工具只返回通过当前对话相关性审核的候选和 pic_id，不会发送；如果没有候选通过审核，就不要调用发送工具。\n"
                 "- 判断候选描述合适后，调用 `send_meme_image(pic_id)` 发送。\n"
                 "- 发图完成后调用 `finish`；不要再发送同义文字。"
             ),
@@ -518,6 +530,8 @@ def _build_builtin_agent_skills(
         ),
     ]
     if not is_private:
+        # 群聊中的表情工具默认可见，规则已放入主提示，不再要求先加载技能。
+        skills = [skill for skill in skills if skill.name != "meme_tools"]
         skills.append(
             AgentSkill(
                 name="group_memory_tools",
@@ -564,6 +578,40 @@ def _image_file_name_from_history(msg: ChatHistorySchema) -> str:
 
 def _is_image_history(msg: ChatHistorySchema) -> bool:
     return is_image_history(msg)
+
+
+def _detect_repeat_chain(
+    history: list[ChatHistorySchema],
+    *,
+    max_chars: int = 40,
+) -> str | None:
+    """检测由至少两名群友连续发送的同一条短文本。"""
+    if len(history) < 2 or history[-1].content_type != "text":
+        return None
+
+    _, _, latest_body = _parse_msg_meta(history[-1].content)
+    latest_body = latest_body.strip()
+    normalized = " ".join(latest_body.split()).casefold()
+    if not normalized or len(normalized) > max_chars or "@" in latest_body:
+        return None
+
+    user_ids = {str(history[-1].user_id)}
+    repeat_count = 1
+    for message in reversed(history[:-1]):
+        if message.content_type != "text":
+            break
+        _, _, body = _parse_msg_meta(message.content)
+        if " ".join(body.strip().split()).casefold() != normalized:
+            break
+        repeat_count += 1
+        user_ids.add(str(message.user_id))
+
+    if repeat_count < 2 or len(user_ids) < 2:
+        return None
+    chain_start = len(history) - repeat_count
+    if not any(message.content_type == "bot" for message in history[:chain_start]):
+        return None
+    return latest_body
 
 
 def _build_current_request_boundary(
@@ -749,6 +797,8 @@ async def create_chat_graph(
     is_private: bool = False,
     group_members: list[Any] | None = None,
     vision_metrics: VisionRunMetrics | None = None,
+    proactive_meme_only: bool = False,
+    repeat_text: str | None = None,
 ) -> tuple[Any, list[Any], str]:
     """创建 LangGraph 聊天图"""
     relation_context = await get_user_relation_context(db_session, user_id, user_name)
@@ -859,7 +909,15 @@ async def create_chat_graph(
         self_id=bot_id,
     )
 
-    search_meme_tool = create_search_meme_tool(db_session, session_id, request_id)
+    approved_meme_ids: set[int] = set()
+    search_meme_tool = create_search_meme_tool(
+        db_session,
+        session_id,
+        request_id,
+        model=model,
+        history=history or [],
+        approved_meme_ids=approved_meme_ids,
+    )
     send_meme_tool = create_send_meme_tool(
         db_session,
         session_id,
@@ -867,6 +925,7 @@ async def create_chat_graph(
         send_target=send_target,
         pic_dir=pic_dir,
         bot_name=plugin_config.bot_name,
+        approved_meme_ids=approved_meme_ids,
     )
     relation_tool = create_relation_tool(
         db_session,
@@ -889,7 +948,12 @@ async def create_chat_graph(
         else None
     )
     similar_meme_tool = create_similar_meme_tool(
-        db_session, session_id, request_id, user_id, pic_dir=pic_dir
+        db_session,
+        session_id,
+        request_id,
+        user_id,
+        pic_dir=pic_dir,
+        approved_meme_ids=approved_meme_ids,
     )
     mute_tool = create_mute_tool(
         db_session,
@@ -970,6 +1034,8 @@ async def create_chat_graph(
         ),
         *custom_agent_skills,
     ]
+    if proactive_meme_only or repeat_text is not None:
+        agent_skills = []
     skill_index = build_agent_skill_index(agent_skills)
     if skill_index:
         system_prompt += "\n" + skill_index
@@ -1000,21 +1066,44 @@ async def create_chat_graph(
         bot_name=plugin_config.bot_name,
         parse_msg_meta=_parse_msg_meta,
         group_members=member_snapshot,
+        repeat_text=repeat_text,
     )
     base_agent_tools = [
-        reply_tool,
+        *([reply_tool] if not proactive_meme_only else []),
+        *(
+            [search_meme_tool, similar_meme_tool, send_meme_tool]
+            if not is_private
+            else []
+        ),
         *([recall_tool] if recall_tool is not None else []),
         *([private_message_tool] if private_message_tool is not None else []),
         *([skill_loader_tool] if skill_loader_tool is not None else []),
         *custom_agent_tools,
         finish,
     ]
+    if repeat_text is not None:
+        # 复读队形只允许原样跟一句或保持沉默，杜绝对队形作元点评。
+        base_agent_tools = [reply_tool, finish]
+    elif proactive_meme_only:
+        # 独立采样只允许发一张合适的表情或保持沉默，不能转成普通文字插话。
+        base_agent_tools = [
+            search_meme_tool,
+            send_meme_tool,
+            finish,
+        ]
     tools_by_skill: dict[str, list[Any]] = {
-        "meme_tools": [search_meme_tool, similar_meme_tool, send_meme_tool],
         "search_context_tools": [search_web, search_history_context, calculate_expression],
         "schedule_tools": [schedule_tool, schedule_agent_tool],
         "profile_memory_tools": [relation_tool, report_tool],
     }
+    if is_private:
+        tools_by_skill["meme_tools"] = [
+            search_meme_tool,
+            similar_meme_tool,
+            send_meme_tool,
+        ]
+    if proactive_meme_only or repeat_text is not None:
+        tools_by_skill = {}
     if group_memory_tool is not None:
         tools_by_skill["group_memory_tools"] = [group_memory_tool]
     if is_onebot_context(bot, event):
@@ -1079,6 +1168,8 @@ async def choice_response_strategy(
     event: Event | None = None,
     is_private: bool = False,
     group_members: list[Any] | None = None,
+    proactive_meme_only: bool = False,
+    repeat_text: str | None = None,
 ) -> ResponseMessage:
     """
     使用LangGraph Agent决定回复策略
@@ -1095,6 +1186,8 @@ async def choice_response_strategy(
 
         agent_started_at = time.perf_counter()
         vision_metrics = VisionRunMetrics()
+        if is_private or proactive_meme_only:
+            repeat_text = None
         graph, _, dynamic_context = await create_chat_graph(
             db_session,
             session_id,
@@ -1109,6 +1202,8 @@ async def choice_response_strategy(
             is_private=is_private,
             group_members=member_snapshot,
             vision_metrics=vision_metrics,
+            proactive_meme_only=proactive_meme_only,
+            repeat_text=repeat_text,
         )
 
         # 1. 获取多模态格式的历史消息列表 (List[BaseMessage])
@@ -1159,6 +1254,34 @@ async def choice_response_strategy(
             user_name,
             event,
         )
+        if repeat_text is not None:
+            task_instruction = f"""
+【当前正在形成复读队形】
+最近至少两名群友连续发送了同一句短文本：
+<repeat_text>{repeat_text}</repeat_text>
+
+这不是需要点评的问题。本轮只能二选一：
+1. 自然加入队形：调用 `reply_user` 原样发送上面的文本，不加引号、前后缀或解释，并设置 next_step="end"。
+2. 不加入：调用 `finish` 保持沉默。
+禁止回复“复读是吧”“又开始了”“你们搁这复读”等任何评价复读行为的话。
+""".strip()
+        elif proactive_meme_only:
+            task_instruction = """
+【本轮主动表情机会】
+本轮由低概率主动表情采样触发，只能选择以下两种结果：
+1. 当前语境确实适合用一张图自然接梗：调用 `search_meme_image`，从审核通过的候选中最多发送一张，然后结束。
+2. 没有足够自然的表情反应：直接调用 `finish` 保持沉默。
+不要发送文字，不要为了完成采样而强行发表情，也不要调用无关工具。
+""".strip()
+        else:
+            task_instruction = """
+请以【本轮当前请求】为唯一待办，结合上述对话历史判断是否需要回复。如果需要，请调用相应工具。
+普通图片/表情包通常只是群聊氛围，不要主动解读、复述或围绕它展开回复。
+只有当前用户明确询问图片内容、回复/引用图片、要求找图/发图，或上下文确实在讨论这张图时，才重点结合图片内容回答。
+群友在质疑、反问时不要优先质疑这种行为本身；正常复读队形只能原样跟一句或保持沉默，禁止评价复读行为。
+如果不需要回复，必须调用 `finish`；禁止返回空内容或无工具调用的空响应。
+即使不需要发送回复，如果近期群聊出现了值得长期记住的稳定变化，也可以在读取群档案技能后执行后台维护，然后调用 `finish`。
+""".strip()
 
         prompt_text = f"""
 【当前环境】
@@ -1169,12 +1292,7 @@ async def choice_response_strategy(
 {current_request_boundary}
 
 【任务】
-请以【本轮当前请求】为唯一待办，结合上述对话历史判断是否需要回复。如果需要，请调用相应工具。
-普通图片/表情包通常只是群聊氛围，不要主动解读、复述或围绕它展开回复。
-只有当前用户明确询问图片内容、回复/引用图片、要求找图/发图，或上下文确实在讨论这张图时，才重点结合图片内容回答。
-群友在质疑、反问、跟风或复读时，不要优先质疑这种行为本身；可以自然接一句、复读关键词、跟队形，或者保持沉默。
-如果不需要回复，必须调用 `finish`；禁止返回空内容或无工具调用的空响应。
-即使不需要发送回复，如果近期群聊出现了值得长期记住的稳定变化，也可以在读取群档案技能后执行后台维护，然后调用 `finish`。
+{task_instruction}
 """
 
         # 3. 组合消息列表 (核心修改)

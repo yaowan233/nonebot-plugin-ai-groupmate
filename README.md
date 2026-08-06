@@ -21,7 +21,7 @@
 
 - **群体认知档案**：由 bot 在发现值得长期记住的新话题、成员特征、内部梗或氛围变化时自主更新，让 bot 对群文化有持续感知。
 - **长记忆**（需配置 Qdrant）：RAG 自动存储聊天历史，学习群友发言习惯，使 bot 更像真人。
-- **表情包学习**（需配置 Qdrant）：使用 `qwen-vl-max` 理解图片内容，分别索引描述语义与视觉特征，自动从群内偷学表情包并在回复时多路召回。
+- **表情包学习**（需配置 Qdrant）：使用 `qwen-vl-max` 理解图片内容，分别索引描述语义与视觉特征，自动从群内偷学表情包；回复时通过 RRF 多路召回，结合当前群的真实使用频率重排，并在发送前按当前对话审核相关性。
 - **自定义 Agent Tools**：可以注册自己的 LangChain tools 扩展 agent 能力，详见 [自定义 Agent Tools](./docs/custom-agent-tools.md)。
 
 对于主模型选择：推荐使用支持 Function Calling 的通义千问系列模型（如 `qwen-plus`、`qwen-max`）。图片理解固定使用 `qwen-vl-max`，群档案摘要固定使用 `qwen-flash`。
@@ -102,6 +102,8 @@
 |:-----:|:----:|:----:|:----:|
 | ai_groupmate__bot_name | 否 | `"bot"` | bot 名 |
 | ai_groupmate__reply_probability | 否 | `0.01` | 群内主动发言概率 |
+| ai_groupmate__repeat_probability | 否 | `0.15` | Bot 已在当前连续对话窗口参与，且至少两名不同群友连续发送同一句短文本后，Bot 对每条新跟读加入队形的概率 |
+| ai_groupmate__proactive_meme_probability | 否 | `0.02` | 群消息触发“只考虑发表情包”决策的概率；不合适时保持沉默 |
 | ai_groupmate__personality_setting | 否 | 无 | 自定义人设和固定业务知识 prompt |
 | ai_groupmate__tavily_api_key | 否 | 无 | Tavily 搜索 API 密钥（联网搜索功能） |
 | ai_groupmate__llm_api_key | 推荐 | 无 | 通用 LLM API Key，未单独配置各角色 key 时使用 |
@@ -201,7 +203,7 @@ AI_GROUPMATE__CHAT_MODEL=qwen3.7-plus
 
 ## 🎉 使用
 
-@bot 即可触发回复，也会以 `reply_probability` 的概率主动发言。
+@bot 即可触发回复，也会以 `reply_probability` 的概率主动发言；Bot 已在当前连续对话窗口参与、随后至少两名不同群友连续发送同一句短文本时，会按 `repeat_probability` 独立决定是否原样加入队形；此外会按 `proactive_meme_probability` 低概率进入“只考虑发表情包”的决策，不适合时保持沉默。
 
 ### 自定义 Agent Tools
 

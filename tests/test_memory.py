@@ -292,6 +292,42 @@ def test_meme_results_exclude_recent_ids_before_fallback(
     assert result == [3, 4, 1]
 
 
+def test_meme_search_routes_use_rrf_and_reward_cross_route_hits(
+    memory_module: Any,
+):
+    primary = [
+        SimpleNamespace(id=1, score=0.9),
+        SimpleNamespace(id=2, score=0.8),
+    ]
+    legacy = [
+        SimpleNamespace(id=2, score=0.95),
+        SimpleNamespace(id=3, score=0.9),
+    ]
+
+    result = memory_module.VectorDBOperator._merge_meme_search_routes(
+        primary,
+        legacy,
+    )
+
+    assert [media_id for media_id, _ in result] == [2, 1, 3]
+
+
+def test_group_usage_boost_promotes_a_group_favorite(memory_module: Any):
+    candidates = [
+        (1, 0.9),
+        (2, 0.8),
+        (3, 0.7),
+        (4, 0.6),
+    ]
+
+    result = memory_module.VectorDBOperator.apply_group_usage_boost(
+        candidates,
+        {3: 10},
+    )
+
+    assert [media_id for media_id, _ in result][:3] == [3, 1, 2]
+
+
 @pytest.mark.asyncio
 async def test_search_meme_uses_larger_candidate_pool_and_recent_exclusion(
     memory_module: Any,
