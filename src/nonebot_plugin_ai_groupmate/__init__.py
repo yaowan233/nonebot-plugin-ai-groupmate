@@ -1017,6 +1017,27 @@ async def handle_reply_logic(
         if repeat_text is not None and not is_private:
             # 复读采样已经代表“加入队形”的决定，直接发送，避免模型二次犹豫或点评。
             async with get_session() as repeat_session:
+                # 请求可能在群队列里等待；执行前重新检查队形，避免 bot 已经
+                # 跟过一次后，旧的待处理请求再次复读同一条连续队形。
+                current_repeat_text = await _load_repeat_chain_text(
+                    repeat_session,
+                    session.scene.id,
+                )
+                current_normalized = (
+                    " ".join(current_repeat_text.split()).casefold()
+                    if current_repeat_text is not None
+                    else None
+                )
+                requested_normalized = " ".join(repeat_text.split()).casefold()
+                if current_normalized != requested_normalized:
+                    logger.info(
+                        f"复读队形已变化或 bot 已参与，跳过二次复读: {repeat_text}"
+                    )
+                    await repeat_session.commit()
+                    return
+                # 跟随执行时最新一条的原始格式，检测比较仍使用标准化文本。
+                assert current_repeat_text is not None
+                repeat_text = current_repeat_text
                 reply_tool = create_reply_tool(
                     repeat_session,
                     session.scene.id,

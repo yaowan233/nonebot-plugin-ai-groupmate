@@ -587,7 +587,7 @@ def _detect_repeat_chain(
     *,
     max_chars: int = 40,
 ) -> str | None:
-    """检测由至少两名群友连续发送的同一条短文本。"""
+    """检测由至少两名群友连续发送、且 bot 尚未加入的同一条短文本。"""
     if len(history) < 2 or history[-1].content_type != "text":
         return None
 
@@ -598,19 +598,29 @@ def _detect_repeat_chain(
         return None
 
     user_ids = {str(history[-1].user_id)}
-    repeat_count = 1
-    for message in reversed(history[:-1]):
-        if message.content_type != "text":
+    user_repeat_count = 1
+    bot_already_repeated = False
+    chain_start = len(history) - 1
+    for index in range(len(history) - 2, -1, -1):
+        message = history[index]
+        if message.content_type not in {"text", "bot"}:
             break
         _, _, body = _parse_msg_meta(message.content)
         if " ".join(body.strip().split()).casefold() != normalized:
             break
-        repeat_count += 1
-        user_ids.add(str(message.user_id))
+        chain_start = index
+        if message.content_type == "bot":
+            bot_already_repeated = True
+        else:
+            user_repeat_count += 1
+            user_ids.add(str(message.user_id))
 
-    if repeat_count < 2 or len(user_ids) < 2:
+    # 同一条连续队形中 bot 最多加入一次。Bot 的同文消息不能被当作
+    # 队形中断，否则后续两个群友继续刷屏时会触发二次复读。
+    if bot_already_repeated:
         return None
-    chain_start = len(history) - repeat_count
+    if user_repeat_count < 2 or len(user_ids) < 2:
+        return None
     if not any(message.content_type == "bot" for message in history[:chain_start]):
         return None
     return latest_body

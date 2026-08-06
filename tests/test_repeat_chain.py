@@ -51,12 +51,34 @@ def test_repeat_chain_requires_two_different_users_with_the_same_short_text():
     without_bot = agent._detect_repeat_chain(
         [_history(1, "user-1", "确实"), _history(2, "user-2", "确实")]
     )
+    bot_already_repeated = agent._detect_repeat_chain(
+        [
+            bot_context,
+            _history(2, "user-1", "确实"),
+            _history(3, "user-2", "确实"),
+            _history(4, "bot", "确实", content_type="bot"),
+            _history(5, "user-3", "确实"),
+            _history(6, "user-4", "确实"),
+        ]
+    )
+    new_chain_after_interruption = agent._detect_repeat_chain(
+        [
+            bot_context,
+            _history(2, "user-1", "确实"),
+            _history(3, "bot", "确实", content_type="bot"),
+            _history(4, "user-2", "换个话题"),
+            _history(5, "user-3", "确实"),
+            _history(6, "user-4", "确实"),
+        ]
+    )
 
     assert repeated == "确实"
     assert same_user is None
     assert changed is None
     assert mention is None
     assert without_bot is None
+    assert bot_already_repeated is None
+    assert new_chain_after_interruption == "确实"
 
 
 def test_repeat_chain_uses_an_independent_probability(monkeypatch):
@@ -102,9 +124,13 @@ async def test_sampled_repeat_is_sent_without_calling_the_agent(monkeypatch):
     async def forbidden_agent(*args: Any, **kwargs: Any):
         raise AssertionError("抽中的复读不应调用 Agent")
 
+    async def unchanged_repeat_chain(*args: Any, **kwargs: Any) -> str:
+        return "确实"
+
     monkeypatch.setattr(plugin, "get_session", lambda: FakeSessionContext())
     monkeypatch.setattr(plugin, "create_reply_tool", lambda *args, **kwargs: FakeReplyTool())
     monkeypatch.setattr(plugin, "choice_response_strategy", forbidden_agent)
+    monkeypatch.setattr(plugin, "_load_repeat_chain_text", unchanged_repeat_chain)
 
     session = SimpleNamespace(
         scene=SimpleNamespace(type=SceneType.GROUP, id="group-1"),
@@ -126,6 +152,54 @@ async def test_sampled_repeat_is_sent_without_calling_the_agent(monkeypatch):
     )
 
     assert invoked == [{"content": "确实", "next_step": "end"}]
+
+
+@pytest.mark.asyncio
+async def test_queued_repeat_is_skipped_after_bot_has_joined_chain(monkeypatch):
+    from nonebot.adapters import Bot, Event
+    from nonebot_plugin_uninfo import Uninfo, SceneType, QryItrface
+
+    import nonebot_plugin_ai_groupmate as plugin
+
+    class FakeDbSession:
+        async def commit(self):
+            return None
+
+    class FakeSessionContext:
+        async def __aenter__(self):
+            return FakeDbSession()
+
+        async def __aexit__(self, *args: object):
+            return None
+
+    async def bot_already_joined(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    def forbidden_reply_tool(*args: Any, **kwargs: Any):
+        raise AssertionError("bot 已参与的同一队形不应再次发送")
+
+    monkeypatch.setattr(plugin, "get_session", lambda: FakeSessionContext())
+    monkeypatch.setattr(plugin, "_load_repeat_chain_text", bot_already_joined)
+    monkeypatch.setattr(plugin, "create_reply_tool", forbidden_reply_tool)
+
+    session = SimpleNamespace(
+        scene=SimpleNamespace(type=SceneType.GROUP, id="group-1"),
+        self_id="bot-1",
+    )
+    await plugin.handle_reply_logic(
+        "request-2",
+        cast(Uninfo, session),
+        cast(QryItrface, object()),
+        cast(Bot, object()),
+        cast(Event, object()),
+        "bot",
+        "user-3",
+        "Carol",
+        False,
+        False,
+        None,
+        repeat_text="确实",
+    )
 
 
 @pytest.mark.asyncio
