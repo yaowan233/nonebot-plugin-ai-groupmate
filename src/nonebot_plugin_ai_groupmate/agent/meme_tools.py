@@ -12,6 +12,27 @@ from ..model import ChatHistory, MediaStorage
 from ..memory import DB
 from ..reply_guard import is_request_active
 
+RECENT_MEME_EXCLUSION_COUNT = 20
+
+
+async def _get_recent_sent_meme_ids(
+    db_session,
+    session_id: str,
+    *,
+    limit: int = RECENT_MEME_EXCLUSION_COUNT,
+) -> set[int]:
+    result = await db_session.execute(
+        Select(ChatHistory.media_id)
+        .where(
+            ChatHistory.session_id == session_id,
+            ChatHistory.content_type == "bot",
+            ChatHistory.media_id.is_not(None),
+        )
+        .order_by(desc(ChatHistory.created_at))
+        .limit(limit)
+    )
+    return {int(media_id) for media_id in result.scalars().all()}
+
 
 def create_similar_meme_tool(
     db_session,
@@ -72,9 +93,15 @@ def create_similar_meme_tool(
 
             source_media_id = msg.media_id
             source_file_path = media_obj.file_path
+            recent_ids = await _get_recent_sent_meme_ids(db_session, session_id)
+            if source_media_id is not None:
+                recent_ids.add(int(source_media_id))
             await db_session.commit()
 
-            pic_ids = await DB.search_similar_meme(str(pic_dir / source_file_path))
+            pic_ids = await DB.search_similar_meme(
+                str(pic_dir / source_file_path),
+                exclude_ids=recent_ids,
+            )
 
             if not pic_ids:
                 logger.info(f"未找到相似图片, source_id: {source_media_id}")
@@ -133,21 +160,26 @@ def create_search_meme_tool(db_session, session_id: str, request_id: str | None)
             return "请求已过期，已取消搜索。"
 
         try:
-            pic_ids = await DB.search_meme(description)
+            recent_ids = await _get_recent_sent_meme_ids(db_session, session_id)
+            # 向量请求可能耗时，先释放刚才查询历史记录占用的连接。
+            await db_session.commit()
+            pic_ids = await DB.search_meme(
+                description,
+                limit=5,
+                exclude_ids=recent_ids,
+            )
 
             if not pic_ids:
                 logger.info(f"未找到匹配的表情包: {description}")
                 return json.dumps({"success": False, "images": []}, ensure_ascii=False)
 
             images_info = []
-            for pic_id in pic_ids[:5]:
-                pic = (
-                    await db_session.execute(
-                        Select(MediaStorage).where(MediaStorage.media_id == int(pic_id))
-                    )
-                ).scalar()
-
-                if pic:
+            result = await db_session.execute(
+                Select(MediaStorage).where(MediaStorage.media_id.in_(pic_ids))
+            )
+            media_map = {media.media_id: media for media in result.scalars().all()}
+            for pic_id in pic_ids:
+                if pic := media_map.get(int(pic_id)):
                     images_info.append(
                         {
                             "pic_id": pic_id,

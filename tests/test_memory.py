@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -43,6 +45,7 @@ def memory_module():
 def make_operator(memory_module: Any):
     operator = object.__new__(memory_module.VectorDBOperator)
     operator.media_col = "media_collection"
+    operator.media_multivector_col = "media_collection_v3"
     return operator
 
 
@@ -59,6 +62,37 @@ def mock_http_client(
         lambda **kwargs: FakeAsyncClient(response, calls, **kwargs),
     )
     return calls
+
+
+@pytest.mark.asyncio
+async def test_ensure_collections_creates_named_media_vectors(memory_module: Any):
+    operator = make_operator(memory_module)
+    operator.chat_col = "chat_collection"
+    operator._collections_ready = False
+    operator._init_lock = asyncio.Lock()
+    create_calls: list[dict[str, Any]] = []
+
+    class FakeQdrantClient:
+        async def collection_exists(self, collection_name: str) -> bool:
+            return collection_name != "media_collection_v3"
+
+        async def create_collection(self, **kwargs: Any) -> None:
+            create_calls.append(kwargs)
+
+    operator.client = FakeQdrantClient()
+
+    await operator._ensure_collections()
+
+    assert len(create_calls) == 1
+    vectors_config = create_calls[0]["vectors_config"]
+    assert set(vectors_config) == {
+        memory_module.MEDIA_TEXT_VECTOR,
+        memory_module.MEDIA_IMAGE_VECTOR,
+    }
+    assert all(
+        vector.size == memory_module.MEDIA_VECTOR_SIZE
+        for vector in vectors_config.values()
+    )
 
 
 @pytest.mark.asyncio
@@ -143,6 +177,40 @@ async def test_qwen_vl_embedding_rejects_multiple_vectors(
 
 
 @pytest.mark.asyncio
+async def test_qwen_vl_embedding_returns_ordered_independent_pair(
+    memory_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    text_vector = [0.31] * memory_module.MEDIA_VECTOR_SIZE
+    image_vector = [0.32] * memory_module.MEDIA_VECTOR_SIZE
+    calls = mock_http_client(
+        memory_module,
+        monkeypatch,
+        {
+            "output": {
+                "embeddings": [
+                    {"index": 1, "type": "vl", "embedding": image_vector},
+                    {"index": 0, "type": "vl", "embedding": text_vector},
+                ]
+            }
+        },
+    )
+
+    result = await make_operator(memory_module)._get_qwen_vl_independent_pair(
+        "熊猫头流泪",
+        "data:image/png;base64,AAAA",
+    )
+
+    assert result == (text_vector, image_vector)
+    payload = calls[0]["json"]
+    assert payload["input"]["contents"] == [
+        {"text": "熊猫头流泪"},
+        {"image": "data:image/png;base64,AAAA"},
+    ]
+    assert payload["parameters"] == {"dimension": memory_module.MEDIA_VECTOR_SIZE}
+
+
+@pytest.mark.asyncio
 async def test_insert_media_reports_embedding_failure(memory_module: Any):
     operator = make_operator(memory_module)
     operator.enabled = True
@@ -151,7 +219,7 @@ async def test_insert_media_reports_embedding_failure(memory_module: Any):
     async def ensure_collections() -> None:
         return None
 
-    async def get_embedding(**_: Any) -> None:
+    async def get_embedding(*_: Any, **__: Any) -> None:
         return None
 
     class FakeQdrantClient:
@@ -160,7 +228,7 @@ async def test_insert_media_reports_embedding_failure(memory_module: Any):
             upsert_called = True
 
     operator._ensure_collections = ensure_collections
-    operator._get_qwen_vl_embedding = get_embedding
+    operator._get_qwen_vl_independent_pair = get_embedding
     operator.client = FakeQdrantClient()
 
     assert await operator.insert_media(1, "data:image/png;base64,AAAA", "描述") is False
@@ -177,18 +245,96 @@ async def test_insert_media_waits_for_confirmed_upsert(memory_module: Any):
     async def ensure_collections() -> None:
         return None
 
-    async def get_embedding(**_: Any) -> list[float]:
-        return vector
+    async def get_embedding(*_: Any, **__: Any) -> tuple[list[float], list[float]]:
+        return vector, vector
 
     class FakeQdrantClient:
         async def upsert(self, **kwargs: Any) -> None:
             upsert_calls.append(kwargs)
 
     operator._ensure_collections = ensure_collections
-    operator._get_qwen_vl_embedding = get_embedding
+    operator._get_qwen_vl_independent_pair = get_embedding
     operator.client = FakeQdrantClient()
 
     assert await operator.insert_media(7, "data:image/png;base64,AAAA", "描述") is True
     assert upsert_calls[0]["wait"] is True
+    assert upsert_calls[0]["collection_name"] == "media_collection_v3"
     point = upsert_calls[0]["points"][0]
+    assert point.vector == {
+        memory_module.MEDIA_TEXT_VECTOR: vector,
+        memory_module.MEDIA_IMAGE_VECTOR: vector,
+    }
     assert point.payload["embedding_version"] == memory_module.MEDIA_EMBEDDING_VERSION
+
+
+def test_meme_results_exclude_recent_ids_before_fallback(
+    memory_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(
+        memory_module.random,
+        "choices",
+        lambda population, **_: [population[0]],
+    )
+    points = [
+        SimpleNamespace(id=1, score=0.90),
+        SimpleNamespace(id=2, score=0.85),
+        SimpleNamespace(id=3, score=0.80),
+        SimpleNamespace(id=4, score=0.75),
+    ]
+
+    result = memory_module.VectorDBOperator._diversify_meme_results(
+        points,
+        exclude_ids={1, 2},
+        limit=3,
+    )
+
+    assert result == [3, 4, 1]
+
+
+@pytest.mark.asyncio
+async def test_search_meme_uses_larger_candidate_pool_and_recent_exclusion(
+    memory_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    operator = make_operator(memory_module)
+    operator.enabled = True
+    query_calls: list[dict[str, Any]] = []
+
+    async def ensure_collections() -> None:
+        return None
+
+    async def get_embedding(**_: Any) -> list[float]:
+        return [0.1] * memory_module.MEDIA_VECTOR_SIZE
+
+    class FakeQdrantClient:
+        async def query_points(self, **kwargs: Any) -> Any:
+            query_calls.append(kwargs)
+            if kwargs["collection_name"] == "media_collection":
+                return SimpleNamespace(points=[])
+            return SimpleNamespace(
+                points=[
+                    SimpleNamespace(id=1, score=0.9),
+                    SimpleNamespace(id=2, score=0.8),
+                    SimpleNamespace(id=3, score=0.7),
+                ]
+            )
+
+    monkeypatch.setattr(
+        memory_module.random,
+        "choices",
+        lambda population, **_: [population[0]],
+    )
+    operator._ensure_collections = ensure_collections
+    operator._get_qwen_vl_embedding = get_embedding
+    operator.client = FakeQdrantClient()
+
+    result = await operator.search_meme("无奈", limit=2, exclude_ids={1})
+
+    assert result == [2, 3]
+    assert len(query_calls) == 2
+    assert query_calls[0]["collection_name"] == "media_collection_v3"
+    assert query_calls[0]["using"] == memory_module.MEDIA_TEXT_VECTOR
+    assert query_calls[0]["limit"] == memory_module.MEME_SEARCH_POOL_SIZE
+    assert query_calls[0]["with_payload"] is False
+    assert query_calls[1]["collection_name"] == "media_collection"

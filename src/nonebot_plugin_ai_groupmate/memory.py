@@ -1,9 +1,12 @@
 import os
+import math
 import time
 import uuid
 import base64
+import random
 import asyncio
 import mimetypes
+from collections.abc import Sequence, Collection
 
 import httpx
 from openai import AsyncOpenAI
@@ -16,7 +19,15 @@ plugin_config = get_runtime_config()
 
 QWEN_VL_EMBEDDING_MODEL = "qwen3-vl-embedding"
 MEDIA_VECTOR_SIZE = 2560
-MEDIA_EMBEDDING_VERSION = 2
+MEDIA_EMBEDDING_VERSION = 3
+MEDIA_TEXT_VECTOR = "text"
+MEDIA_IMAGE_VECTOR = "image"
+MEME_SEARCH_POOL_SIZE = 50
+MEME_SEARCH_TEMPERATURE = 0.08
+MEME_TEXT_QUERY_INSTRUCT = (
+    "Retrieve meme images matching the requested quote, emotion, reaction, "
+    "character, action, and conversational intent."
+)
 
 
 class VectorDBOperator:
@@ -37,7 +48,10 @@ class VectorDBOperator:
         )
 
         self.chat_col = "chat_collection"
+        # v2 及更早版本的图文融合向量，迁移期间继续作为回退召回源。
         self.media_col = "media_collection"
+        # v3 将描述文本和原图拆成独立向量，避免视觉信息稀释梗和台词。
+        self.media_multivector_col = "media_collection_v3"
 
         # 2. Embedding API (用于文本 -> 向量)
         # 使用硅基流动/OpenAI兼容接口
@@ -45,6 +59,7 @@ class VectorDBOperator:
             api_key=plugin_config.embedding_api_key,
             base_url=plugin_config.embedding_base_url
         )
+        self.qwen_http_client = httpx.AsyncClient(timeout=60.0)
         self.emb_model = "BAAI/bge-m3"
 
         # 3. Rerank API 配置
@@ -54,10 +69,11 @@ class VectorDBOperator:
         self._init_lock = asyncio.Lock()
         self._collections_ready = False
 
-    async def reconfigure(self) -> None:
-        """重建连接，使启动阶段加载的 WebUI 配置真正生效。"""
+    async def close(self) -> None:
+        """关闭向量库相关连接。"""
         qdrant_client = getattr(self, "client", None)
         embedding_client = getattr(self, "emb_client", None)
+        qwen_http_client = getattr(self, "qwen_http_client", None)
         if qdrant_client is not None:
             try:
                 await qdrant_client.close()
@@ -68,6 +84,15 @@ class VectorDBOperator:
                 await embedding_client.close()
             except Exception:
                 logger.exception("关闭旧 Embedding 客户端失败")
+        if qwen_http_client is not None:
+            try:
+                await qwen_http_client.aclose()
+            except Exception:
+                logger.exception("关闭旧 Qwen Embedding 客户端失败")
+
+    async def reconfigure(self) -> None:
+        """重建连接，使启动阶段加载的 WebUI 配置真正生效。"""
+        await self.close()
         self._configure()
 
     # ================= 内部工具函数 =================
@@ -110,6 +135,22 @@ class VectorDBOperator:
                 )
                 logger.info(f"Qdrant集合 {self.media_col} 已创建")
 
+            if not await self.client.collection_exists(self.media_multivector_col):
+                await self.client.create_collection(
+                    collection_name=self.media_multivector_col,
+                    vectors_config={
+                        MEDIA_TEXT_VECTOR: models.VectorParams(
+                            size=MEDIA_VECTOR_SIZE,
+                            distance=models.Distance.COSINE,
+                        ),
+                        MEDIA_IMAGE_VECTOR: models.VectorParams(
+                            size=MEDIA_VECTOR_SIZE,
+                            distance=models.Distance.COSINE,
+                        ),
+                    },
+                )
+                logger.info(f"Qdrant集合 {self.media_multivector_col} 已创建")
+
             self._collections_ready = True
 
     async def _get_text_embedding(self, text: str) -> list[float] | None:
@@ -124,98 +165,111 @@ class VectorDBOperator:
             logger.error(f"Embedding API Error: {e}")
             return None
 
-    async def _get_qwen_vl_embedding(self, text: str = "", image_source: str = "") -> list[float] | None:
-        """调用阿里云 Qwen3-VL-Embedding 获取多模态向量 (纯异步版)"""
-
-        # 阿里云多模态 Embedding 的原生 REST API 地址
-        aliyun_url = "https://dashscope.aliyuncs.com/api/v1/services/embeddings/multimodal-embedding/multimodal-embedding"
-
-        headers = {
-            "Authorization": f"Bearer {plugin_config.qwen_token}",
-            "Content-Type": "application/json"
-        }
-
+    @staticmethod
+    def _build_qwen_vl_contents(
+        text: str = "",
+        image_source: str = "",
+    ) -> list[dict[str, str]]:
         contents: list[dict[str, str]] = []
-
-        # 1. 填充文本（如果只有文本，就是纯文本搜索）
         if text:
             contents.append({"text": text})
 
-        # 2. 填充图片（支持本地文件路径、纯 Base64、带有 Header 的 Base64 以及 http 链接）
         if image_source:
-            # 场景 A: 传入的是本地文件路径 (如 "/path/to/meme.png")
             if os.path.isfile(image_source):
-                # 自动推断图片的 mime_type
                 mime_type, _ = mimetypes.guess_type(image_source)
-                mime_type = mime_type or "image/jpeg"  # 兜底
-
+                mime_type = mime_type or "image/jpeg"
                 with open(image_source, "rb") as f:
                     base64_data = base64.b64encode(f.read()).decode("utf-8")
-                    # ⚠️ 阿里要求必须拼装上 data:image/... 的头部
                     image_value = f"data:{mime_type};base64,{base64_data}"
-
-            # 场景 B: 传入的已经是标准的 Data URI (前端传来的 data:image/png;base64,xxx...)
             elif image_source.startswith("data:image"):
-                # ⚠️ 和 Jina 最大的不同：千万【不要】切掉头部，直接原样传给阿里
                 image_value = image_source
-
-            # 场景 C: 普通网络图片
             elif image_source.startswith("http://") or image_source.startswith("https://"):
                 image_value = image_source
-
-            # 场景 D: 传入的是被切掉头部的纯 Base64 字符串 (兜底处理)
             else:
-                # 假设它是纯 Base64，给它强行补上头部
                 image_value = f"data:image/jpeg;base64,{image_source}"
-
             contents.append({"image": image_value})
+        return contents
 
+    async def _request_qwen_vl_embeddings(
+        self,
+        contents: Sequence[dict[str, str]],
+        *,
+        enable_fusion: bool = False,
+        instruct: str = "",
+    ) -> list[list[float]] | None:
         if not contents:
-            logger.warning("Aliyun Embedding: text 和 image_source 均为 None")
+            logger.warning("Aliyun Embedding: contents 为空")
             return None
 
-        # 3. 构造最终 Payload
+        aliyun_url = "https://dashscope.aliyuncs.com/api/v1/services/embeddings/multimodal-embedding/multimodal-embedding"
+        headers = {
+            "Authorization": f"Bearer {plugin_config.qwen_token}",
+            "Content-Type": "application/json",
+        }
         payload = {
             "model": QWEN_VL_EMBEDDING_MODEL,
-            "input": {
-                "contents": contents
-            },
+            "input": {"contents": list(contents)},
             "parameters": {
-                # 显式固定维度，避免服务端默认值变更后与 Qdrant 集合不兼容。
                 "dimension": MEDIA_VECTOR_SIZE,
             },
         }
-        is_fusion_request = bool(text and image_source)
-        if is_fusion_request:
-            # qwen3-vl-embedding 默认返回各模态的独立表示；图文共同入库时
-            # 必须显式启用融合，才能得到唯一的图文联合向量。
+        if enable_fusion:
             payload["parameters"]["enable_fusion"] = True
+        if instruct:
+            payload["parameters"]["instruct"] = instruct
 
-        max_retries = 3  # 最多试3次
+        max_retries = 3
+        client = getattr(self, "qwen_http_client", None)
+        if client is None or getattr(client, "is_closed", False):
+            client = httpx.AsyncClient(timeout=60.0)
+            self.qwen_http_client = client
 
-        # client 在循环外创建，避免每次 retry 都重新握手
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            for attempt in range(max_retries):
-                try:
-                    resp = await client.post(aliyun_url, json=payload, headers=headers)
+        for attempt in range(max_retries):
+            try:
+                resp = await client.post(aliyun_url, json=payload, headers=headers)
 
-                    if resp.status_code != 200:
-                        logger.error(f"Aliyun API Error {resp.status_code}: {resp.text}")
-                        # 4xx 错误通常是参数错误或欠费，没必要重试
-                        if 400 <= resp.status_code < 500:
+                if resp.status_code != 200:
+                    logger.error(f"Aliyun API Error {resp.status_code}: {resp.text}")
+                    # 限流属于临时错误，按 Retry-After 或指数退避后重试。
+                    if resp.status_code == 429:
+                        if attempt == max_retries - 1:
                             return None
-                        resp.raise_for_status()
-
-                    response_data = resp.json()
-                    embeddings = response_data.get("output", {}).get("embeddings", [])
-                    if len(embeddings) != 1:
-                        logger.error(
-                            "Aliyun Embedding 返回向量数量异常: "
-                            f"expected=1, actual={len(embeddings)}"
-                        )
+                        retry_after = resp.headers.get("Retry-After")
+                        try:
+                            wait_time = float(retry_after) if retry_after else 0.0
+                        except (TypeError, ValueError):
+                            wait_time = 0.0
+                        await asyncio.sleep(max(wait_time, 2 ** attempt) + random.random())
+                        continue
+                    # 其余 4xx 通常是参数错误、内容违规或欠费，无需重试。
+                    if 400 <= resp.status_code < 500:
                         return None
+                    resp.raise_for_status()
 
-                    embedding_data = embeddings[0]
+                response_data = resp.json()
+                embeddings = response_data.get("output", {}).get("embeddings", [])
+                expected_count = 1 if enable_fusion else len(contents)
+                if len(embeddings) != expected_count:
+                    logger.error(
+                        "Aliyun Embedding 返回向量数量异常: "
+                        f"expected={expected_count}, actual={len(embeddings)}"
+                    )
+                    return None
+
+                if enable_fusion and embeddings[0].get("type") not in {"fusion", "fused"}:
+                    logger.error(
+                        "Aliyun Embedding 未返回图文融合向量: "
+                        f"type={embeddings[0].get('type')!r}"
+                    )
+                    return None
+
+                # 独立模式按 index 对齐输入；qwen3-vl-embedding 的 type 可能统一为 vl。
+                indexed_embeddings = list(enumerate(embeddings))
+                indexed_embeddings.sort(
+                    key=lambda item: int(item[1].get("index", item[0]))
+                )
+                vectors: list[list[float]] = []
+                for _, embedding_data in indexed_embeddings:
                     embedding = embedding_data.get("embedding")
                     if not isinstance(embedding, list) or len(embedding) != MEDIA_VECTOR_SIZE:
                         actual_size = len(embedding) if isinstance(embedding, list) else None
@@ -224,32 +278,56 @@ class VectorDBOperator:
                             f"expected={MEDIA_VECTOR_SIZE}, actual={actual_size}"
                         )
                         return None
+                    vectors.append(embedding)
+                return vectors
 
-                    if is_fusion_request and embedding_data.get("type") not in {"fusion", "fused"}:
-                        logger.error(
-                            "Aliyun Embedding 未返回图文融合向量: "
-                            f"type={embedding_data.get('type')!r}"
-                        )
-                        return None
+            except (httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError, httpx.PoolTimeout) as e:
+                is_last_attempt = (attempt == max_retries - 1)
 
-                    return embedding
-
-                except (httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError, httpx.PoolTimeout) as e:
-                    is_last_attempt = (attempt == max_retries - 1)
-
-                    if is_last_attempt:
-                        logger.error(f"Aliyun API 重试3次后最终失败: {repr(e)}")
-                        return None
-                    else:
-                        wait_time = 2 * (attempt + 1)  # 2秒, 4秒...
-                        logger.warning(f"Aliyun API 连接抖动 ({repr(e)})，正在第 {attempt + 1} 次重试...")
-                        await asyncio.sleep(wait_time)
-
-                except Exception as e:
-                    logger.error(f"Aliyun API 未知异常: {e}")
+                if is_last_attempt:
+                    logger.error(f"Aliyun API 重试3次后最终失败: {repr(e)}")
                     return None
+                wait_time = 2 * (attempt + 1)  # 2秒, 4秒...
+                logger.warning(f"Aliyun API 连接抖动 ({repr(e)})，正在第 {attempt + 1} 次重试...")
+                await asyncio.sleep(wait_time)
+
+            except Exception as e:
+                logger.error(f"Aliyun API 未知异常: {e}")
+                return None
 
         return None
+
+    async def _get_qwen_vl_embedding(
+        self,
+        text: str = "",
+        image_source: str = "",
+        *,
+        instruct: str = "",
+    ) -> list[float] | None:
+        """获取单模态向量，或在同时传入图文时获取旧版融合向量。"""
+        contents = self._build_qwen_vl_contents(text, image_source)
+        vectors = await self._request_qwen_vl_embeddings(
+            contents,
+            enable_fusion=bool(text and image_source),
+            instruct=instruct,
+        )
+        if not vectors or len(vectors) != 1:
+            return None
+        return vectors[0]
+
+    async def _get_qwen_vl_independent_pair(
+        self,
+        text: str,
+        image_source: str,
+    ) -> tuple[list[float], list[float]] | None:
+        """在一次请求中分别生成描述文本向量与图片向量。"""
+        if not text or not image_source:
+            return None
+        contents = self._build_qwen_vl_contents(text, image_source)
+        vectors = await self._request_qwen_vl_embeddings(contents)
+        if not vectors or len(vectors) != 2:
+            return None
+        return vectors[0], vectors[1]
 
 
     async def _rerank(self, query: str, docs: list[str]) -> list[str]:
@@ -363,16 +441,20 @@ class VectorDBOperator:
         if not self.enabled:
             return False
         await self._ensure_collections()
-        vector = await self._get_qwen_vl_embedding(image_source=image_url, text=description)
-        if not vector:
+        vectors = await self._get_qwen_vl_independent_pair(description, image_url)
+        if not vectors:
             return False
+        text_vector, image_vector = vectors
 
         await self.client.upsert(
-            collection_name=self.media_col,
+            collection_name=self.media_multivector_col,
             points=[
                 models.PointStruct(
                     id=media_id,  # 保持 Int ID
-                    vector=vector,
+                    vector={
+                        MEDIA_TEXT_VECTOR: text_vector,
+                        MEDIA_IMAGE_VECTOR: image_vector,
+                    },
                     payload={
                         "created_at": int(time.time()),
                         "embedding_version": MEDIA_EMBEDDING_VERSION,
@@ -466,7 +548,121 @@ class VectorDBOperator:
             logger.error(f"Qdrant 批量写入失败: {e}")
             raise e  # 抛出异常让 utils.py 的重试机制捕获
 
-    async def search_meme(self, description: str) -> list[int]:
+    @staticmethod
+    def _weighted_sample_meme_ids(
+        candidates: Sequence[tuple[int, float]],
+        limit: int,
+    ) -> list[int]:
+        """按相似度加权无放回抽样，避免相同查询永远返回同一顺序。"""
+        remaining = list(candidates)
+        selected: list[int] = []
+        while remaining and len(selected) < limit:
+            best_score = max(score for _, score in remaining)
+            weights = [
+                math.exp(max(-20.0, (score - best_score) / MEME_SEARCH_TEMPERATURE))
+                for _, score in remaining
+            ]
+            index = random.choices(range(len(remaining)), weights=weights, k=1)[0]
+            media_id, _ = remaining.pop(index)
+            selected.append(media_id)
+        return selected
+
+    @classmethod
+    def _diversify_meme_results(
+        cls,
+        points: Sequence[models.ScoredPoint],
+        *,
+        exclude_ids: Collection[int],
+        limit: int,
+    ) -> list[int]:
+        candidates = [
+            (int(point.id), float(getattr(point, "score", 0.0)))
+            for point in points
+        ]
+        return cls._diversify_meme_candidates(
+            candidates,
+            exclude_ids=exclude_ids,
+            limit=limit,
+        )
+
+    @staticmethod
+    def _merge_meme_search_routes(
+        primary_points: Sequence[models.ScoredPoint],
+        legacy_points: Sequence[models.ScoredPoint],
+    ) -> list[tuple[int, float]]:
+        """合并独立向量与旧融合向量召回；独立向量优先，双路命中略加分。"""
+        merged: dict[int, float] = {
+            int(point.id): float(point.score) + 0.03
+            for point in primary_points
+        }
+        for point in legacy_points:
+            media_id = int(point.id)
+            legacy_score = float(point.score) - 0.03
+            if media_id in merged:
+                merged[media_id] = max(merged[media_id], legacy_score) + 0.01
+            else:
+                merged[media_id] = legacy_score
+        return sorted(merged.items(), key=lambda item: item[1], reverse=True)
+
+    async def _search_media_routes(
+        self,
+        vector: list[float],
+        *,
+        vector_name: str,
+        limit: int,
+    ) -> list[tuple[int, float]]:
+        primary_result, legacy_result = await asyncio.gather(
+            self.client.query_points(
+                collection_name=self.media_multivector_col,
+                query=vector,
+                using=vector_name,
+                limit=limit,
+                with_payload=False,
+            ),
+            self.client.query_points(
+                collection_name=self.media_col,
+                query=vector,
+                limit=limit,
+                with_payload=False,
+            ),
+            return_exceptions=True,
+        )
+        if isinstance(primary_result, BaseException):
+            logger.warning(f"独立媒体向量检索失败，回退旧索引: {primary_result}")
+            primary_points = []
+        else:
+            primary_points = primary_result.points if primary_result else []
+        if isinstance(legacy_result, BaseException):
+            logger.warning(f"旧媒体融合向量检索失败: {legacy_result}")
+            legacy_points = []
+        else:
+            legacy_points = legacy_result.points if legacy_result else []
+        return self._merge_meme_search_routes(primary_points, legacy_points)
+
+    @classmethod
+    def _diversify_meme_candidates(
+        cls,
+        candidates: Sequence[tuple[int, float]],
+        *,
+        exclude_ids: Collection[int],
+        limit: int,
+    ) -> list[int]:
+        fresh = [item for item in candidates if item[0] not in exclude_ids]
+        recent = [item for item in candidates if item[0] in exclude_ids]
+        selected = cls._weighted_sample_meme_ids(fresh, limit)
+        if len(selected) < limit:
+            selected.extend(
+                cls._weighted_sample_meme_ids(recent, limit - len(selected))
+            )
+        return selected
+
+    async def search_meme(
+        self,
+        description: str,
+        *,
+        limit: int = 5,
+        exclude_ids: Collection[int] = (),
+    ) -> list[int]:
         """
         根据描述搜表情包
         Text -> Clip Vector -> Search Qdrant -> Return IDs
@@ -475,23 +671,39 @@ class VectorDBOperator:
             return []
         await self._ensure_collections()
         # 1. 文本转向量
-        vector = await self._get_qwen_vl_embedding(text=description)
+        vector = await self._get_qwen_vl_embedding(
+            text=description,
+            instruct=MEME_TEXT_QUERY_INSTRUCT,
+        )
         if not vector:
             return []
 
         # 2. Qdrant 搜索
-        search_result = await self.client.query_points(
-            collection_name=self.media_col,
-            query=vector,
-            limit=10,
-            with_payload=False
+        query_limit = min(
+            100,
+            max(MEME_SEARCH_POOL_SIZE, limit * 8, limit + len(exclude_ids)),
         )
-        if not search_result or not search_result.points:
+        candidates = await self._search_media_routes(
+            vector,
+            vector_name=MEDIA_TEXT_VECTOR,
+            limit=query_limit,
+        )
+        if not candidates:
             return []
-        # 3. 只返回 ID 列表
-        return [int(point.id) for point in search_result.points]
+        # 3. 排除近期发过的图片，并在相关候选中加权随机抽取。
+        return self._diversify_meme_candidates(
+            candidates,
+            exclude_ids=exclude_ids,
+            limit=limit,
+        )
 
-    async def search_similar_meme(self, file_path: str, limit: int = 6) -> list[int] | None:
+    async def search_similar_meme(
+        self,
+        file_path: str,
+        limit: int = 6,
+        *,
+        exclude_ids: Collection[int] = (),
+    ) -> list[int] | None:
         """
         根据图片找图片 (猜你喜欢/找相似)
         ID -> Retrieve Vector -> Search Qdrant -> Return IDs
@@ -504,17 +716,23 @@ class VectorDBOperator:
         if not target_vector:
             return []
 
-        search_result = await self.client.query_points(
-            collection_name=self.media_col,
-            query=target_vector,
-            limit=limit
+        query_limit = min(
+            100,
+            max(MEME_SEARCH_POOL_SIZE, limit * 8, limit + len(exclude_ids)),
         )
-
-        if not search_result or not search_result.points:
+        candidates = await self._search_media_routes(
+            target_vector,
+            vector_name=MEDIA_IMAGE_VECTOR,
+            limit=query_limit,
+        )
+        if not candidates:
             return []
 
-        # 返回匹配到的表情包 ID
-        return [int(point.id) for point in search_result.points]
+        return self._diversify_meme_candidates(
+            candidates,
+            exclude_ids=exclude_ids,
+            limit=limit,
+        )
 
 
 # 实例化单例

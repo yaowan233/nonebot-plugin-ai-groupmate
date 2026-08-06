@@ -21,7 +21,7 @@
 
 - **群体认知档案**：由 bot 在发现值得长期记住的新话题、成员特征、内部梗或氛围变化时自主更新，让 bot 对群文化有持续感知。
 - **长记忆**（需配置 Qdrant）：RAG 自动存储聊天历史，学习群友发言习惯，使 bot 更像真人。
-- **表情包学习**（需配置 Qdrant）：使用 `qwen-vl-max` 理解图片内容，自动从群内偷学表情包并存入向量库，回复时按语义匹配发出。
+- **表情包学习**（需配置 Qdrant）：使用 `qwen-vl-max` 理解图片内容，分别索引描述语义与视觉特征，自动从群内偷学表情包并在回复时多路召回。
 - **自定义 Agent Tools**：可以注册自己的 LangChain tools 扩展 agent 能力，详见 [自定义 Agent Tools](./docs/custom-agent-tools.md)。
 
 对于主模型选择：推荐使用支持 Function Calling 的通义千问系列模型（如 `qwen-plus`、`qwen-max`）。图片理解固定使用 `qwen-vl-max`，群档案摘要固定使用 `qwen-flash`。
@@ -126,6 +126,9 @@
 | ai_groupmate__background_image_max_concurrency | 否 | `2` | 后台图片下载、压缩和入库的并发上限 |
 | ai_groupmate__background_image_max_pending | 否 | `100` | 后台图片任务的最大待处理数，防止高峰期无界堆积 |
 | ai_groupmate__maintenance_max_concurrency | 否 | `1` | 向量化、媒体清理和群档案维护的共享并发上限 |
+| ai_groupmate__media_vectorize_min_references | 否 | `3` | 图片进入表情包识别与向量化队列所需的最低引用次数 |
+| ai_groupmate__media_vectorize_batch_size | 否 | `1000` | 每轮最多处理的新图片数及旧向量重建数 |
+| ai_groupmate__media_vectorize_concurrency | 否 | `8` | 表情包标注与向量化的并发数（过高可能触发接口限流） |
 | ai_groupmate__group_memory_update_timeout_seconds | 否 | `120` | 群档案后台更新超时（秒） |
 | ai_groupmate__agent_max_llm_calls | 否 | `8` | 单次 agent 最多调用主模型次数 |
 | ai_groupmate__agent_max_total_tokens | 否 | `64000` | 单次 agent 最多累计模型 token 数 |

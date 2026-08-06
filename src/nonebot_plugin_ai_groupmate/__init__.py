@@ -121,6 +121,11 @@ async def _load_webui_runtime_config() -> None:
         )
 
 
+@get_driver().on_shutdown
+async def _close_vector_resources() -> None:
+    await DB.close()
+
+
 @dataclass
 class ReplyRequest:
     request_id: str
@@ -1078,118 +1083,28 @@ def _read_image_data_uri(file_path: Path, media_file_path: str) -> str | None:
     return f"data:{mime};base64,{encoded_string}"
 
 
-async def _vectorize_media_impl():
-    """
-    定期处理图片：
-    1. 筛选高频图片
-    2. 使用 qwen-vl-max 判断是否为表情包 + 生成描述
-    3. 写入 SQL (描述) 和 Qdrant (向量)
-    """
-    reindex_batch_size = 100
-
+async def _mark_media_vectorized(
+    media_id: int,
+    description: str | None = None,
+    *,
+    embedding_version: int | None = None,
+) -> bool:
     async with get_session() as db_session:
-        async def mark_vectorized(
-            media_id: int,
-            description: str | None = None,
-            *,
-            embedding_version: int | None = None,
-        ) -> bool:
-            media = await db_session.get(MediaStorage, media_id)
-            if media is None:
-                await db_session.commit()
-                return False
-            if description is not None:
-                media.description = description
-            if embedding_version is not None:
-                media.embedding_version = embedding_version
-            media.vectorized = True
-            db_session.add(media)
+        media = await db_session.get(MediaStorage, media_id)
+        if media is None:
             await db_session.commit()
-            return True
-
-        # 只处理引用次数 >= 3 且未向量化的图片
-        pending_res = await db_session.execute(
-            Select(MediaStorage.media_id).where(
-                MediaStorage.references >= 3, MediaStorage.vectorized.is_(False)
-            )
-        )
-        pending_ids = list(pending_res.scalars().all())
-
-        # 已有描述的旧表情包无需再次调用视觉模型，只需按当前格式重建向量。
-        outdated_res = await db_session.execute(
-            Select(MediaStorage.media_id)
-            .where(
-                MediaStorage.references >= 3,
-                MediaStorage.vectorized.is_(True),
-                MediaStorage.description != "[图片]",
-                MediaStorage.embedding_version < MEDIA_EMBEDDING_VERSION,
-            )
-            .order_by(MediaStorage.media_id)
-            .limit(reindex_batch_size)
-        )
-        outdated_ids = list(outdated_res.scalars().all())
-        media_ids = pending_ids + outdated_ids
+            return False
+        if description is not None:
+            media.description = description
+        if embedding_version is not None:
+            media.embedding_version = embedding_version
+        media.vectorized = True
+        db_session.add(media)
         await db_session.commit()
-        logger.info(
-            f"待处理高频图片数量: {len(pending_ids)}，"
-            f"待重建旧表情包向量数量: {len(outdated_ids)}"
-        )
+        return True
 
-        for media_id in media_ids:
-            media = await db_session.get(MediaStorage, media_id)
-            if media is None:
-                await db_session.commit()
-                continue
-            media_file_path = media.file_path
-            existing_description = media.description
-            needs_reindex = (
-                media.vectorized
-                and media.embedding_version < MEDIA_EMBEDDING_VERSION
-                and existing_description != "[图片]"
-            )
-            # Keep only scalar values while calling the vision model and
-            # Qdrant.  Accessing a detached/expired ORM object later could
-            # silently start another long-lived transaction.
-            await db_session.commit()
-            try:
-                file_path = pic_dir / media_file_path
-                # 1. 读取文件并转 Base64 (Qwen VL 需要)
-                # File reads and base64 conversion are synchronous/CPU work;
-                # keep them away from the NoneBot event loop.
-                try:
-                    img_data_uri = await asyncio.to_thread(
-                        _read_image_data_uri, file_path, media_file_path
-                    )
-                except Exception as e:
-                    logger.error(f"读取图片失败: {e}")
-                    continue
-                if img_data_uri is None:
-                    logger.warning(f"文件不存在: {file_path}")
-                    await mark_vectorized(media_id)
-                    continue
 
-                if needs_reindex:
-                    try:
-                        inserted = await DB.insert_media(
-                            media_id,
-                            img_data_uri,
-                            existing_description,
-                        )
-                        if not inserted:
-                            logger.warning(f"旧表情包向量重建失败，等待下轮重试: {media_id}")
-                            continue
-                        await mark_vectorized(
-                            media_id,
-                            embedding_version=MEDIA_EMBEDDING_VERSION,
-                        )
-                        logger.info(f"旧表情包向量重建成功 {media_id}: {existing_description}")
-                    except Exception as e:
-                        logger.error(f"旧表情包向量重建异常 {media_id}: {e}")
-                        await db_session.rollback()
-                    continue
-
-                # 2. 调用 qwen-vl-max 进行【鉴别】和【描述】
-                prompt = """
+MEDIA_TAGGING_PROMPT = """
 你是一个专业的表情包分析员。请分析这张图片：
 
 任务 A：判断这是否是一张“表情包”(Meme)。
@@ -1205,89 +1120,191 @@ async def _vectorize_media_impl():
     "description": "熊猫头流泪，配文'我太难了'"
 }
 """
-                try:
-                    # 调用模型
-                    response = await get_tagging_model().ainvoke(
-                        [
-                            HumanMessage(
-                                content=[
-                                    {"type": "text", "text": prompt},
-                                    {
-                                        "type": "image_url",
-                                        "image_url": {"url": img_data_uri},
-                                    },
-                                ]
-                            )
+
+
+async def _process_media_vectorization(media_id: int) -> str:
+    """处理单张图片；网络请求期间不占用 SQL 连接。"""
+    async with get_session() as db_session:
+        media = await db_session.get(MediaStorage, media_id)
+        if media is None:
+            await db_session.commit()
+            return "skipped"
+        media_file_path = media.file_path
+        existing_description = media.description
+        needs_reindex = (
+            media.vectorized
+            and media.embedding_version < MEDIA_EMBEDDING_VERSION
+            and existing_description != "[图片]"
+        )
+        await db_session.commit()
+
+    try:
+        file_path = pic_dir / media_file_path
+        try:
+            img_data_uri = await asyncio.to_thread(
+                _read_image_data_uri, file_path, media_file_path
+            )
+        except Exception as e:
+            logger.error(f"读取图片失败 {media_id}: {e}")
+            return "failed"
+
+        if img_data_uri is None:
+            logger.warning(f"文件不存在: {file_path}")
+            # 新图片不再反复尝试；旧向量则保留旧版本，方便文件恢复后重试。
+            if not needs_reindex:
+                await _mark_media_vectorized(media_id)
+                return "skipped"
+            return "failed"
+
+        if needs_reindex:
+            try:
+                inserted = await DB.insert_media(
+                    media_id,
+                    img_data_uri,
+                    existing_description,
+                )
+                if not inserted:
+                    logger.warning(f"旧表情包向量重建失败，等待下轮重试: {media_id}")
+                    return "failed"
+                await _mark_media_vectorized(
+                    media_id,
+                    embedding_version=MEDIA_EMBEDDING_VERSION,
+                )
+                logger.info(f"旧表情包向量重建成功 {media_id}: {existing_description}")
+                return "indexed"
+            except Exception as e:
+                logger.error(f"旧表情包向量重建异常 {media_id}: {e}")
+                return "failed"
+
+        try:
+            response = await get_tagging_model().ainvoke(
+                [
+                    HumanMessage(
+                        content=[
+                            {"type": "text", "text": MEDIA_TAGGING_PROMPT},
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": img_data_uri},
+                            },
                         ]
                     )
+                ]
+            )
 
-                    if isinstance(response.content, list):
-                        # 如果模型返回了一个列表，跳过
-                        continue
-                    # 解析 JSON
-                    else:
-                        content = response.content.strip()
-                    if content.startswith("```"):
-                        content = content.replace("```json", "").replace("```", "")
+            if isinstance(response.content, list):
+                logger.warning(f"图片标注返回了非文本内容，等待下轮重试: {media_id}")
+                return "failed"
+            content = response.content.strip()
+            if content.startswith("```"):
+                content = content.replace("```json", "").replace("```", "")
 
-                    res_json = json.loads(content)
-                    is_meme = res_json.get("is_meme", False)
-                    description = res_json.get("description", "")
+            res_json = json.loads(content)
+            is_meme = res_json.get("is_meme", False)
+            description = str(res_json.get("description", "")).strip()
 
-                except Exception as e:
-                    err_str = str(e)
-                    # 400 错误（图片尺寸/格式非法、内容违规）不可重试，标记跳过
-                    if "Error code: 400" in err_str:
-                        if "data_inspection_failed" in err_str:
-                            logger.warning(f"图片 {media_id} 内容违规，跳过向量化")
-                        else:
-                            logger.warning(
-                                f"图片 {media_id} 请求非法（400），跳过向量化: {e}"
-                            )
-                        await mark_vectorized(media_id)
-                    else:
-                        logger.error(f"模型识别图片失败 {media_id}: {e}")
-                    continue
+        except Exception as e:
+            err_str = str(e)
+            # 400 错误（图片尺寸/格式非法、内容违规）不可重试，标记跳过。
+            if "Error code: 400" in err_str:
+                if "data_inspection_failed" in err_str:
+                    logger.warning(f"图片 {media_id} 内容违规，跳过向量化")
+                else:
+                    logger.warning(f"图片 {media_id} 请求非法（400），跳过向量化: {e}")
+                await _mark_media_vectorized(media_id)
+                return "skipped"
+            logger.error(f"模型识别图片失败 {media_id}: {e}")
+            return "failed"
 
-                # 3. 结果处理
-                if not is_meme:
-                    logger.info(f"图片 {media_id} 被判定为非表情包(杂图)，跳过入库")
-                    await mark_vectorized(media_id)
-                    continue
+        if not is_meme:
+            logger.info(f"图片 {media_id} 被判定为非表情包(杂图)，跳过入库")
+            await _mark_media_vectorized(media_id)
+            return "skipped"
+        if not description:
+            logger.warning(f"图片 {media_id} 缺少描述，等待下轮重试")
+            return "failed"
 
-                # 4. 是表情包 -> 入库
-                try:
-                    # A. 存向量到 Qdrant (传带 MIME 头的 data URI，避免 PNG/GIF 被误判为 JPEG)
-                    inserted = await DB.insert_media(media_id, img_data_uri, description)
-                    if not inserted:
-                        logger.warning(f"表情包向量生成失败，保留待重试状态: {media_id}")
-                        continue
+        try:
+            inserted = await DB.insert_media(media_id, img_data_uri, description)
+            if not inserted:
+                logger.warning(f"表情包向量生成失败，保留待重试状态: {media_id}")
+                return "failed"
 
-                    # B. Qdrant 完成后才短暂签出 SQL 连接，保存描述并标记完成。
-                    await mark_vectorized(
-                        media_id,
-                        description,
-                        embedding_version=MEDIA_EMBEDDING_VERSION,
-                    )
-                    logger.info(f"表情包入库成功 {media_id}: {description}")
+            await _mark_media_vectorized(
+                media_id,
+                description,
+                embedding_version=MEDIA_EMBEDDING_VERSION,
+            )
+            logger.info(f"表情包入库成功 {media_id}: {description}")
+            return "indexed"
 
-                except Exception as e:
-                    logger.error(f"向量化插入失败 {media_id}: {e}")
-                    await db_session.rollback()
-                    continue
+        except Exception as e:
+            logger.error(f"向量化插入失败 {media_id}: {e}")
+            return "failed"
 
-            except Exception as e:
-                logger.error(f"处理媒体循环异常 {media_id}: {e}")
-                await db_session.rollback()
-                continue
+    except Exception as e:
+        logger.error(f"处理媒体异常 {media_id}: {e}")
+        return "failed"
 
+
+async def _vectorize_media_impl():
+    """
+    并发处理新图片与旧向量。每个 worker 使用独立 SQL 会话，且网络请求
+    期间不持有数据库连接。
+    """
+    batch_size = plugin_config.media_vectorize_batch_size
+    min_references = plugin_config.media_vectorize_min_references
+    concurrency = plugin_config.media_vectorize_concurrency
+
+    async with get_session() as db_session:
+        # 新图片和旧向量分别取一批，避免大量新图导致历史重建一直饥饿。
+        pending_res = await db_session.execute(
+            Select(MediaStorage.media_id)
+            .where(
+                MediaStorage.references >= min_references,
+                MediaStorage.vectorized.is_(False),
+            )
+            .order_by(MediaStorage.media_id)
+            .limit(batch_size)
+        )
+        pending_ids = list(pending_res.scalars().all())
+
+        outdated_res = await db_session.execute(
+            Select(MediaStorage.media_id)
+            .where(
+                MediaStorage.references >= min_references,
+                MediaStorage.vectorized.is_(True),
+                MediaStorage.description != "[图片]",
+                MediaStorage.embedding_version < MEDIA_EMBEDDING_VERSION,
+            )
+            .order_by(MediaStorage.media_id)
+            .limit(batch_size)
+        )
+        outdated_ids = list(outdated_res.scalars().all())
         await db_session.commit()
-        if media_ids:
-            logger.info("本轮图片处理完成")
+
+    media_ids = list(dict.fromkeys(pending_ids + outdated_ids))
+    logger.info(
+        f"本轮待处理新图片: {len(pending_ids)}，"
+        f"待重建旧表情包: {len(outdated_ids)}，并发数: {concurrency}"
+    )
+    if not media_ids:
+        return
+
+    semaphore = asyncio.Semaphore(concurrency)
+
+    async def process_one(media_id: int) -> str:
+        async with semaphore:
+            return await _process_media_vectorization(media_id)
+
+    results = await asyncio.gather(*(process_one(media_id) for media_id in media_ids))
+    logger.info(
+        f"本轮图片处理完成：成功 {results.count('indexed')}，"
+        f"跳过 {results.count('skipped')}，失败待重试 {results.count('failed')}"
+    )
 
 
 @scheduler.scheduled_job(
-    "interval", minutes=30, max_instances=1, coalesce=True, id="vectorize_media"
+    "interval", minutes=10, max_instances=1, coalesce=True, id="vectorize_media"
 )
 async def vectorize_media():
     async with maintenance_gate.slot(wait=False) as admitted:
