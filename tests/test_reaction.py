@@ -35,6 +35,11 @@ def test_explicit_reaction_request_detection():
     assert plugin._is_explicit_reaction_request("回应表情")
     assert plugin._is_explicit_reaction_request("reaction一下")
     assert not plugin._is_explicit_reaction_request("这个表情是什么意思")
+    assert not plugin._is_explicit_reaction_request("miyuki多发点表情包")
+    assert plugin._is_explicit_meme_request("miyuki多发点表情包")
+    assert plugin._is_explicit_meme_request("随便发点表情")
+    assert plugin._is_explicit_meme_request("miyuki你发一下图")
+    assert plugin._is_explicit_meme_request("图呢")
 
 
 @pytest.mark.asyncio

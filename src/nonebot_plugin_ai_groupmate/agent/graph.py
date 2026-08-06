@@ -72,6 +72,8 @@ class AgentState(TypedDict):
     side_effect_duplicate_count: int
     completed_side_effect_keys: list[str]
     active_skills: list[str]
+    required_side_effect_completed: bool
+    required_side_effect_unavailable: bool
 
 
 @dataclass
@@ -467,6 +469,7 @@ def _make_tool_node(
     *,
     supports_images: bool = True,
     image_summarizer: Any | None = None,
+    required_side_effect_tool: str | None = None,
 ):
     async def tool_node(state: AgentState) -> dict:
         messages = state["messages"]
@@ -488,6 +491,12 @@ def _make_tool_node(
         tool_result_truncation_count = state.get("tool_result_truncation_count", 0)
         side_effect_duplicate_count = state.get("side_effect_duplicate_count", 0)
         completed_side_effect_keys = list(state.get("completed_side_effect_keys", []))
+        required_side_effect_completed = state.get(
+            "required_side_effect_completed", False
+        )
+        required_side_effect_unavailable = state.get(
+            "required_side_effect_unavailable", False
+        )
         session_id = state["session_id"]
         request_id = state["request_id"]
 
@@ -499,7 +508,21 @@ def _make_tool_node(
 
         if not tool_calls:
             direct_reply = _message_text_content(last_message)
-            if direct_reply:
+            required_action_pending = (
+                required_side_effect_tool is not None
+                and not required_side_effect_completed
+                and not required_side_effect_unavailable
+            )
+            if required_action_pending:
+                logger.warning(
+                    f"[AgentTrace] 拦截文字替代必需动作 session={session_id} "
+                    f"required_tool={required_side_effect_tool}"
+                )
+                results.append(HumanMessage(content=(
+                    f"当前任务必须实际完成 `{required_side_effect_tool}`，不能用文字回复、"
+                    "道歉或承诺代替。请继续调用搜索/发送工具；只有搜索明确返回候选池为空时才能结束。"
+                )))
+            elif direct_reply:
                 await _recover_db_session(db_session)
                 reply_tool = tools_by_name.get("reply_user")
                 if reply_tool is None:
@@ -522,12 +545,14 @@ def _make_tool_node(
                 "reply_this_round": reply_this_round,
                 "reply_requires_continuation": reply_requires_continuation,
                 "reaction_this_round": reaction_this_round,
-                "called_finish": 1,
+                "called_finish": 0 if required_action_pending else 1,
                 "tool_timeout_count": tool_timeout_count,
                 "tool_timeout_names": tool_timeout_names,
                 "tool_result_truncation_count": tool_result_truncation_count,
                 "side_effect_duplicate_count": side_effect_duplicate_count,
                 "completed_side_effect_keys": completed_side_effect_keys,
+                "required_side_effect_completed": required_side_effect_completed,
+                "required_side_effect_unavailable": required_side_effect_unavailable,
             }
 
         for tc in tool_calls:
@@ -551,6 +576,23 @@ def _make_tool_node(
                         content="本轮还有工具工作未完成，已忽略提前结束；请先检查工具结果。",
                         tool_call_id=tool_call_id,
                     ))
+                    continue
+                if (
+                    required_side_effect_tool is not None
+                    and not required_side_effect_completed
+                    and not required_side_effect_unavailable
+                ):
+                    results.append(ToolMessage(
+                        content=(
+                            f"当前任务必须实际完成 {required_side_effect_tool}，不能提前结束。"
+                            "请先搜索并发送；只有搜索明确返回候选池为空时才能结束。"
+                        ),
+                        tool_call_id=tool_call_id,
+                    ))
+                    logger.warning(
+                        f"[AgentTrace] 拦截提前结束 session={session_id} "
+                        f"required_tool={required_side_effect_tool}"
+                    )
                     continue
                 called_finish += 1
                 results.append(ToolMessage(content="", tool_call_id=tool_call_id))
@@ -672,6 +714,24 @@ def _make_tool_node(
                 elapsed_ms = (time.perf_counter() - started_at) * 1000
                 tool_content, extra_content = _normalize_tool_result(result)
                 tool_status = _tool_result_status(tool_content)
+                if name == "search_meme_image" and required_side_effect_tool:
+                    try:
+                        search_result = json.loads(tool_content)
+                    except (TypeError, json.JSONDecodeError):
+                        search_result = None
+                    if (
+                        isinstance(search_result, dict)
+                        and search_result.get("success") is False
+                        and search_result.get("reason_code") == "no_candidates"
+                    ):
+                        required_side_effect_unavailable = True
+                if (
+                    name == required_side_effect_tool
+                    and tool_status == "sent"
+                ):
+                    required_side_effect_completed = True
+                    # 必需动作已经实际成功，不再让模型补发解释文字。
+                    called_finish += 1
                 if effect_key is not None and tool_status not in {"failed", "skipped"}:
                     completed_side_effect_keys.append(effect_key)
                 tool_content, truncated = _truncate_tool_content(
@@ -725,6 +785,8 @@ def _make_tool_node(
             "side_effect_duplicate_count": side_effect_duplicate_count,
             "completed_side_effect_keys": completed_side_effect_keys,
             "active_skills": active_skills,
+            "required_side_effect_completed": required_side_effect_completed,
+            "required_side_effect_unavailable": required_side_effect_unavailable,
         }
 
     return tool_node
@@ -780,6 +842,7 @@ def build_chat_graph(
     db_session: Any | None = None,
     supports_images: bool = True,
     image_summarizer: Any | None = None,
+    required_side_effect_tool: str | None = None,
 ) -> Any:
     tools_by_name: dict[str, BaseTool] = {t.name: t for t in tools}
     base_tools = list(base_tools) if base_tools is not None else list(tools)
@@ -798,6 +861,7 @@ def build_chat_graph(
             db_session,
             supports_images=supports_images,
             image_summarizer=image_summarizer,
+            required_side_effect_tool=required_side_effect_tool,
         ),
     )
     builder.add_edge(START, "agent")

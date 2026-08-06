@@ -433,6 +433,7 @@ def create_search_meme_tool(
     model: Any,
     history: Sequence[ChatHistorySchema],
     approved_meme_ids: set[int] | None = None,
+    allow_context_fallback: bool = False,
 ):
     """
     创建一个带数据库会话的表情包搜索工具
@@ -487,6 +488,20 @@ def create_search_meme_tool(
                 history=history,
                 candidates=review_candidates,
             )
+            used_explicit_fallback = False
+            if not context_candidates and allow_context_fallback:
+                # 用户明确索要图片时，“随便发一个”本身没有可供相关性模型
+                # 对齐的语义。此时保留向量召回与本群常用池的排序结果，
+                # 而不是把所有候选清空并用文字敷衍。
+                context_candidates = [
+                    (media_id, MEME_CONTEXT_RELEVANCE_THRESHOLD)
+                    for media_id, _ in review_candidates
+                ]
+                used_explicit_fallback = bool(context_candidates)
+                if used_explicit_fallback:
+                    logger.info(
+                        f"明确表情包请求未通过语境审核，回退到群常用候选: {description}"
+                    )
             pic_ids = _select_group_aware_meme_ids(
                 context_candidates,
                 usage_counts,
@@ -508,6 +523,7 @@ def create_search_meme_tool(
                     {
                         "success": False,
                         "images": [],
+                        "reason_code": "no_candidates",
                         "reason": "没有候选通过当前对话的相关性审核，建议不要发表情包",
                     },
                     ensure_ascii=False,
@@ -535,6 +551,7 @@ def create_search_meme_tool(
                     {
                         "success": False,
                         "images": [],
+                        "reason_code": "no_candidates",
                     },
                     ensure_ascii=False,
                 )
@@ -550,7 +567,11 @@ def create_search_meme_tool(
                     "success": True,
                     "images": images_info,
                     "count": len(images_info),
-                    "note": "候选均已通过当前对话相关性审核；仍需选择最自然的一张，必要时可以不发送",
+                    "note": (
+                        "用户明确索要表情包，已回退到语义召回与本群常用候选，请选择一张发送"
+                        if used_explicit_fallback
+                        else "候选均已通过当前对话相关性审核；仍需选择最自然的一张，必要时可以不发送"
+                    ),
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -597,13 +618,19 @@ def create_send_meme_tool(
         try:
             match = re.search(r"\d+", pic_id)
             if not match:
-                return f"发送表情包失败: 无法从 pic_id 中提取有效数字: {pic_id!r}"
+                return json.dumps({
+                    "status": "failed",
+                    "message": f"发送表情包失败: 无法从 pic_id 中提取有效数字: {pic_id!r}",
+                }, ensure_ascii=False)
             selected_pic_id = int(match.group())
             if (
                 approved_meme_ids is not None
                 and selected_pic_id not in approved_meme_ids
             ):
-                return "发送表情包失败：该图片未通过本轮搜索审核，请先重新搜索。"
+                return json.dumps({
+                    "status": "failed",
+                    "message": "发送表情包失败：该图片未通过本轮搜索审核，请先重新搜索。",
+                }, ensure_ascii=False)
             logger.info(f"使用指定的图片ID: {selected_pic_id}")
 
             pic = (
@@ -614,13 +641,19 @@ def create_send_meme_tool(
 
             if not pic:
                 logger.warning(f"图片记录不存在: {selected_pic_id}")
-                return "图片记录不存在"
+                return json.dumps({
+                    "status": "failed",
+                    "message": "图片记录不存在",
+                }, ensure_ascii=False)
 
             pic_path = pic_dir / pic.file_path
 
             if not pic_path.exists():
                 logger.warning(f"图片文件不存在: {pic_path}")
-                return "图片文件不存在"
+                return json.dumps({
+                    "status": "failed",
+                    "message": "图片文件不存在",
+                }, ensure_ascii=False)
 
             pic_data = pic_path.read_bytes()
             description = pic.description
@@ -657,10 +690,16 @@ def create_send_meme_tool(
             if approved_meme_ids is not None:
                 approved_meme_ids.clear()
             logger.info(f"id:{res.msg_ids}\n发送表情包: {description}")
-            return f"已成功发送表情包: {description}"
+            return json.dumps({
+                "status": "sent",
+                "message": f"已成功发送表情包: {description}",
+            }, ensure_ascii=False)
 
         except Exception as e:
             logger.error(f"发送表情包失败: {e}")
-            return f"发送表情包失败: {str(e)}"
+            return json.dumps({
+                "status": "failed",
+                "message": f"发送表情包失败: {str(e)}",
+            }, ensure_ascii=False)
 
     return send_meme_image

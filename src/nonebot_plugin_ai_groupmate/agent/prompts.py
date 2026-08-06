@@ -36,6 +36,7 @@ def build_reaction_tool_instruction(enabled: bool) -> str:
     return (
         "- 表情回复/reaction：`add_message_reaction`，适合轻量表达态度，也可以和 `reply_user` 搭配；"
         "用户明确要求‘回应表情/点表情/reaction’时必须直接调用该工具，不要只用文字确认；"
+        "‘表情包/发图/发点表情’指发送图片，绝不能使用本工具；"
         "情绪明显时可传 `count=2` 或 `count=3` 连续点同一 mood 下的多个表情，但不要刷屏；"
         "如果用户在提问、求助或需要文字回应，不要只点表情。优先传 `mood`，不要直接传 `emoji`；"
         "通常不要传 `target_msg_id`，默认会给当前触发消息点表情。"

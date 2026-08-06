@@ -154,6 +154,7 @@ class ReplyRequest:
     is_continuous: bool
     reply_to_id: str | None
     proactive_meme_only: bool = False
+    meme_required: bool = False
     proactive_reaction_only: bool = False
     reaction_required: bool = False
     repeat_text: str | None = None
@@ -241,11 +242,29 @@ def _is_explicit_reaction_request(text: str) -> bool:
     normalized = " ".join((text or "").strip().lower().split())
     if not normalized:
         return False
+    if _is_explicit_meme_request(normalized):
+        return False
     return bool(
         re.search(
             r"(?:回应|回复|点|加|来|贴|上)(?:一个|个|一下|点)?(?:表情|reaction)"
             r"|(?:表情|reaction)(?:回应|回复|一下)"
             r"|点(?:个|一下)?(?:赞|爱心)",
+            normalized,
+        )
+    )
+
+
+def _is_explicit_meme_request(text: str) -> bool:
+    normalized = " ".join((text or "").strip().lower().split())
+    if not normalized:
+        return False
+    if "表情包" in normalized:
+        return True
+    return bool(
+        re.search(
+            r"(?:发|来|整|找|搜|给)(?:一个|个|点|些|一下|几张|张)?(?:图片|图|表情)"
+            r"|(?:图片|图|表情)(?:发|来|整|找|搜)(?:一个|个|点|些|一下)?"
+            r"|(?:图片|图|表情包)(?:呢|在哪)[？?]?($|\s)",
             normalized,
         )
     )
@@ -503,6 +522,7 @@ async def _run_group_reply_worker(group_id: str):
                     request.is_continuous,
                     request.reply_to_id,
                     getattr(request, "proactive_meme_only", False),
+                    getattr(request, "meme_required", False),
                     getattr(request, "proactive_reaction_only", False),
                     getattr(request, "reaction_required", False),
                     getattr(request, "repeat_text", None),
@@ -725,12 +745,21 @@ async def handle_message(
             is_group=is_group,
             reaction_supported=is_onebot_context(bot, event),
         )
-    reaction_required = (
+    meme_required = (
         (to_me or continuous_to_me)
+        and _is_explicit_meme_request(stripped_plain_text)
+    )
+    reaction_required = (
+        not meme_required
+        and (to_me or continuous_to_me)
         and is_onebot_context(bot, event)
         and _is_explicit_reaction_request(stripped_plain_text)
     )
-    if reaction_required:
+    if meme_required:
+        random_reply_sample = False
+        proactive_reaction_only = False
+        proactive_meme_only = True
+    elif reaction_required:
         random_reply_sample = False
         proactive_reaction_only = True
         proactive_meme_only = False
@@ -791,6 +820,7 @@ async def handle_message(
             is_continuous=continuous_to_me,
             reply_to_id=reply_id,
             proactive_meme_only=proactive_meme_only,
+            meme_required=meme_required,
             proactive_reaction_only=proactive_reaction_only,
             reaction_required=reaction_required,
             repeat_text=repeat_text if repeat_reply_sample else None,
@@ -976,6 +1006,7 @@ async def handle_reply_logic(
     is_continuous: bool,
     reply_to_id: str | None,
     proactive_meme_only: bool = False,
+    meme_required: bool = False,
     proactive_reaction_only: bool = False,
     reaction_required: bool = False,
     repeat_text: str | None = None,
@@ -1131,6 +1162,7 @@ async def handle_reply_logic(
                         is_private=is_private,
                         group_members=group_members,
                         proactive_meme_only=proactive_meme_only,
+                        meme_required=meme_required,
                         proactive_reaction_only=proactive_reaction_only,
                         reaction_required=reaction_required,
                         repeat_text=repeat_text,

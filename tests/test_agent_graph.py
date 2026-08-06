@@ -31,6 +31,8 @@ def _state(message: AIMessage, *, tool_count: int = 0) -> "AgentState":
         "side_effect_duplicate_count": 0,
         "completed_side_effect_keys": [],
         "active_skills": [],
+        "required_side_effect_completed": False,
+        "required_side_effect_unavailable": False,
     }
 
 
@@ -499,6 +501,125 @@ async def test_failed_side_effect_can_be_retried():
 
     assert calls == ["42", "42"]
     assert result["side_effect_duplicate_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_required_meme_send_blocks_text_and_finish_until_image_is_sent():
+    from nonebot_plugin_ai_groupmate.agent.graph import build_chat_graph
+
+    events: list[str] = []
+
+    @tool("search_meme_image")
+    async def search_meme_image(description: str) -> str:
+        """Return one approved meme candidate."""
+        events.append(f"search:{description}")
+        return json.dumps({
+            "success": True,
+            "images": [{"pic_id": "42", "description": "震惊"}],
+        })
+
+    @tool("send_meme_image")
+    async def send_meme_image(pic_id: str) -> str:
+        """Send one approved meme candidate."""
+        events.append(f"send:{pic_id}")
+        return json.dumps({"status": "sent", "message": "sent"})
+
+    @tool("finish")
+    def finish() -> str:
+        """End this test graph."""
+        return ""
+
+    model = _ToolSpyModel(
+        [
+            AIMessage(content="没找到，下次补上"),
+            AIMessage(
+                content="",
+                tool_calls=[{"name": "finish", "args": {}, "id": "finish-early"}],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[{
+                    "name": "search_meme_image",
+                    "args": {"description": "震惊"},
+                    "id": "search-1",
+                }],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[{
+                    "name": "send_meme_image",
+                    "args": {"pic_id": "42"},
+                    "id": "send-1",
+                }],
+            ),
+        ]
+    )
+    graph = build_chat_graph(
+        model,
+        [search_meme_image, send_meme_image, finish],
+        "system",
+        required_side_effect_tool="send_meme_image",
+    )
+
+    result = await graph.ainvoke(_state(AIMessage(content="placeholder")))
+
+    assert events == ["search:震惊", "send:42"]
+    assert result["required_side_effect_completed"] is True
+    assert result["called_finish"] == 1
+    assert model.invoke_count == 4
+
+
+@pytest.mark.asyncio
+async def test_required_meme_send_may_finish_when_search_pool_is_empty():
+    from nonebot_plugin_ai_groupmate.agent.graph import build_chat_graph
+
+    @tool("search_meme_image")
+    async def search_meme_image(description: str) -> str:
+        """Report that the candidate pool is truly empty."""
+        return json.dumps({
+            "success": False,
+            "images": [],
+            "reason_code": "no_candidates",
+        })
+
+    @tool("send_meme_image")
+    async def send_meme_image(pic_id: str) -> str:
+        """This must not be called without a candidate."""
+        raise AssertionError(pic_id)
+
+    @tool("finish")
+    def finish() -> str:
+        """End this test graph."""
+        return ""
+
+    model = _ToolSpyModel(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[{
+                    "name": "search_meme_image",
+                    "args": {"description": "震惊"},
+                    "id": "search-1",
+                }],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[{"name": "finish", "args": {}, "id": "finish-1"}],
+            ),
+        ]
+    )
+    graph = build_chat_graph(
+        model,
+        [search_meme_image, send_meme_image, finish],
+        "system",
+        required_side_effect_tool="send_meme_image",
+    )
+
+    result = await graph.ainvoke(_state(AIMessage(content="placeholder")))
+
+    assert result["required_side_effect_unavailable"] is True
+    assert result["required_side_effect_completed"] is False
+    assert result["called_finish"] == 1
 
 
 @pytest.mark.asyncio

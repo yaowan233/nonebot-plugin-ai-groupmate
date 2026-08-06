@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import uuid
 import datetime
+from types import SimpleNamespace
 
 import pytest
 
@@ -203,6 +205,64 @@ async def test_context_reranker_fails_closed():
     )
 
     assert result == []
+
+
+@pytest.mark.asyncio
+async def test_explicit_meme_request_falls_back_to_group_candidates(monkeypatch):
+    from nonebot_plugin_ai_groupmate.agent import meme_tools
+
+    class FakeResult:
+        def scalars(self):
+            return self
+
+        def all(self):
+            return [SimpleNamespace(media_id=1, description="群内常用表情包")]
+
+    class FakeSession:
+        async def commit(self):
+            return None
+
+        async def execute(self, statement):
+            return FakeResult()
+
+    async def no_recent(*args, **kwargs):
+        return set()
+
+    async def fake_search(*args, **kwargs):
+        return [(1, 0.9)]
+
+    async def fake_prepare(*args, **kwargs):
+        return [(1, "群内常用表情包")], {1: 5}, {1}
+
+    async def reject_all(*args, **kwargs):
+        return []
+
+    monkeypatch.setattr(meme_tools, "_get_recent_sent_meme_ids", no_recent)
+    monkeypatch.setattr(meme_tools.DB, "search_meme_candidates", fake_search)
+    monkeypatch.setattr(meme_tools, "_prepare_meme_context_review", fake_prepare)
+    monkeypatch.setattr(
+        meme_tools,
+        "_rerank_meme_candidates_for_context",
+        reject_all,
+    )
+
+    approved: set[int] = set()
+    tool = meme_tools.create_search_meme_tool(
+        FakeSession(),
+        "group-1",
+        None,
+        model=object(),
+        history=[],
+        approved_meme_ids=approved,
+        allow_context_fallback=True,
+    )
+
+    result = json.loads(await tool.ainvoke({"description": "随便发一个表情包"}))
+
+    assert result["success"] is True
+    assert result["images"][0]["pic_id"] == 1
+    assert "回退" in result["note"]
+    assert approved == {1}
 
 
 @pytest.mark.asyncio

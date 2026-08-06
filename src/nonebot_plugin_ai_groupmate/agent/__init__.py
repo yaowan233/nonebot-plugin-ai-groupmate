@@ -444,6 +444,8 @@ async def _run_scheduled_agent_task(
                         "side_effect_duplicate_count": 0,
                         "completed_side_effect_keys": [],
                         "active_skills": [],
+                        "required_side_effect_completed": False,
+                        "required_side_effect_unavailable": False,
                     }),
                     timeout=plugin_config.agent_timeout_seconds,
                 )
@@ -798,6 +800,7 @@ async def create_chat_graph(
     group_members: list[Any] | None = None,
     vision_metrics: VisionRunMetrics | None = None,
     proactive_meme_only: bool = False,
+    meme_required: bool = False,
     proactive_reaction_only: bool = False,
     repeat_text: str | None = None,
 ) -> tuple[Any, list[Any], str]:
@@ -920,6 +923,7 @@ async def create_chat_graph(
         model=model,
         history=history or [],
         approved_meme_ids=approved_meme_ids,
+        allow_context_fallback=meme_required,
     )
     send_meme_tool = create_send_meme_tool(
         db_session,
@@ -1157,6 +1161,7 @@ async def create_chat_graph(
         db_session=db_session,
         supports_images=supports_images,
         image_summarizer=summarize_image_content if not supports_images else None,
+        required_side_effect_tool=("send_meme_image" if meme_required else None),
     )
     return graph, agent_tools, dynamic_context
 
@@ -1178,6 +1183,7 @@ async def choice_response_strategy(
     is_private: bool = False,
     group_members: list[Any] | None = None,
     proactive_meme_only: bool = False,
+    meme_required: bool = False,
     proactive_reaction_only: bool = False,
     reaction_required: bool = False,
     repeat_text: str | None = None,
@@ -1214,6 +1220,7 @@ async def choice_response_strategy(
             group_members=member_snapshot,
             vision_metrics=vision_metrics,
             proactive_meme_only=proactive_meme_only,
+            meme_required=meme_required,
             proactive_reaction_only=proactive_reaction_only,
             repeat_text=repeat_text,
         )
@@ -1294,7 +1301,15 @@ async def choice_response_strategy(
 不要发送文字或图片，不要为了完成采样而强行回应，也不要调用无关工具。
 """.strip()
         elif proactive_meme_only:
-            task_instruction = """
+            if meme_required:
+                task_instruction = """
+【用户明确要求发送图片表情包】
+用户明确要求你发送表情包图片。本轮必须先调用 `search_meme_image`，再从候选中选择一张调用 `send_meme_image`。
+“随便发一个/多发点表情包”表示可以优先选择本群常用候选，不要误用 `add_message_reaction`，也不要只发文字道歉或承诺下次再发。
+发送一张后结束；只有搜索工具明确返回数据库中完全没有可用候选时才调用 `finish`。
+""".strip()
+            else:
+                task_instruction = """
 【本轮主动表情机会】
 本轮由低概率主动表情采样触发，只能选择以下两种结果：
 1. 当前语境确实适合用一张图自然接梗：调用 `search_meme_image`，从审核通过的候选中最多发送一张，然后结束。
@@ -1304,6 +1319,7 @@ async def choice_response_strategy(
         else:
             task_instruction = """
 请以【本轮当前请求】为唯一待办，结合上述对话历史判断是否需要回复。如果需要，请调用相应工具。
+“表情包/发图/发点表情”指图片表情包，必须使用 `search_meme_image` 和 `send_meme_image`，绝不能改用消息 reaction。
 用户明确要求“回应表情/点表情/reaction”时，必须直接调用 `add_message_reaction`；通常不要传 target_msg_id，让工具作用于当前触发消息。若用户明确引用或指定另一条历史消息，才传该消息的数字 id。
 普通图片/表情包通常只是群聊氛围，不要主动解读、复述或围绕它展开回复。
 只有当前用户明确询问图片内容、回复/引用图片、要求找图/发图，或上下文确实在讨论这张图时，才重点结合图片内容回答。
@@ -1471,6 +1487,8 @@ async def choice_response_strategy(
             "side_effect_duplicate_count": 0,
             "completed_side_effect_keys": [],
             "active_skills": [],
+            "required_side_effect_completed": False,
+            "required_side_effect_unavailable": False,
         }
 
         # 4. 调用 Agent
@@ -1625,6 +1643,9 @@ if __name__ == "__main__":
             "tool_result_truncation_count": 0,
             "side_effect_duplicate_count": 0,
             "completed_side_effect_keys": [],
+            "active_skills": [],
+            "required_side_effect_completed": False,
+            "required_side_effect_unavailable": False,
         })
     )
     print(result)
