@@ -158,6 +158,139 @@ async def test_group_workers_wait_for_agent_slot_before_running(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_addressed_requests_queue_without_background_preemption(monkeypatch):
+    import nonebot_plugin_ai_groupmate as plugin
+
+    invalidated_requests: list[str] = []
+
+    class FakeTask:
+        cancelled = False
+
+        def done(self) -> bool:
+            return False
+
+        def cancel(self) -> None:
+            self.cancelled = True
+
+    def request(
+        request_id: str,
+        user_id: str,
+        *,
+        is_tome: bool = False,
+        is_continuous: bool = False,
+        proactive_meme_only: bool = False,
+    ):
+        return cast(
+            Any,
+            SimpleNamespace(
+                request_id=request_id,
+                user_id=user_id,
+                is_tome=is_tome,
+                is_continuous=is_continuous,
+                proactive_meme_only=proactive_meme_only,
+                repeat_text=None,
+            ),
+        )
+
+    async def fake_set_latest_request_id(group_id: str, request_id: str) -> None:
+        invalidated_requests.append(request_id)
+
+    monkeypatch.setattr(plugin, "set_latest_request_id", fake_set_latest_request_id)
+    plugin._group_reply_states.clear()
+    direct_request = request("direct-1", "user-1", is_tome=True)
+    fake_task = FakeTask()
+    plugin._group_reply_states["group-1"] = plugin.GroupReplyState(
+        running=True,
+        active=direct_request,
+        task=cast(Any, fake_task),
+    )
+
+    try:
+        accepted = await plugin._queue_group_reply_request(
+            "group-1",
+            request("background-1", "user-2", proactive_meme_only=True),
+        )
+
+        assert accepted is False
+        assert invalidated_requests == []
+        assert fake_task.cancelled is False
+        assert plugin._group_reply_states["group-1"].active is direct_request
+
+        accepted = await plugin._queue_group_reply_request(
+            "group-1",
+            request("continuous-1", "user-1", is_continuous=True),
+        )
+
+        assert accepted is False
+        assert invalidated_requests == []
+        assert fake_task.cancelled is False
+
+        accepted = await plugin._queue_group_reply_request(
+            "group-1",
+            request("direct-2", "user-2", is_tome=True),
+        )
+
+        assert accepted is True
+        assert invalidated_requests == []
+        assert fake_task.cancelled is False
+        addressed = plugin._group_reply_states["group-1"].addressed
+        assert [item.request_id for item in addressed] == ["direct-2"]
+    finally:
+        plugin._group_reply_states.clear()
+
+
+@pytest.mark.asyncio
+async def test_group_worker_processes_multiple_addressed_requests_in_order(
+    monkeypatch,
+):
+    import nonebot_plugin_ai_groupmate as plugin
+
+    handled: list[str] = []
+    activated: list[str] = []
+
+    def request(request_id: str):
+        return cast(
+            Any,
+            SimpleNamespace(
+                request_id=request_id,
+                session=None,
+                interface=None,
+                bot=None,
+                event=None,
+                bot_name="bot",
+                user_id=request_id,
+                user_name=request_id,
+                is_tome=True,
+                is_continuous=False,
+                reply_to_id=None,
+                proactive_meme_only=False,
+                repeat_text=None,
+            ),
+        )
+
+    async def fake_handle_reply_logic(request_id: str, *args, **kwargs) -> None:
+        handled.append(request_id)
+
+    async def fake_set_latest_request_id(group_id: str, request_id: str) -> None:
+        activated.append(request_id)
+
+    monkeypatch.setattr(plugin, "handle_reply_logic", fake_handle_reply_logic)
+    monkeypatch.setattr(plugin, "set_latest_request_id", fake_set_latest_request_id)
+    plugin._group_reply_states.clear()
+    state = plugin.GroupReplyState(running=True)
+    state.addressed.extend([request("direct-1"), request("direct-2")])
+    plugin._group_reply_states["group-1"] = state
+
+    try:
+        await plugin._run_group_reply_worker("group-1")
+
+        assert handled == ["direct-1", "direct-2"]
+        assert activated == ["direct-1", "direct-2"]
+    finally:
+        plugin._group_reply_states.clear()
+
+
+@pytest.mark.asyncio
 async def test_small_pool_survives_many_slow_agent_runs(tmp_path):
     from sqlalchemy import text
     from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine

@@ -286,11 +286,20 @@ async def check_if_should_reply(
     bot_name: str,
     is_private: bool = False,
     proactive_meme_only: bool = False,
+    proactive_reaction_only: bool = False,
 ) -> bool:
     """
     使用 qwen-flash 快速判断是否需要回复
     """
-    if proactive_meme_only and not is_private:
+    if proactive_reaction_only and not is_private:
+        scene_desc = "群聊"
+        scene_extra = (
+            "3. 当前消息已命中低概率主动 reaction 采样。只有适合用一个消息表情回应"
+            "自然表达赞同、好笑、惊讶、安慰、感谢或轻量态度时返回 YES。\n"
+            "4. 提问、求助、敏感或沉重话题、真实冲突、他人之间的定向对话，"
+            "以及没有明显反应价值的普通消息，返回 NO。"
+        )
+    elif proactive_meme_only and not is_private:
         scene_desc = "群聊"
         scene_extra = (
             "3. 当前消息已命中低概率主动表情包采样。只有适合用一张表情包自然接梗、"
@@ -454,7 +463,6 @@ def _build_builtin_agent_skills(
     *,
     is_private: bool,
     has_admin_permission: bool,
-    reaction_tool_instruction: str,
     mute_tool_instruction: str,
 ) -> list[AgentSkill]:
     context_name = "聊天上下文" if is_private else "群内上下文"
@@ -543,14 +551,6 @@ def _build_builtin_agent_skills(
                     "- 工具会自动读取自上次维护以来的聊天并合并旧档案，不要自行编写档案内容。\n"
                     "- 若用户没有明确询问群档案，维护后不要在群里播报；没有其他需要回复的内容时调用 `finish`。"
                 ),
-            )
-        )
-    if reaction_tool_instruction.strip():
-        skills.append(
-            AgentSkill(
-                name="reaction_tools",
-                description="给消息点 reaction，用表情轻量表达态度。",
-                prompt=reaction_tool_instruction.strip(),
             )
         )
     if has_admin_permission and mute_tool_instruction.strip():
@@ -798,6 +798,7 @@ async def create_chat_graph(
     group_members: list[Any] | None = None,
     vision_metrics: VisionRunMetrics | None = None,
     proactive_meme_only: bool = False,
+    proactive_reaction_only: bool = False,
     repeat_text: str | None = None,
 ) -> tuple[Any, list[Any], str]:
     """创建 LangGraph 聊天图"""
@@ -863,6 +864,8 @@ async def create_chat_graph(
         reaction_tool_instruction=reaction_tool_instruction,
     )
     system_prompt = prompt_result.system_prompt
+    if reaction_tool_instruction.strip():
+        system_prompt += "\n【消息表情回应】\n" + reaction_tool_instruction.strip() + "\n"
     if private_message_enabled:
         system_prompt += """
 【主动私聊】
@@ -1029,12 +1032,11 @@ async def create_chat_graph(
         *_build_builtin_agent_skills(
             is_private=is_private,
             has_admin_permission=has_admin_permission,
-            reaction_tool_instruction=reaction_tool_instruction,
             mute_tool_instruction=mute_tool_instruction,
         ),
         *custom_agent_skills,
     ]
-    if proactive_meme_only or repeat_text is not None:
+    if proactive_meme_only or proactive_reaction_only or repeat_text is not None:
         agent_skills = []
     skill_index = build_agent_skill_index(agent_skills)
     if skill_index:
@@ -1068,8 +1070,14 @@ async def create_chat_graph(
         group_members=member_snapshot,
         repeat_text=repeat_text,
     )
+    reaction_enabled = is_onebot_context(bot, event)
     base_agent_tools = [
-        *([reply_tool] if not proactive_meme_only else []),
+        *(
+            [reply_tool]
+            if not proactive_meme_only and not proactive_reaction_only
+            else []
+        ),
+        *([reaction_tool] if reaction_enabled else []),
         *(
             [search_meme_tool, similar_meme_tool, send_meme_tool]
             if not is_private
@@ -1084,6 +1092,9 @@ async def create_chat_graph(
     if repeat_text is not None:
         # 复读队形只允许原样跟一句或保持沉默，杜绝对队形作元点评。
         base_agent_tools = [reply_tool, finish]
+    elif proactive_reaction_only:
+        # 主动 reaction 轮次只能点一个消息表情或保持沉默，不能转成文字/图片。
+        base_agent_tools = [reaction_tool, finish] if reaction_enabled else [finish]
     elif proactive_meme_only:
         # 独立采样只允许发一张合适的表情或保持沉默，不能转成普通文字插话。
         base_agent_tools = [
@@ -1102,12 +1113,10 @@ async def create_chat_graph(
             similar_meme_tool,
             send_meme_tool,
         ]
-    if proactive_meme_only or repeat_text is not None:
+    if proactive_meme_only or proactive_reaction_only or repeat_text is not None:
         tools_by_skill = {}
     if group_memory_tool is not None:
         tools_by_skill["group_memory_tools"] = [group_memory_tool]
-    if is_onebot_context(bot, event):
-        tools_by_skill["reaction_tools"] = [reaction_tool]
     if has_admin_permission:
         tools_by_skill["moderation_tools"] = [mute_tool]
 
@@ -1169,6 +1178,8 @@ async def choice_response_strategy(
     is_private: bool = False,
     group_members: list[Any] | None = None,
     proactive_meme_only: bool = False,
+    proactive_reaction_only: bool = False,
+    reaction_required: bool = False,
     repeat_text: str | None = None,
 ) -> ResponseMessage:
     """
@@ -1186,7 +1197,7 @@ async def choice_response_strategy(
 
         agent_started_at = time.perf_counter()
         vision_metrics = VisionRunMetrics()
-        if is_private or proactive_meme_only:
+        if is_private or proactive_meme_only or proactive_reaction_only:
             repeat_text = None
         graph, _, dynamic_context = await create_chat_graph(
             db_session,
@@ -1203,6 +1214,7 @@ async def choice_response_strategy(
             group_members=member_snapshot,
             vision_metrics=vision_metrics,
             proactive_meme_only=proactive_meme_only,
+            proactive_reaction_only=proactive_reaction_only,
             repeat_text=repeat_text,
         )
 
@@ -1265,6 +1277,22 @@ async def choice_response_strategy(
 2. 不加入：调用 `finish` 保持沉默。
 禁止回复“复读是吧”“又开始了”“你们搁这复读”等任何评价复读行为的话。
 """.strip()
+        elif proactive_reaction_only:
+            if reaction_required:
+                task_instruction = """
+【用户明确要求消息表情回应】
+用户明确要求你添加 reaction。本轮必须调用 `add_message_reaction`，不要改成文字确认，也不要调用 `finish` 逃避执行。
+通常不要传 target_msg_id，让工具作用于当前触发消息；若用户通过引用或正文明确指定另一条历史消息，传该消息的数字 id。
+根据语气选择最贴切的 mood，默认 count=1；工具执行后结束，不要再发同义文字或图片。
+""".strip()
+            else:
+                task_instruction = """
+【本轮主动消息表情回应机会】
+本轮由低概率 reaction 采样触发，只能选择以下两种结果：
+1. 当前消息有明确、自然的轻量情绪反应价值：调用 `add_message_reaction`，通常不要传 target_msg_id，然后结束。
+2. 不值得点 reaction：直接调用 `finish` 保持沉默。
+不要发送文字或图片，不要为了完成采样而强行回应，也不要调用无关工具。
+""".strip()
         elif proactive_meme_only:
             task_instruction = """
 【本轮主动表情机会】
@@ -1276,6 +1304,7 @@ async def choice_response_strategy(
         else:
             task_instruction = """
 请以【本轮当前请求】为唯一待办，结合上述对话历史判断是否需要回复。如果需要，请调用相应工具。
+用户明确要求“回应表情/点表情/reaction”时，必须直接调用 `add_message_reaction`；通常不要传 target_msg_id，让工具作用于当前触发消息。若用户明确引用或指定另一条历史消息，才传该消息的数字 id。
 普通图片/表情包通常只是群聊氛围，不要主动解读、复述或围绕它展开回复。
 只有当前用户明确询问图片内容、回复/引用图片、要求找图/发图，或上下文确实在讨论这张图时，才重点结合图片内容回答。
 群友在质疑、反问时不要优先质疑这种行为本身；正常复读队形只能原样跟一句或保持沉默，禁止评价复读行为。

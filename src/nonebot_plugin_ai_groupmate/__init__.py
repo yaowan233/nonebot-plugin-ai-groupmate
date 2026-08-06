@@ -10,7 +10,8 @@ from io import BytesIO
 from typing import Any
 from pathlib import Path
 from functools import lru_cache
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import field, dataclass
 
 import jieba
 from nonebot import logger, require, get_bots, get_driver, on_command, on_message
@@ -58,6 +59,7 @@ from .config import Config, create_tagging_llm
 from .memory import DB, MEDIA_EMBEDDING_VERSION
 from .concurrency import agent_run_gate, maintenance_gate, background_image_gate
 from .reply_guard import set_latest_request_id
+from .agent.reaction import is_onebot_context
 from .runtime_config import (
     RESTART_REQUIRED_FIELDS,
     get_runtime_config,
@@ -152,6 +154,8 @@ class ReplyRequest:
     is_continuous: bool
     reply_to_id: str | None
     proactive_meme_only: bool = False
+    proactive_reaction_only: bool = False
+    reaction_required: bool = False
     repeat_text: str | None = None
 
 
@@ -159,13 +163,16 @@ class ReplyRequest:
 class GroupReplyState:
     running: bool = False
     latest: ReplyRequest | None = None
+    addressed: deque[ReplyRequest] = field(default_factory=deque)
+    active: ReplyRequest | None = None
     task: asyncio.Task | None = None
 
 
-# 每个群只保留"最新一条"待处理回复请求，避免高峰期堆积后刷屏。
+# 每个群串行处理少量明确 @；非定向回复只保留最新一条，避免高峰期刷屏。
 _group_reply_states: dict[str, GroupReplyState] = {}
 _group_reply_state_lock = asyncio.Lock()
 _continuous_conversation_until: dict[tuple[str, str], datetime.datetime] = {}
+MAX_GROUP_ADDRESSED_REQUESTS = 3
 
 # 多bot去重锁: 每个群串行化消息记录,防止并发SELECT查不到对方未提交数据
 _dedup_locks: dict[str, asyncio.Lock] = {}
@@ -208,19 +215,40 @@ def _sample_proactive_reply_modes(
     command_like: bool,
     has_text: bool,
     is_group: bool,
-) -> tuple[bool, bool]:
-    """返回（普通随机回复，主动表情专用回复）；定向消息不参与采样。"""
+    reaction_supported: bool,
+) -> tuple[bool, bool, bool]:
+    """返回（普通回复、reaction 专用、图片表情专用）；定向消息不采样。"""
     if addressed or continuous:
-        return False, False
+        return False, False, False
     random_reply = random.random() < plugin_config.reply_probability
+    eligible = not command_like and has_text and is_group
+    proactive_reaction_only = (
+        not random_reply
+        and eligible
+        and reaction_supported
+        and random.random() < plugin_config.proactive_reaction_probability
+    )
     proactive_meme_only = (
         not random_reply
-        and not command_like
-        and has_text
-        and is_group
+        and not proactive_reaction_only
+        and eligible
         and random.random() < plugin_config.proactive_meme_probability
     )
-    return random_reply, proactive_meme_only
+    return random_reply, proactive_reaction_only, proactive_meme_only
+
+
+def _is_explicit_reaction_request(text: str) -> bool:
+    normalized = " ".join((text or "").strip().lower().split())
+    if not normalized:
+        return False
+    return bool(
+        re.search(
+            r"(?:回应|回复|点|加|来|贴|上)(?:一个|个|一下|点)?(?:表情|reaction)"
+            r"|(?:表情|reaction)(?:回应|回复|一下)"
+            r"|点(?:个|一下)?(?:赞|爱心)",
+            normalized,
+        )
+    )
 
 
 def _sample_repeat_reply(
@@ -385,19 +413,78 @@ def _start_group_reply_worker_locked(group_id: str, state: GroupReplyState):
     state.task = asyncio.create_task(_run_group_reply_worker(group_id))
 
 
+async def _queue_group_reply_request(
+    group_id: str,
+    request: ReplyRequest,
+) -> bool:
+    """明确 @ 串行排队；非定向消息不能打断或挤占定向请求。"""
+    async with _group_reply_state_lock:
+        reply_state = _group_reply_states.setdefault(group_id, GroupReplyState())
+        active_is_addressed = bool(
+            reply_state.active is not None and reply_state.active.is_tome
+        )
+
+        if request.is_tome:
+            addressed_count = len(reply_state.addressed) + int(active_is_addressed)
+            if addressed_count >= MAX_GROUP_ADDRESSED_REQUESTS:
+                logger.warning(
+                    f"群 {group_id} 待处理的 @Bot 请求已达上限，忽略额外请求"
+                )
+                return False
+            reply_state.addressed.append(request)
+            # 明确 @ 到来时丢弃尚未开始的随机/表情/复读请求。
+            reply_state.latest = None
+            if not reply_state.running:
+                _start_group_reply_worker_locked(group_id, reply_state)
+            elif not reply_state.task or reply_state.task.done():
+                logger.warning(f"群 {group_id} 回复 worker 不可用，已重新启动")
+                _start_group_reply_worker_locked(group_id, reply_state)
+            elif reply_state.active is not None and not active_is_addressed:
+                # 抢占正在运行的低优先级 Agent，并提前使其发送工具失效。
+                await set_latest_request_id(group_id, request.request_id)
+                reply_state.task.cancel()
+                logger.info(f"群 {group_id} 收到明确 @，已取消后台回复")
+            return True
+
+        if active_is_addressed or reply_state.addressed:
+            logger.debug(f"群 {group_id} 存在待处理的 @Bot 请求，忽略后台回复采样")
+            return False
+
+        # 非定向请求仍只保留最新一个，避免随机插话、主动表情或复读积压刷屏。
+        reply_state.latest = request
+        if not reply_state.running:
+            _start_group_reply_worker_locked(group_id, reply_state)
+        elif not reply_state.task or reply_state.task.done():
+            logger.warning(f"群 {group_id} 回复 worker 不可用，已重新启动")
+            _start_group_reply_worker_locked(group_id, reply_state)
+        elif reply_state.active is not None:
+            await set_latest_request_id(group_id, request.request_id)
+            reply_state.task.cancel()
+            logger.info(f"群 {group_id} 已将后台回复切换到最新消息")
+        return True
+
+
 async def _run_group_reply_worker(group_id: str):
-    """按群串行处理回复，只消费最新请求。"""
+    """按群串行处理明确 @ 队列，并在队列为空时消费最新后台请求。"""
     try:
         while True:
             async with _group_reply_state_lock:
                 state = _group_reply_states.get(group_id)
                 if not state:
                     return
-                request = state.latest
-                state.latest = None
+                if state.addressed:
+                    request = state.addressed.popleft()
+                else:
+                    request = state.latest
+                    state.latest = None
+                state.active = request
 
             if request is None:
                 break
+
+            # 排队中的 @ 请求不能提前覆盖当前请求的发送许可；轮到它执行时
+            # 再切换 request_id，保证前一个 Agent 能正常完成发送。
+            await set_latest_request_id(group_id, request.request_id)
 
             # Wait for an Agent slot before opening a database session.  This
             # bounds cross-group concurrency without consuming pool capacity
@@ -416,6 +503,8 @@ async def _run_group_reply_worker(group_id: str):
                     request.is_continuous,
                     request.reply_to_id,
                     getattr(request, "proactive_meme_only", False),
+                    getattr(request, "proactive_reaction_only", False),
+                    getattr(request, "reaction_required", False),
                     getattr(request, "repeat_text", None),
                 )
     finally:
@@ -423,8 +512,9 @@ async def _run_group_reply_worker(group_id: str):
             state = _group_reply_states.get(group_id)
             if state:
                 state.running = False
+                state.active = None
                 state.task = None
-                if state.latest is not None:
+                if state.addressed or state.latest is not None:
                     _start_group_reply_worker_locked(group_id, state)
 
 
@@ -590,6 +680,8 @@ async def handle_message(
     continuous_to_me = (
         not explicit_to_me
         and not command_like
+        and not has_at_mention
+        and not reply_id
         and bool(stripped_plain_text)
         and session.scene.type == SceneType.GROUP
         and _is_continuous_conversation(session.scene.id, session.user.id)
@@ -616,21 +708,37 @@ async def handle_message(
         is_group=is_group,
     )
     if repeat_text is not None:
-        # 队形中的消息只走复读采样，不再触发普通插话或主动表情包。
+        # 队形中的消息只走复读采样，不再触发普通插话或主动表情回应。
         random_reply_sample = False
+        proactive_reaction_only = False
         proactive_meme_only = False
     else:
-        random_reply_sample, proactive_meme_only = _sample_proactive_reply_modes(
+        (
+            random_reply_sample,
+            proactive_reaction_only,
+            proactive_meme_only,
+        ) = _sample_proactive_reply_modes(
             addressed=to_me,
             continuous=continuous_to_me,
             command_like=command_like,
             has_text=bool(stripped_plain_text),
             is_group=is_group,
+            reaction_supported=is_onebot_context(bot, event),
         )
+    reaction_required = (
+        (to_me or continuous_to_me)
+        and is_onebot_context(bot, event)
+        and _is_explicit_reaction_request(stripped_plain_text)
+    )
+    if reaction_required:
+        random_reply_sample = False
+        proactive_reaction_only = True
+        proactive_meme_only = False
     should_reply = (
         to_me
         or continuous_to_me
         or random_reply_sample
+        or proactive_reaction_only
         or proactive_meme_only
         or repeat_reply_sample
     )
@@ -683,25 +791,11 @@ async def handle_message(
             is_continuous=continuous_to_me,
             reply_to_id=reply_id,
             proactive_meme_only=proactive_meme_only,
+            proactive_reaction_only=proactive_reaction_only,
+            reaction_required=reaction_required,
             repeat_text=repeat_text if repeat_reply_sample else None,
         )
-        await set_latest_request_id(group_id, request.request_id)
-        async with _group_reply_state_lock:
-            reply_state = _group_reply_states.setdefault(group_id, GroupReplyState())
-            reply_state.latest = request
-            if reply_state.running:
-                if reply_state.task and not reply_state.task.done():
-                    reply_state.task.cancel()
-                    logger.info(f"群 {group_id} 收到更新请求，已取消旧回复并切换到最新")
-                else:
-                    # 兜底：若 running=True 但 worker 已结束（或异常丢失），立即拉起新 worker，
-                    # 避免最新请求长期卡在 latest 槽位里无人消费。
-                    logger.warning(
-                        f"群 {group_id} 回复状态异常（running=True 但 worker 不可用），已重启并切换到最新请求"
-                    )
-                    _start_group_reply_worker_locked(group_id, reply_state)
-            else:
-                _start_group_reply_worker_locked(group_id, reply_state)
+        await _queue_group_reply_request(group_id, request)
 
     await db_session.commit()
 
@@ -882,6 +976,8 @@ async def handle_reply_logic(
     is_continuous: bool,
     reply_to_id: str | None,
     proactive_meme_only: bool = False,
+    proactive_reaction_only: bool = False,
+    reaction_required: bool = False,
     repeat_text: str | None = None,
 ):
     """处理回复逻辑"""
@@ -961,6 +1057,14 @@ async def handle_reply_logic(
                 "如果只是“嗯”“哈哈”“行”等无需回应的短反馈，可以不回复。\n"
                 f"{current_msg_text}"
             )
+        elif proactive_reaction_only:
+            gatekeeper_msg_text = (
+                "这条群消息命中了低概率主动 reaction 采样。"
+                "仅当用一个消息表情回应就能自然表达赞同、好笑、惊讶、安慰、感谢或轻量态度时才回复；"
+                "提问、求助、敏感/沉重话题、真实冲突、他人之间的定向对话，"
+                "以及没有明显反应价值的普通消息都应保持沉默。\n"
+                f"{current_msg_text}"
+            )
         elif proactive_meme_only:
             gatekeeper_msg_text = (
                 "这条群消息命中了低概率主动表情包采样。"
@@ -978,6 +1082,7 @@ async def handle_reply_logic(
                 bot_name,
                 is_private=is_private,
                 proactive_meme_only=proactive_meme_only,
+                proactive_reaction_only=proactive_reaction_only,
             )
             if not should_reply:
                 return
@@ -1026,6 +1131,8 @@ async def handle_reply_logic(
                         is_private=is_private,
                         group_members=group_members,
                         proactive_meme_only=proactive_meme_only,
+                        proactive_reaction_only=proactive_reaction_only,
+                        reaction_required=reaction_required,
                         repeat_text=repeat_text,
                     ),
                     timeout=plugin_config.agent_timeout_seconds,

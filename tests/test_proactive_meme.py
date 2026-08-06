@@ -10,8 +10,9 @@ def test_proactive_meme_sampling_is_independent_from_random_text_reply(monkeypat
     import nonebot_plugin_ai_groupmate as plugin
 
     monkeypatch.setattr(plugin.plugin_config, "reply_probability", 0.01)
+    monkeypatch.setattr(plugin.plugin_config, "proactive_reaction_probability", 0.05)
     monkeypatch.setattr(plugin.plugin_config, "proactive_meme_probability", 0.02)
-    rolls = iter([0.5, 0.01])
+    rolls = iter([0.5, 0.5, 0.01])
     monkeypatch.setattr(plugin.random, "random", lambda: next(rolls))
 
     result = plugin._sample_proactive_reply_modes(
@@ -20,9 +21,10 @@ def test_proactive_meme_sampling_is_independent_from_random_text_reply(monkeypat
         command_like=False,
         has_text=True,
         is_group=True,
+        reaction_supported=True,
     )
 
-    assert result == (False, True)
+    assert result == (False, False, True)
 
 
 def test_addressed_message_never_uses_proactive_sampling(monkeypatch):
@@ -40,9 +42,10 @@ def test_addressed_message_never_uses_proactive_sampling(monkeypatch):
         command_like=False,
         has_text=True,
         is_group=True,
+        reaction_supported=True,
     )
 
-    assert result == (False, False)
+    assert result == (False, False, False)
 
 
 @pytest.mark.asyncio

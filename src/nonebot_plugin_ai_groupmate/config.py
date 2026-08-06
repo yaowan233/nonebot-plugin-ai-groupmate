@@ -8,6 +8,7 @@ class ScopedConfig(BaseModel):
     bot_name: str = "bot"
     reply_probability: float = 0.01
     repeat_probability: float = Field(default=0.15, ge=0.0, le=1.0)
+    proactive_reaction_probability: float = Field(default=0.05, ge=0.0, le=1.0)
     proactive_meme_probability: float = Field(default=0.02, ge=0.0, le=1.0)
     proactive_private_message: bool = True
     continuous_conversation_minutes: float = 5.0

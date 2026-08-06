@@ -10,13 +10,11 @@ def test_group_memory_skill_is_only_available_in_groups():
     group_skills = _build_builtin_agent_skills(
         is_private=False,
         has_admin_permission=False,
-        reaction_tool_instruction="",
         mute_tool_instruction="",
     )
     private_skills = _build_builtin_agent_skills(
         is_private=True,
         has_admin_permission=False,
-        reaction_tool_instruction="",
         mute_tool_instruction="",
     )
 
@@ -25,6 +23,7 @@ def test_group_memory_skill_is_only_available_in_groups():
     # 群聊表情工具默认可见，不再要求额外加载；私聊仍按需加载。
     assert "meme_tools" not in {skill.name for skill in group_skills}
     assert "meme_tools" in {skill.name for skill in private_skills}
+    assert "reaction_tools" not in {skill.name for skill in group_skills}
 
 
 @pytest.mark.asyncio
