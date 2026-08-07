@@ -1,4 +1,5 @@
 import os
+import re
 import math
 import time
 import uuid
@@ -25,7 +26,11 @@ MEDIA_IMAGE_VECTOR = "image"
 MEME_SEARCH_POOL_SIZE = 50
 MEME_RRF_K = 60
 MEME_LEGACY_ROUTE_WEIGHT = 0.35
-MEME_VISUAL_ROUTE_WEIGHT = 0.85
+MEME_CONTEXT_VISUAL_ROUTE_WEIGHT = 0.85
+MEME_CONTENT_VISUAL_ROUTE_WEIGHT = 0.65
+MEME_LEGACY_ROUTE_QUOTA = 3
+MEME_LEGACY_ROUTE_WINDOW = 15
+MEME_QDRANT_ROUTE_TIMEOUT_SECONDS = 8.0
 MEME_GROUP_USAGE_WEIGHT = 0.35
 MEME_GROUP_USAGE_MIN_USES = 2
 MEME_SAMPLE_RANK_SCALE = 18.0
@@ -34,6 +39,24 @@ MEME_TEXT_QUERY_INSTRUCT = (
     "meme references, named characters or IP, visible appearance, objects, actions, "
     "scene and style, as well as emotion, reaction and conversational intent."
 )
+MEME_DRAGON_IMAGE_JARGON_EXPLANATION = (
+    "术语释义：‘龙图’特指黑白熊猫头、熊猫脸或人脸熊猫头的网络梗表情包，"
+    "常搭配文字并以‘某某龙’命名；不是动物龙、卡通龙、龙图案、龙图标或末影龙。"
+)
+MEME_DRAGON_IMAGE_JARGON_PATTERN = re.compile(r"龙图(?!案|标|像|腾)")
+
+
+def expand_meme_search_terms(description: str) -> str:
+    """把小圈子梗名展开成图库标注能识别的视觉与语义条件。"""
+    if (
+        MEME_DRAGON_IMAGE_JARGON_EXPLANATION in description
+        or not MEME_DRAGON_IMAGE_JARGON_PATTERN.search(description)
+    ):
+        return description
+    return (
+        f"{MEME_DRAGON_IMAGE_JARGON_EXPLANATION}\n"
+        f"用户原始搜索：{description}"
+    )
 
 
 class VectorDBOperator:
@@ -616,6 +639,63 @@ class VectorDBOperator:
         ])
 
     @staticmethod
+    def _reserve_meme_route_candidates(
+        candidates: Sequence[tuple[int, float]],
+        route_points: Sequence[models.ScoredPoint],
+        *,
+        exclude_ids: Collection[int],
+        quota: int,
+        window: int,
+    ) -> list[tuple[int, float]]:
+        """在靠前窗口为互补路线保留少量独立候选。"""
+        ranked = list(candidates)
+        if not ranked or not route_points or quota <= 0 or window <= 0:
+            return ranked
+
+        excluded = set(exclude_ids)
+        route_only_ids = [
+            int(point.id)
+            for point in route_points
+            if int(point.id) not in excluded
+        ]
+        if not route_only_ids:
+            return ranked
+
+        window_size = min(window, len(ranked))
+        head = ranked[:window_size]
+        route_only_set = set(route_only_ids)
+        existing_ids = {
+            media_id for media_id, _ in head if media_id in route_only_set
+        }
+        needed = max(0, quota - len(existing_ids))
+        if needed == 0:
+            return ranked
+
+        score_by_id = dict(ranked)
+        promoted_ids: list[int] = []
+        for media_id in route_only_ids:
+            if (
+                media_id in score_by_id
+                and media_id not in existing_ids
+                and media_id not in promoted_ids
+            ):
+                promoted_ids.append(media_id)
+                if len(promoted_ids) >= needed:
+                    break
+        if not promoted_ids:
+            return ranked
+
+        promoted_set = set(promoted_ids)
+        retained_head = [item for item in head if item[0] not in promoted_set]
+        retained_head = retained_head[:window_size - len(promoted_ids)]
+        new_head = retained_head + [
+            (media_id, score_by_id[media_id]) for media_id in promoted_ids
+        ]
+        new_head_ids = {media_id for media_id, _ in new_head}
+        tail = [item for item in ranked if item[0] not in new_head_ids]
+        return new_head + tail
+
+    @staticmethod
     def apply_group_usage_boost(
         candidates: Sequence[tuple[int, float]],
         usage_counts: dict[int, int],
@@ -653,6 +733,7 @@ class VectorDBOperator:
         *,
         vector_name: str,
         limit: int,
+        visual_route_weight: float = MEME_CONTEXT_VISUAL_ROUTE_WEIGHT,
     ) -> list[tuple[int, float]]:
         query_specs: list[tuple[str, str | None, float, str]] = [
             (self.media_multivector_col, vector_name, 1.0, "独立媒体向量"),
@@ -663,7 +744,7 @@ class VectorDBOperator:
             query_specs.append((
                 self.media_multivector_col,
                 MEDIA_IMAGE_VECTOR,
-                MEME_VISUAL_ROUTE_WEIGHT,
+                visual_route_weight,
                 "跨模态视觉向量",
             ))
         query_specs.append((
@@ -680,20 +761,45 @@ class VectorDBOperator:
                 "query": vector,
                 "limit": limit,
                 "with_payload": False,
+                "timeout": math.ceil(MEME_QDRANT_ROUTE_TIMEOUT_SECONDS),
             }
             if using is not None:
                 kwargs["using"] = using
-            calls.append(self.client.query_points(**kwargs))
+            calls.append(asyncio.wait_for(
+                self.client.query_points(**kwargs),
+                timeout=MEME_QDRANT_ROUTE_TIMEOUT_SECONDS + 1.0,
+            ))
         results = await asyncio.gather(*calls, return_exceptions=True)
 
         routes: list[tuple[Sequence[models.ScoredPoint], float]] = []
-        for (_, _, weight, label), result in zip(query_specs, results):
+        primary_ids: set[int] = set()
+        legacy_points: Sequence[models.ScoredPoint] = []
+        for (collection_name, _, weight, label), result in zip(query_specs, results):
             if isinstance(result, BaseException):
-                logger.warning(f"{label}检索失败，跳过该路线: {result}")
+                error_detail = (
+                    f"超过 {MEME_QDRANT_ROUTE_TIMEOUT_SECONDS:.1f}s"
+                    if isinstance(result, TimeoutError)
+                    else str(result).strip() or repr(result)
+                )
+                logger.warning(
+                    f"{label}检索失败，跳过该路线: {error_detail}"
+                )
                 continue
             points = result.points if result else []
             routes.append((points, weight))
-        return self._merge_weighted_meme_search_routes(routes)
+            if collection_name == self.media_col:
+                legacy_points = points
+            else:
+                primary_ids.update(int(point.id) for point in points)
+
+        merged = self._merge_weighted_meme_search_routes(routes)
+        return self._reserve_meme_route_candidates(
+            merged,
+            legacy_points,
+            exclude_ids=primary_ids,
+            quota=MEME_LEGACY_ROUTE_QUOTA,
+            window=MEME_LEGACY_ROUTE_WINDOW,
+        )
 
     @classmethod
     def _diversify_meme_candidates(
@@ -746,13 +852,15 @@ class VectorDBOperator:
         description: str,
         *,
         limit: int = MEME_SEARCH_POOL_SIZE,
+        strict_content_match: bool = False,
     ) -> list[tuple[int, float]]:
         """返回多路融合后的候选，供上层结合群热度再次排序。"""
         if not self.enabled:
             return []
         await self._ensure_collections()
+        expanded_description = expand_meme_search_terms(description)
         vector = await self._get_qwen_vl_embedding(
-            text=description,
+            text=expanded_description,
             instruct=MEME_TEXT_QUERY_INSTRUCT,
         )
         if not vector:
@@ -762,6 +870,11 @@ class VectorDBOperator:
             vector,
             vector_name=MEDIA_TEXT_VECTOR,
             limit=limit,
+            visual_route_weight=(
+                MEME_CONTENT_VISUAL_ROUTE_WEIGHT
+                if strict_content_match
+                else MEME_CONTEXT_VISUAL_ROUTE_WEIGHT
+            ),
         )
 
     async def search_similar_meme(

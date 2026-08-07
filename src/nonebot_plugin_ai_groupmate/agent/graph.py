@@ -74,6 +74,8 @@ class AgentState(TypedDict):
     active_skills: list[str]
     required_side_effect_completed: bool
     required_side_effect_unavailable: bool
+    required_side_effect_success_count: int
+    required_side_effect_target_count: int
 
 
 @dataclass
@@ -470,6 +472,7 @@ def _make_tool_node(
     supports_images: bool = True,
     image_summarizer: Any | None = None,
     required_side_effect_tool: str | None = None,
+    required_side_effect_count: int = 1,
 ):
     async def tool_node(state: AgentState) -> dict:
         messages = state["messages"]
@@ -497,6 +500,18 @@ def _make_tool_node(
         required_side_effect_unavailable = state.get(
             "required_side_effect_unavailable", False
         )
+        required_side_effect_success_count = int(state.get(
+            "required_side_effect_success_count", 0
+        ) or 0)
+        required_side_effect_target_count = max(1, int(state.get(
+            "required_side_effect_target_count",
+            required_side_effect_count,
+        ) or 1))
+        required_side_effect_completed = (
+            required_side_effect_completed
+            or required_side_effect_success_count
+            >= required_side_effect_target_count
+        )
         session_id = state["session_id"]
         request_id = state["request_id"]
 
@@ -520,7 +535,9 @@ def _make_tool_node(
                 )
                 results.append(HumanMessage(content=(
                     f"当前任务必须实际完成 `{required_side_effect_tool}`，不能用文字回复、"
-                    "道歉或承诺代替。请继续调用搜索/发送工具；只有搜索明确返回候选池为空时才能结束。"
+                    "道歉或承诺代替。请继续调用搜索/发送工具；"
+                    f"还需成功执行 {required_side_effect_target_count - required_side_effect_success_count} 次。"
+                    "只有搜索明确返回候选池为空时才能结束。"
                 )))
             elif direct_reply:
                 await _recover_db_session(db_session)
@@ -553,6 +570,10 @@ def _make_tool_node(
                 "completed_side_effect_keys": completed_side_effect_keys,
                 "required_side_effect_completed": required_side_effect_completed,
                 "required_side_effect_unavailable": required_side_effect_unavailable,
+                "required_side_effect_success_count": (
+                    required_side_effect_success_count
+                ),
+                "required_side_effect_target_count": required_side_effect_target_count,
             }
 
         for tc in tool_calls:
@@ -585,7 +606,8 @@ def _make_tool_node(
                     results.append(ToolMessage(
                         content=(
                             f"当前任务必须实际完成 {required_side_effect_tool}，不能提前结束。"
-                            "请先搜索并发送；只有搜索明确返回候选池为空时才能结束。"
+                            f"还需成功执行 {required_side_effect_target_count - required_side_effect_success_count} 次。"
+                            "请继续搜索并发送；只有搜索明确返回候选池为空时才能结束。"
                         ),
                         tool_call_id=tool_call_id,
                     ))
@@ -725,13 +747,37 @@ def _make_tool_node(
                         and search_result.get("reason_code") == "no_candidates"
                     ):
                         required_side_effect_unavailable = True
+                    elif (
+                        isinstance(search_result, dict)
+                        and search_result.get("success") is True
+                    ):
+                        images = search_result.get("images")
+                        available_count = (
+                            len(images) if isinstance(images, list) else 0
+                        )
+                        try:
+                            available_count = int(
+                                search_result.get("count", available_count)
+                            )
+                        except (TypeError, ValueError):
+                            pass
+                        if available_count > 0:
+                            required_side_effect_target_count = min(
+                                required_side_effect_target_count,
+                                required_side_effect_success_count + available_count,
+                            )
                 if (
                     name == required_side_effect_tool
                     and tool_status == "sent"
                 ):
-                    required_side_effect_completed = True
-                    # 必需动作已经实际成功，不再让模型补发解释文字。
-                    called_finish += 1
+                    required_side_effect_success_count += 1
+                    required_side_effect_completed = (
+                        required_side_effect_success_count
+                        >= required_side_effect_target_count
+                    )
+                    if required_side_effect_completed:
+                        # 必需动作已经达到目标次数，不再让模型补发解释文字。
+                        called_finish += 1
                 if effect_key is not None and tool_status not in {"failed", "skipped"}:
                     completed_side_effect_keys.append(effect_key)
                 tool_content, truncated = _truncate_tool_content(
@@ -787,6 +833,8 @@ def _make_tool_node(
             "active_skills": active_skills,
             "required_side_effect_completed": required_side_effect_completed,
             "required_side_effect_unavailable": required_side_effect_unavailable,
+            "required_side_effect_success_count": required_side_effect_success_count,
+            "required_side_effect_target_count": required_side_effect_target_count,
         }
 
     return tool_node
@@ -843,6 +891,7 @@ def build_chat_graph(
     supports_images: bool = True,
     image_summarizer: Any | None = None,
     required_side_effect_tool: str | None = None,
+    required_side_effect_count: int = 1,
 ) -> Any:
     tools_by_name: dict[str, BaseTool] = {t.name: t for t in tools}
     base_tools = list(base_tools) if base_tools is not None else list(tools)
@@ -862,6 +911,7 @@ def build_chat_graph(
             supports_images=supports_images,
             image_summarizer=image_summarizer,
             required_side_effect_tool=required_side_effect_tool,
+            required_side_effect_count=required_side_effect_count,
         ),
     )
     builder.add_edge(START, "agent")

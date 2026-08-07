@@ -242,6 +242,73 @@ async def test_content_reranker_treats_character_quote_and_meme_as_hard_constrai
 
 
 @pytest.mark.asyncio
+async def test_explicit_dragon_image_request_expands_jargon_for_search_and_review(
+    monkeypatch,
+):
+    from nonebot_plugin_ai_groupmate.agent import meme_tools
+
+    search_queries: list[str] = []
+    review_queries: list[str] = []
+
+    class FakeResult:
+        def scalars(self):
+            return self
+
+        def all(self):
+            return [SimpleNamespace(media_id=1, description="黑白熊猫头表情包")]
+
+    class FakeSession:
+        async def commit(self):
+            return None
+
+        async def execute(self, statement):
+            return FakeResult()
+
+    async def no_recent(*args, **kwargs):
+        return set()
+
+    async def fake_search(description, *args, **kwargs):
+        search_queries.append(description)
+        return [(1, 0.9)]
+
+    async def fake_prepare(*args, **kwargs):
+        return [(1, "黑白熊猫头表情包")], {}, set()
+
+    async def fake_review(*args, **kwargs):
+        review_queries.append(kwargs["search_intent"])
+        return [(1, 0.9)]
+
+    monkeypatch.setattr(meme_tools, "_get_recent_sent_meme_ids", no_recent)
+    monkeypatch.setattr(meme_tools.DB, "search_meme_candidates", fake_search)
+    monkeypatch.setattr(meme_tools, "_prepare_meme_context_review", fake_prepare)
+    monkeypatch.setattr(
+        meme_tools,
+        "_rerank_meme_candidates_for_context",
+        fake_review,
+    )
+
+    tool = meme_tools.create_search_meme_tool(
+        FakeSession(),
+        "group-1",
+        None,
+        model=object(),
+        history=[],
+        default_match_type="content",
+        explicit_request_text="来张龙图",
+    )
+
+    result = json.loads(await tool.ainvoke({
+        "description": "龙图",
+        "match_type": "content",
+    }))
+
+    assert result["success"] is True
+    assert search_queries == review_queries
+    assert "黑白熊猫头" in search_queries[0]
+    assert "不是动物龙" in search_queries[0]
+
+
+@pytest.mark.asyncio
 async def test_context_reranker_fails_closed():
     from nonebot_plugin_ai_groupmate.agent import meme_tools
 
@@ -265,7 +332,7 @@ async def test_explicit_meme_request_preserves_original_text_in_multimodal_fallb
 ):
     from nonebot_plugin_ai_groupmate.agent import meme_tools
 
-    search_queries: list[str] = []
+    search_calls: list[tuple[str, bool]] = []
 
     class FakeResult:
         def scalars(self):
@@ -285,7 +352,7 @@ async def test_explicit_meme_request_preserves_original_text_in_multimodal_fallb
         return set()
 
     async def fake_search(description, *args, **kwargs):
-        search_queries.append(description)
+        search_calls.append((description, kwargs["strict_content_match"]))
         return [(1, 0.9)]
 
     async def fake_prepare(*args, **kwargs):
@@ -326,8 +393,11 @@ async def test_explicit_meme_request_preserves_original_text_in_multimodal_fallb
     assert result["images"][0]["pic_id"] == 1
     assert "回退" in result["note"]
     assert approved == {1}
-    assert search_queries == [
-        "开心的二次元表情\n用户原始找图要求：发一个初音未来拿着葱的表情包"
+    assert search_calls == [
+        (
+            "开心的二次元表情\n用户原始找图要求：发一个初音未来拿着葱的表情包",
+            True,
+        )
     ]
 
 
@@ -346,3 +416,83 @@ async def test_send_meme_rejects_an_id_outside_current_approval(tmp_path):
     result = await send_tool.ainvoke({"pic_id": "42"})
 
     assert "未通过本轮搜索审核" in result
+
+
+@pytest.mark.asyncio
+async def test_send_meme_honors_multi_send_limit_and_uses_distinct_ids(
+    tmp_path,
+    monkeypatch,
+):
+    from nonebot_plugin_ai_groupmate.agent import meme_tools
+
+    pictures = []
+    for pic_id in (1, 2):
+        file_path = f"{pic_id}.png"
+        (tmp_path / file_path).write_bytes(f"image-{pic_id}".encode())
+        pictures.append(SimpleNamespace(
+            media_id=pic_id,
+            file_path=file_path,
+            description=f"表情包 {pic_id}",
+        ))
+
+    class FakeResult:
+        def __init__(self, picture):
+            self.picture = picture
+
+        def scalar(self):
+            return self.picture
+
+    class FakeSession:
+        def __init__(self):
+            self.remaining = iter(pictures)
+            self.added = []
+            self.commit_count = 0
+
+        async def execute(self, statement):
+            return FakeResult(next(self.remaining))
+
+        async def commit(self):
+            self.commit_count += 1
+
+        def add(self, record):
+            self.added.append(record)
+
+    sends: list[bytes] = []
+
+    class FakeOutgoingMessage:
+        def __init__(self, raw: bytes):
+            self.raw = raw
+
+        async def send(self, target=None):
+            sends.append(self.raw)
+            return SimpleNamespace(msg_ids=[{"message_id": len(sends)}])
+
+    monkeypatch.setattr(
+        meme_tools.UniMessage,
+        "image",
+        staticmethod(lambda *, raw: FakeOutgoingMessage(raw)),
+    )
+
+    session = FakeSession()
+    approved = {1, 2, 3}
+    send_tool = meme_tools.create_send_meme_tool(
+        session,
+        "group-1",
+        pic_dir=tmp_path,
+        bot_name="bot",
+        approved_meme_ids=approved,
+        max_sends=2,
+    )
+
+    first = json.loads(await send_tool.ainvoke({"pic_id": "1"}))
+    second = json.loads(await send_tool.ainvoke({"pic_id": "2"}))
+    blocked = json.loads(await send_tool.ainvoke({"pic_id": "3"}))
+
+    assert first["status"] == "sent"
+    assert second["status"] == "sent"
+    assert blocked["status"] == "skipped"
+    assert blocked["max_sends"] == 2
+    assert sends == [b"image-1", b"image-2"]
+    assert approved == {3}
+    assert len(session.added) == 2
+    assert session.commit_count == 2

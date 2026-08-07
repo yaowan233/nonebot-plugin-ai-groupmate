@@ -40,6 +40,20 @@ def test_explicit_reaction_request_detection():
     assert plugin._is_explicit_meme_request("随便发点表情")
     assert plugin._is_explicit_meme_request("miyuki你发一下图")
     assert plugin._is_explicit_meme_request("图呢")
+    assert plugin._is_explicit_meme_request("来几张龙图")
+    assert plugin._is_explicit_meme_request("发五张卡通猫娘图")
+
+
+def test_explicit_meme_send_count_is_parsed_and_capped():
+    import nonebot_plugin_ai_groupmate as plugin
+
+    assert plugin._get_explicit_meme_send_count("发一个表情包") == 1
+    assert plugin._get_explicit_meme_send_count("发3张图") == 3
+    assert plugin._get_explicit_meme_send_count("发五张卡通猫娘图") == 5
+    assert plugin._get_explicit_meme_send_count("发10张表情包") == 5
+    assert plugin._get_explicit_meme_send_count("多发点表情包") == 3
+    assert plugin._get_explicit_meme_send_count("来几张龙图") == 3
+    assert plugin._get_explicit_meme_send_count("今天聊点别的") == 1
 
 
 @pytest.mark.asyncio

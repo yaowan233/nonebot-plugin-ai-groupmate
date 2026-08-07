@@ -33,6 +33,8 @@ def _state(message: AIMessage, *, tool_count: int = 0) -> "AgentState":
         "active_skills": [],
         "required_side_effect_completed": False,
         "required_side_effect_unavailable": False,
+        "required_side_effect_success_count": 0,
+        "required_side_effect_target_count": 1,
     }
 
 
@@ -564,6 +566,72 @@ async def test_required_meme_send_blocks_text_and_finish_until_image_is_sent():
     result = await graph.ainvoke(_state(AIMessage(content="placeholder")))
 
     assert events == ["search:震惊", "send:42"]
+    assert result["required_side_effect_completed"] is True
+    assert result["called_finish"] == 1
+    assert model.invoke_count == 4
+
+
+@pytest.mark.asyncio
+async def test_required_multi_meme_send_waits_for_distinct_images():
+    from nonebot_plugin_ai_groupmate.agent.graph import build_chat_graph
+
+    events: list[str] = []
+
+    @tool("search_meme_image")
+    async def search_meme_image(description: str) -> str:
+        """Return three approved meme candidates."""
+        events.append(f"search:{description}")
+        return json.dumps({
+            "success": True,
+            "count": 3,
+            "images": [
+                {"pic_id": "41", "description": "第一张"},
+                {"pic_id": "42", "description": "第二张"},
+                {"pic_id": "43", "description": "第三张"},
+            ],
+        })
+
+    @tool("send_meme_image")
+    async def send_meme_image(pic_id: str) -> str:
+        """Send one approved meme candidate."""
+        events.append(f"send:{pic_id}")
+        return json.dumps({"status": "sent", "message": "sent"})
+
+    @tool("finish")
+    def finish() -> str:
+        """End this test graph."""
+        return ""
+
+    model = _ToolSpyModel([
+        AIMessage(content="", tool_calls=[{
+            "name": "search_meme_image",
+            "args": {"description": "龙图"},
+            "id": "search-1",
+        }]),
+        *[
+            AIMessage(content="", tool_calls=[{
+                "name": "send_meme_image",
+                "args": {"pic_id": str(pic_id)},
+                "id": f"send-{pic_id}",
+            }])
+            for pic_id in (41, 42, 43)
+        ],
+    ])
+    graph = build_chat_graph(
+        model,
+        [search_meme_image, send_meme_image, finish],
+        "system",
+        required_side_effect_tool="send_meme_image",
+        required_side_effect_count=3,
+    )
+    state = _state(AIMessage(content="placeholder"))
+    state["required_side_effect_target_count"] = 3
+
+    result = await graph.ainvoke(state)
+
+    assert events == ["search:龙图", "send:41", "send:42", "send:43"]
+    assert result["required_side_effect_success_count"] == 3
+    assert result["required_side_effect_target_count"] == 3
     assert result["required_side_effect_completed"] is True
     assert result["called_finish"] == 1
     assert model.invoke_count == 4

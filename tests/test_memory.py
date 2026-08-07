@@ -321,11 +321,139 @@ def test_weighted_meme_routes_combine_text_visual_and_legacy_hits(
 
     result = memory_module.VectorDBOperator._merge_weighted_meme_search_routes([
         (text, 1.0),
-        (visual, memory_module.MEME_VISUAL_ROUTE_WEIGHT),
+        (visual, memory_module.MEME_CONTEXT_VISUAL_ROUTE_WEIGHT),
         (legacy, memory_module.MEME_LEGACY_ROUTE_WEIGHT),
     ])
 
     assert [media_id for media_id, _ in result] == [1, 2, 3, 4]
+
+
+def test_meme_search_expands_dragon_image_jargon(memory_module: Any):
+    expanded = memory_module.expand_meme_search_terms("来张龙图")
+
+    assert "黑白熊猫头" in expanded
+    assert "人脸熊猫头" in expanded
+    assert "不是动物龙" in expanded
+    assert "用户原始搜索：来张龙图" in expanded
+    assert memory_module.expand_meme_search_terms(expanded) == expanded
+    assert memory_module.expand_meme_search_terms("黑色龙图案") == "黑色龙图案"
+    assert memory_module.expand_meme_search_terms("末影龙图像") == "末影龙图像"
+
+
+@pytest.mark.asyncio
+async def test_meme_search_embeds_expanded_jargon(memory_module: Any):
+    operator = make_operator(memory_module)
+    operator.enabled = True
+    embedded_texts: list[str] = []
+
+    async def ensure_collections() -> None:
+        return None
+
+    async def get_embedding(**kwargs: Any) -> list[float]:
+        embedded_texts.append(kwargs["text"])
+        return [0.1] * memory_module.MEDIA_VECTOR_SIZE
+
+    async def search_routes(*_: Any, **__: Any) -> list[tuple[int, float]]:
+        return []
+
+    operator._ensure_collections = ensure_collections
+    operator._get_qwen_vl_embedding = get_embedding
+    operator._search_media_routes = search_routes
+
+    await operator.search_meme_candidates("发个龙图", strict_content_match=True)
+
+    assert len(embedded_texts) == 1
+    assert "黑白熊猫头" in embedded_texts[0]
+    assert "用户原始搜索：发个龙图" in embedded_texts[0]
+
+
+def test_legacy_route_reserves_independent_candidates_in_review_window(
+    memory_module: Any,
+):
+    primary = [SimpleNamespace(id=media_id) for media_id in range(1, 21)]
+    legacy = [SimpleNamespace(id=media_id) for media_id in range(101, 106)]
+    candidates = [
+        (media_id, 1.0 / (memory_module.MEME_RRF_K + rank))
+        for rank, media_id in enumerate(range(1, 21), start=1)
+    ] + [
+        (media_id, memory_module.MEME_LEGACY_ROUTE_WEIGHT / (
+            memory_module.MEME_RRF_K + rank
+        ))
+        for rank, media_id in enumerate(range(101, 106), start=1)
+    ]
+
+    result = memory_module.VectorDBOperator._reserve_meme_route_candidates(
+        candidates,
+        legacy,
+        exclude_ids={int(point.id) for point in primary},
+        quota=3,
+        window=15,
+    )
+
+    assert [media_id for media_id, _ in result[:12]] == list(range(1, 13))
+    assert [media_id for media_id, _ in result[12:15]] == [101, 102, 103]
+    assert sorted(media_id for media_id, _ in result) == sorted(
+        media_id for media_id, _ in candidates
+    )
+
+
+@pytest.mark.asyncio
+async def test_media_route_timeout_keeps_successful_routes(
+    memory_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    operator = make_operator(memory_module)
+
+    class FakeQdrantClient:
+        async def query_points(self, **kwargs: Any) -> Any:
+            if kwargs["collection_name"] == "media_collection":
+                await asyncio.Event().wait()
+            return SimpleNamespace(points=[SimpleNamespace(id=1, score=0.9)])
+
+    operator.client = FakeQdrantClient()
+    monkeypatch.setattr(
+        memory_module,
+        "MEME_QDRANT_ROUTE_TIMEOUT_SECONDS",
+        0.01,
+    )
+
+    result = await operator._search_media_routes(
+        [0.1] * memory_module.MEDIA_VECTOR_SIZE,
+        vector_name=memory_module.MEDIA_TEXT_VECTOR,
+        limit=5,
+    )
+
+    assert result
+    assert result[0][0] == 1
+
+
+@pytest.mark.asyncio
+async def test_content_search_uses_lower_visual_route_weight(memory_module: Any):
+    operator = make_operator(memory_module)
+    operator.enabled = True
+    route_weights: list[float] = []
+
+    async def ensure_collections() -> None:
+        return None
+
+    async def get_embedding(**_: Any) -> list[float]:
+        return [0.1] * memory_module.MEDIA_VECTOR_SIZE
+
+    async def search_routes(*_: Any, **kwargs: Any) -> list[tuple[int, float]]:
+        route_weights.append(kwargs["visual_route_weight"])
+        return []
+
+    operator._ensure_collections = ensure_collections
+    operator._get_qwen_vl_embedding = get_embedding
+    operator._search_media_routes = search_routes
+
+    await operator.search_meme_candidates("随对话自然反应")
+    await operator.search_meme_candidates("初音未来拿着葱", strict_content_match=True)
+
+    assert route_weights == [
+        memory_module.MEME_CONTEXT_VISUAL_ROUTE_WEIGHT,
+        memory_module.MEME_CONTENT_VISUAL_ROUTE_WEIGHT,
+    ]
 
 
 def test_group_usage_boost_promotes_a_group_favorite(memory_module: Any):
@@ -389,6 +517,7 @@ async def test_search_meme_uses_larger_candidate_pool_and_recent_exclusion(
     assert query_calls[0]["using"] == memory_module.MEDIA_TEXT_VECTOR
     assert query_calls[0]["limit"] == memory_module.MEME_SEARCH_POOL_SIZE
     assert query_calls[0]["with_payload"] is False
+    assert query_calls[0]["timeout"] == 8
     assert query_calls[1]["collection_name"] == "media_collection_v3"
     assert query_calls[1]["using"] == memory_module.MEDIA_IMAGE_VECTOR
     assert query_calls[2]["collection_name"] == "media_collection"

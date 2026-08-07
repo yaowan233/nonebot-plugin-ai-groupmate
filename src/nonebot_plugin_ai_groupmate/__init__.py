@@ -155,6 +155,7 @@ class ReplyRequest:
     reply_to_id: str | None
     proactive_meme_only: bool = False
     meme_required: bool = False
+    meme_send_count: int = 1
     proactive_reaction_only: bool = False
     reaction_required: bool = False
     repeat_text: str | None = None
@@ -262,12 +263,76 @@ def _is_explicit_meme_request(text: str) -> bool:
         return True
     return bool(
         re.search(
-            r"(?:发|来|整|找|搜|给)(?:一个|个|点|些|一下|几张|张)?(?:图片|图|表情)"
-            r"|(?:图片|图|表情)(?:发|来|整|找|搜)(?:一个|个|点|些|一下)?"
+            r"(?:发|来|整|找|搜|给)"
+            r"(?:(?:\d{1,3}|[一二两三四五六七八九十]{1,3})(?:张|个)?"
+            r"|一个|个|点|些|一下|几张|张)?(?:图片|图|表情)"
+            r"|(?:图片|图|表情)(?:发|来|整|找|搜)"
+            r"(?:(?:\d{1,3}|[一二两三四五六七八九十]{1,3})(?:张|个)?"
+            r"|一个|个|点|些|一下)?"
             r"|(?:图片|图|表情包)(?:呢|在哪)[？?]?($|\s)",
             normalized,
         )
+        or re.search(
+            r"(?:发|来|整|找|搜|给)"
+            r"(?:(?:\d{1,3}|[一二两三四五六七八九十]{1,3})(?:张|个)?"
+            r"|一个|个|点|些|一下|几张|张)"
+            r"[^，。！？?\n]{1,20}?(?:图片|图|表情)",
+            normalized,
+        )
     )
+
+
+MAX_EXPLICIT_MEME_SEND_COUNT = 5
+DEFAULT_MULTIPLE_MEME_SEND_COUNT = 3
+
+
+def _parse_chinese_number(token: str) -> int | None:
+    digits = {
+        "一": 1,
+        "二": 2,
+        "两": 2,
+        "三": 3,
+        "四": 4,
+        "五": 5,
+        "六": 6,
+        "七": 7,
+        "八": 8,
+        "九": 9,
+    }
+    if token in digits:
+        return digits[token]
+    if token == "十":
+        return 10
+    if "十" not in token:
+        return None
+    tens, ones = token.split("十", 1)
+    tens_value = digits.get(tens, 1) if tens else 1
+    ones_value = digits.get(ones, 0) if ones else 0
+    return tens_value * 10 + ones_value
+
+
+def _get_explicit_meme_send_count(text: str) -> int:
+    """解析用户明确要求的发图数量；模糊复数按 3 张处理，最终硬限制为 5。"""
+    normalized = " ".join((text or "").strip().lower().split())
+    if not _is_explicit_meme_request(normalized):
+        return 1
+
+    match = re.search(
+        r"(\d{1,3}|[一二两三四五六七八九十]{1,3})\s*(?:张|个)(?=[^\d]|$)",
+        normalized,
+    )
+    if match:
+        token = match.group(1)
+        requested = int(token) if token.isdigit() else _parse_chinese_number(token)
+        if requested is not None:
+            return max(1, min(requested, MAX_EXPLICIT_MEME_SEND_COUNT))
+
+    if re.search(
+        r"多发|多来|多整|发点|来点|整点|发些|来些|整些|几张|几个|多张|一组|一套",
+        normalized,
+    ):
+        return DEFAULT_MULTIPLE_MEME_SEND_COUNT
+    return 1
 
 
 def _sample_repeat_reply(
@@ -523,6 +588,7 @@ async def _run_group_reply_worker(group_id: str):
                     request.reply_to_id,
                     getattr(request, "proactive_meme_only", False),
                     getattr(request, "meme_required", False),
+                    getattr(request, "meme_send_count", 1),
                     getattr(request, "proactive_reaction_only", False),
                     getattr(request, "reaction_required", False),
                     getattr(request, "repeat_text", None),
@@ -749,6 +815,11 @@ async def handle_message(
         (to_me or continuous_to_me)
         and _is_explicit_meme_request(stripped_plain_text)
     )
+    meme_send_count = (
+        _get_explicit_meme_send_count(stripped_plain_text)
+        if meme_required
+        else 1
+    )
     reaction_required = (
         not meme_required
         and (to_me or continuous_to_me)
@@ -821,6 +892,7 @@ async def handle_message(
             reply_to_id=reply_id,
             proactive_meme_only=proactive_meme_only,
             meme_required=meme_required,
+            meme_send_count=meme_send_count,
             proactive_reaction_only=proactive_reaction_only,
             reaction_required=reaction_required,
             repeat_text=repeat_text if repeat_reply_sample else None,
@@ -1007,6 +1079,7 @@ async def handle_reply_logic(
     reply_to_id: str | None,
     proactive_meme_only: bool = False,
     meme_required: bool = False,
+    meme_send_count: int = 1,
     proactive_reaction_only: bool = False,
     reaction_required: bool = False,
     repeat_text: str | None = None,
@@ -1185,6 +1258,7 @@ async def handle_reply_logic(
                         group_members=group_members,
                         proactive_meme_only=proactive_meme_only,
                         meme_required=meme_required,
+                        meme_send_count=meme_send_count,
                         proactive_reaction_only=proactive_reaction_only,
                         reaction_required=reaction_required,
                         repeat_text=repeat_text,

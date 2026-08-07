@@ -38,6 +38,7 @@ from .prompts import (
 )
 from .reaction import is_onebot_context, create_reaction_tool
 from .meme_tools import (
+    MAX_MEME_SEND_COUNT,
     create_send_meme_tool,
     create_search_meme_tool,
     create_similar_meme_tool,
@@ -446,6 +447,8 @@ async def _run_scheduled_agent_task(
                         "active_skills": [],
                         "required_side_effect_completed": False,
                         "required_side_effect_unavailable": False,
+                        "required_side_effect_success_count": 0,
+                        "required_side_effect_target_count": 1,
                     }),
                     timeout=plugin_config.agent_timeout_seconds,
                 )
@@ -813,10 +816,12 @@ async def create_chat_graph(
     vision_metrics: VisionRunMetrics | None = None,
     proactive_meme_only: bool = False,
     meme_required: bool = False,
+    meme_send_count: int = 1,
     proactive_reaction_only: bool = False,
     repeat_text: str | None = None,
 ) -> tuple[Any, list[Any], str]:
     """创建 LangGraph 聊天图"""
+    meme_send_count = max(1, min(int(meme_send_count), MAX_MEME_SEND_COUNT))
     relation_context = await get_user_relation_context(db_session, user_id, user_name)
     group_context = ""
     recent_relations_context = ""
@@ -938,7 +943,9 @@ async def create_chat_graph(
         db_session,
         session_id,
         request_id,
-        model=model,
+        # 表情包候选审核是短结构化分类任务。使用 Flash 能显著缩短
+        # 二次审核耗时，也避免主模型偶发超过工具时限。
+        model=get_flash_model(),
         history=history or [],
         approved_meme_ids=approved_meme_ids,
         allow_context_fallback=meme_required or proactive_meme_only,
@@ -953,6 +960,7 @@ async def create_chat_graph(
         pic_dir=pic_dir,
         bot_name=plugin_config.bot_name,
         approved_meme_ids=approved_meme_ids,
+        max_sends=meme_send_count if meme_required else 1,
     )
     relation_tool = create_relation_tool(
         db_session,
@@ -1182,6 +1190,7 @@ async def create_chat_graph(
         supports_images=supports_images,
         image_summarizer=summarize_image_content if not supports_images else None,
         required_side_effect_tool=("send_meme_image" if meme_required else None),
+        required_side_effect_count=meme_send_count if meme_required else 1,
     )
     return graph, agent_tools, dynamic_context
 
@@ -1204,6 +1213,7 @@ async def choice_response_strategy(
     group_members: list[Any] | None = None,
     proactive_meme_only: bool = False,
     meme_required: bool = False,
+    meme_send_count: int = 1,
     proactive_reaction_only: bool = False,
     reaction_required: bool = False,
     repeat_text: str | None = None,
@@ -1211,6 +1221,7 @@ async def choice_response_strategy(
     """
     使用LangGraph Agent决定回复策略
     """
+    meme_send_count = max(1, min(int(meme_send_count), MAX_MEME_SEND_COUNT))
     try:
         member_snapshot = group_members
         if not is_private and interface is not None and member_snapshot is None:
@@ -1241,6 +1252,7 @@ async def choice_response_strategy(
             vision_metrics=vision_metrics,
             proactive_meme_only=proactive_meme_only,
             meme_required=meme_required,
+            meme_send_count=meme_send_count,
             proactive_reaction_only=proactive_reaction_only,
             repeat_text=repeat_text,
         )
@@ -1322,7 +1334,16 @@ async def choice_response_strategy(
 """.strip()
         elif proactive_meme_only:
             if meme_required:
-                task_instruction = """
+                if meme_send_count > 1:
+                    task_instruction = f"""
+【用户明确要求发送多张图片表情包】
+用户明确要求发送多张表情包，本轮目标是发送 {meme_send_count} 张不同图片，且绝不能超过这个数量。
+先调用一次 `search_meme_image`；再从候选中选择不同的 pic_id，逐张调用 `send_meme_image`，直到发送 {meme_send_count} 张。如果实际候选不足，就把通过审核的候选各发送一次后结束。
+如果用户指定角色/IP、形象、外观、物体、动作、场景、画风、台词、梗或情绪，使用 `match_type="content"`，description 必须保留全部原始条件。完全没有内容条件时使用 `match_type="random"`。
+不要重复发送同一张，不要发送候选外图片，不要用文字或 reaction 替代，也不要在图片之间插入解释文字。
+""".strip()
+                else:
+                    task_instruction = """
 【用户明确要求发送图片表情包】
 用户明确要求你发送表情包图片。本轮必须先调用 `search_meme_image`，再从候选中选择一张调用 `send_meme_image`。
 如果用户指定角色/IP、形象、外观、物体、动作、场景、画风、台词、梗或情绪，调用 `search_meme_image(..., match_type="content")`，description 必须保留全部原始条件，不得只概括成情绪。
@@ -1510,6 +1531,10 @@ async def choice_response_strategy(
             "active_skills": [],
             "required_side_effect_completed": False,
             "required_side_effect_unavailable": False,
+            "required_side_effect_success_count": 0,
+            "required_side_effect_target_count": (
+                meme_send_count if meme_required else 1
+            ),
         }
 
         # 4. 调用 Agent
@@ -1667,6 +1692,8 @@ if __name__ == "__main__":
             "active_skills": [],
             "required_side_effect_completed": False,
             "required_side_effect_unavailable": False,
+            "required_side_effect_success_count": 0,
+            "required_side_effect_target_count": 1,
         })
     )
     print(result)
