@@ -80,6 +80,7 @@ async def test_proactive_meme_graph_only_exposes_meme_actions(monkeypatch):
     captured_base_tools: list[str] = []
     captured_search_options: dict[str, Any] = {}
     flash_model = object()
+    flash_factory_calls = 0
 
     class FakeSession:
         async def commit(self):
@@ -106,7 +107,12 @@ async def test_proactive_meme_graph_only_exposes_meme_actions(monkeypatch):
     monkeypatch.setattr(agent, "get_recent_relations_context", empty_context)
     monkeypatch.setattr(agent, "build_registered_agent_extensions", no_extensions)
     monkeypatch.setattr(agent, "get_chat_model", lambda: object())
-    monkeypatch.setattr(agent, "get_flash_model", lambda: flash_model)
+    def flash_model_factory():
+        nonlocal flash_factory_calls
+        flash_factory_calls += 1
+        return flash_model
+
+    monkeypatch.setattr(agent, "get_flash_model", flash_model_factory)
     monkeypatch.setattr(agent, "build_chat_graph", fake_build_chat_graph)
     monkeypatch.setattr(agent, "create_search_meme_tool", capture_search_options)
 
@@ -127,4 +133,6 @@ async def test_proactive_meme_graph_only_exposes_meme_actions(monkeypatch):
         "finish",
     ]
     assert captured_search_options["allow_context_fallback"] is True
-    assert captured_search_options["model"] is flash_model
+    assert captured_search_options["model_factory"] is flash_model_factory
+    assert "model" not in captured_search_options
+    assert flash_factory_calls == 0

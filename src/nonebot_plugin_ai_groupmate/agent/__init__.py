@@ -944,8 +944,9 @@ async def create_chat_graph(
         session_id,
         request_id,
         # 表情包候选审核是短结构化分类任务。使用 Flash 能显著缩短
-        # 二次审核耗时，也避免主模型偶发超过工具时限。
-        model=get_flash_model(),
+        # 二次审核耗时，也避免主模型偶发超过工具时限。工厂只在真正
+        # 搜索表情包时执行，其他 Agent 路径无需提前初始化模型客户端。
+        model_factory=get_flash_model,
         history=history or [],
         approved_meme_ids=approved_meme_ids,
         allow_context_fallback=meme_required or proactive_meme_only,

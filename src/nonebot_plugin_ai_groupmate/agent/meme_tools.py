@@ -5,7 +5,7 @@ import asyncio
 import traceback
 from typing import Any, Literal
 from pathlib import Path
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 from pydantic import Field, BaseModel
 from sqlalchemy import Select, desc, func
@@ -477,7 +477,8 @@ def create_search_meme_tool(
     session_id: str,
     request_id: str | None,
     *,
-    model: Any,
+    model: Any | None = None,
+    model_factory: Callable[[], Any] | None = None,
     history: Sequence[ChatHistorySchema],
     approved_meme_ids: set[int] | None = None,
     allow_context_fallback: bool = False,
@@ -555,12 +556,23 @@ def create_search_meme_tool(
                     for rank, (media_id, _) in enumerate(review_candidates)
                 ]
             else:
-                context_candidates = await _rerank_meme_candidates_for_context(
-                    model,
-                    search_intent=search_query,
-                    history=history,
-                    candidates=review_candidates,
-                    match_type=effective_match_type,
+                review_model = model
+                if model_factory is not None:
+                    try:
+                        review_model = model_factory()
+                    except Exception as e:
+                        logger.warning(f"表情包审核模型初始化失败: {e}")
+                        review_model = None
+                context_candidates = (
+                    await _rerank_meme_candidates_for_context(
+                        review_model,
+                        search_intent=search_query,
+                        history=history,
+                        candidates=review_candidates,
+                        match_type=effective_match_type,
+                    )
+                    if review_model is not None
+                    else []
                 )
             used_explicit_fallback = False
             if not context_candidates and allow_context_fallback:
