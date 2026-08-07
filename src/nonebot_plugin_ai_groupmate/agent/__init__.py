@@ -302,8 +302,8 @@ async def check_if_should_reply(
     elif proactive_meme_only and not is_private:
         scene_desc = "群聊"
         scene_extra = (
-            "3. 当前消息已命中低概率主动表情包采样。只有适合用一张表情包自然接梗、"
-            "吐槽、庆祝或表达明显情绪时返回 YES。\n"
+            "3. 当前消息已命中低概率主动表情包采样。只要一张表情包能大致接梗、"
+            "吐槽、庆祝或表达情绪就返回 YES，不要求完全精确。\n"
             "4. 认真求助、事实问题、敏感或沉重话题、真实冲突、他人之间的定向对话，"
             "以及没有反应价值的普通消息，返回 NO。"
         )
@@ -941,7 +941,7 @@ async def create_chat_graph(
         model=model,
         history=history or [],
         approved_meme_ids=approved_meme_ids,
-        allow_context_fallback=meme_required,
+        allow_context_fallback=meme_required or proactive_meme_only,
         default_match_type="content" if meme_required else "context",
         explicit_request_text=explicit_meme_request_text,
     )
@@ -1333,9 +1333,9 @@ async def choice_response_strategy(
                 task_instruction = """
 【本轮主动表情机会】
 本轮由低概率主动表情采样触发，只能选择以下两种结果：
-1. 当前语境确实适合用一张图自然接梗：调用 `search_meme_image(..., match_type="context")`，从审核通过的候选中最多发送一张，然后结束。
-2. 没有足够自然的表情反应：直接调用 `finish` 保持沉默。
-不要发送文字，不要为了完成采样而强行发表情，也不要调用无关工具。
+1. 当前语境大致适合用一张图接梗、吐槽或表达情绪：调用 `search_meme_image(..., match_type="context")`，选择一张大致合拍的候选发送，然后结束；允许轻微偏题或随机感，不要求完美匹配。
+2. 只有语境明显严肃、候选明显冲突或完全无关时，才调用 `finish` 保持沉默。
+不要发送文字，也不要调用无关工具。
 """.strip()
         else:
             task_instruction = """

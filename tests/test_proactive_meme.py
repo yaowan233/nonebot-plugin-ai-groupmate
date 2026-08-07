@@ -78,6 +78,7 @@ async def test_proactive_meme_graph_only_exposes_meme_actions(monkeypatch):
     from nonebot_plugin_ai_groupmate import agent
 
     captured_base_tools: list[str] = []
+    captured_search_options: dict[str, Any] = {}
 
     class FakeSession:
         async def commit(self):
@@ -93,12 +94,19 @@ async def test_proactive_meme_graph_only_exposes_meme_actions(monkeypatch):
         captured_base_tools.extend(tool.name for tool in kwargs["base_tools"])
         return object()
 
+    original_create_search_meme_tool = agent.create_search_meme_tool
+
+    def capture_search_options(*args: Any, **kwargs: Any):
+        captured_search_options.update(kwargs)
+        return original_create_search_meme_tool(*args, **kwargs)
+
     monkeypatch.setattr(agent, "get_user_relation_context", empty_context)
     monkeypatch.setattr(agent, "get_group_context", empty_context)
     monkeypatch.setattr(agent, "get_recent_relations_context", empty_context)
     monkeypatch.setattr(agent, "build_registered_agent_extensions", no_extensions)
     monkeypatch.setattr(agent, "get_chat_model", lambda: object())
     monkeypatch.setattr(agent, "build_chat_graph", fake_build_chat_graph)
+    monkeypatch.setattr(agent, "create_search_meme_tool", capture_search_options)
 
     await agent.create_chat_graph(
         FakeSession(),
@@ -116,3 +124,4 @@ async def test_proactive_meme_graph_only_exposes_meme_actions(monkeypatch):
         "send_meme_image",
         "finish",
     ]
+    assert captured_search_options["allow_context_fallback"] is True

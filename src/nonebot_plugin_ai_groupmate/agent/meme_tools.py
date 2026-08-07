@@ -26,7 +26,8 @@ GROUP_FAVORITE_MIN_USES = 2
 MEME_CONTEXT_HISTORY_LIMIT = 8
 MEME_CONTEXT_SEMANTIC_POOL_SIZE = 15
 MEME_CONTEXT_FAVORITE_POOL_SIZE = 5
-MEME_CONTEXT_RELEVANCE_THRESHOLD = 0.6
+MEME_CONTEXT_RELEVANCE_THRESHOLD = 0.4
+MEME_CONTENT_RELEVANCE_THRESHOLD = 0.6
 MEME_CONTEXT_RERANK_TIMEOUT_SECONDS = 20.0
 MemeSearchType = Literal["context", "content", "random"]
 
@@ -220,7 +221,7 @@ async def _rerank_meme_candidates_for_context(
     candidates: Sequence[tuple[int, str]],
     match_type: MemeSearchType = "context",
 ) -> list[tuple[int, float]]:
-    """用当前对话审核候选；调用失败时保守地不返回表情包。"""
+    """用当前对话审核候选；调用失败时由调用方决定是否回退。"""
     if not candidates:
         return []
 
@@ -240,8 +241,8 @@ async def _rerank_meme_candidates_for_context(
         task_rules = """
 当前任务是根据对话选择自然反应。
 - 重点判断语用是否匹配：情绪、态度、对象、台词和笑点是否与当前对话及检索意图一致。
-- 只有“现在把这张图单独发出去也自然”的候选才可达到 0.60；仅主题沾边、泛用但态度不明为 0.40～0.59；冲突或无关低于 0.40。
-- 宁缺毋滥。所有候选都不合适时 should_send=false。
+- 表情包允许带一点随机性：明显自然为 0.70～1.00，大致合拍、略有偏差但仍能接话为 0.40～0.69；只有明显冲突或完全无关才低于 0.40。
+- 不要求候选完美复述当前语境。只要至少一张不明显冲突，should_send=true；所有候选都明显不合适时才返回 false。
 """.strip()
     system_prompt = f"""
 你是群聊表情包的多维检索审核器。表情包不仅表达情绪，也可能由特定角色/形象、画面元素、动作、台词、梗模板和文化语境定义。
@@ -275,17 +276,22 @@ async def _rerank_meme_candidates_for_context(
         )
         review = MemeContextReview.model_validate(raw_review)
     except Exception as e:
-        logger.warning(f"表情包上下文审核失败，保守跳过发送: {e}")
+        logger.warning(f"表情包上下文审核失败，返回空审核结果: {e}")
         return []
 
     if not review.should_send:
         return []
     valid_ids = {media_id for media_id, _ in candidates}
+    relevance_threshold = (
+        MEME_CONTENT_RELEVANCE_THRESHOLD
+        if match_type == "content"
+        else MEME_CONTEXT_RELEVANCE_THRESHOLD
+    )
     scores: dict[int, float] = {}
     for item in review.candidates:
         if (
             item.pic_id in valid_ids
-            and item.relevance >= MEME_CONTEXT_RELEVANCE_THRESHOLD
+            and item.relevance >= relevance_threshold
         ):
             scores[item.pic_id] = max(scores.get(item.pic_id, 0.0), item.relevance)
     return sorted(scores.items(), key=lambda item: item[1], reverse=True)
@@ -554,9 +560,9 @@ def create_search_meme_tool(
                 )
             used_explicit_fallback = False
             if not context_candidates and allow_context_fallback:
-                # 用户明确索要图片时，“随便发一个”本身没有可供相关性模型
-                # 对齐的语义。此时保留向量召回与本群常用池的排序结果，
-                # 而不是把所有候选清空并用文字敷衍。
+                # 明确索图或主动表情轮次已经通过前置语境判断时，不再因为
+                # 二次审核过于保守而清空所有候选。保留多路召回和群常用池，
+                # 允许表情包有一点不精确的随机感。
                 context_candidates = [
                     (media_id, max(0.6, 1.0 - rank * 0.01))
                     for rank, (media_id, _) in enumerate(review_candidates)
@@ -564,7 +570,7 @@ def create_search_meme_tool(
                 used_explicit_fallback = bool(context_candidates)
                 if used_explicit_fallback:
                     logger.info(
-                        "明确表情包请求未通过审核，回退到多路召回候选: "
+                        "表情包上下文审核未通过，回退到多路召回候选: "
                         f"{search_query}"
                     )
             if effective_match_type == "content":
@@ -641,7 +647,7 @@ def create_search_meme_tool(
             if used_explicit_fallback and effective_match_type == "content":
                 result_note = "按用户指定内容回退到文本与视觉语义召回候选，请选择最匹配的一张发送"
             elif used_explicit_fallback:
-                result_note = "用户明确索要表情包，已回退到语义召回与本群常用候选，请选择一张发送"
+                result_note = "上下文审核未选出候选，已宽松回退到语义召回与本群常用候选，请选择大致合拍的一张发送"
             elif effective_match_type == "random":
                 result_note = "用户未指定内容条件，已返回语义候选与本群常用候选"
             else:

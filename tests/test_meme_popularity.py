@@ -168,7 +168,8 @@ async def test_context_reranker_filters_low_scores_and_unknown_ids():
                 "should_send": True,
                 "candidates": [
                     {"pic_id": 2, "relevance": 0.92},
-                    {"pic_id": 1, "relevance": 0.59},
+                    {"pic_id": 3, "relevance": 0.45},
+                    {"pic_id": 1, "relevance": 0.39},
                     {"pic_id": 999, "relevance": 1.0},
                 ],
             }
@@ -193,10 +194,15 @@ async def test_context_reranker_filters_low_scores_and_unknown_ids():
         FakeModel(),
         search_intent="表达累到崩溃",
         history=history,
-        candidates=[(1, "开心庆祝"), (2, "熊猫头累趴下")],
+        candidates=[
+            (1, "开心庆祝"),
+            (2, "熊猫头累趴下"),
+            (3, "泛用疲惫表情"),
+        ],
     )
 
-    assert result == [(2, 0.92)]
+    assert result == [(2, 0.92), (3, 0.45)]
+    assert "允许带一点随机性" in captured_messages[0].content
     assert "今天又加班了" in captured_messages[1].content
     assert "id: 123" not in captured_messages[1].content
 
