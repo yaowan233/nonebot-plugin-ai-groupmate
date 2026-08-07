@@ -142,6 +142,18 @@ def test_group_favorite_cannot_bypass_context_review():
     assert selected == [1]
 
 
+def test_content_selection_preserves_match_ranking_without_random_favorite():
+    from nonebot_plugin_ai_groupmate.agent import meme_tools
+
+    selected = meme_tools._select_content_meme_ids(
+        [(7, 0.95), (8, 0.90), (99, 0.85)],
+        {7},
+        limit=3,
+    )
+
+    assert selected == [8, 99, 7]
+
+
 @pytest.mark.asyncio
 async def test_context_reranker_filters_low_scores_and_unknown_ids():
     from nonebot_plugin_ai_groupmate.agent import meme_tools
@@ -190,6 +202,40 @@ async def test_context_reranker_filters_low_scores_and_unknown_ids():
 
 
 @pytest.mark.asyncio
+async def test_content_reranker_treats_character_quote_and_meme_as_hard_constraints():
+    from nonebot_plugin_ai_groupmate.agent import meme_tools
+
+    captured_messages = []
+
+    class FakeReviewer:
+        async def ainvoke(self, messages):
+            captured_messages.extend(messages)
+            return {
+                "should_send": True,
+                "candidates": [{"pic_id": 2, "relevance": 0.9}],
+            }
+
+    class FakeModel:
+        def with_structured_output(self, schema):
+            assert schema is meme_tools.MemeContextReview
+            return FakeReviewer()
+
+    result = await meme_tools._rerank_meme_candidates_for_context(
+        FakeModel(),
+        search_intent="初音未来拿着葱，玩甩葱歌的梗",
+        history=[],
+        candidates=[(1, "普通开心女孩"), (2, "初音未来拿着葱的甩葱歌梗")],
+        match_type="content",
+    )
+
+    assert result == [(2, 0.9)]
+    assert "硬条件" in captured_messages[0].content
+    payload = json.loads(captured_messages[1].content)
+    assert payload["search_request"] == "初音未来拿着葱，玩甩葱歌的梗"
+    assert payload["match_type"] == "content"
+
+
+@pytest.mark.asyncio
 async def test_context_reranker_fails_closed():
     from nonebot_plugin_ai_groupmate.agent import meme_tools
 
@@ -208,8 +254,12 @@ async def test_context_reranker_fails_closed():
 
 
 @pytest.mark.asyncio
-async def test_explicit_meme_request_falls_back_to_group_candidates(monkeypatch):
+async def test_explicit_meme_request_preserves_original_text_in_multimodal_fallback(
+    monkeypatch,
+):
     from nonebot_plugin_ai_groupmate.agent import meme_tools
+
+    search_queries: list[str] = []
 
     class FakeResult:
         def scalars(self):
@@ -228,7 +278,8 @@ async def test_explicit_meme_request_falls_back_to_group_candidates(monkeypatch)
     async def no_recent(*args, **kwargs):
         return set()
 
-    async def fake_search(*args, **kwargs):
+    async def fake_search(description, *args, **kwargs):
+        search_queries.append(description)
         return [(1, 0.9)]
 
     async def fake_prepare(*args, **kwargs):
@@ -255,14 +306,23 @@ async def test_explicit_meme_request_falls_back_to_group_candidates(monkeypatch)
         history=[],
         approved_meme_ids=approved,
         allow_context_fallback=True,
+        default_match_type="content",
+        explicit_request_text="发一个初音未来拿着葱的表情包",
     )
 
-    result = json.loads(await tool.ainvoke({"description": "随便发一个表情包"}))
+    result = json.loads(await tool.ainvoke({
+        "description": "开心的二次元表情",
+        "match_type": "content",
+    }))
 
     assert result["success"] is True
+    assert result["match_type"] == "content"
     assert result["images"][0]["pic_id"] == 1
     assert "回退" in result["note"]
     assert approved == {1}
+    assert search_queries == [
+        "开心的二次元表情\n用户原始找图要求：发一个初音未来拿着葱的表情包"
+    ]
 
 
 @pytest.mark.asyncio

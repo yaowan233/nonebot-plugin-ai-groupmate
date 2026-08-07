@@ -489,7 +489,9 @@ def _build_builtin_agent_skills(
             description="搜索、选择和发送表情包图片。",
             prompt=(
                 "表情包工具规则：\n"
-                "- 普通表情包需求：先调用 `search_meme_image(description)` 搜索合适图片；description 要写清此刻想表达的情绪、态度、对象和反应，不要只给一个宽泛关键词。\n"
+                "- 表情包不只是情绪反应，也可能按角色/IP、人物或动物形象、外观、物体、动作、场景、画风、原文台词、梗名或梗义来检索。\n"
+                '- 用户指定任何内容条件时使用 `search_meme_image(description, match_type="content")`；description 必须逐项保留用户点名的专有名词、原句和视觉条件，绝不能只改写成泛化情绪。\n'
+                '- 用户明确说随便发、没有任何条件时使用 `match_type="random"`；根据对话主动接梗或表达反应时使用 `match_type="context"`，并写清情绪、态度、对象、笑点和反应。\n'
                 "- 用户引用图片或要求“找一张类似这张的”：调用 `search_similar_meme_by_id(target_msg_id)`；没有明确 id 时可不传，工具会优先找当前用户最近图片。\n"
                 "- 搜索工具只返回通过当前对话相关性审核的候选和 pic_id，不会发送；如果没有候选通过审核，就不要调用发送工具。\n"
                 "- 判断候选描述合适后，调用 `send_meme_image(pic_id)` 发送。\n"
@@ -926,6 +928,12 @@ async def create_chat_graph(
     )
 
     approved_meme_ids: set[int] = set()
+    explicit_meme_request_text: str | None = None
+    if meme_required and event is not None:
+        try:
+            explicit_meme_request_text = event.get_plaintext().strip() or None
+        except Exception:
+            explicit_meme_request_text = None
     search_meme_tool = create_search_meme_tool(
         db_session,
         session_id,
@@ -934,6 +942,8 @@ async def create_chat_graph(
         history=history or [],
         approved_meme_ids=approved_meme_ids,
         allow_context_fallback=meme_required,
+        default_match_type="content" if meme_required else "context",
+        explicit_request_text=explicit_meme_request_text,
     )
     send_meme_tool = create_send_meme_tool(
         db_session,
@@ -1315,14 +1325,15 @@ async def choice_response_strategy(
                 task_instruction = """
 【用户明确要求发送图片表情包】
 用户明确要求你发送表情包图片。本轮必须先调用 `search_meme_image`，再从候选中选择一张调用 `send_meme_image`。
-“随便发一个/多发点表情包”表示可以优先选择本群常用候选，不要误用 `add_message_reaction`，也不要只发文字道歉或承诺下次再发。
+如果用户指定角色/IP、形象、外观、物体、动作、场景、画风、台词、梗或情绪，调用 `search_meme_image(..., match_type="content")`，description 必须保留全部原始条件，不得只概括成情绪。
+“随便发一个/多发点表情包”等完全没有内容条件的请求使用 `match_type="random"`，可以优先选择本群常用候选。不要误用 `add_message_reaction`，也不要只发文字道歉或承诺下次再发。
 发送一张后结束；只有搜索工具明确返回数据库中完全没有可用候选时才调用 `finish`。
 """.strip()
             else:
                 task_instruction = """
 【本轮主动表情机会】
 本轮由低概率主动表情采样触发，只能选择以下两种结果：
-1. 当前语境确实适合用一张图自然接梗：调用 `search_meme_image`，从审核通过的候选中最多发送一张，然后结束。
+1. 当前语境确实适合用一张图自然接梗：调用 `search_meme_image(..., match_type="context")`，从审核通过的候选中最多发送一张，然后结束。
 2. 没有足够自然的表情反应：直接调用 `finish` 保持沉默。
 不要发送文字，不要为了完成采样而强行发表情，也不要调用无关工具。
 """.strip()

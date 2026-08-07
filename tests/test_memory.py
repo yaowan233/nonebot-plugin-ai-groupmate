@@ -312,6 +312,22 @@ def test_meme_search_routes_use_rrf_and_reward_cross_route_hits(
     assert [media_id for media_id, _ in result] == [2, 1, 3]
 
 
+def test_weighted_meme_routes_combine_text_visual_and_legacy_hits(
+    memory_module: Any,
+):
+    text = [SimpleNamespace(id=1, score=0.9), SimpleNamespace(id=2, score=0.8)]
+    visual = [SimpleNamespace(id=3, score=0.95), SimpleNamespace(id=1, score=0.7)]
+    legacy = [SimpleNamespace(id=4, score=0.9)]
+
+    result = memory_module.VectorDBOperator._merge_weighted_meme_search_routes([
+        (text, 1.0),
+        (visual, memory_module.MEME_VISUAL_ROUTE_WEIGHT),
+        (legacy, memory_module.MEME_LEGACY_ROUTE_WEIGHT),
+    ])
+
+    assert [media_id for media_id, _ in result] == [1, 2, 3, 4]
+
+
 def test_group_usage_boost_promotes_a_group_favorite(memory_module: Any):
     candidates = [
         (1, 0.9),
@@ -368,9 +384,12 @@ async def test_search_meme_uses_larger_candidate_pool_and_recent_exclusion(
     result = await operator.search_meme("无奈", limit=2, exclude_ids={1})
 
     assert result == [2, 3]
-    assert len(query_calls) == 2
+    assert len(query_calls) == 3
     assert query_calls[0]["collection_name"] == "media_collection_v3"
     assert query_calls[0]["using"] == memory_module.MEDIA_TEXT_VECTOR
     assert query_calls[0]["limit"] == memory_module.MEME_SEARCH_POOL_SIZE
     assert query_calls[0]["with_payload"] is False
-    assert query_calls[1]["collection_name"] == "media_collection"
+    assert query_calls[1]["collection_name"] == "media_collection_v3"
+    assert query_calls[1]["using"] == memory_module.MEDIA_IMAGE_VECTOR
+    assert query_calls[2]["collection_name"] == "media_collection"
+    assert "using" not in query_calls[2]

@@ -25,12 +25,14 @@ MEDIA_IMAGE_VECTOR = "image"
 MEME_SEARCH_POOL_SIZE = 50
 MEME_RRF_K = 60
 MEME_LEGACY_ROUTE_WEIGHT = 0.35
+MEME_VISUAL_ROUTE_WEIGHT = 0.85
 MEME_GROUP_USAGE_WEIGHT = 0.35
 MEME_GROUP_USAGE_MIN_USES = 2
 MEME_SAMPLE_RANK_SCALE = 18.0
 MEME_TEXT_QUERY_INSTRUCT = (
-    "Retrieve meme images matching the requested quote, emotion, reaction, "
-    "character, action, and conversational intent."
+    "Retrieve meme images by all requested constraints. Preserve exact quotes, "
+    "meme references, named characters or IP, visible appearance, objects, actions, "
+    "scene and style, as well as emotion, reaction and conversational intent."
 )
 
 
@@ -589,21 +591,29 @@ class VectorDBOperator:
         )
 
     @staticmethod
+    def _merge_weighted_meme_search_routes(
+        routes: Sequence[tuple[Sequence[models.ScoredPoint], float]],
+    ) -> list[tuple[int, float]]:
+        """使用加权 RRF 合并任意数量的文本、视觉与兼容召回路线。"""
+        merged: dict[int, float] = {}
+        for points, weight in routes:
+            for rank, point in enumerate(points, start=1):
+                media_id = int(point.id)
+                merged[media_id] = merged.get(media_id, 0.0) + (
+                    weight / (MEME_RRF_K + rank)
+                )
+        return sorted(merged.items(), key=lambda item: item[1], reverse=True)
+
+    @staticmethod
     def _merge_meme_search_routes(
         primary_points: Sequence[models.ScoredPoint],
         legacy_points: Sequence[models.ScoredPoint],
     ) -> list[tuple[int, float]]:
         """使用加权 RRF 合并独立向量与旧融合向量召回。"""
-        merged: dict[int, float] = {}
-        for rank, point in enumerate(primary_points, start=1):
-            media_id = int(point.id)
-            merged[media_id] = merged.get(media_id, 0.0) + 1.0 / (MEME_RRF_K + rank)
-        for rank, point in enumerate(legacy_points, start=1):
-            media_id = int(point.id)
-            merged[media_id] = merged.get(media_id, 0.0) + (
-                MEME_LEGACY_ROUTE_WEIGHT / (MEME_RRF_K + rank)
-            )
-        return sorted(merged.items(), key=lambda item: item[1], reverse=True)
+        return VectorDBOperator._merge_weighted_meme_search_routes([
+            (primary_points, 1.0),
+            (legacy_points, MEME_LEGACY_ROUTE_WEIGHT),
+        ])
 
     @staticmethod
     def apply_group_usage_boost(
@@ -644,33 +654,46 @@ class VectorDBOperator:
         vector_name: str,
         limit: int,
     ) -> list[tuple[int, float]]:
-        primary_result, legacy_result = await asyncio.gather(
-            self.client.query_points(
-                collection_name=self.media_multivector_col,
-                query=vector,
-                using=vector_name,
-                limit=limit,
-                with_payload=False,
-            ),
-            self.client.query_points(
-                collection_name=self.media_col,
-                query=vector,
-                limit=limit,
-                with_payload=False,
-            ),
-            return_exceptions=True,
-        )
-        if isinstance(primary_result, BaseException):
-            logger.warning(f"独立媒体向量检索失败，回退旧索引: {primary_result}")
-            primary_points = []
-        else:
-            primary_points = primary_result.points if primary_result else []
-        if isinstance(legacy_result, BaseException):
-            logger.warning(f"旧媒体融合向量检索失败: {legacy_result}")
-            legacy_points = []
-        else:
-            legacy_points = legacy_result.points if legacy_result else []
-        return self._merge_meme_search_routes(primary_points, legacy_points)
+        query_specs: list[tuple[str, str | None, float, str]] = [
+            (self.media_multivector_col, vector_name, 1.0, "独立媒体向量"),
+        ]
+        if vector_name == MEDIA_TEXT_VECTOR:
+            # Qwen VL 的文本和图片向量位于同一语义空间。文字搜图时同时查询
+            # 原图视觉向量，才能召回描述中漏写的角色、外观、物体与构图。
+            query_specs.append((
+                self.media_multivector_col,
+                MEDIA_IMAGE_VECTOR,
+                MEME_VISUAL_ROUTE_WEIGHT,
+                "跨模态视觉向量",
+            ))
+        query_specs.append((
+            self.media_col,
+            None,
+            MEME_LEGACY_ROUTE_WEIGHT,
+            "旧媒体融合向量",
+        ))
+
+        calls = []
+        for collection_name, using, _, _ in query_specs:
+            kwargs = {
+                "collection_name": collection_name,
+                "query": vector,
+                "limit": limit,
+                "with_payload": False,
+            }
+            if using is not None:
+                kwargs["using"] = using
+            calls.append(self.client.query_points(**kwargs))
+        results = await asyncio.gather(*calls, return_exceptions=True)
+
+        routes: list[tuple[Sequence[models.ScoredPoint], float]] = []
+        for (_, _, weight, label), result in zip(query_specs, results):
+            if isinstance(result, BaseException):
+                logger.warning(f"{label}检索失败，跳过该路线: {result}")
+                continue
+            points = result.points if result else []
+            routes.append((points, weight))
+        return self._merge_weighted_meme_search_routes(routes)
 
     @classmethod
     def _diversify_meme_candidates(
