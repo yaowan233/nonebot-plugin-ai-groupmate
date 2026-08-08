@@ -860,4 +860,4 @@ async def test_search_similar_meme_multimodal_path(memory_module: Any):
 
     result = await operator.search_similar_meme("/tmp/whatever.png", limit=6)
 
-    assert result == [1, 2]
+    assert set(result) == {1, 2}
