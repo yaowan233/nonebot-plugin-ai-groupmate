@@ -23,6 +23,9 @@ MEDIA_VECTOR_SIZE = 2560
 MEDIA_EMBEDDING_VERSION = 3
 MEDIA_TEXT_VECTOR = "text"
 MEDIA_IMAGE_VECTOR = "image"
+# text 模式（meme_embedding_mode="text"）专用：纯文本向量集合
+MEDIA_TEXT_COL = "media_collection_text"
+MEDIA_TEXT_VECTOR_SIZE = 1024
 MEME_SEARCH_POOL_SIZE = 50
 MEME_RRF_K = 60
 MEME_LEGACY_ROUTE_WEIGHT = 0.35
@@ -60,6 +63,11 @@ def expand_meme_search_terms(description: str) -> str:
 
 
 class VectorDBOperator:
+    # 类级默认值，保证绕过 _configure 的场景（如测试）也能访问
+    enabled: bool = False
+    text_only: bool = False
+    media_text_col = MEDIA_TEXT_COL
+
     def __init__(self):
         self._configure()
 
@@ -81,12 +89,30 @@ class VectorDBOperator:
         self.media_col = "media_collection"
         # v3 将描述文本和原图拆成独立向量，避免视觉信息稀释梗和台词。
         self.media_multivector_col = "media_collection_v3"
+        # text 模式：纯文本向量集合（BGE-M3，1024 维）
+        self.media_text_col = MEDIA_TEXT_COL
+        # 多模态是否启用。text 模式不依赖 qwen_token，也不需要多模态 embedding。
+        # 未配置 qwen_token 时强制降级为 text 模式，避免空 token 调用 qwen3-vl 报错。
+        self.text_only = (
+            plugin_config.meme_embedding_mode == "text" or not plugin_config.qwen_token
+        )
+        if self.text_only:
+            if plugin_config.meme_embedding_mode != "text":
+                logger.warning("qwen_token 未配置，强制启用 text 模式")
+            logger.info("表情包向量化模式: text（纯文本向量，图找图不可用）")
+        else:
+            logger.info("表情包向量化模式: multimodal（需要配置 qwen_token）")
 
         # 2. Embedding API (用于文本 -> 向量)
         # 使用硅基流动/OpenAI兼容接口
+        # AsyncOpenAI client 会自动在 base_url 后追加 /embeddings，
+        # 兼容用户直接填完整路径 (…/v1/embeddings) 的写法，去掉尾部重复路径。
+        embedding_base_url = plugin_config.embedding_base_url.rstrip("/")
+        if embedding_base_url.endswith("/embeddings"):
+            embedding_base_url = embedding_base_url[: -len("/embeddings")]
         self.emb_client = AsyncOpenAI(
             api_key=plugin_config.embedding_api_key,
-            base_url=plugin_config.embedding_base_url
+            base_url=embedding_base_url
         )
         self.qwen_http_client = httpx.AsyncClient(timeout=60.0)
         self.emb_model = "BAAI/bge-m3"
@@ -154,31 +180,42 @@ class VectorDBOperator:
                 logger.info(f"Qdrant集合 {self.chat_col} 已创建")
 
             # 2. 检查并创建 Media 集合
-            if not await self.client.collection_exists(self.media_col):
-                await self.client.create_collection(
-                    collection_name=self.media_col,
-                    vectors_config=models.VectorParams(
-                        size=MEDIA_VECTOR_SIZE,
-                        distance=models.Distance.COSINE
-                    ),
-                )
-                logger.info(f"Qdrant集合 {self.media_col} 已创建")
+            if self.text_only:
+                if not await self.client.collection_exists(self.media_text_col):
+                    await self.client.create_collection(
+                        collection_name=self.media_text_col,
+                        vectors_config=models.VectorParams(
+                            size=MEDIA_TEXT_VECTOR_SIZE,
+                            distance=models.Distance.COSINE
+                        ),
+                    )
+                    logger.info(f"Qdrant集合 {self.media_text_col} 已创建")
+            else:
+                if not await self.client.collection_exists(self.media_col):
+                    await self.client.create_collection(
+                        collection_name=self.media_col,
+                        vectors_config=models.VectorParams(
+                            size=MEDIA_VECTOR_SIZE,
+                            distance=models.Distance.COSINE
+                        ),
+                    )
+                    logger.info(f"Qdrant集合 {self.media_col} 已创建")
 
-            if not await self.client.collection_exists(self.media_multivector_col):
-                await self.client.create_collection(
-                    collection_name=self.media_multivector_col,
-                    vectors_config={
-                        MEDIA_TEXT_VECTOR: models.VectorParams(
-                            size=MEDIA_VECTOR_SIZE,
-                            distance=models.Distance.COSINE,
-                        ),
-                        MEDIA_IMAGE_VECTOR: models.VectorParams(
-                            size=MEDIA_VECTOR_SIZE,
-                            distance=models.Distance.COSINE,
-                        ),
-                    },
-                )
-                logger.info(f"Qdrant集合 {self.media_multivector_col} 已创建")
+                if not await self.client.collection_exists(self.media_multivector_col):
+                    await self.client.create_collection(
+                        collection_name=self.media_multivector_col,
+                        vectors_config={
+                            MEDIA_TEXT_VECTOR: models.VectorParams(
+                                size=MEDIA_VECTOR_SIZE,
+                                distance=models.Distance.COSINE,
+                            ),
+                            MEDIA_IMAGE_VECTOR: models.VectorParams(
+                                size=MEDIA_VECTOR_SIZE,
+                                distance=models.Distance.COSINE,
+                            ),
+                        },
+                    )
+                    logger.info(f"Qdrant集合 {self.media_multivector_col} 已创建")
 
             self._collections_ready = True
 
@@ -470,6 +507,31 @@ class VectorDBOperator:
         if not self.enabled:
             return False
         await self._ensure_collections()
+
+        if self.text_only:
+            # text 模式：只对描述文本做 BGE-M3 向量化，不依赖多模态 embedding
+            if not description:
+                logger.warning(f"text 模式缺少描述，跳过 {media_id}")
+                return False
+            vector = await self._get_text_embedding(description)
+            if not vector:
+                return False
+            await self.client.upsert(
+                collection_name=self.media_text_col,
+                points=[
+                    models.PointStruct(
+                        id=media_id,
+                        vector=vector,
+                        payload={
+                            "created_at": int(time.time()),
+                            "embedding_version": MEDIA_EMBEDDING_VERSION,
+                        }
+                    )
+                ],
+                wait=True,
+            )
+            return True
+
         vectors = await self._get_qwen_vl_independent_pair(description, image_url)
         if not vectors:
             return False
@@ -859,6 +921,26 @@ class VectorDBOperator:
             return []
         await self._ensure_collections()
         expanded_description = expand_meme_search_terms(description)
+
+        if self.text_only:
+            # text 模式：BGE-M3 文本向量 -> 单路线检索 media_collection_text
+            vector = await self._get_text_embedding(expanded_description)
+            if not vector:
+                return []
+            search_result = await self.client.query_points(
+                collection_name=self.media_text_col,
+                query=vector,
+                limit=limit,
+                with_payload=False,
+                timeout=math.ceil(MEME_QDRANT_ROUTE_TIMEOUT_SECONDS),
+            )
+            if not search_result or not search_result.points:
+                return []
+            return [
+                (int(point.id), float(getattr(point, "score", 0.0)))
+                for point in search_result.points
+            ]
+
         vector = await self._get_qwen_vl_embedding(
             text=expanded_description,
             instruct=MEME_TEXT_QUERY_INSTRUCT,
@@ -889,6 +971,9 @@ class VectorDBOperator:
         ID -> Retrieve Vector -> Search Qdrant -> Return IDs
         """
         if not self.enabled:
+            return []
+        if self.text_only:
+            logger.warning("text 模式下图找图 (search_similar_meme) 不可用")
             return []
         await self._ensure_collections()
 

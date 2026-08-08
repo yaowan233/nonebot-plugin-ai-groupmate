@@ -98,6 +98,14 @@ class ScopedConfig(BaseModel):
     rerank_api_url: str = ""
     rerank_api_key: str = ""
 
+    # 表情包向量化模式:
+    #   "multimodal": 使用 qwen3-vl-embedding 生成描述文本 + 原图双向量，
+    #                  需要配置 qwen_token (DashScope)，图找图可用。
+    #                  若未配置 qwen_token，会自动降级为 "text"。
+    #   "text":       仅用 embedding_api_key 的文本向量化描述，无需 qwen_token，
+    #                  运维最轻；图找图 (search_similar_meme_by_id) 不可用。
+    meme_embedding_mode: str = "multimodal"
+
 
 class Config(BaseModel):
     ai_groupmate: ScopedConfig = Field(default_factory=ScopedConfig)
