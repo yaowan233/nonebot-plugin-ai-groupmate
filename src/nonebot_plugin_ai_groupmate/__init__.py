@@ -219,24 +219,16 @@ def _sample_proactive_reply_modes(
     is_group: bool,
     reaction_supported: bool,
 ) -> tuple[bool, bool, bool]:
-    """返回（普通回复、reaction 专用、图片表情专用）；定向消息不采样。"""
+    """返回（普通回复、reaction 专用、图片表情专用）。
+
+    未提及 Bot 的消息只保留低概率普通插话。reaction 和图片表情必须先命中
+    定向/连续对话规则，再由正常 Agent 自行选择或按用户明确要求执行，避免对
+    每条普通群消息额外调用 Gatekeeper 和主模型。
+    """
     if addressed or continuous:
         return False, False, False
     random_reply = random.random() < plugin_config.reply_probability
-    eligible = not command_like and has_text and is_group
-    proactive_reaction_only = (
-        not random_reply
-        and eligible
-        and reaction_supported
-        and random.random() < plugin_config.proactive_reaction_probability
-    )
-    proactive_meme_only = (
-        not random_reply
-        and not proactive_reaction_only
-        and eligible
-        and random.random() < plugin_config.proactive_meme_probability
-    )
-    return random_reply, proactive_reaction_only, proactive_meme_only
+    return random_reply, False, False
 
 
 def _is_explicit_reaction_request(text: str) -> bool:
@@ -1432,6 +1424,9 @@ async def _(
     "interval", minutes=60, max_instances=1, coalesce=True, id="vectorize_chat"
 )
 async def vectorize_message_history():
+    if not DB.enabled:
+        logger.debug("Qdrant 未启用，跳过会话向量化任务")
+        return
     async with maintenance_gate.slot(wait=False) as admitted:
         if not admitted:
             logger.info("其他维护任务正在运行，跳过本轮会话向量化")
@@ -1528,6 +1523,8 @@ MEDIA_TAGGING_PROMPT = """
 
 async def _process_media_vectorization(media_id: int) -> str:
     """处理单张图片；网络请求期间不占用 SQL 连接。"""
+    if not DB.enabled:
+        return "disabled"
     async with get_session() as db_session:
         media = await db_session.get(MediaStorage, media_id)
         if media is None:
@@ -1655,6 +1652,9 @@ async def _vectorize_media_impl():
     并发处理新图片与旧向量。每个 worker 使用独立 SQL 会话，且网络请求
     期间不持有数据库连接。
     """
+    if not DB.enabled:
+        logger.debug("Qdrant 未启用，跳过媒体向量化任务")
+        return
     batch_size = plugin_config.media_vectorize_batch_size
     min_references = plugin_config.media_vectorize_min_references
     concurrency = plugin_config.media_vectorize_concurrency
@@ -1711,6 +1711,9 @@ async def _vectorize_media_impl():
     "interval", minutes=10, max_instances=1, coalesce=True, id="vectorize_media"
 )
 async def vectorize_media():
+    if not DB.enabled:
+        logger.debug("Qdrant 未启用，跳过媒体向量化调度")
+        return
     async with maintenance_gate.slot(wait=False) as admitted:
         if not admitted:
             logger.info("其他维护任务正在运行，跳过本轮媒体向量化")

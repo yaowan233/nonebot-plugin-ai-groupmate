@@ -83,6 +83,7 @@ async def test_vectorize_media_reindexes_legacy_meme_without_retagging(
 
     monkeypatch.setattr(plugin_module, "get_session", fake_get_session)
     monkeypatch.setattr(plugin_module, "pic_dir", tmp_path)
+    monkeypatch.setattr(plugin_module.DB, "enabled", True)
     monkeypatch.setattr(plugin_module.DB, "insert_media", fake_insert_media)
     monkeypatch.setattr(plugin_module, "get_tagging_model", fail_if_tagging_model_is_used)
 
@@ -131,6 +132,7 @@ async def test_vectorize_media_uses_configured_concurrency(
         return "indexed"
 
     monkeypatch.setattr(plugin_module, "get_session", fake_get_session)
+    monkeypatch.setattr(plugin_module.DB, "enabled", True)
     monkeypatch.setattr(plugin_module, "_process_media_vectorization", fake_process)
     monkeypatch.setattr(plugin_module.plugin_config, "media_vectorize_batch_size", 10)
     monkeypatch.setattr(plugin_module.plugin_config, "media_vectorize_min_references", 1)
@@ -139,3 +141,22 @@ async def test_vectorize_media_uses_configured_concurrency(
     await plugin_module._vectorize_media_impl()
 
     assert max_active == 3
+
+
+@pytest.mark.asyncio
+async def test_media_vectorization_skips_all_work_without_qdrant(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import nonebot_plugin_ai_groupmate as plugin_module
+
+    def fail_if_session_is_opened():
+        raise AssertionError("Qdrant 未启用时不应查询媒体或启动模型任务")
+
+    monkeypatch.setattr(plugin_module.DB, "enabled", False)
+    monkeypatch.setattr(plugin_module, "get_session", fail_if_session_is_opened)
+
+    await plugin_module.vectorize_media()
+    await plugin_module._vectorize_media_impl()
+    result = await plugin_module._process_media_vectorization(42)
+
+    assert result == "disabled"

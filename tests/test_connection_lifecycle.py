@@ -91,6 +91,7 @@ async def test_chat_vectorization_releases_connection_before_qdrant(monkeypatch)
     monkeypatch.setattr(utils, "split_chat_into_context_groups", fake_split)
     monkeypatch.setattr(utils, "insert_vectors_with_retry", fake_insert)
     monkeypatch.setattr(utils, "update_messages_in_batches", fake_update)
+    monkeypatch.setattr(utils.DB, "enabled", True)
 
     result = await utils.process_and_vectorize_session_chats(
         cast(AsyncSession, _Session()), "group-1"
@@ -98,6 +99,41 @@ async def test_chat_vectorization_releases_connection_before_qdrant(monkeypatch)
 
     assert result is not None
     assert events[:3] == ["query", "commit", "qdrant"]
+
+
+@pytest.mark.asyncio
+async def test_chat_vectorization_keeps_messages_pending_without_qdrant(monkeypatch):
+    from nonebot_plugin_ai_groupmate import utils
+
+    async def fail_if_history_is_queried(*args, **kwargs):
+        raise AssertionError("Qdrant 未启用时不应查询或标记聊天记录")
+
+    monkeypatch.setattr(utils.DB, "enabled", False)
+    monkeypatch.setattr(
+        utils,
+        "split_chat_into_context_groups",
+        fail_if_history_is_queried,
+    )
+
+    result = await utils.process_and_vectorize_session_chats(
+        cast(AsyncSession, object()),
+        "group-1",
+    )
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_chat_vectorization_scheduler_skips_without_qdrant(monkeypatch):
+    import nonebot_plugin_ai_groupmate as plugin
+
+    def fail_if_session_is_opened():
+        raise AssertionError("Qdrant 未启用时不应启动会话向量化")
+
+    monkeypatch.setattr(plugin.DB, "enabled", False)
+    monkeypatch.setattr(plugin, "get_session", fail_if_session_is_opened)
+
+    await plugin.vectorize_message_history()
 
 
 @pytest.mark.asyncio

@@ -259,6 +259,10 @@ async def process_and_vectorize_session_chats(
         chunk_size: 每批次向量化的数量
         commit_interval: 数据库提交间隔（消息数）
     """
+    if not DB.enabled:
+        logger.debug("Qdrant 未启用，跳过会话向量化并保留待处理状态")
+        return None
+
     # 1. 获取并切分会话
     context_groups = await split_chat_into_context_groups(
         db_session,

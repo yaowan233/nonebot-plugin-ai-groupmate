@@ -7,13 +7,13 @@ import pytest
 from langchain_core.messages import AIMessage
 
 
-def test_proactive_reaction_sampling_is_independent(monkeypatch):
+def test_unaddressed_message_does_not_sample_proactive_reaction(monkeypatch):
     import nonebot_plugin_ai_groupmate as plugin
 
     monkeypatch.setattr(plugin.plugin_config, "reply_probability", 0.01)
     monkeypatch.setattr(plugin.plugin_config, "proactive_reaction_probability", 0.05)
     monkeypatch.setattr(plugin.plugin_config, "proactive_meme_probability", 0.02)
-    rolls = iter([0.5, 0.01])
+    rolls = iter([0.5])
     monkeypatch.setattr(plugin.random, "random", lambda: next(rolls))
 
     result = plugin._sample_proactive_reply_modes(
@@ -25,7 +25,7 @@ def test_proactive_reaction_sampling_is_independent(monkeypatch):
         reaction_supported=True,
     )
 
-    assert result == (False, True, False)
+    assert result == (False, False, False)
 
 
 def test_explicit_reaction_request_detection():

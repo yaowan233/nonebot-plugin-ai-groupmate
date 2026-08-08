@@ -103,8 +103,8 @@
 | ai_groupmate__bot_name | 否 | `"bot"` | bot 名 |
 | ai_groupmate__reply_probability | 否 | `0.01` | 群内主动发言概率 |
 | ai_groupmate__repeat_probability | 否 | `0.15` | Bot 已在当前连续对话窗口参与，且至少两名不同群友连续发送同一句短文本后，Bot 对每条新跟读加入队形的概率 |
-| ai_groupmate__proactive_reaction_probability | 否 | `0.05` | OneBot 群消息触发“只考虑添加 reaction/消息表情回应”决策的概率 |
-| ai_groupmate__proactive_meme_probability | 否 | `0.02` | 群消息触发“只考虑发表情包”决策的概率；不合适时保持沉默 |
+| ai_groupmate__proactive_reaction_probability | 否 | `0.05` | 兼容旧配置；非定向群消息的主动 reaction 采样已停用，避免额外模型调用 |
+| ai_groupmate__proactive_meme_probability | 否 | `0.02` | 兼容旧配置；非定向群消息的主动表情包采样已停用，避免额外模型调用 |
 | ai_groupmate__personality_setting | 否 | 无 | 自定义人设和固定业务知识 prompt |
 | ai_groupmate__tavily_api_key | 否 | 无 | Tavily 搜索 API 密钥（联网搜索功能） |
 | ai_groupmate__llm_api_key | 推荐 | 无 | 通用 LLM API Key，未单独配置各角色 key 时使用 |
@@ -204,7 +204,7 @@ AI_GROUPMATE__CHAT_MODEL=qwen3.7-plus
 
 ## 🎉 使用
 
-@bot 即可触发回复，也会以 `reply_probability` 的概率主动发言；Bot 已在当前连续对话窗口参与、随后至少两名不同群友连续发送同一句短文本时，会按 `repeat_probability` 独立决定是否原样加入队形；此外会按 `proactive_reaction_probability` 低概率进入“只考虑添加消息 reaction”的决策，或按 `proactive_meme_probability` 进入“只考虑发表情包”的决策，不适合时保持沉默。
+@bot 即可触发回复，也会以 `reply_probability` 的概率主动发言；Bot 已在当前连续对话窗口参与、随后至少两名不同群友连续发送同一句短文本时，会按 `repeat_probability` 独立决定是否原样加入队形。reaction 和图片表情不再对未提及 Bot 的普通群消息主动采样；只有当前消息明确呼叫 Bot、回复 Bot、处于同一用户的连续对话窗口，或用户明确要求时，才会交给 Agent 选择或执行。
 
 ### 自定义 Agent Tools
 
