@@ -91,9 +91,14 @@ class VectorDBOperator:
         self.media_multivector_col = "media_collection_v3"
         # text 模式：纯文本向量集合（BGE-M3，1024 维）
         self.media_text_col = MEDIA_TEXT_COL
-        # 多模态是否启用。text 模式不依赖 qwen_token，也不需要多模态 embedding
-        self.text_only = plugin_config.meme_embedding_mode == "text"
+        # 多模态是否启用。text 模式不依赖 qwen_token，也不需要多模态 embedding。
+        # 未配置 qwen_token 时强制降级为 text 模式，避免空 token 调用 qwen3-vl 报错。
+        self.text_only = (
+            plugin_config.meme_embedding_mode == "text" or not plugin_config.qwen_token
+        )
         if self.text_only:
+            if plugin_config.meme_embedding_mode != "text":
+                logger.warning("qwen_token 未配置，强制启用 text 模式")
             logger.info("表情包向量化模式: text（纯文本向量，图找图不可用）")
         else:
             logger.info("表情包向量化模式: multimodal（需要配置 qwen_token）")

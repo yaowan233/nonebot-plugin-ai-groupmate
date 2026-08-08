@@ -631,3 +631,51 @@ async def test_text_mode_search_similar_meme_disabled(memory_module: Any):
     result = await operator.search_similar_meme("/tmp/whatever.png")
 
     assert result == []
+
+
+def test_configure_forces_text_mode_when_qwen_token_missing(
+    memory_module: Any, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(
+        memory_module,
+        "plugin_config",
+        SimpleNamespace(
+            qdrant_uri="http://127.0.0.1:6333",
+            qwen_token="",
+            meme_embedding_mode="multimodal",
+            embedding_api_key="k",
+            embedding_base_url="http://emb",
+            rerank_api_url="",
+            rerank_api_key="",
+            qdrant_api_key="",
+        ),
+    )
+    operator = object.__new__(memory_module.VectorDBOperator)
+
+    operator._configure()
+
+    assert operator.text_only is True
+
+
+def test_configure_keeps_multimodal_when_qwen_token_set(
+    memory_module: Any, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(
+        memory_module,
+        "plugin_config",
+        SimpleNamespace(
+            qdrant_uri="http://127.0.0.1:6333",
+            qwen_token="sk-xxx",
+            meme_embedding_mode="multimodal",
+            embedding_api_key="k",
+            embedding_base_url="http://emb",
+            rerank_api_url="",
+            rerank_api_key="",
+            qdrant_api_key="",
+        ),
+    )
+    operator = object.__new__(memory_module.VectorDBOperator)
+
+    operator._configure()
+
+    assert operator.text_only is False
