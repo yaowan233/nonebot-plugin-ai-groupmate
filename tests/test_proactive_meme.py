@@ -136,3 +136,92 @@ async def test_proactive_meme_graph_only_exposes_meme_actions(monkeypatch):
     assert captured_search_options["model_factory"] is flash_model_factory
     assert "model" not in captured_search_options
     assert flash_factory_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_private_text_mode_exposes_meme_tools_without_similar(monkeypatch):
+    from nonebot_plugin_ai_groupmate import agent
+
+    captured_base_tools: list[str] = []
+    captured_skills: dict[str, list[str]] = {}
+
+    class FakeSession:
+        async def commit(self):
+            return None
+
+    async def empty_context(*args: Any, **kwargs: Any) -> str:
+        return ""
+
+    async def no_extensions(*args: Any, **kwargs: Any):
+        return [], [], []
+
+    class DummyTool:
+        def __init__(self, name: str):
+            self.name = name
+
+    def fake_build_chat_graph(model, tools, system_prompt, **kwargs):
+        captured_base_tools.extend(tool.name for tool in kwargs["base_tools"])
+        captured_skills.update(
+            {
+                skill: [tool.name for tool in skill_tools]
+                for skill, skill_tools in kwargs["tools_by_skill"].items()
+            }
+        )
+        return object()
+
+    monkeypatch.setattr(agent, "get_user_relation_context", empty_context)
+    monkeypatch.setattr(agent, "get_group_context", empty_context)
+    monkeypatch.setattr(agent, "get_recent_relations_context", empty_context)
+    monkeypatch.setattr(agent, "build_registered_agent_extensions", no_extensions)
+    monkeypatch.setattr(agent, "get_chat_model", lambda: object())
+    monkeypatch.setattr(agent, "get_flash_model", lambda: object())
+    monkeypatch.setattr(agent, "build_chat_graph", fake_build_chat_graph)
+    monkeypatch.setattr(
+        agent, "create_search_meme_tool", lambda *a, **k: DummyTool("search_meme_image")
+    )
+    monkeypatch.setattr(
+        agent, "create_similar_meme_tool", lambda *a, **k: DummyTool("search_similar_meme_by_id")
+    )
+    monkeypatch.setattr(
+        agent, "create_send_meme_tool", lambda *a, **k: DummyTool("send_meme_image")
+    )
+    monkeypatch.setattr(
+        agent, "create_reply_tool", lambda *a, **k: DummyTool("reply_user")
+    )
+    monkeypatch.setattr(
+        agent, "create_relation_tool", lambda *a, **k: DummyTool("relation_tool")
+    )
+    monkeypatch.setattr(
+        agent, "create_report_tool", lambda *a, **k: DummyTool("report_tool")
+    )
+    monkeypatch.setattr(
+        agent, "create_mute_tool", lambda *a, **k: DummyTool("mute_user")
+    )
+    monkeypatch.setattr(
+        agent, "create_schedule_message_tool", lambda *a, **k: DummyTool("schedule_task")
+    )
+    monkeypatch.setattr(
+        agent, "create_schedule_agent_task_tool", lambda *a, **k: DummyTool("schedule_agent")
+    )
+    monkeypatch.setattr(
+        agent, "create_reaction_tool", lambda *a, **k: DummyTool("reaction_tool")
+    )
+    monkeypatch.setattr(
+        agent, "create_agent_skill_loader_tool", lambda *a, **k: DummyTool("load_agent_skill")
+    )
+    monkeypatch.setattr(agent.plugin_config, "meme_embedding_mode", "text")
+    monkeypatch.setattr(agent.plugin_config, "proactive_private_message", False)
+
+    await agent.create_chat_graph(
+        FakeSession(),
+        "user-private-1",
+        None,
+        "user-1",
+        "Alice",
+        history=[],
+        is_private=True,
+    )
+
+    assert "search_similar_meme_by_id" not in captured_base_tools
+    assert "search_similar_meme_by_id" not in captured_skills.get("meme_tools", [])
+    assert captured_skills["meme_tools"] == ["search_meme_image", "send_meme_image"]

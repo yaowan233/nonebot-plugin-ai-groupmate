@@ -587,6 +587,49 @@ async def test_text_mode_insert_media_uses_text_embedding(memory_module: Any):
 
 
 @pytest.mark.asyncio
+async def test_insert_media_skips_when_disabled(memory_module: Any):
+    operator = make_operator(memory_module)
+    operator.enabled = False
+
+    assert await operator.insert_media(1, "data:image/png;base64,AAAA", "描述") is False
+
+
+@pytest.mark.asyncio
+async def test_text_mode_insert_media_skips_missing_description(memory_module: Any):
+    operator = make_operator(memory_module)
+    operator.enabled = True
+    operator.text_only = True
+
+    async def ensure_collections() -> None:
+        return None
+
+    operator._ensure_collections = ensure_collections
+
+    assert await operator.insert_media(1, "data:image/png;base64,AAAA", "") is False
+
+
+@pytest.mark.asyncio
+async def test_text_mode_insert_media_skips_embedding_failure(memory_module: Any):
+    operator = make_operator(memory_module)
+    operator.enabled = True
+    operator.text_only = True
+
+    async def ensure_collections() -> None:
+        return None
+
+    async def get_text_embedding(text: str) -> None:
+        return None
+
+    operator._ensure_collections = ensure_collections
+    operator._get_text_embedding = get_text_embedding
+
+    assert (
+        await operator.insert_media(1, "data:image/png;base64,AAAA", "熊猫头流泪")
+        is False
+    )
+
+
+@pytest.mark.asyncio
 async def test_text_mode_search_meme_candidates_single_route(memory_module: Any):
     operator = make_operator(memory_module)
     operator.enabled = True
@@ -631,6 +674,64 @@ async def test_text_mode_search_similar_meme_disabled(memory_module: Any):
     result = await operator.search_similar_meme("/tmp/whatever.png")
 
     assert result == []
+
+
+@pytest.mark.asyncio
+async def test_search_meme_candidates_skips_when_disabled(memory_module: Any):
+    operator = make_operator(memory_module)
+    operator.enabled = False
+
+    assert await operator.search_meme_candidates("无奈") == []
+
+
+@pytest.mark.asyncio
+async def test_text_mode_search_meme_candidates_embedding_failure(memory_module: Any):
+    operator = make_operator(memory_module)
+    operator.enabled = True
+    operator.text_only = True
+
+    async def ensure_collections() -> None:
+        return None
+
+    async def get_text_embedding(text: str) -> None:
+        return None
+
+    operator._ensure_collections = ensure_collections
+    operator._get_text_embedding = get_text_embedding
+
+    assert await operator.search_meme_candidates("无奈") == []
+
+
+@pytest.mark.asyncio
+async def test_text_mode_search_meme_candidates_empty_result(memory_module: Any):
+    operator = make_operator(memory_module)
+    operator.enabled = True
+    operator.text_only = True
+    vector = [0.5] * memory_module.MEDIA_TEXT_VECTOR_SIZE
+
+    async def ensure_collections() -> None:
+        return None
+
+    async def get_text_embedding(text: str) -> list[float]:
+        return vector
+
+    class FakeQdrantClient:
+        async def query_points(self, **kwargs: Any) -> SimpleNamespace:
+            return SimpleNamespace(points=[])
+
+    operator._ensure_collections = ensure_collections
+    operator._get_text_embedding = get_text_embedding
+    operator.client = FakeQdrantClient()
+
+    assert await operator.search_meme_candidates("无奈") == []
+
+
+@pytest.mark.asyncio
+async def test_search_similar_meme_skips_when_disabled(memory_module: Any):
+    operator = make_operator(memory_module)
+    operator.enabled = False
+
+    assert await operator.search_similar_meme("/tmp/whatever.png") == []
 
 
 def test_configure_forces_text_mode_when_qwen_token_missing(
@@ -679,3 +780,84 @@ def test_configure_keeps_multimodal_when_qwen_token_set(
     operator._configure()
 
     assert operator.text_only is False
+
+
+def test_configure_strips_duplicate_embeddings_suffix(
+    memory_module: Any, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(
+        memory_module,
+        "plugin_config",
+        SimpleNamespace(
+            qdrant_uri="http://127.0.0.1:6333",
+            qwen_token="sk-xxx",
+            meme_embedding_mode="multimodal",
+            embedding_api_key="k",
+            embedding_base_url="http://emb/v1/embeddings",
+            rerank_api_url="",
+            rerank_api_key="",
+            qdrant_api_key="",
+        ),
+    )
+    operator = object.__new__(memory_module.VectorDBOperator)
+
+    operator._configure()
+
+    base_url = str(operator.emb_client.base_url).rstrip("/")
+    assert base_url.endswith("/embeddings") is False
+    assert base_url == "http://emb/v1"
+
+
+@pytest.mark.asyncio
+async def test_ensure_collections_creates_chat_and_multimodal_collections(
+    memory_module: Any,
+):
+    operator = make_operator(memory_module)
+    operator.text_only = False
+    operator.chat_col = "chat_collection"
+    operator._collections_ready = False
+    operator._init_lock = asyncio.Lock()
+    create_calls: list[str] = []
+
+    class FakeQdrantClient:
+        async def collection_exists(self, collection_name: str) -> bool:
+            return False
+
+        async def create_collection(self, **kwargs: Any) -> None:
+            create_calls.append(kwargs["collection_name"])
+
+        async def create_payload_index(self, **kwargs: Any) -> None:
+            return None
+
+    operator.client = FakeQdrantClient()
+
+    await operator._ensure_collections()
+
+    assert "chat_collection" in create_calls
+    assert operator.media_col in create_calls
+    assert operator.media_multivector_col in create_calls
+
+
+@pytest.mark.asyncio
+async def test_search_similar_meme_multimodal_path(memory_module: Any):
+    operator = make_operator(memory_module)
+    operator.enabled = True
+    operator.text_only = False
+    vector = [0.1] * memory_module.MEDIA_VECTOR_SIZE
+
+    async def ensure_collections() -> None:
+        return None
+
+    async def get_qwen_vl_embedding(**kwargs: Any) -> list[float]:
+        return vector
+
+    async def search_routes(*_: Any, **__: Any) -> list[tuple[int, float]]:
+        return [(1, 0.9), (2, 0.8)]
+
+    operator._ensure_collections = ensure_collections
+    operator._get_qwen_vl_embedding = get_qwen_vl_embedding
+    operator._search_media_routes = search_routes
+
+    result = await operator.search_similar_meme("/tmp/whatever.png", limit=6)
+
+    assert result == [1, 2]
