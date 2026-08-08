@@ -105,9 +105,14 @@ class VectorDBOperator:
 
         # 2. Embedding API (用于文本 -> 向量)
         # 使用硅基流动/OpenAI兼容接口
+        # AsyncOpenAI client 会自动在 base_url 后追加 /embeddings，
+        # 兼容用户直接填完整路径 (…/v1/embeddings) 的写法，去掉尾部重复路径。
+        embedding_base_url = plugin_config.embedding_base_url.rstrip("/")
+        if embedding_base_url.endswith("/embeddings"):
+            embedding_base_url = embedding_base_url[: -len("/embeddings")]
         self.emb_client = AsyncOpenAI(
             api_key=plugin_config.embedding_api_key,
-            base_url=plugin_config.embedding_base_url
+            base_url=embedding_base_url
         )
         self.qwen_http_client = httpx.AsyncClient(timeout=60.0)
         self.emb_model = "BAAI/bge-m3"
