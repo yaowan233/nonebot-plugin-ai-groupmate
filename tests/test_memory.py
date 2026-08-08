@@ -522,3 +522,112 @@ async def test_search_meme_uses_larger_candidate_pool_and_recent_exclusion(
     assert query_calls[1]["using"] == memory_module.MEDIA_IMAGE_VECTOR
     assert query_calls[2]["collection_name"] == "media_collection"
     assert "using" not in query_calls[2]
+
+
+# ================= text 模式（meme_embedding_mode="text"） =================
+
+
+@pytest.mark.asyncio
+async def test_text_mode_ensure_collections_creates_text_collection(
+    memory_module: Any,
+):
+    operator = make_operator(memory_module)
+    operator.text_only = True
+    operator.chat_col = "chat_collection"
+    operator._collections_ready = False
+    operator._init_lock = asyncio.Lock()
+    create_calls: list[dict[str, Any]] = []
+
+    class FakeQdrantClient:
+        async def collection_exists(self, collection_name: str) -> bool:
+            return collection_name == operator.chat_col
+
+        async def create_collection(self, **kwargs: Any) -> None:
+            create_calls.append(kwargs)
+
+    operator.client = FakeQdrantClient()
+
+    await operator._ensure_collections()
+
+    names = [c["collection_name"] for c in create_calls]
+    assert memory_module.MEDIA_TEXT_COL in names
+    assert "media_collection_v3" not in names
+    text_call = next(c for c in create_calls if c["collection_name"] == memory_module.MEDIA_TEXT_COL)
+    assert text_call["vectors_config"].size == memory_module.MEDIA_TEXT_VECTOR_SIZE
+
+
+@pytest.mark.asyncio
+async def test_text_mode_insert_media_uses_text_embedding(memory_module: Any):
+    operator = make_operator(memory_module)
+    operator.enabled = True
+    operator.text_only = True
+    vector = [0.5] * memory_module.MEDIA_TEXT_VECTOR_SIZE
+    upsert_calls: list[dict[str, Any]] = []
+
+    async def ensure_collections() -> None:
+        return None
+
+    async def get_text_embedding(text: str) -> list[float]:
+        return vector
+
+    class FakeQdrantClient:
+        async def upsert(self, **kwargs: Any) -> None:
+            upsert_calls.append(kwargs)
+
+    operator._ensure_collections = ensure_collections
+    operator._get_text_embedding = get_text_embedding
+    operator.client = FakeQdrantClient()
+
+    assert await operator.insert_media(1, "data:image/png;base64,AAAA", "熊猫头流泪") is True
+    assert len(upsert_calls) == 1
+    assert upsert_calls[0]["collection_name"] == memory_module.MEDIA_TEXT_COL
+    point = upsert_calls[0]["points"][0]
+    assert point.id == 1
+    assert point.vector == vector
+
+
+@pytest.mark.asyncio
+async def test_text_mode_search_meme_candidates_single_route(memory_module: Any):
+    operator = make_operator(memory_module)
+    operator.enabled = True
+    operator.text_only = True
+    vector = [0.5] * memory_module.MEDIA_TEXT_VECTOR_SIZE
+    query_calls: list[dict[str, Any]] = []
+
+    async def ensure_collections() -> None:
+        return None
+
+    async def get_text_embedding(text: str) -> list[float]:
+        return vector
+
+    class FakeQdrantClient:
+        async def query_points(self, **kwargs: Any) -> SimpleNamespace:
+            query_calls.append(kwargs)
+            return SimpleNamespace(
+                points=[
+                    SimpleNamespace(id=7, score=0.9),
+                    SimpleNamespace(id=8, score=0.8),
+                ]
+            )
+
+    operator._ensure_collections = ensure_collections
+    operator._get_text_embedding = get_text_embedding
+    operator.client = FakeQdrantClient()
+
+    result = await operator.search_meme_candidates("无奈", limit=10)
+
+    assert result == [(7, 0.9), (8, 0.8)]
+    assert len(query_calls) == 1
+    assert query_calls[0]["collection_name"] == memory_module.MEDIA_TEXT_COL
+    assert "using" not in query_calls[0]
+
+
+@pytest.mark.asyncio
+async def test_text_mode_search_similar_meme_disabled(memory_module: Any):
+    operator = make_operator(memory_module)
+    operator.enabled = True
+    operator.text_only = True
+
+    result = await operator.search_similar_meme("/tmp/whatever.png")
+
+    assert result == []

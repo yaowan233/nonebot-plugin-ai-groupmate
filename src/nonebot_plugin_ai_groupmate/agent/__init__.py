@@ -991,6 +991,10 @@ async def create_chat_graph(
         pic_dir=pic_dir,
         approved_meme_ids=approved_meme_ids,
     )
+    # text 模式（纯文本向量）下无图片向量，图找图工具不提供给 Agent
+    meme_similar_enabled = plugin_config.meme_embedding_mode != "text"
+    if not meme_similar_enabled:
+        logger.info("表情包向量化模式为 text，图找图工具已禁用")
     mute_tool = create_mute_tool(
         db_session,
         session_id,
@@ -1112,7 +1116,11 @@ async def create_chat_graph(
         ),
         *([reaction_tool] if reaction_enabled else []),
         *(
-            [search_meme_tool, similar_meme_tool, send_meme_tool]
+            (
+                [search_meme_tool, similar_meme_tool, send_meme_tool]
+                if meme_similar_enabled
+                else [search_meme_tool, send_meme_tool]
+            )
             if not is_private
             else []
         ),
@@ -1141,11 +1149,11 @@ async def create_chat_graph(
         "profile_memory_tools": [relation_tool, report_tool],
     }
     if is_private:
-        tools_by_skill["meme_tools"] = [
-            search_meme_tool,
-            similar_meme_tool,
-            send_meme_tool,
-        ]
+        tools_by_skill["meme_tools"] = (
+            [search_meme_tool, similar_meme_tool, send_meme_tool]
+            if meme_similar_enabled
+            else [search_meme_tool, send_meme_tool]
+        )
     if proactive_meme_only or proactive_reaction_only or repeat_text is not None:
         tools_by_skill = {}
     if group_memory_tool is not None:
