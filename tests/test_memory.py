@@ -68,13 +68,30 @@ def mock_http_client(
 async def test_ensure_collections_creates_named_media_vectors(memory_module: Any):
     operator = make_operator(memory_module)
     operator.chat_col = "chat_collection"
-    operator._collections_ready = False
     operator._init_lock = asyncio.Lock()
     create_calls: list[dict[str, Any]] = []
 
     class FakeQdrantClient:
         async def collection_exists(self, collection_name: str) -> bool:
             return collection_name != "media_collection_v3"
+
+        async def get_collection(self, collection_name: str) -> Any:
+            size = (
+                memory_module.MEDIA_VECTOR_SIZE
+                if collection_name == "media_collection"
+                else operator.text_embedding_dimension
+            )
+            return SimpleNamespace(
+                config=SimpleNamespace(
+                    metadata={},
+                    params=SimpleNamespace(
+                        vectors=SimpleNamespace(size=size),
+                    ),
+                ),
+            )
+
+        async def update_collection(self, **_kwargs: Any) -> bool:
+            return True
 
         async def create_collection(self, **kwargs: Any) -> None:
             create_calls.append(kwargs)
@@ -216,7 +233,7 @@ async def test_insert_media_reports_embedding_failure(memory_module: Any):
     operator.enabled = True
     upsert_called = False
 
-    async def ensure_collections() -> None:
+    async def ensure_collections(*_args: Any, **_kwargs: Any) -> None:
         return None
 
     async def get_embedding(*_: Any, **__: Any) -> None:
@@ -242,7 +259,7 @@ async def test_insert_media_waits_for_confirmed_upsert(memory_module: Any):
     vector = [0.4] * memory_module.MEDIA_VECTOR_SIZE
     upsert_calls: list[dict[str, Any]] = []
 
-    async def ensure_collections() -> None:
+    async def ensure_collections(*_args: Any, **_kwargs: Any) -> None:
         return None
 
     async def get_embedding(*_: Any, **__: Any) -> tuple[list[float], list[float]]:
@@ -346,7 +363,7 @@ async def test_meme_search_embeds_expanded_jargon(memory_module: Any):
     operator.enabled = True
     embedded_texts: list[str] = []
 
-    async def ensure_collections() -> None:
+    async def ensure_collections(*_args: Any, **_kwargs: Any) -> None:
         return None
 
     async def get_embedding(**kwargs: Any) -> list[float]:
@@ -433,7 +450,7 @@ async def test_content_search_uses_lower_visual_route_weight(memory_module: Any)
     operator.enabled = True
     route_weights: list[float] = []
 
-    async def ensure_collections() -> None:
+    async def ensure_collections(*_args: Any, **_kwargs: Any) -> None:
         return None
 
     async def get_embedding(**_: Any) -> list[float]:
@@ -481,7 +498,7 @@ async def test_search_meme_uses_larger_candidate_pool_and_recent_exclusion(
     operator.enabled = True
     query_calls: list[dict[str, Any]] = []
 
-    async def ensure_collections() -> None:
+    async def ensure_collections(*_args: Any, **_kwargs: Any) -> None:
         return None
 
     async def get_embedding(**_: Any) -> list[float]:
@@ -534,13 +551,27 @@ async def test_text_mode_ensure_collections_creates_text_collection(
     operator = make_operator(memory_module)
     operator.text_only = True
     operator.chat_col = "chat_collection"
-    operator._collections_ready = False
     operator._init_lock = asyncio.Lock()
     create_calls: list[dict[str, Any]] = []
 
     class FakeQdrantClient:
         async def collection_exists(self, collection_name: str) -> bool:
             return collection_name == operator.chat_col
+
+        async def get_collection(self, _collection_name: str) -> Any:
+            return SimpleNamespace(
+                config=SimpleNamespace(
+                    metadata={},
+                    params=SimpleNamespace(
+                        vectors=SimpleNamespace(
+                            size=operator.text_embedding_dimension,
+                        ),
+                    ),
+                ),
+            )
+
+        async def update_collection(self, **_kwargs: Any) -> bool:
+            return True
 
         async def create_collection(self, **kwargs: Any) -> None:
             create_calls.append(kwargs)
@@ -557,6 +588,403 @@ async def test_text_mode_ensure_collections_creates_text_collection(
 
 
 @pytest.mark.asyncio
+async def test_existing_collection_without_metadata_is_backfilled(
+    memory_module: Any,
+):
+    operator = make_operator(memory_module)
+    operator.text_only = True
+    operator.chat_col = "chat_collection"
+    operator.media_text_col = memory_module.MEDIA_TEXT_COL
+    operator._init_lock = asyncio.Lock()
+    update_calls: list[dict[str, Any]] = []
+
+    class FakeQdrantClient:
+        async def collection_exists(self, _collection_name: str) -> bool:
+            return True
+
+        async def get_collection(self, _collection_name: str) -> Any:
+            return SimpleNamespace(
+                config=SimpleNamespace(
+                    metadata=None,
+                    params=SimpleNamespace(
+                        vectors=SimpleNamespace(
+                            size=operator.text_embedding_dimension,
+                        ),
+                    ),
+                ),
+            )
+
+        async def update_collection(self, **kwargs: Any) -> bool:
+            update_calls.append(kwargs)
+            return True
+
+    operator.client = FakeQdrantClient()
+
+    await operator._ensure_collections()
+
+    assert len(update_calls) == 2
+    assert all(
+        call["metadata"] == {
+            memory_module.EMBEDDING_MODEL_METADATA_KEY: operator.emb_model,
+            memory_module.EMBEDDING_DIMENSION_METADATA_KEY: operator.text_embedding_dimension,
+        }
+        for call in update_calls
+    )
+
+
+@pytest.mark.asyncio
+async def test_metadata_backfill_failure_is_retryable(memory_module: Any):
+    operator = make_operator(memory_module)
+    operator.text_only = True
+    operator.chat_col = "chat_collection"
+    operator.media_text_col = memory_module.MEDIA_TEXT_COL
+    operator._init_lock = asyncio.Lock()
+    update_attempts = 0
+
+    class FakeQdrantClient:
+        async def collection_exists(self, _collection_name: str) -> bool:
+            return True
+
+        async def get_collection(self, _collection_name: str) -> Any:
+            return SimpleNamespace(
+                config=SimpleNamespace(
+                    metadata=None,
+                    params=SimpleNamespace(
+                        vectors=SimpleNamespace(
+                            size=operator.text_embedding_dimension,
+                        ),
+                    ),
+                ),
+            )
+
+        async def update_collection(self, **_kwargs: Any) -> bool:
+            nonlocal update_attempts
+            update_attempts += 1
+            if update_attempts == 1:
+                raise ConnectionError("temporary qdrant outage")
+            return True
+
+    operator.client = FakeQdrantClient()
+
+    with pytest.raises(memory_module.CollectionMetadataBackfillError):
+        await operator._ensure_collections({operator.chat_col})
+    assert operator._collection_validation_errors == {}
+
+    await operator._ensure_collections({operator.chat_col})
+
+    assert update_attempts == 2
+    assert operator._collection_validation_errors == {}
+
+
+@pytest.mark.asyncio
+async def test_existing_collection_with_unrelated_metadata_is_backfilled(
+    memory_module: Any,
+):
+    operator = make_operator(memory_module)
+    operator.text_only = True
+    operator.chat_col = "chat_collection"
+    operator.media_text_col = memory_module.MEDIA_TEXT_COL
+    operator._init_lock = asyncio.Lock()
+    update_calls: list[dict[str, Any]] = []
+
+    class FakeQdrantClient:
+        async def collection_exists(self, _collection_name: str) -> bool:
+            return True
+
+        async def get_collection(self, _collection_name: str) -> Any:
+            return SimpleNamespace(
+                config=SimpleNamespace(
+                    metadata={"owner": "other-plugin"},
+                    params=SimpleNamespace(
+                        vectors=SimpleNamespace(
+                            size=operator.text_embedding_dimension,
+                        ),
+                    ),
+                ),
+            )
+
+        async def update_collection(self, **kwargs: Any) -> bool:
+            update_calls.append(kwargs)
+            return True
+
+    operator.client = FakeQdrantClient()
+
+    await operator._ensure_collections()
+
+    assert len(update_calls) == 2
+    assert all(
+        call["metadata"] == {
+            memory_module.EMBEDDING_MODEL_METADATA_KEY: operator.emb_model,
+            memory_module.EMBEDDING_DIMENSION_METADATA_KEY: operator.text_embedding_dimension,
+        }
+        for call in update_calls
+    )
+
+
+@pytest.mark.asyncio
+async def test_collection_embedding_mismatch_is_rejected(memory_module: Any):
+    operator = make_operator(memory_module)
+    operator.text_only = True
+    operator.chat_col = "chat_collection"
+    operator._init_lock = asyncio.Lock()
+
+    class FakeQdrantClient:
+        async def collection_exists(self, _collection_name: str) -> bool:
+            return True
+
+        async def get_collection(self, _collection_name: str) -> Any:
+            return SimpleNamespace(
+                config=SimpleNamespace(
+                    metadata={
+                        memory_module.EMBEDDING_MODEL_METADATA_KEY: "old-model",
+                        memory_module.EMBEDDING_DIMENSION_METADATA_KEY: 1024,
+                    },
+                    params=SimpleNamespace(
+                        vectors=SimpleNamespace(size=1024),
+                    ),
+                ),
+            )
+
+    operator.client = FakeQdrantClient()
+
+    with pytest.raises(memory_module.CollectionEmbeddingConfigMismatchError):
+        await operator._ensure_collections()
+
+
+@pytest.mark.asyncio
+async def test_chat_collection_mismatch_does_not_block_multimodal_media(
+    memory_module: Any,
+):
+    operator = make_operator(memory_module)
+    operator.text_only = False
+    operator.chat_col = "chat_collection"
+    operator._init_lock = asyncio.Lock()
+
+    def collection_info(
+        metadata: dict[str, str | int],
+        vectors: Any,
+    ) -> Any:
+        return SimpleNamespace(
+            config=SimpleNamespace(
+                metadata=metadata,
+                params=SimpleNamespace(vectors=vectors),
+            ),
+        )
+
+    class FakeQdrantClient:
+        async def collection_exists(self, _collection_name: str) -> bool:
+            return True
+
+        async def get_collection(self, collection_name: str) -> Any:
+            if collection_name == operator.chat_col:
+                return collection_info(
+                    {
+                        memory_module.EMBEDDING_MODEL_METADATA_KEY: "old-model",
+                        memory_module.EMBEDDING_DIMENSION_METADATA_KEY: 1024,
+                    },
+                    SimpleNamespace(size=1024),
+                )
+            if collection_name == operator.media_col:
+                return collection_info(
+                    {
+                        memory_module.EMBEDDING_MODEL_METADATA_KEY:
+                            memory_module.QWEN_VL_EMBEDDING_MODEL,
+                        memory_module.EMBEDDING_DIMENSION_METADATA_KEY:
+                            memory_module.MEDIA_VECTOR_SIZE,
+                    },
+                    SimpleNamespace(size=memory_module.MEDIA_VECTOR_SIZE),
+                )
+            return collection_info(
+                {
+                    memory_module.EMBEDDING_MODEL_METADATA_KEY:
+                        memory_module.QWEN_VL_EMBEDDING_MODEL,
+                    memory_module.EMBEDDING_DIMENSION_METADATA_KEY:
+                        memory_module.MEDIA_VECTOR_SIZE,
+                },
+                {
+                    memory_module.MEDIA_TEXT_VECTOR: SimpleNamespace(
+                        size=memory_module.MEDIA_VECTOR_SIZE,
+                    ),
+                    memory_module.MEDIA_IMAGE_VECTOR: SimpleNamespace(
+                        size=memory_module.MEDIA_VECTOR_SIZE,
+                    ),
+                },
+            )
+
+    operator.client = FakeQdrantClient()
+
+    with pytest.raises(memory_module.CollectionEmbeddingConfigMismatchError):
+        await operator._ensure_collections({operator.chat_col})
+
+    await operator._ensure_collections(
+        {operator.media_col, operator.media_multivector_col},
+        validate_text_embedding=False,
+    )
+
+    assert operator._get_ready_collections() == {
+        operator.media_col,
+        operator.media_multivector_col,
+    }
+
+
+@pytest.mark.asyncio
+async def test_legacy_media_mismatch_does_not_block_v3_insert_or_search(
+    memory_module: Any,
+):
+    operator = make_operator(memory_module)
+    operator.enabled = True
+    operator.text_only = False
+    operator.chat_col = "chat_collection"
+    operator._init_lock = asyncio.Lock()
+    vector = [0.5] * memory_module.MEDIA_VECTOR_SIZE
+    created_collections: list[str] = []
+    upsert_collections: list[str] = []
+    query_collections: list[str] = []
+
+    class FakeQdrantClient:
+        async def collection_exists(self, collection_name: str) -> bool:
+            return collection_name == operator.media_col
+
+        async def get_collection(self, collection_name: str) -> Any:
+            assert collection_name == operator.media_col
+            return SimpleNamespace(
+                config=SimpleNamespace(
+                    metadata={
+                        memory_module.EMBEDDING_MODEL_METADATA_KEY:
+                            memory_module.QWEN_VL_EMBEDDING_MODEL,
+                        memory_module.EMBEDDING_DIMENSION_METADATA_KEY: 1024,
+                    },
+                    params=SimpleNamespace(
+                        vectors=SimpleNamespace(size=1024),
+                    ),
+                ),
+            )
+
+        async def create_collection(self, **kwargs: Any) -> None:
+            created_collections.append(kwargs["collection_name"])
+
+        async def upsert(self, **kwargs: Any) -> None:
+            upsert_collections.append(kwargs["collection_name"])
+
+        async def query_points(self, **kwargs: Any) -> Any:
+            query_collections.append(kwargs["collection_name"])
+            return SimpleNamespace(points=[SimpleNamespace(id=1, score=0.9)])
+
+    async def get_qwen_vl_independent_pair(
+        *_args: Any,
+        **_kwargs: Any,
+    ) -> tuple[list[float], list[float]]:
+        return vector, vector
+
+    async def get_qwen_vl_embedding(**_kwargs: Any) -> list[float]:
+        return vector
+
+    operator.client = FakeQdrantClient()
+    operator._get_qwen_vl_independent_pair = get_qwen_vl_independent_pair
+    operator._get_qwen_vl_embedding = get_qwen_vl_embedding
+
+    with pytest.raises(memory_module.CollectionEmbeddingConfigMismatchError):
+        await operator._ensure_collections(
+            {operator.media_col},
+            validate_text_embedding=False,
+        )
+
+    assert await operator.insert_media(1, "data:image/png;base64,AAAA", "描述")
+    candidates = await operator.search_meme_candidates("无奈")
+
+    assert created_collections == [operator.media_multivector_col]
+    assert upsert_collections == [operator.media_multivector_col]
+    assert query_collections == [
+        operator.media_multivector_col,
+        operator.media_multivector_col,
+    ]
+    assert [media_id for media_id, _ in candidates] == [1]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_collection_validation_failure_is_not_retried(
+    memory_module: Any,
+):
+    operator = make_operator(memory_module)
+    operator.text_only = True
+    operator.chat_col = "chat_collection"
+    operator._init_lock = asyncio.Lock()
+    get_collection_started = asyncio.Event()
+    allow_failure = asyncio.Event()
+    get_collection_calls = 0
+
+    class FakeQdrantClient:
+        async def collection_exists(self, _collection_name: str) -> bool:
+            return True
+
+        async def get_collection(self, _collection_name: str) -> Any:
+            nonlocal get_collection_calls
+            get_collection_calls += 1
+            get_collection_started.set()
+            await allow_failure.wait()
+            return SimpleNamespace(
+                config=SimpleNamespace(
+                    metadata={
+                        memory_module.EMBEDDING_MODEL_METADATA_KEY: "old-model",
+                        memory_module.EMBEDDING_DIMENSION_METADATA_KEY: 1024,
+                    },
+                    params=SimpleNamespace(
+                        vectors=SimpleNamespace(size=1024),
+                    ),
+                ),
+            )
+
+    operator.client = FakeQdrantClient()
+    first = asyncio.create_task(operator._ensure_collections())
+    await get_collection_started.wait()
+    second = asyncio.create_task(operator._ensure_collections())
+    await asyncio.sleep(0)
+    allow_failure.set()
+
+    results = await asyncio.gather(first, second, return_exceptions=True)
+
+    assert all(
+        isinstance(result, memory_module.CollectionEmbeddingConfigMismatchError)
+        for result in results
+    )
+    assert get_collection_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_partial_collection_metadata_is_rejected(memory_module: Any):
+    operator = make_operator(memory_module)
+    operator.text_only = True
+    operator.chat_col = "chat_collection"
+    operator._init_lock = asyncio.Lock()
+
+    class FakeQdrantClient:
+        async def collection_exists(self, _collection_name: str) -> bool:
+            return True
+
+        async def get_collection(self, _collection_name: str) -> Any:
+            return SimpleNamespace(
+                config=SimpleNamespace(
+                    metadata={
+                        memory_module.EMBEDDING_MODEL_METADATA_KEY: operator.emb_model,
+                    },
+                    params=SimpleNamespace(
+                        vectors=SimpleNamespace(
+                            size=operator.text_embedding_dimension,
+                        ),
+                    ),
+                ),
+            )
+
+    operator.client = FakeQdrantClient()
+
+    with pytest.raises(memory_module.CollectionEmbeddingConfigMismatchError):
+        await operator._ensure_collections()
+
+    with pytest.raises(memory_module.CollectionEmbeddingConfigMismatchError):
+        await operator._ensure_collections()
+
+
+@pytest.mark.asyncio
 async def test_text_collections_use_configured_embedding_dimension(
     memory_module: Any,
 ):
@@ -564,7 +992,6 @@ async def test_text_collections_use_configured_embedding_dimension(
     operator.text_only = True
     operator.chat_col = "chat_collection"
     operator.text_embedding_dimension = 1536
-    operator._collections_ready = False
     operator._init_lock = asyncio.Lock()
     create_calls: list[dict[str, Any]] = []
 
@@ -597,16 +1024,152 @@ async def test_text_embedding_rejects_unexpected_dimension(memory_module: Any):
     operator = make_operator(memory_module)
     operator.text_embedding_dimension = 1024
     operator.emb_model = "test-model"
+    embedding_requests = 0
 
     class FakeEmbeddings:
         async def create(self, **_kwargs: Any):
+            nonlocal embedding_requests
+            embedding_requests += 1
             return SimpleNamespace(
                 data=[SimpleNamespace(embedding=[0.5] * 1536)]
             )
 
     operator.emb_client = SimpleNamespace(embeddings=FakeEmbeddings())
 
-    assert await operator._get_text_embedding("hello") is None
+    with pytest.raises(memory_module.CollectionEmbeddingConfigMismatchError):
+        await operator._get_text_embedding("hello")
+    with pytest.raises(memory_module.CollectionEmbeddingConfigMismatchError):
+        await operator._get_text_embedding("hello again")
+
+    assert embedding_requests == 1
+
+
+@pytest.mark.asyncio
+async def test_wrong_embedding_dimension_does_not_create_collections(
+    memory_module: Any,
+):
+    operator = make_operator(memory_module)
+    operator.text_only = True
+    operator.chat_col = "chat_collection"
+    operator.text_embedding_dimension = 1536
+    operator._init_lock = asyncio.Lock()
+    qdrant_calls: list[str] = []
+    embedding_requests = 0
+
+    class FakeEmbeddings:
+        async def create(self, **_kwargs: Any):
+            nonlocal embedding_requests
+            embedding_requests += 1
+            return SimpleNamespace(
+                data=[SimpleNamespace(embedding=[0.5] * 1024)]
+            )
+
+    class FakeQdrantClient:
+        async def collection_exists(self, _collection_name: str) -> bool:
+            qdrant_calls.append("collection_exists")
+            return False
+
+        async def create_collection(self, **_kwargs: Any) -> None:
+            qdrant_calls.append("create_collection")
+
+    operator.emb_client = SimpleNamespace(embeddings=FakeEmbeddings())
+    operator.client = FakeQdrantClient()
+
+    with pytest.raises(memory_module.CollectionEmbeddingConfigMismatchError):
+        await operator._ensure_collections()
+    with pytest.raises(memory_module.CollectionEmbeddingConfigMismatchError):
+        await operator._ensure_collections()
+
+    assert embedding_requests == 1
+    assert qdrant_calls == []
+
+
+@pytest.mark.asyncio
+async def test_embedding_probe_outage_is_soft_failure(memory_module: Any):
+    operator = make_operator(memory_module)
+    operator.text_only = True
+    operator.chat_col = "chat_collection"
+    operator._init_lock = asyncio.Lock()
+    probe_attempts = 0
+    created_collections: list[str] = []
+
+    class FakeEmbeddings:
+        async def create(self, **_kwargs: Any):
+            nonlocal probe_attempts
+            probe_attempts += 1
+            raise ConnectionError("temporary embedding outage")
+
+    class FakeQdrantClient:
+        async def collection_exists(self, _collection_name: str) -> bool:
+            return False
+
+        async def create_collection(self, **kwargs: Any) -> None:
+            created_collections.append(kwargs["collection_name"])
+
+        async def create_payload_index(self, **_kwargs: Any) -> None:
+            return None
+
+    operator.emb_client = SimpleNamespace(embeddings=FakeEmbeddings())
+    operator.client = FakeQdrantClient()
+
+    await operator._ensure_collections({operator.chat_col})
+
+    assert probe_attempts == 1
+    assert created_collections == [operator.chat_col]
+
+
+@pytest.mark.asyncio
+async def test_multimodal_media_remains_available_when_text_embedding_is_unavailable(
+    memory_module: Any,
+):
+    operator = make_operator(memory_module)
+    operator.enabled = True
+    operator.text_only = False
+    operator.chat_col = "chat_collection"
+    operator._init_lock = asyncio.Lock()
+    embedding_requests = 0
+    created_collections: list[str] = []
+    upsert_collections: list[str] = []
+    vector = [0.5] * memory_module.MEDIA_VECTOR_SIZE
+
+    class FakeEmbeddings:
+        async def create(self, **_kwargs: Any):
+            nonlocal embedding_requests
+            embedding_requests += 1
+            raise ConnectionError("embedding provider unavailable")
+
+    class FakeQdrantClient:
+        async def collection_exists(self, _collection_name: str) -> bool:
+            return False
+
+        async def create_collection(self, **kwargs: Any) -> None:
+            created_collections.append(kwargs["collection_name"])
+
+        async def create_payload_index(self, **_kwargs: Any) -> None:
+            return None
+
+        async def upsert(self, **kwargs: Any) -> None:
+            upsert_collections.append(kwargs["collection_name"])
+
+    async def get_qwen_vl_independent_pair(
+        *_args: Any,
+        **_kwargs: Any,
+    ) -> tuple[list[float], list[float]]:
+        return vector, vector
+
+    operator.emb_client = SimpleNamespace(embeddings=FakeEmbeddings())
+    operator.client = FakeQdrantClient()
+    operator._get_qwen_vl_independent_pair = get_qwen_vl_independent_pair
+
+    await operator._ensure_collections({operator.chat_col})
+
+    assert await operator.insert_media(1, "data:image/png;base64,AAAA", "描述")
+    assert embedding_requests == 1
+    assert created_collections == [
+        operator.chat_col,
+        operator.media_multivector_col,
+    ]
+    assert upsert_collections == [operator.media_multivector_col]
 
 
 @pytest.mark.asyncio
@@ -630,7 +1193,7 @@ async def test_insert_chat_stores_vector_from_configured_model(memory_module: An
         async def upsert(self, **kwargs: Any) -> None:
             upsert_calls.append(kwargs)
 
-    async def ensure_collections() -> None:
+    async def ensure_collections(*_args: Any, **_kwargs: Any) -> None:
         return None
 
     operator.emb_client = SimpleNamespace(embeddings=FakeEmbeddings())
@@ -656,7 +1219,7 @@ async def test_text_mode_insert_media_uses_text_embedding(memory_module: Any):
     vector = [0.5] * memory_module.MEDIA_TEXT_VECTOR_SIZE
     upsert_calls: list[dict[str, Any]] = []
 
-    async def ensure_collections() -> None:
+    async def ensure_collections(*_args: Any, **_kwargs: Any) -> None:
         return None
 
     async def get_text_embedding(text: str) -> list[float]:
@@ -696,7 +1259,7 @@ async def test_text_mode_insert_media_skips_missing_description(memory_module: A
     operator.enabled = True
     operator.text_only = True
 
-    async def ensure_collections() -> None:
+    async def ensure_collections(*_args: Any, **_kwargs: Any) -> None:
         return None
 
     operator._ensure_collections = ensure_collections
@@ -710,7 +1273,7 @@ async def test_text_mode_insert_media_skips_embedding_failure(memory_module: Any
     operator.enabled = True
     operator.text_only = True
 
-    async def ensure_collections() -> None:
+    async def ensure_collections(*_args: Any, **_kwargs: Any) -> None:
         return None
 
     async def get_text_embedding(text: str) -> None:
@@ -733,7 +1296,7 @@ async def test_text_mode_search_meme_candidates_single_route(memory_module: Any)
     vector = [0.5] * memory_module.MEDIA_TEXT_VECTOR_SIZE
     query_calls: list[dict[str, Any]] = []
 
-    async def ensure_collections() -> None:
+    async def ensure_collections(*_args: Any, **_kwargs: Any) -> None:
         return None
 
     async def get_text_embedding(text: str) -> list[float]:
@@ -786,7 +1349,7 @@ async def test_text_mode_search_meme_candidates_embedding_failure(memory_module:
     operator.enabled = True
     operator.text_only = True
 
-    async def ensure_collections() -> None:
+    async def ensure_collections(*_args: Any, **_kwargs: Any) -> None:
         return None
 
     async def get_text_embedding(text: str) -> None:
@@ -805,7 +1368,7 @@ async def test_text_mode_search_meme_candidates_empty_result(memory_module: Any)
     operator.text_only = True
     vector = [0.5] * memory_module.MEDIA_TEXT_VECTOR_SIZE
 
-    async def ensure_collections() -> None:
+    async def ensure_collections(*_args: Any, **_kwargs: Any) -> None:
         return None
 
     async def get_text_embedding(text: str) -> list[float]:
@@ -945,7 +1508,6 @@ async def test_ensure_collections_creates_chat_and_multimodal_collections(
     operator = make_operator(memory_module)
     operator.text_only = False
     operator.chat_col = "chat_collection"
-    operator._collections_ready = False
     operator._init_lock = asyncio.Lock()
     create_calls: list[str] = []
 
@@ -975,7 +1537,7 @@ async def test_search_similar_meme_multimodal_path(memory_module: Any):
     operator.text_only = False
     vector = [0.1] * memory_module.MEDIA_VECTOR_SIZE
 
-    async def ensure_collections() -> None:
+    async def ensure_collections(*_args: Any, **_kwargs: Any) -> None:
         return None
 
     async def get_qwen_vl_embedding(**kwargs: Any) -> list[float]:

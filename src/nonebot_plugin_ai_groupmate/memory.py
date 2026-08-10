@@ -7,6 +7,7 @@ import base64
 import random
 import asyncio
 import mimetypes
+from typing import Any, NoReturn
 from collections.abc import Sequence, Collection
 
 import httpx
@@ -30,6 +31,9 @@ MEDIA_TEXT_VECTOR = "text"
 MEDIA_IMAGE_VECTOR = "image"
 # text 模式（meme_embedding_mode="text"）专用：纯文本向量集合
 MEDIA_TEXT_COL = "media_collection_text"
+# Qdrant collection metadata keys used to pin an embedding space to a collection.
+EMBEDDING_MODEL_METADATA_KEY = "embedding_model"
+EMBEDDING_DIMENSION_METADATA_KEY = "embedding_dimension"
 # 默认维度用于兼容未设置 embedding_dimension 的旧配置和测试替身。
 MEDIA_TEXT_VECTOR_SIZE = 1024
 MEME_SEARCH_POOL_SIZE = 50
@@ -55,6 +59,18 @@ MEME_DRAGON_IMAGE_JARGON_EXPLANATION = (
 MEME_DRAGON_IMAGE_JARGON_PATTERN = re.compile(r"龙图(?!案|标|像|腾)")
 
 
+class CollectionEmbeddingConfigMismatchError(RuntimeError):
+    """Raised when a collection cannot be used with the active embedding space."""
+
+
+class EmbeddingProviderUnavailableError(RuntimeError):
+    """Raised when the embedding endpoint cannot be checked or reached."""
+
+
+class CollectionMetadataBackfillError(RuntimeError):
+    """Raised when a legacy collection cannot be marked with its embedding space."""
+
+
 def expand_meme_search_terms(description: str) -> str:
     """把小圈子梗名展开成图库标注能识别的视觉与语义条件。"""
     if (
@@ -76,11 +92,22 @@ class VectorDBOperator:
     media_embedding_version: int = MEDIA_MULTIMODAL_EMBEDDING_VERSION
     media_text_col = MEDIA_TEXT_COL
     text_embedding_dimension: int = MEDIA_TEXT_VECTOR_SIZE
+    emb_model: str = "BAAI/bge-m3"
+    _collection_validation_errors: dict[
+        str, CollectionEmbeddingConfigMismatchError
+    ] | None = None
+    _text_embedding_validation_error: CollectionEmbeddingConfigMismatchError | None = None
+    _text_embedding_probe_done: bool = False
 
     def __init__(self):
         self._configure()
 
     def _configure(self) -> None:
+        self._init_lock = asyncio.Lock()
+        self._ready_collections: set[str] = set()
+        self._collection_validation_errors = {}
+        self._text_embedding_validation_error = None
+        self._text_embedding_probe_done = False
         self.effective_meme_embedding_mode = (
             "text"
             if plugin_config.meme_embedding_mode == "text"
@@ -149,8 +176,6 @@ class VectorDBOperator:
         self.rerank_url = plugin_config.rerank_api_url
         self.rerank_key = plugin_config.rerank_api_key
 
-        self._init_lock = asyncio.Lock()
-        self._collections_ready = False
 
     async def close(self) -> None:
         """关闭向量库相关连接。"""
@@ -179,94 +204,410 @@ class VectorDBOperator:
         self._configure()
 
     # ================= 内部工具函数 =================
-    async def _ensure_collections(self):
+    @staticmethod
+    def _embedding_metadata(model: str, dimension: int) -> dict[str, str | int]:
+        return {
+            EMBEDDING_MODEL_METADATA_KEY: model,
+            EMBEDDING_DIMENSION_METADATA_KEY: dimension,
+        }
+
+    @staticmethod
+    def _vector_size(vector_config: Any) -> int | None:
+        size = (
+            vector_config.get("size")
+            if isinstance(vector_config, dict)
+            else getattr(vector_config, "size", None)
+        )
+        try:
+            return int(size) if size is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _collection_vector_schema(cls, collection_info: Any) -> dict[str, int | None]:
+        params = getattr(getattr(collection_info, "config", None), "params", None)
+        vectors = getattr(params, "vectors", None)
+        if isinstance(vectors, dict):
+            return {
+                str(vector_name): cls._vector_size(vector_config)
+                for vector_name, vector_config in vectors.items()
+            }
+        return {"": cls._vector_size(vectors)}
+
+    def _active_collection_specs(
+        self,
+    ) -> list[tuple[str, str, int, dict[str, int]]]:
+        specs = [
+            (
+                self.chat_col,
+                self.emb_model,
+                self.text_embedding_dimension,
+                {"": self.text_embedding_dimension},
+            )
+        ]
+        if self.text_only:
+            specs.append((
+                self.media_text_col,
+                self.emb_model,
+                self.text_embedding_dimension,
+                {"": self.text_embedding_dimension},
+            ))
+        else:
+            specs.extend((
+                (
+                    self.media_col,
+                    QWEN_VL_EMBEDDING_MODEL,
+                    MEDIA_VECTOR_SIZE,
+                    {"": MEDIA_VECTOR_SIZE},
+                ),
+                (
+                    self.media_multivector_col,
+                    QWEN_VL_EMBEDDING_MODEL,
+                    MEDIA_VECTOR_SIZE,
+                    {
+                        MEDIA_TEXT_VECTOR: MEDIA_VECTOR_SIZE,
+                        MEDIA_IMAGE_VECTOR: MEDIA_VECTOR_SIZE,
+                    },
+                ),
+            ))
+        return specs
+
+    def _reject_collection(
+        self,
+        collection_name: str,
+        current_config: dict[str, Any],
+        collection_config: dict[str, Any],
+        reason: str,
+    ) -> None:
+        message = (
+            "Qdrant 集合 Embedding 配置不匹配，拒绝使用: "
+            f"collection={collection_name!r}, reason={reason}, "
+            f"当前配置={current_config!r}, collection配置={collection_config!r}"
+        )
+        errors = self._get_collection_validation_errors()
+        error = errors.get(collection_name)
+        if error is None:
+            error = CollectionEmbeddingConfigMismatchError(message)
+            errors[collection_name] = error
+            logger.error(message)
+        raise error
+
+    def _reject_validation(
+        self,
+        message: str,
+    ) -> NoReturn:
+        existing_error = getattr(self, "_text_embedding_validation_error", None)
+        if existing_error is not None:
+            raise existing_error
+        error = CollectionEmbeddingConfigMismatchError(message)
+        self._text_embedding_validation_error = error
+        logger.error(message)
+        raise error
+
+    def _raise_if_validation_rejected(self) -> None:
+        validation_error = getattr(self, "_text_embedding_validation_error", None)
+        if validation_error is not None:
+            raise validation_error
+
+    def _text_collection_names(self) -> set[str]:
+        names = {self.chat_col}
+        if self.text_only:
+            names.add(self.media_text_col)
+        return names
+
+    def _primary_media_collection_names(self) -> set[str]:
+        if self.text_only:
+            return {self.media_text_col}
+        return {self.media_multivector_col}
+
+    def _get_ready_collections(self) -> set[str]:
+        ready_collections = getattr(self, "_ready_collections", None)
+        if ready_collections is None:
+            ready_collections = set()
+            self._ready_collections = ready_collections
+        return ready_collections
+
+    def _get_collection_validation_errors(
+        self,
+    ) -> dict[str, CollectionEmbeddingConfigMismatchError]:
+        errors = getattr(self, "_collection_validation_errors", None)
+        if errors is None:
+            errors = {}
+            self._collection_validation_errors = errors
+        return errors
+
+    def _raise_if_collections_rejected(
+        self,
+        collection_names: Collection[str],
+    ) -> None:
+        errors = self._get_collection_validation_errors()
+        for collection_name in collection_names:
+            error = errors.get(collection_name)
+            if error is not None:
+                raise error
+
+    async def _legacy_media_collection_available(self) -> bool:
+        """确认旧融合向量集合可作为可选召回路线使用。"""
+        if self.text_only:
+            return False
+        if self.media_col in self._get_collection_validation_errors():
+            return False
+        try:
+            await self._ensure_collections(
+                {self.media_col},
+                validate_text_embedding=False,
+            )
+        except (CollectionEmbeddingConfigMismatchError, CollectionMetadataBackfillError):
+            return False
+        except Exception as exc:
+            logger.warning(f"旧媒体融合向量集合校验失败，跳过该路线: {exc}")
+            return False
+        return True
+
+    async def _validate_collection(
+        self,
+        collection_name: str,
+        expected_model: str,
+        expected_dimension: int,
+        expected_schema: dict[str, int],
+    ) -> None:
+        info = await self.client.get_collection(collection_name)
+        metadata = getattr(getattr(info, "config", None), "metadata", None)
+        metadata = dict(metadata) if isinstance(metadata, dict) else {}
+        vector_schema = self._collection_vector_schema(info)
+        current_config = {
+            **self._embedding_metadata(expected_model, expected_dimension),
+            "vector_schema": expected_schema,
+        }
+        collection_config = {
+            "metadata": metadata,
+            "vector_schema": vector_schema,
+        }
+
+        embedding_metadata_keys = {
+            EMBEDDING_MODEL_METADATA_KEY,
+            EMBEDDING_DIMENSION_METADATA_KEY,
+        }
+        present_embedding_metadata_keys = embedding_metadata_keys & metadata.keys()
+        if not present_embedding_metadata_keys:
+            if vector_schema != expected_schema:
+                self._reject_collection(
+                    collection_name,
+                    current_config,
+                    collection_config,
+                    "旧集合向量维度或名称不匹配，未写入新 metadata",
+                )
+            try:
+                result = await self.client.update_collection(
+                    collection_name=collection_name,
+                    metadata=self._embedding_metadata(
+                        expected_model,
+                        expected_dimension,
+                    ),
+                )
+                if result is False:
+                    raise RuntimeError("Qdrant update_collection 返回 False")
+            except Exception as exc:
+                message = (
+                    "旧 Qdrant 集合 metadata 补写暂时失败，本次向量操作已中止，"
+                    "将在后续操作时重试: "
+                    f"collection={collection_name!r}, error={exc}"
+                )
+                logger.warning(message)
+                raise CollectionMetadataBackfillError(message) from exc
+            logger.info(
+                "已为旧 Qdrant 集合补充 Embedding metadata: "
+                f"collection={collection_name!r}, metadata="
+                f"{self._embedding_metadata(expected_model, expected_dimension)!r}"
+            )
+            metadata.update(self._embedding_metadata(expected_model, expected_dimension))
+            collection_config["metadata"] = metadata
+        elif present_embedding_metadata_keys != embedding_metadata_keys:
+            self._reject_collection(
+                collection_name,
+                current_config,
+                collection_config,
+                "collection metadata 不完整",
+            )
+
+        actual_model = metadata.get(EMBEDDING_MODEL_METADATA_KEY)
+        raw_dimension = metadata.get(EMBEDDING_DIMENSION_METADATA_KEY)
+        if isinstance(raw_dimension, (int, str)):
+            try:
+                actual_dimension = int(raw_dimension)
+            except ValueError:
+                actual_dimension = None
+        else:
+            actual_dimension = None
+        if (
+            actual_model != expected_model
+            or actual_dimension != expected_dimension
+            or vector_schema != expected_schema
+        ):
+            self._reject_collection(
+                collection_name,
+                current_config,
+                collection_config,
+                "metadata 或向量 schema 不匹配",
+            )
+
+    async def _ensure_collections(
+        self,
+        collection_names: Collection[str] | None = None,
+        *,
+        validate_text_embedding: bool = True,
+    ) -> None:
         """
         初始化集合：如果集合不存在，则创建并开启 Int8 量化。
         """
-        if self._collections_ready:
+        collection_specs = self._active_collection_specs()
+        requested_names = (
+            {name for name, _, _, _ in collection_specs}
+            if collection_names is None
+            else set(collection_names)
+        )
+        self._raise_if_collections_rejected(requested_names)
+        needs_text_embedding = bool(
+            requested_names & self._text_collection_names()
+        )
+        if validate_text_embedding and needs_text_embedding:
+            text_validation_error = getattr(
+                self, "_text_embedding_validation_error", None
+            )
+            if text_validation_error is not None:
+                raise text_validation_error
+        ready_collections = self._get_ready_collections()
+        if requested_names <= ready_collections:
             return
 
         async with self._init_lock:
-            if self._collections_ready:
+            self._raise_if_collections_rejected(requested_names)
+            if validate_text_embedding and needs_text_embedding:
+                text_validation_error = getattr(
+                    self, "_text_embedding_validation_error", None
+                )
+                if text_validation_error is not None:
+                    raise text_validation_error
+            if requested_names <= ready_collections:
                 return
 
-            # 1. 检查并创建 Chat 集合
-            if not await self.client.collection_exists(self.chat_col):
+            if (
+                validate_text_embedding
+                and needs_text_embedding
+                and getattr(self, "emb_client", None) is not None
+            ):
+                try:
+                    await self._probe_text_embedding_dimension()
+                except EmbeddingProviderUnavailableError:
+                    # 探针失败通常是临时网络/API 故障；让实际文本调用走原有
+                    # 降级逻辑，且不要阻断多模态 collection 的初始化。
+                    pass
+
+            for collection_name, model, dimension, expected_schema in collection_specs:
+                if collection_name not in requested_names:
+                    continue
+                if collection_name in ready_collections:
+                    continue
+                if await self.client.collection_exists(collection_name):
+                    await self._validate_collection(
+                        collection_name,
+                        model,
+                        dimension,
+                        expected_schema,
+                    )
+                    ready_collections.add(collection_name)
+                    continue
+
+                if expected_schema.keys() == {""}:
+                    vectors_config: Any = models.VectorParams(
+                        size=dimension,
+                        distance=models.Distance.COSINE,
+                    )
+                else:
+                    vectors_config = {
+                        vector_name: models.VectorParams(
+                            size=vector_size,
+                            distance=models.Distance.COSINE,
+                        )
+                        for vector_name, vector_size in expected_schema.items()
+                    }
                 await self.client.create_collection(
-                    collection_name=self.chat_col,
-                    vectors_config=models.VectorParams(
-                        size=self.text_embedding_dimension,
-                        distance=models.Distance.COSINE
-                    ),
+                    collection_name=collection_name,
+                    vectors_config=vectors_config,
+                    metadata=self._embedding_metadata(model, dimension),
                 )
-                # 创建 session_id 索引 (加速过滤)
-                await self.client.create_payload_index(
-                    collection_name=self.chat_col,
-                    field_name="session_id",
-                    field_schema=models.PayloadSchemaType.KEYWORD
+                if collection_name == self.chat_col:
+                    # 创建 session_id 索引 (加速过滤)
+                    await self.client.create_payload_index(
+                        collection_name=self.chat_col,
+                        field_name="session_id",
+                        field_schema=models.PayloadSchemaType.KEYWORD
+                    )
+                logger.info(
+                    f"Qdrant集合 {collection_name} 已创建，Embedding metadata="
+                    f"{self._embedding_metadata(model, dimension)!r}"
                 )
-                logger.info(f"Qdrant集合 {self.chat_col} 已创建")
+                ready_collections.add(collection_name)
 
-            # 2. 检查并创建 Media 集合
+    async def check_collections(self) -> None:
+        """在启动阶段或首次使用时校验 Qdrant 集合的 Embedding 配置。"""
+        if self.enabled:
             if self.text_only:
-                if not await self.client.collection_exists(self.media_text_col):
-                    await self.client.create_collection(
-                        collection_name=self.media_text_col,
-                        vectors_config=models.VectorParams(
-                            size=self.text_embedding_dimension,
-                            distance=models.Distance.COSINE
-                        ),
-                    )
-                    logger.info(f"Qdrant集合 {self.media_text_col} 已创建")
-            else:
-                if not await self.client.collection_exists(self.media_col):
-                    await self.client.create_collection(
-                        collection_name=self.media_col,
-                        vectors_config=models.VectorParams(
-                            size=MEDIA_VECTOR_SIZE,
-                            distance=models.Distance.COSINE
-                        ),
-                    )
-                    logger.info(f"Qdrant集合 {self.media_col} 已创建")
+                await self._ensure_collections()
+                return
+            await self._ensure_collections(
+                {self.chat_col, self.media_multivector_col},
+            )
+            await self._legacy_media_collection_available()
 
-                if not await self.client.collection_exists(self.media_multivector_col):
-                    await self.client.create_collection(
-                        collection_name=self.media_multivector_col,
-                        vectors_config={
-                            MEDIA_TEXT_VECTOR: models.VectorParams(
-                                size=MEDIA_VECTOR_SIZE,
-                                distance=models.Distance.COSINE,
-                            ),
-                            MEDIA_IMAGE_VECTOR: models.VectorParams(
-                                size=MEDIA_VECTOR_SIZE,
-                                distance=models.Distance.COSINE,
-                            ),
-                        },
-                    )
-                    logger.info(f"Qdrant集合 {self.media_multivector_col} 已创建")
-
-            self._collections_ready = True
+    async def _probe_text_embedding_dimension(self) -> None:
+        if getattr(self, "_text_embedding_probe_done", False):
+            return
+        try:
+            response = await self.emb_client.embeddings.create(
+                input=["embedding dimension validation probe"],
+                model=self.emb_model,
+            )
+            if not response.data:
+                raise ValueError("Embedding API 返回空结果")
+            self._validate_text_embedding_dimension(response.data[0].embedding)
+            self._text_embedding_probe_done = True
+        except CollectionEmbeddingConfigMismatchError:
+            raise
+        except Exception as exc:
+            logger.error(
+                "Embedding API 暂时不可用，跳过本次文本向量维度探针: "
+                f"model={self.emb_model!r}, dimension={self.text_embedding_dimension}, "
+                f"error={exc}"
+            )
+            raise EmbeddingProviderUnavailableError(str(exc)) from exc
 
     def _validate_text_embedding_dimension(
         self, embedding: list[float]
-    ) -> list[float] | None:
+    ) -> list[float]:
         if len(embedding) == self.text_embedding_dimension:
             return embedding
-        logger.error(
-            "Embedding API 返回维度不匹配: "
-            f"model={self.emb_model}, expected={self.text_embedding_dimension}, "
-            f"actual={len(embedding)}"
+        self._reject_validation(
+            "Embedding API 返回维度与当前配置不匹配，拒绝使用向量库: "
+            f"当前配置={{'embedding_model': {self.emb_model!r}, "
+            f"'embedding_dimension': {self.text_embedding_dimension}}}, "
+            f"API返回配置={{'embedding_model': {self.emb_model!r}, "
+            f"'embedding_dimension': {len(embedding)}}}；"
+            "请修正 embedding_dimension 或更换模型；若已有 collection 按错误维度创建，"
+            "请删除并人工重建向量"
         )
-        return None
 
     async def _get_text_embedding(self, text: str) -> list[float] | None:
         """调用 API 获取配置的文本 Dense 向量。"""
+        self._raise_if_validation_rejected()
         try:
             resp = await self.emb_client.embeddings.create(
                 input=[text],
                 model=self.emb_model
             )
             return self._validate_text_embedding_dimension(resp.data[0].embedding)
+        except CollectionEmbeddingConfigMismatchError:
+            raise
         except Exception as e:
             logger.error(f"Embedding API Error: {e}")
             return None
@@ -476,7 +817,7 @@ class VectorDBOperator:
 
     async def insert_chat(self, text: str, session_id: str):
         """插入新的聊天记录"""
-        await self._ensure_collections()
+        await self._ensure_collections({self.chat_col})
         vector = await self._get_text_embedding(text)
         if not vector:
             return
@@ -504,7 +845,7 @@ class VectorDBOperator:
         """
         if not self.enabled:
             return "未找到相关历史记录"
-        await self._ensure_collections()
+        await self._ensure_collections({self.chat_col})
         # 1. 获取向量
         vector = await self._get_text_embedding(query)
         if not vector:
@@ -546,9 +887,8 @@ class VectorDBOperator:
         """插入新表情包 (新图入库用)"""
         if not self.enabled:
             return False
-        await self._ensure_collections()
-
         if self.text_only:
+            await self._ensure_collections({self.media_text_col})
             # text 模式：只对描述文本做 BGE-M3 向量化，不依赖多模态 embedding
             if not description:
                 logger.warning(f"text 模式缺少描述，跳过 {media_id}")
@@ -572,6 +912,10 @@ class VectorDBOperator:
             )
             return True
 
+        await self._ensure_collections(
+            self._primary_media_collection_names(),
+            validate_text_embedding=False,
+        )
         vectors = await self._get_qwen_vl_independent_pair(description, image_url)
         if not vectors:
             return False
@@ -602,6 +946,7 @@ class VectorDBOperator:
         """
         if not texts:
             return []
+        self._raise_if_validation_rejected()
 
         # 硅基流动限制单次 max=64，我们设为 50 以保万无一失
         API_BATCH_LIMIT = 50
@@ -625,16 +970,15 @@ class VectorDBOperator:
                     embedding = self._validate_text_embedding_dimension(
                         data.embedding
                     )
-                    if embedding is None:
-                        return []
                     chunk_embeddings.append(embedding)
                 all_embeddings.extend(chunk_embeddings)
 
             return all_embeddings
 
+        except CollectionEmbeddingConfigMismatchError:
+            raise
         except Exception as e:
             logger.error(f"Batch Embedding API Error: {e}")
-            # 如果中间失败了，返回空列表，触发上层重试机制
             return []
 
     async def batch_insert(self, texts: list[str], session_id: str):
@@ -643,13 +987,15 @@ class VectorDBOperator:
         """
         if not self.enabled:
             return
-        await self._ensure_collections()
+        await self._ensure_collections({self.chat_col})
         if not texts:
             return
 
         # 1. 批量获取向量
         try:
             vectors = await self._get_batch_text_embeddings(texts)
+        except CollectionEmbeddingConfigMismatchError:
+            raise
         except Exception as e:
             logger.error(f"批量向量化失败: {e}")
             return
@@ -843,6 +1189,7 @@ class VectorDBOperator:
         vector_name: str,
         limit: int,
         visual_route_weight: float = MEME_CONTEXT_VISUAL_ROUTE_WEIGHT,
+        include_legacy: bool = True,
     ) -> list[tuple[int, float]]:
         query_specs: list[tuple[str, str | None, float, str]] = [
             (self.media_multivector_col, vector_name, 1.0, "独立媒体向量"),
@@ -856,12 +1203,13 @@ class VectorDBOperator:
                 visual_route_weight,
                 "跨模态视觉向量",
             ))
-        query_specs.append((
-            self.media_col,
-            None,
-            MEME_LEGACY_ROUTE_WEIGHT,
-            "旧媒体融合向量",
-        ))
+        if include_legacy:
+            query_specs.append((
+                self.media_col,
+                None,
+                MEME_LEGACY_ROUTE_WEIGHT,
+                "旧媒体融合向量",
+            ))
 
         calls = []
         for collection_name, using, _, _ in query_specs:
@@ -966,10 +1314,10 @@ class VectorDBOperator:
         """返回多路融合后的候选，供上层结合群热度再次排序。"""
         if not self.enabled:
             return []
-        await self._ensure_collections()
         expanded_description = expand_meme_search_terms(description)
 
         if self.text_only:
+            await self._ensure_collections({self.media_text_col})
             # text 模式：BGE-M3 文本向量 -> 单路线检索 media_collection_text
             vector = await self._get_text_embedding(expanded_description)
             if not vector:
@@ -988,6 +1336,11 @@ class VectorDBOperator:
                 for point in search_result.points
             ]
 
+        await self._ensure_collections(
+            self._primary_media_collection_names(),
+            validate_text_embedding=False,
+        )
+        include_legacy = await self._legacy_media_collection_available()
         vector = await self._get_qwen_vl_embedding(
             text=expanded_description,
             instruct=MEME_TEXT_QUERY_INSTRUCT,
@@ -1004,6 +1357,7 @@ class VectorDBOperator:
                 if strict_content_match
                 else MEME_CONTEXT_VISUAL_ROUTE_WEIGHT
             ),
+            include_legacy=include_legacy,
         )
 
     async def search_similar_meme(
@@ -1022,7 +1376,11 @@ class VectorDBOperator:
         if self.text_only:
             logger.warning("text 模式下图找图 (search_similar_meme) 不可用")
             return []
-        await self._ensure_collections()
+        await self._ensure_collections(
+            self._primary_media_collection_names(),
+            validate_text_embedding=False,
+        )
+        include_legacy = await self._legacy_media_collection_available()
 
         target_vector = await self._get_qwen_vl_embedding(image_source=file_path)
         if not target_vector:
@@ -1036,6 +1394,7 @@ class VectorDBOperator:
             target_vector,
             vector_name=MEDIA_IMAGE_VECTOR,
             limit=query_limit,
+            include_legacy=include_legacy,
         )
         if not candidates:
             return []

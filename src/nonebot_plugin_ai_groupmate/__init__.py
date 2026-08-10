@@ -56,7 +56,12 @@ from .utils import (
 )
 from .webui import register_usage_webui
 from .config import Config, create_tagging_llm
-from .memory import DB, MEDIA_EMBEDDING_VERSION as MEDIA_EMBEDDING_VERSION
+from .memory import (
+    DB,
+    MEDIA_EMBEDDING_VERSION as MEDIA_EMBEDDING_VERSION,
+    EmbeddingProviderUnavailableError,
+    CollectionEmbeddingConfigMismatchError,
+)
 from .concurrency import agent_run_gate, maintenance_gate, background_image_gate
 from .reply_guard import set_latest_request_id
 from .agent.reaction import is_onebot_context
@@ -122,8 +127,33 @@ async def _load_webui_runtime_config() -> None:
         async with get_session() as db_session:
             changed_fields = await load_runtime_config_overrides(db_session)
         _refresh_runtime_resources(changed_fields)
-        if changed_fields & RESTART_REQUIRED_FIELDS:
+        has_restart_required_changes = bool(
+            changed_fields & RESTART_REQUIRED_FIELDS
+        )
+        if has_restart_required_changes:
             await DB.reconfigure()
+        collections_checked = not DB.enabled
+        if DB.enabled:
+            try:
+                await DB.check_collections()
+                collections_checked = True
+            except CollectionEmbeddingConfigMismatchError:
+                logger.error(
+                    "启动时 Qdrant 集合校验失败，相关向量操作已拒绝；"
+                    "请根据上方日志中的当前配置和 collection 配置人工重建向量"
+                )
+            except EmbeddingProviderUnavailableError:
+                # 连接配置已由 reconfigure 应用；临时探针失败不应让 WebUI
+                # 永久显示等待重启，文本向量操作会在后续请求中重试。
+                collections_checked = True
+                logger.warning(
+                    "启动时 Embedding API 暂时不可用，文本向量操作将在首次使用时重试"
+                )
+            except Exception:
+                logger.exception(
+                    "启动时 Qdrant 集合校验暂时失败，将在首次向量操作时重试"
+                )
+        if has_restart_required_changes and collections_checked:
             mark_restart_fields_applied()
         if changed_fields:
             logger.info(

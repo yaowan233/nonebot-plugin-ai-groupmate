@@ -26,6 +26,9 @@ async def test_startup_reconfigures_vector_db_for_persisted_meme_mode(
     async def fake_reconfigure():
         calls.append("reconfigure")
 
+    async def fake_check_collections():
+        calls.append("check_collections")
+
     monkeypatch.setattr(plugin, "get_session", fake_get_session)
     monkeypatch.setattr(
         plugin,
@@ -34,6 +37,8 @@ async def test_startup_reconfigures_vector_db_for_persisted_meme_mode(
     )
     monkeypatch.setattr(plugin, "_refresh_runtime_resources", lambda _fields: None)
     monkeypatch.setattr(plugin.DB, "reconfigure", fake_reconfigure)
+    monkeypatch.setattr(plugin.DB, "enabled", True)
+    monkeypatch.setattr(plugin.DB, "check_collections", fake_check_collections)
     monkeypatch.setattr(
         plugin,
         "mark_restart_fields_applied",
@@ -42,7 +47,93 @@ async def test_startup_reconfigures_vector_db_for_persisted_meme_mode(
 
     await plugin._load_webui_runtime_config()
 
-    assert calls == ["reconfigure", "marked"]
+    assert calls == ["reconfigure", "check_collections", "marked"]
+
+
+@pytest.mark.asyncio
+async def test_startup_keeps_restart_marker_when_collection_check_fails(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import nonebot_plugin_ai_groupmate as plugin
+
+    calls: list[str] = []
+
+    @asynccontextmanager
+    async def fake_get_session():
+        yield object()
+
+    async def fake_load_runtime_config_overrides(_session):
+        return {"embedding_dimension"}
+
+    async def fake_reconfigure():
+        calls.append("reconfigure")
+
+    async def fake_check_collections():
+        calls.append("check_collections")
+        raise plugin.CollectionEmbeddingConfigMismatchError("mismatch")
+
+    monkeypatch.setattr(plugin, "get_session", fake_get_session)
+    monkeypatch.setattr(
+        plugin,
+        "load_runtime_config_overrides",
+        fake_load_runtime_config_overrides,
+    )
+    monkeypatch.setattr(plugin, "_refresh_runtime_resources", lambda _fields: None)
+    monkeypatch.setattr(plugin.DB, "reconfigure", fake_reconfigure)
+    monkeypatch.setattr(plugin.DB, "enabled", True)
+    monkeypatch.setattr(plugin.DB, "check_collections", fake_check_collections)
+    monkeypatch.setattr(
+        plugin,
+        "mark_restart_fields_applied",
+        lambda: calls.append("marked"),
+    )
+
+    await plugin._load_webui_runtime_config()
+
+    assert calls == ["reconfigure", "check_collections"]
+
+
+@pytest.mark.asyncio
+async def test_startup_marks_restart_fields_when_embedding_provider_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import nonebot_plugin_ai_groupmate as plugin
+
+    calls: list[str] = []
+
+    @asynccontextmanager
+    async def fake_get_session():
+        yield object()
+
+    async def fake_load_runtime_config_overrides(_session):
+        return {"embedding_base_url"}
+
+    async def fake_reconfigure():
+        calls.append("reconfigure")
+
+    async def fake_check_collections():
+        calls.append("check_collections")
+        raise plugin.EmbeddingProviderUnavailableError("temporary failure")
+
+    monkeypatch.setattr(plugin, "get_session", fake_get_session)
+    monkeypatch.setattr(
+        plugin,
+        "load_runtime_config_overrides",
+        fake_load_runtime_config_overrides,
+    )
+    monkeypatch.setattr(plugin, "_refresh_runtime_resources", lambda _fields: None)
+    monkeypatch.setattr(plugin.DB, "reconfigure", fake_reconfigure)
+    monkeypatch.setattr(plugin.DB, "enabled", True)
+    monkeypatch.setattr(plugin.DB, "check_collections", fake_check_collections)
+    monkeypatch.setattr(
+        plugin,
+        "mark_restart_fields_applied",
+        lambda: calls.append("marked"),
+    )
+
+    await plugin._load_webui_runtime_config()
+
+    assert calls == ["reconfigure", "check_collections", "marked"]
 
 
 @pytest.mark.asyncio
@@ -158,6 +249,28 @@ async def test_chat_vectorization_keeps_messages_pending_without_qdrant(monkeypa
     )
 
     assert result is None
+
+
+@pytest.mark.asyncio
+async def test_chat_vectorization_does_not_retry_embedding_dimension_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from nonebot_plugin_ai_groupmate import utils
+    from nonebot_plugin_ai_groupmate.memory import CollectionEmbeddingConfigMismatchError
+
+    calls = 0
+
+    async def fail_with_dimension_mismatch(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        raise CollectionEmbeddingConfigMismatchError("dimension mismatch")
+
+    monkeypatch.setattr(utils.DB, "batch_insert", fail_with_dimension_mismatch)
+
+    with pytest.raises(CollectionEmbeddingConfigMismatchError):
+        await utils.insert_vectors_with_retry(["context"], "group-1")
+
+    assert calls == 1
 
 
 @pytest.mark.asyncio
