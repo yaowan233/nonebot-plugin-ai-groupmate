@@ -1,8 +1,9 @@
+import io
 import base64
-import mimetypes
 from typing import Any
 from pathlib import Path
 
+from PIL import Image, ImageOps
 from sqlalchemy import Select
 from nonebot.log import logger
 from nonebot_plugin_uninfo import SceneType, QryItrface
@@ -12,19 +13,43 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from ..model import ChatHistory, ChatHistorySchema
 
 
+def _image_bytes_to_data_uri(image_bytes: bytes, *, source: str) -> str | None:
+    """Decode and normalize an image before sending it to an OpenAI-compatible API."""
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as image:
+            image.seek(0)
+            image.load()
+            has_transparency = image.mode in {"RGBA", "LA"} or (
+                image.mode == "P" and "transparency" in image.info
+            )
+            normalized = ImageOps.exif_transpose(image)
+            output = io.BytesIO()
+            if has_transparency:
+                normalized.convert("RGBA").save(output, format="PNG", optimize=True)
+                mime_type = "image/png"
+            else:
+                normalized.convert("RGB").save(
+                    output,
+                    format="JPEG",
+                    quality=90,
+                    optimize=True,
+                )
+                mime_type = "image/jpeg"
+    except Exception as e:
+        logger.warning(f"图片无法解码，跳过模型图片输入 source={source}: {e}")
+        return None
+
+    encoded_string = base64.b64encode(output.getvalue()).decode("ascii")
+    return f"data:{mime_type};base64,{encoded_string}"
+
+
 def get_image_data_uri(file_name: str, *, pic_dir: Path) -> str | None:
     file_path = pic_dir / file_name
     if not file_path.exists():
         return None
 
     try:
-        mime_type, _ = mimetypes.guess_type(file_path)
-        if not mime_type:
-            mime_type = "image/jpeg"
-
-        with open(file_path, "rb") as image_file:
-            encoded_string = base64.b64encode(image_file.read()).decode("utf-8")
-            return f"data:{mime_type};base64,{encoded_string}"
+        return _image_bytes_to_data_uri(file_path.read_bytes(), source=file_name)
     except Exception as e:
         logger.error(f"读取图片失败 {file_name}: {e}")
         return None

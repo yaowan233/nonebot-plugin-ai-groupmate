@@ -453,6 +453,7 @@ async def _run_scheduled_agent_task(
                         "required_side_effect_unavailable": False,
                         "required_side_effect_success_count": 0,
                         "required_side_effect_target_count": 1,
+                        "image_input_disabled": False,
                     }),
                     timeout=plugin_config.agent_timeout_seconds,
                 )
@@ -1579,6 +1580,7 @@ async def choice_response_strategy(
             "required_side_effect_target_count": (
                 meme_send_count if meme_required else 1
             ),
+            "image_input_disabled": False,
         }
 
         # 4. 调用 Agent
@@ -1738,6 +1740,7 @@ if __name__ == "__main__":
             "required_side_effect_unavailable": False,
             "required_side_effect_success_count": 0,
             "required_side_effect_target_count": 1,
+            "image_input_disabled": False,
         })
     )
     print(result)

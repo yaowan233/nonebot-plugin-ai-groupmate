@@ -35,6 +35,7 @@ def _state(message: AIMessage, *, tool_count: int = 0) -> "AgentState":
         "required_side_effect_unavailable": False,
         "required_side_effect_success_count": 0,
         "required_side_effect_target_count": 1,
+        "image_input_disabled": False,
     }
 
 
@@ -88,6 +89,62 @@ class _ToolSpyModel:
     async def ainvoke(self, messages):
         self.invoke_count += 1
         return next(self.responses)
+
+
+class _InvalidImageThenResponseModel:
+    def __init__(self, response: AIMessage):
+        self.response = response
+        self.invoke_messages = []
+
+    def bind_tools(self, tools):
+        return self
+
+    async def ainvoke(self, messages):
+        self.invoke_messages.append(messages)
+        if len(self.invoke_messages) == 1:
+            raise RuntimeError(
+                "Error code: 400 - The image format is illegal and cannot be opened"
+            )
+        return self.response
+
+
+@pytest.mark.asyncio
+async def test_invalid_image_error_retries_with_text_only_messages():
+    from nonebot_plugin_ai_groupmate.agent.graph import (
+        AgentRunLimits,
+        _make_agent_node,
+    )
+
+    model = _InvalidImageThenResponseModel(AIMessage(content="recovered"))
+    agent_node = _make_agent_node(
+        model,
+        [],
+        "system",
+        {},
+        AgentRunLimits(),
+    )
+    state = _state(AIMessage(content=[
+        {"type": "text", "text": "look"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,eA=="}},
+    ]))
+
+    result = await agent_node(state)
+
+    assert len(model.invoke_messages) == 2
+    assert any(
+        isinstance(item, dict) and item.get("type") == "image_url"
+        for message in model.invoke_messages[0]
+        if isinstance(message.content, list)
+        for item in message.content
+    )
+    assert not any(
+        isinstance(item, dict) and item.get("type") == "image_url"
+        for message in model.invoke_messages[1]
+        if isinstance(message.content, list)
+        for item in message.content
+    )
+    assert result["image_input_disabled"] is True
+    assert result["llm_call_count"] == 2
 
 
 @pytest.mark.asyncio

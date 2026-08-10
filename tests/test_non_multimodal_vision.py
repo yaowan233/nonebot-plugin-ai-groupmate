@@ -1,12 +1,39 @@
 """Tests for non-multimodal chat model support and vision-model fallback."""
 
+import io
+import base64
 import datetime
 from typing import TYPE_CHECKING
 
 import pytest
+from PIL import Image
 
 if TYPE_CHECKING:
     pass
+
+
+def test_get_image_data_uri_rejects_corrupt_image(tmp_path):
+    from nonebot_plugin_ai_groupmate.agent.history_format import get_image_data_uri
+
+    (tmp_path / "broken.jpg").write_bytes(b"not an image")
+
+    assert get_image_data_uri("broken.jpg", pic_dir=tmp_path) is None
+
+
+def test_get_image_data_uri_normalizes_image_content(tmp_path):
+    from nonebot_plugin_ai_groupmate.agent.history_format import get_image_data_uri
+
+    image_buffer = io.BytesIO()
+    Image.new("RGB", (2, 2), "red").save(image_buffer, format="PNG")
+    (tmp_path / "mislabeled.gif").write_bytes(image_buffer.getvalue())
+
+    data_uri = get_image_data_uri("mislabeled.gif", pic_dir=tmp_path)
+
+    assert data_uri is not None
+    assert data_uri.startswith("data:image/jpeg;base64,")
+    normalized_bytes = base64.b64decode(data_uri.split(",", 1)[1])
+    with Image.open(io.BytesIO(normalized_bytes)) as normalized:
+        assert normalized.format == "JPEG"
 
 
 def _image_msg(

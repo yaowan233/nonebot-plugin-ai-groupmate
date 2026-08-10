@@ -76,6 +76,7 @@ class AgentState(TypedDict):
     required_side_effect_unavailable: bool
     required_side_effect_success_count: int
     required_side_effect_target_count: int
+    image_input_disabled: bool
 
 
 @dataclass
@@ -355,6 +356,59 @@ def _message_text_content(message: AIMessage) -> str:
     return ""
 
 
+def _is_invalid_image_error(error: Exception) -> bool:
+    error_text = str(error).lower()
+    is_bad_request = (
+        getattr(error, "status_code", None) == 400
+        or "error code: 400" in error_text
+        or "status code: 400" in error_text
+    )
+    invalid_image_markers = (
+        "image format is illegal",
+        "cannot be opened",
+        "invalid image",
+        "failed to process image",
+    )
+    return is_bad_request and any(
+        marker in error_text for marker in invalid_image_markers
+    )
+
+
+def _remove_image_blocks(
+    messages: Sequence[BaseMessage],
+) -> tuple[list[BaseMessage], int]:
+    sanitized_messages: list[BaseMessage] = []
+    removed_count = 0
+    for message in messages:
+        content = message.content
+        if not isinstance(content, list):
+            sanitized_messages.append(message)
+            continue
+
+        sanitized_content: list[Any] = []
+        removed_from_message = 0
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "image_url":
+                removed_count += 1
+                removed_from_message += 1
+                continue
+            sanitized_content.append(item)
+
+        if removed_from_message == 0:
+            sanitized_messages.append(message)
+            continue
+
+        sanitized_content.append({
+            "type": "text",
+            "text": "[图片无法被模型读取，已降级为纯文本上下文]",
+        })
+        sanitized_messages.append(
+            message.model_copy(update={"content": sanitized_content})
+        )
+
+    return sanitized_messages, removed_count
+
+
 def _active_tools(
     base_tools: list[BaseTool],
     tools_by_skill: dict[str, list[BaseTool]],
@@ -399,6 +453,10 @@ def _make_agent_node(
         cached_tokens = state.get("llm_cached_tokens", 0)
         cache_creation_tokens = state.get("llm_cache_creation_tokens", 0)
         retried_empty_response = False
+        image_input_disabled = state.get("image_input_disabled", False)
+        if image_input_disabled:
+            full, _ = _remove_image_blocks(full)
+            call_messages = full
 
         while True:
             call_number += 1
@@ -413,6 +471,27 @@ def _make_agent_node(
                     f"[AgentTrace] LLM 超时 session={state['session_id']} "
                     f"call={call_number} timeout={limits.llm_timeout_seconds:.1f}s"
                 )
+                raise
+            except Exception as e:
+                can_retry_without_images = (
+                    not image_input_disabled
+                    and call_number < limits.max_llm_calls
+                    and _is_invalid_image_error(e)
+                )
+                if can_retry_without_images:
+                    sanitized_messages, removed_count = _remove_image_blocks(
+                        call_messages
+                    )
+                    if removed_count:
+                        full, _ = _remove_image_blocks(full)
+                        call_messages = sanitized_messages
+                        image_input_disabled = True
+                        logger.warning(
+                            f"[AgentTrace] 模型拒绝图片输入 session={state['session_id']} "
+                            f"call={call_number} removed_images={removed_count}，"
+                            "已降级为纯文本自动重试"
+                        )
+                        continue
                 raise
             elapsed_ms = (time.perf_counter() - started_at) * 1000
             usage = _log_llm_cache_usage(response)
@@ -457,6 +536,7 @@ def _make_agent_node(
             "llm_cache_creation_tokens": cache_creation_tokens,
             "llm_call_count": call_number,
             "llm_total_tokens": total_tokens,
+            "image_input_disabled": image_input_disabled,
         }
 
     return agent_node
