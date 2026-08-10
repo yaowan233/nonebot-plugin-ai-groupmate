@@ -557,6 +557,97 @@ async def test_text_mode_ensure_collections_creates_text_collection(
 
 
 @pytest.mark.asyncio
+async def test_text_collections_use_configured_embedding_dimension(
+    memory_module: Any,
+):
+    operator = make_operator(memory_module)
+    operator.text_only = True
+    operator.chat_col = "chat_collection"
+    operator.text_embedding_dimension = 1536
+    operator._collections_ready = False
+    operator._init_lock = asyncio.Lock()
+    create_calls: list[dict[str, Any]] = []
+
+    class FakeQdrantClient:
+        async def collection_exists(self, _collection_name: str) -> bool:
+            return False
+
+        async def create_collection(self, **kwargs: Any) -> None:
+            create_calls.append(kwargs)
+
+        async def create_payload_index(self, **_kwargs: Any) -> None:
+            return None
+
+    operator.client = FakeQdrantClient()
+
+    await operator._ensure_collections()
+
+    sizes = {
+        call["collection_name"]: call["vectors_config"].size
+        for call in create_calls
+    }
+    assert sizes == {
+        "chat_collection": 1536,
+        memory_module.MEDIA_TEXT_COL: 1536,
+    }
+
+
+@pytest.mark.asyncio
+async def test_text_embedding_rejects_unexpected_dimension(memory_module: Any):
+    operator = make_operator(memory_module)
+    operator.text_embedding_dimension = 1024
+    operator.emb_model = "test-model"
+
+    class FakeEmbeddings:
+        async def create(self, **_kwargs: Any):
+            return SimpleNamespace(
+                data=[SimpleNamespace(embedding=[0.5] * 1536)]
+            )
+
+    operator.emb_client = SimpleNamespace(embeddings=FakeEmbeddings())
+
+    assert await operator._get_text_embedding("hello") is None
+
+
+@pytest.mark.asyncio
+async def test_insert_chat_stores_vector_from_configured_model(memory_module: Any):
+    operator = make_operator(memory_module)
+    operator.enabled = True
+    operator.chat_col = "chat_collection"
+    operator.emb_model = "Qwen/Qwen3-Embedding-0.6B"
+    operator.text_embedding_dimension = 1536
+    embedding_requests: list[dict[str, Any]] = []
+    upsert_calls: list[dict[str, Any]] = []
+
+    class FakeEmbeddings:
+        async def create(self, **kwargs: Any):
+            embedding_requests.append(kwargs)
+            return SimpleNamespace(
+                data=[SimpleNamespace(embedding=[0.5] * 1536)]
+            )
+
+    class FakeQdrantClient:
+        async def upsert(self, **kwargs: Any) -> None:
+            upsert_calls.append(kwargs)
+
+    async def ensure_collections() -> None:
+        return None
+
+    operator.emb_client = SimpleNamespace(embeddings=FakeEmbeddings())
+    operator.client = FakeQdrantClient()
+    operator._ensure_collections = ensure_collections
+
+    await operator.insert_chat("hello", "group-1")
+
+    assert embedding_requests == [{
+        "input": ["hello"],
+        "model": "Qwen/Qwen3-Embedding-0.6B",
+    }]
+    assert len(upsert_calls) == 1
+    assert len(upsert_calls[0]["points"][0].vector) == 1536
+
+
+@pytest.mark.asyncio
 async def test_text_mode_insert_media_uses_text_embedding(memory_module: Any):
     operator = make_operator(memory_module)
     operator.enabled = True
@@ -818,6 +909,33 @@ def test_configure_strips_duplicate_embeddings_suffix(
     base_url = str(operator.emb_client.base_url).rstrip("/")
     assert base_url.endswith("/embeddings") is False
     assert base_url == "http://emb/v1"
+
+
+def test_configure_uses_configured_text_embedding_model(
+    memory_module: Any, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(
+        memory_module,
+        "plugin_config",
+        SimpleNamespace(
+            qdrant_uri="http://127.0.0.1:6333",
+            qwen_token="sk-xxx",
+            meme_embedding_mode="multimodal",
+            embedding_api_key="k",
+            embedding_base_url="http://emb",
+            embedding_model="Qwen/Qwen3-Embedding-0.6B",
+            embedding_dimension=1536,
+            rerank_api_url="",
+            rerank_api_key="",
+            qdrant_api_key="",
+        ),
+    )
+    operator = object.__new__(memory_module.VectorDBOperator)
+
+    operator._configure()
+
+    assert operator.emb_model == "Qwen/Qwen3-Embedding-0.6B"
+    assert operator.text_embedding_dimension == 1536
 
 
 @pytest.mark.asyncio

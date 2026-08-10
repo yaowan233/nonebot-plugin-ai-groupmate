@@ -30,6 +30,7 @@ MEDIA_TEXT_VECTOR = "text"
 MEDIA_IMAGE_VECTOR = "image"
 # text 模式（meme_embedding_mode="text"）专用：纯文本向量集合
 MEDIA_TEXT_COL = "media_collection_text"
+# 默认维度用于兼容未设置 embedding_dimension 的旧配置和测试替身。
 MEDIA_TEXT_VECTOR_SIZE = 1024
 MEME_SEARCH_POOL_SIZE = 50
 MEME_RRF_K = 60
@@ -74,6 +75,7 @@ class VectorDBOperator:
     effective_meme_embedding_mode: str = "multimodal"
     media_embedding_version: int = MEDIA_MULTIMODAL_EMBEDDING_VERSION
     media_text_col = MEDIA_TEXT_COL
+    text_embedding_dimension: int = MEDIA_TEXT_VECTOR_SIZE
 
     def __init__(self):
         self._configure()
@@ -131,7 +133,17 @@ class VectorDBOperator:
             base_url=embedding_base_url
         )
         self.qwen_http_client = httpx.AsyncClient(timeout=60.0)
-        self.emb_model = "BAAI/bge-m3"
+        self.emb_model = (
+            str(getattr(plugin_config, "embedding_model", "BAAI/bge-m3")).strip()
+            or "BAAI/bge-m3"
+        )
+        self.text_embedding_dimension = int(
+            getattr(
+                plugin_config,
+                "embedding_dimension",
+                MEDIA_TEXT_VECTOR_SIZE,
+            )
+        )
 
         # 3. Rerank API 配置
         self.rerank_url = plugin_config.rerank_api_url
@@ -183,7 +195,7 @@ class VectorDBOperator:
                 await self.client.create_collection(
                     collection_name=self.chat_col,
                     vectors_config=models.VectorParams(
-                        size=1024,
+                        size=self.text_embedding_dimension,
                         distance=models.Distance.COSINE
                     ),
                 )
@@ -201,7 +213,7 @@ class VectorDBOperator:
                     await self.client.create_collection(
                         collection_name=self.media_text_col,
                         vectors_config=models.VectorParams(
-                            size=MEDIA_TEXT_VECTOR_SIZE,
+                            size=self.text_embedding_dimension,
                             distance=models.Distance.COSINE
                         ),
                     )
@@ -235,14 +247,26 @@ class VectorDBOperator:
 
             self._collections_ready = True
 
+    def _validate_text_embedding_dimension(
+        self, embedding: list[float]
+    ) -> list[float] | None:
+        if len(embedding) == self.text_embedding_dimension:
+            return embedding
+        logger.error(
+            "Embedding API 返回维度不匹配: "
+            f"model={self.emb_model}, expected={self.text_embedding_dimension}, "
+            f"actual={len(embedding)}"
+        )
+        return None
+
     async def _get_text_embedding(self, text: str) -> list[float] | None:
-        """调用 API 获取文本 Dense 向量 (BGE-M3)"""
+        """调用 API 获取配置的文本 Dense 向量。"""
         try:
             resp = await self.emb_client.embeddings.create(
                 input=[text],
                 model=self.emb_model
             )
-            return resp.data[0].embedding
+            return self._validate_text_embedding_dimension(resp.data[0].embedding)
         except Exception as e:
             logger.error(f"Embedding API Error: {e}")
             return None
@@ -596,7 +620,14 @@ class VectorDBOperator:
 
                 # 收集结果
                 # resp.data 是按顺序返回的，直接 extend 即可
-                chunk_embeddings = [data.embedding for data in resp.data]
+                chunk_embeddings = []
+                for data in resp.data:
+                    embedding = self._validate_text_embedding_dimension(
+                        data.embedding
+                    )
+                    if embedding is None:
+                        return []
+                    chunk_embeddings.append(embedding)
                 all_embeddings.extend(chunk_embeddings)
 
             return all_embeddings

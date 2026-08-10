@@ -247,11 +247,15 @@ def test_settings_page_groups_all_fields_and_never_renders_secrets():
         SETTING_GROUPS,
         render_settings_page,
     )
-    from nonebot_plugin_ai_groupmate.runtime_config import CONFIGURABLE_FIELDS
+    from nonebot_plugin_ai_groupmate.runtime_config import (
+        CONFIGURABLE_FIELDS,
+    )
 
     config = ScopedConfig(
         llm_api_key="sk-do-not-render",
         qdrant_api_key="qdrant-do-not-render",
+        embedding_model="Qwen/Qwen3-Embedding-0.6B",
+        embedding_dimension=1536,
     )
     html = render_settings_page(
         config,
@@ -270,6 +274,11 @@ def test_settings_page_groups_all_fields_and_never_renders_secrets():
     assert grouped_fields == CONFIGURABLE_FIELDS
     assert "sk-do-not-render" not in html
     assert "qdrant-do-not-render" not in html
+    assert "Qwen/Qwen3-Embedding-0.6B" in html
+    assert "1536" in html
+    assert 'data-setting="embedding_model"' in html
+    assert 'data-setting="embedding_dimension"' in html
+    assert "Qdrant、Embedding 与 Rerank 连接配置重启后生效" in html
     assert "已配置，留空保持不变" in html
     assert "网页覆盖" in html
     assert "等待重启" in html
@@ -281,6 +290,7 @@ def test_runtime_config_update_is_validated_and_bootstrap_fields_are_blocked():
 
     from nonebot_plugin_ai_groupmate.config import ScopedConfig
     from nonebot_plugin_ai_groupmate.runtime_config import (
+        CONFIGURABLE_FIELDS,
         RESTART_REQUIRED_FIELDS,
         preview_runtime_config_update,
     )
@@ -296,12 +306,29 @@ def test_runtime_config_update_is_validated_and_bootstrap_fields_are_blocked():
 
     with pytest.raises(ValueError, match="不支持通过网页修改"):
         preview_runtime_config_update({"usage_webui_token": "new-token"})
+    candidate, overrides, changed = preview_runtime_config_update({
+        "embedding_model": "custom-model",
+        "embedding_dimension": "1536",
+    })
+    assert candidate.embedding_model == "custom-model"
+    assert candidate.embedding_dimension == 1536
+    assert overrides["embedding_model"] == "custom-model"
+    assert overrides["embedding_dimension"] == 1536
+    assert {"embedding_model", "embedding_dimension"} <= changed
     with pytest.raises(ValueError, match="不是密钥配置"):
         preview_runtime_config_update({}, clear_secrets={"usage_webui_token"})
     with pytest.raises(ValidationError):
         ScopedConfig.model_validate({"meme_embedding_mode": "invalid"})
+    with pytest.raises(ValidationError):
+        ScopedConfig.model_validate({"embedding_dimension": 0})
 
-    assert {"meme_embedding_mode", "qwen_token"} <= RESTART_REQUIRED_FIELDS
+    assert {"embedding_model", "embedding_dimension"} <= CONFIGURABLE_FIELDS
+    assert {
+        "embedding_model",
+        "embedding_dimension",
+        "meme_embedding_mode",
+        "qwen_token",
+    } <= RESTART_REQUIRED_FIELDS
 
 
 def test_connection_error_redacts_configured_secrets():
