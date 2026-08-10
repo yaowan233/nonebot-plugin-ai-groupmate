@@ -561,6 +561,7 @@ async def test_text_mode_insert_media_uses_text_embedding(memory_module: Any):
     operator = make_operator(memory_module)
     operator.enabled = True
     operator.text_only = True
+    operator.media_embedding_version = memory_module.MEDIA_TEXT_EMBEDDING_VERSION
     vector = [0.5] * memory_module.MEDIA_TEXT_VECTOR_SIZE
     upsert_calls: list[dict[str, Any]] = []
 
@@ -584,6 +585,10 @@ async def test_text_mode_insert_media_uses_text_embedding(memory_module: Any):
     point = upsert_calls[0]["points"][0]
     assert point.id == 1
     assert point.vector == vector
+    assert (
+        point.payload["embedding_version"]
+        == memory_module.MEDIA_TEXT_EMBEDDING_VERSION
+    )
 
 
 @pytest.mark.asyncio
@@ -756,6 +761,8 @@ def test_configure_forces_text_mode_when_qwen_token_missing(
     operator._configure()
 
     assert operator.text_only is True
+    assert operator.effective_meme_embedding_mode == "text"
+    assert operator.media_embedding_version == memory_module.MEDIA_TEXT_EMBEDDING_VERSION
 
 
 def test_configure_keeps_multimodal_when_qwen_token_set(
@@ -780,6 +787,11 @@ def test_configure_keeps_multimodal_when_qwen_token_set(
     operator._configure()
 
     assert operator.text_only is False
+    assert operator.effective_meme_embedding_mode == "multimodal"
+    assert (
+        operator.media_embedding_version
+        == memory_module.MEDIA_MULTIMODAL_EMBEDDING_VERSION
+    )
 
 
 def test_configure_strips_duplicate_embeddings_suffix(

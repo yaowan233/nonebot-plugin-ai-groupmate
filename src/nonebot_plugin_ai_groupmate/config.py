@@ -1,4 +1,4 @@
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import Field, BaseModel, SecretStr
 from langchain_openai import ChatOpenAI
@@ -104,7 +104,7 @@ class ScopedConfig(BaseModel):
     #                  若未配置 qwen_token，会自动降级为 "text"。
     #   "text":       仅用 embedding_api_key 的文本向量化描述，无需 qwen_token，
     #                  运维最轻；图找图 (search_similar_meme_by_id) 不可用。
-    meme_embedding_mode: str = "multimodal"
+    meme_embedding_mode: Literal["multimodal", "text"] = "multimodal"
 
 
 class Config(BaseModel):

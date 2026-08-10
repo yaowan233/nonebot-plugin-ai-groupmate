@@ -51,10 +51,17 @@ class FakeSession:
         return None
 
 
+@pytest.mark.parametrize(
+    ("stored_version", "active_version"),
+    [(0, 3), (3, 4), (4, 3)],
+    ids=["legacy", "multimodal-to-text", "text-to-multimodal"],
+)
 @pytest.mark.asyncio
-async def test_vectorize_media_reindexes_legacy_meme_without_retagging(
+async def test_vectorize_media_reindexes_mismatched_version_without_retagging(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
+    stored_version: int,
+    active_version: int,
 ):
     import nonebot_plugin_ai_groupmate as plugin_module
 
@@ -63,7 +70,7 @@ async def test_vectorize_media_reindexes_legacy_meme_without_retagging(
         file_path="legacy.png",
         description="熊猫头流泪，表达无奈",
         vectorized=True,
-        embedding_version=0,
+        embedding_version=stored_version,
     )
     session = FakeSession(media)
     (tmp_path / media.file_path).write_bytes(b"legacy-image")
@@ -84,6 +91,11 @@ async def test_vectorize_media_reindexes_legacy_meme_without_retagging(
     monkeypatch.setattr(plugin_module, "get_session", fake_get_session)
     monkeypatch.setattr(plugin_module, "pic_dir", tmp_path)
     monkeypatch.setattr(plugin_module.DB, "enabled", True)
+    monkeypatch.setattr(
+        plugin_module.DB,
+        "media_embedding_version",
+        active_version,
+    )
     monkeypatch.setattr(plugin_module.DB, "insert_media", fake_insert_media)
     monkeypatch.setattr(plugin_module, "get_tagging_model", fail_if_tagging_model_is_used)
 
@@ -93,7 +105,7 @@ async def test_vectorize_media_reindexes_legacy_meme_without_retagging(
     assert insert_calls[0][0] == media.media_id
     assert insert_calls[0][1].startswith("data:image/png;base64,")
     assert insert_calls[0][2] == media.description
-    assert media.embedding_version == plugin_module.MEDIA_EMBEDDING_VERSION
+    assert media.embedding_version == active_version
     assert session.rollback_count == 0
 
 

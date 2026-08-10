@@ -26,6 +26,7 @@ from ..usage import (
     extract_cache_creation_tokens,
 )
 from ..config import create_chat_llm, create_vision_llm, create_chat_openai
+from ..memory import DB
 from .context import (
     get_group_context,
     get_user_relation_context,
@@ -992,7 +993,7 @@ async def create_chat_graph(
         approved_meme_ids=approved_meme_ids,
     )
     # text 模式（纯文本向量）下无图片向量，图找图工具不提供给 Agent
-    meme_similar_enabled = plugin_config.meme_embedding_mode != "text"
+    meme_similar_enabled = not DB.text_only
     if not meme_similar_enabled:
         logger.info("表情包向量化模式为 text，图找图工具已禁用")
     mute_tool = create_mute_tool(

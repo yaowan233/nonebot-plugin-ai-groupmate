@@ -9,6 +9,43 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 
 @pytest.mark.asyncio
+async def test_startup_reconfigures_vector_db_for_persisted_meme_mode(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import nonebot_plugin_ai_groupmate as plugin
+
+    calls: list[str] = []
+
+    @asynccontextmanager
+    async def fake_get_session():
+        yield object()
+
+    async def fake_load_runtime_config_overrides(_session):
+        return {"meme_embedding_mode"}
+
+    async def fake_reconfigure():
+        calls.append("reconfigure")
+
+    monkeypatch.setattr(plugin, "get_session", fake_get_session)
+    monkeypatch.setattr(
+        plugin,
+        "load_runtime_config_overrides",
+        fake_load_runtime_config_overrides,
+    )
+    monkeypatch.setattr(plugin, "_refresh_runtime_resources", lambda _fields: None)
+    monkeypatch.setattr(plugin.DB, "reconfigure", fake_reconfigure)
+    monkeypatch.setattr(
+        plugin,
+        "mark_restart_fields_applied",
+        lambda: calls.append("marked"),
+    )
+
+    await plugin._load_webui_runtime_config()
+
+    assert calls == ["reconfigure", "marked"]
+
+
+@pytest.mark.asyncio
 async def test_reply_releases_database_connection_before_adapter_send(monkeypatch):
     from nonebot_plugin_alconna import UniMessage
 

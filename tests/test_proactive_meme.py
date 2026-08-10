@@ -139,7 +139,9 @@ async def test_proactive_meme_graph_only_exposes_meme_actions(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_private_text_mode_exposes_meme_tools_without_similar(monkeypatch):
+async def test_private_effective_text_mode_exposes_meme_tools_without_similar(
+    monkeypatch,
+):
     from nonebot_plugin_ai_groupmate import agent
 
     captured_base_tools: list[str] = []
@@ -209,7 +211,10 @@ async def test_private_text_mode_exposes_meme_tools_without_similar(monkeypatch)
     monkeypatch.setattr(
         agent, "create_agent_skill_loader_tool", lambda *a, **k: DummyTool("load_agent_skill")
     )
-    monkeypatch.setattr(agent.plugin_config, "meme_embedding_mode", "text")
+    # 默认配置仍请求 multimodal，但底层可因缺少 qwen_token 自动降级。
+    # Agent 必须跟随 DB 当前实际模式，而不是原始配置值。
+    monkeypatch.setattr(agent.plugin_config, "meme_embedding_mode", "multimodal")
+    monkeypatch.setattr(agent.DB, "text_only", True)
     monkeypatch.setattr(agent.plugin_config, "proactive_private_message", False)
 
     await agent.create_chat_graph(

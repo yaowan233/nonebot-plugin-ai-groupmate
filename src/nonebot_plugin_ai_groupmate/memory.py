@@ -20,7 +20,12 @@ plugin_config = get_runtime_config()
 
 QWEN_VL_EMBEDDING_MODEL = "qwen3-vl-embedding"
 MEDIA_VECTOR_SIZE = 2560
-MEDIA_EMBEDDING_VERSION = 3
+# SQL 中的 embedding_version 同时标识向量结构和当前表情包向量化模式。
+# 两种模式使用不同版本，并在模式切换时按“不等于当前版本”重新入库。
+MEDIA_MULTIMODAL_EMBEDDING_VERSION = 3
+MEDIA_TEXT_EMBEDDING_VERSION = 4
+# 保留原常量，兼容现有的多模态向量版本引用。
+MEDIA_EMBEDDING_VERSION = MEDIA_MULTIMODAL_EMBEDDING_VERSION
 MEDIA_TEXT_VECTOR = "text"
 MEDIA_IMAGE_VECTOR = "image"
 # text 模式（meme_embedding_mode="text"）专用：纯文本向量集合
@@ -66,12 +71,26 @@ class VectorDBOperator:
     # 类级默认值，保证绕过 _configure 的场景（如测试）也能访问
     enabled: bool = False
     text_only: bool = False
+    effective_meme_embedding_mode: str = "multimodal"
+    media_embedding_version: int = MEDIA_MULTIMODAL_EMBEDDING_VERSION
     media_text_col = MEDIA_TEXT_COL
 
     def __init__(self):
         self._configure()
 
     def _configure(self) -> None:
+        self.effective_meme_embedding_mode = (
+            "text"
+            if plugin_config.meme_embedding_mode == "text"
+            or not plugin_config.qwen_token
+            else "multimodal"
+        )
+        self.text_only = self.effective_meme_embedding_mode == "text"
+        self.media_embedding_version = (
+            MEDIA_TEXT_EMBEDDING_VERSION
+            if self.text_only
+            else MEDIA_MULTIMODAL_EMBEDDING_VERSION
+        )
         self.enabled = bool(plugin_config.qdrant_uri)
         if not self.enabled:
             logger.info("未配置 qdrant_uri，向量库功能已禁用")
@@ -93,9 +112,6 @@ class VectorDBOperator:
         self.media_text_col = MEDIA_TEXT_COL
         # 多模态是否启用。text 模式不依赖 qwen_token，也不需要多模态 embedding。
         # 未配置 qwen_token 时强制降级为 text 模式，避免空 token 调用 qwen3-vl 报错。
-        self.text_only = (
-            plugin_config.meme_embedding_mode == "text" or not plugin_config.qwen_token
-        )
         if self.text_only:
             if plugin_config.meme_embedding_mode != "text":
                 logger.warning("qwen_token 未配置，强制启用 text 模式")
@@ -524,7 +540,7 @@ class VectorDBOperator:
                         vector=vector,
                         payload={
                             "created_at": int(time.time()),
-                            "embedding_version": MEDIA_EMBEDDING_VERSION,
+                            "embedding_version": self.media_embedding_version,
                         }
                     )
                 ],
@@ -548,7 +564,7 @@ class VectorDBOperator:
                     },
                     payload={
                         "created_at": int(time.time()),
-                        "embedding_version": MEDIA_EMBEDDING_VERSION,
+                        "embedding_version": self.media_embedding_version,
                     }
                 )
             ],
