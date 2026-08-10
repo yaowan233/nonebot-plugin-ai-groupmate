@@ -11,11 +11,13 @@ def test_group_memory_skill_is_only_available_in_groups():
         is_private=False,
         has_admin_permission=False,
         mute_tool_instruction="",
+        meme_similar_enabled=True,
     )
     private_skills = _build_builtin_agent_skills(
         is_private=True,
         has_admin_permission=False,
         mute_tool_instruction="",
+        meme_similar_enabled=True,
     )
 
     assert "group_memory_tools" in {skill.name for skill in group_skills}

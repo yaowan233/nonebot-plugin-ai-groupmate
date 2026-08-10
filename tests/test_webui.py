@@ -277,7 +277,11 @@ def test_settings_page_groups_all_fields_and_never_renders_secrets():
 
 
 def test_runtime_config_update_is_validated_and_bootstrap_fields_are_blocked():
+    from pydantic import ValidationError
+
+    from nonebot_plugin_ai_groupmate.config import ScopedConfig
     from nonebot_plugin_ai_groupmate.runtime_config import (
+        RESTART_REQUIRED_FIELDS,
         preview_runtime_config_update,
     )
 
@@ -294,6 +298,10 @@ def test_runtime_config_update_is_validated_and_bootstrap_fields_are_blocked():
         preview_runtime_config_update({"usage_webui_token": "new-token"})
     with pytest.raises(ValueError, match="不是密钥配置"):
         preview_runtime_config_update({}, clear_secrets={"usage_webui_token"})
+    with pytest.raises(ValidationError):
+        ScopedConfig.model_validate({"meme_embedding_mode": "invalid"})
+
+    assert {"meme_embedding_mode", "qwen_token"} <= RESTART_REQUIRED_FIELDS
 
 
 def test_connection_error_redacts_configured_secrets():

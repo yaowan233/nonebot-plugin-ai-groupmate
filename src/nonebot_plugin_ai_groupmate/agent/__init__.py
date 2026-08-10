@@ -26,6 +26,7 @@ from ..usage import (
     extract_cache_creation_tokens,
 )
 from ..config import create_chat_llm, create_vision_llm, create_chat_openai
+from ..memory import DB
 from .context import (
     get_group_context,
     get_user_relation_context,
@@ -402,6 +403,9 @@ async def _run_scheduled_agent_task(
                 )
                 await _finish_db_operation(tool_session.commit())
 
+                scheduled_meme_instruction = _scheduled_meme_tool_instruction(
+                    meme_similar_enabled=not DB.text_only,
+                )
                 prompt = f"""
 【定时任务触发】
 这是之前安排的定时 agent 任务，现在已经到执行时间。
@@ -413,7 +417,7 @@ async def _run_scheduled_agent_task(
 - 你必须通过工具完成任务，不要直接输出正文。
 - 如果任务只是提醒/转告，调用 `reply_user`，并传 `next_step="end"`。
 - 如果任务要求查最新信息，先调用 `search_web`，再调用 `reply_user` 并传 `next_step="end"`。
-- 如果任务要求发送表情包图片，先调用 `search_meme_image` 或 `search_similar_meme_by_id`，再调用 `send_meme_image`。
+{scheduled_meme_instruction}
 - 定时任务没有可用的原始消息事件，不要调用 `add_message_reaction`。
 - 最后一条文本回复使用 `next_step="end"` 会自动结束；只有未发送文本且无后续操作时才调用 `finish`。
 """
@@ -464,13 +468,43 @@ async def _run_scheduled_agent_task(
 tools = [search_web, search_history_context, calculate_expression]
 
 
+def _scheduled_meme_tool_instruction(*, meme_similar_enabled: bool) -> str:
+    search_tools = (
+        "`search_meme_image` 或 `search_similar_meme_by_id`"
+        if meme_similar_enabled
+        else "`search_meme_image`"
+    )
+    return (
+        f"- 如果任务要求发送表情包图片，先调用 {search_tools}，"
+        "再调用 `send_meme_image`。"
+    )
+
+
+def _meme_similarity_skill_instruction(*, meme_similar_enabled: bool) -> str:
+    if meme_similar_enabled:
+        return (
+            "- 用户引用图片或要求‘找一张类似这张的’：调用 "
+            "`search_similar_meme_by_id(target_msg_id)`；没有明确 id 时可不传，"
+            "工具会优先找当前用户最近图片。\n"
+        )
+    return (
+        "- 当前为纯文本向量模式，不支持按原图找相似图；如果能从上下文明确提取"
+        "文字、角色或画面条件，可改用 `search_meme_image` 进行内容检索，否则如实"
+        "说明当前模式不支持图找图。\n"
+    )
+
+
 def _build_builtin_agent_skills(
     *,
     is_private: bool,
     has_admin_permission: bool,
     mute_tool_instruction: str,
+    meme_similar_enabled: bool,
 ) -> list[AgentSkill]:
     context_name = "聊天上下文" if is_private else "群内上下文"
+    meme_similarity_instruction = _meme_similarity_skill_instruction(
+        meme_similar_enabled=meme_similar_enabled,
+    )
     skills = [
         AgentSkill(
             name="core_reply_tools",
@@ -495,7 +529,7 @@ def _build_builtin_agent_skills(
                 "- 表情包不只是情绪反应，也可能按角色/IP、人物或动物形象、外观、物体、动作、场景、画风、原文台词、梗名或梗义来检索。\n"
                 '- 用户指定任何内容条件时使用 `search_meme_image(description, match_type="content")`；description 必须逐项保留用户点名的专有名词、原句和视觉条件，绝不能只改写成泛化情绪。\n'
                 '- 用户明确说随便发、没有任何条件时使用 `match_type="random"`；根据对话主动接梗或表达反应时使用 `match_type="context"`，并写清情绪、态度、对象、笑点和反应。\n'
-                "- 用户引用图片或要求“找一张类似这张的”：调用 `search_similar_meme_by_id(target_msg_id)`；没有明确 id 时可不传，工具会优先找当前用户最近图片。\n"
+                f"{meme_similarity_instruction}"
                 "- 搜索工具只返回通过当前对话相关性审核的候选和 pic_id，不会发送；如果没有候选通过审核，就不要调用发送工具。\n"
                 "- 判断候选描述合适后，调用 `send_meme_image(pic_id)` 发送。\n"
                 "- 发图完成后调用 `finish`；不要再发送同义文字。"
@@ -991,6 +1025,10 @@ async def create_chat_graph(
         pic_dir=pic_dir,
         approved_meme_ids=approved_meme_ids,
     )
+    # text 模式（纯文本向量）下无图片向量，图找图工具不提供给 Agent
+    meme_similar_enabled = not DB.text_only
+    if not meme_similar_enabled:
+        logger.info("表情包向量化模式为 text，图找图工具已禁用")
     mute_tool = create_mute_tool(
         db_session,
         session_id,
@@ -1066,6 +1104,7 @@ async def create_chat_graph(
             is_private=is_private,
             has_admin_permission=has_admin_permission,
             mute_tool_instruction=mute_tool_instruction,
+            meme_similar_enabled=meme_similar_enabled,
         ),
         *custom_agent_skills,
     ]
@@ -1112,7 +1151,11 @@ async def create_chat_graph(
         ),
         *([reaction_tool] if reaction_enabled else []),
         *(
-            [search_meme_tool, similar_meme_tool, send_meme_tool]
+            (
+                [search_meme_tool, similar_meme_tool, send_meme_tool]
+                if meme_similar_enabled
+                else [search_meme_tool, send_meme_tool]
+            )
             if not is_private
             else []
         ),
@@ -1141,11 +1184,11 @@ async def create_chat_graph(
         "profile_memory_tools": [relation_tool, report_tool],
     }
     if is_private:
-        tools_by_skill["meme_tools"] = [
-            search_meme_tool,
-            similar_meme_tool,
-            send_meme_tool,
-        ]
+        tools_by_skill["meme_tools"] = (
+            [search_meme_tool, similar_meme_tool, send_meme_tool]
+            if meme_similar_enabled
+            else [search_meme_tool, send_meme_tool]
+        )
     if proactive_meme_only or proactive_reaction_only or repeat_text is not None:
         tools_by_skill = {}
     if group_memory_tool is not None:

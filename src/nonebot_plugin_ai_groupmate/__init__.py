@@ -56,7 +56,7 @@ from .utils import (
 )
 from .webui import register_usage_webui
 from .config import Config, create_tagging_llm
-from .memory import DB, MEDIA_EMBEDDING_VERSION
+from .memory import DB, MEDIA_EMBEDDING_VERSION as MEDIA_EMBEDDING_VERSION
 from .concurrency import agent_run_gate, maintenance_gate, background_image_gate
 from .reply_guard import set_latest_request_id
 from .agent.reaction import is_onebot_context
@@ -1525,6 +1525,7 @@ async def _process_media_vectorization(media_id: int) -> str:
     """处理单张图片；网络请求期间不占用 SQL 连接。"""
     if not DB.enabled:
         return "disabled"
+    active_embedding_version = DB.media_embedding_version
     async with get_session() as db_session:
         media = await db_session.get(MediaStorage, media_id)
         if media is None:
@@ -1534,7 +1535,7 @@ async def _process_media_vectorization(media_id: int) -> str:
         existing_description = media.description
         needs_reindex = (
             media.vectorized
-            and media.embedding_version < MEDIA_EMBEDDING_VERSION
+            and media.embedding_version != active_embedding_version
             and existing_description != "[图片]"
         )
         await db_session.commit()
@@ -1569,7 +1570,7 @@ async def _process_media_vectorization(media_id: int) -> str:
                     return "failed"
                 await _mark_media_vectorized(
                     media_id,
-                    embedding_version=MEDIA_EMBEDDING_VERSION,
+                    embedding_version=active_embedding_version,
                 )
                 logger.info(f"旧表情包向量重建成功 {media_id}: {existing_description}")
                 return "indexed"
@@ -1633,7 +1634,7 @@ async def _process_media_vectorization(media_id: int) -> str:
             await _mark_media_vectorized(
                 media_id,
                 description,
-                embedding_version=MEDIA_EMBEDDING_VERSION,
+                embedding_version=active_embedding_version,
             )
             logger.info(f"表情包入库成功 {media_id}: {description}")
             return "indexed"
@@ -1658,6 +1659,7 @@ async def _vectorize_media_impl():
     batch_size = plugin_config.media_vectorize_batch_size
     min_references = plugin_config.media_vectorize_min_references
     concurrency = plugin_config.media_vectorize_concurrency
+    active_embedding_version = DB.media_embedding_version
 
     async with get_session() as db_session:
         # 新图片和旧向量分别取一批，避免大量新图导致历史重建一直饥饿。
@@ -1678,7 +1680,7 @@ async def _vectorize_media_impl():
                 MediaStorage.references >= min_references,
                 MediaStorage.vectorized.is_(True),
                 MediaStorage.description != "[图片]",
-                MediaStorage.embedding_version < MEDIA_EMBEDDING_VERSION,
+                MediaStorage.embedding_version != active_embedding_version,
             )
             .order_by(MediaStorage.media_id)
             .limit(batch_size)

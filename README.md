@@ -156,7 +156,8 @@
 | ai_groupmate__qdrant_uri | 否 | 无 | Qdrant 地址，不填则禁用表情包、RAG 等向量功能 |
 | ai_groupmate__qdrant_api_key | 否 | 无 | Qdrant API Key（使用 Qdrant Cloud 时需要） |
 | ai_groupmate__embedding_api_key | 否 | 无 | Embedding API Key，启用 Qdrant 时必填（推荐硅基流动，免费） |
-| ai_groupmate__embedding_base_url | 否 | 无 | Embedding Base URL，启用 Qdrant 时必填（推荐硅基流动，免费） |
+| ai_groupmate__embedding_base_url | 否 | 无 | Embedding Base URL，启用 Qdrant 时必填（推荐硅基流动，免费）。填根地址如 `https://api.siliconflow.cn/v1`，也可填完整路径 `…/v1/embeddings`（插件会自动去重） |
+| ai_groupmate__meme_embedding_mode | 否 | `multimodal` | 表情包向量化模式。`multimodal`：qwen3-vl-embedding 生成描述+原图双向量（需配 `qwen_token`，支持图找图）；`text`：仅用描述文本向量化（无需 `qwen_token`，图找图不可用） |
 | ai_groupmate__rerank_api_url | 否 | 无 | Rerank API URL，启用 Qdrant 时使用（推荐硅基流动，免费） |
 | ai_groupmate__rerank_api_key | 否 | 无 | Rerank API Key，启用 Qdrant 时使用（推荐硅基流动，免费） |
 
@@ -172,7 +173,7 @@ SQLALCHEMY_ENGINE_OPTIONS={"pool_size":5,"max_overflow":10,"pool_timeout":5,"poo
 
 页面右上角的“配置中心”可维护插件运行配置。使用前必须在环境变量中设置非空的 `AI_GROUPMATE__USAGE_WEBUI_TOKEN`，配置中心会使用独立的 HttpOnly Cookie 登录，不会在页面中回显 API Key。网页保存的值存入插件数据库，加载顺序为“代码默认值 → 环境变量 → 网页覆盖值”；可随时一键恢复环境变量配置。
 
-回复概率、Agent 限制、模型与费用配置会在保存后热更新；Qdrant、Embedding 和 Rerank 连接配置会标记为“等待重启”。WebUI 开关、访问路径和管理密码属于启动配置，仍需通过环境变量修改。升级后请先执行：
+回复概率、Agent 限制、模型与费用配置会在保存后热更新；Qdrant、Embedding、表情包向量化模式、兼容 Qwen Token 和 Rerank 连接配置会标记为“等待重启”。WebUI 开关、访问路径和管理密码属于启动配置，仍需通过环境变量修改。升级后请先执行：
 
 ```bash
 nb orm upgrade
