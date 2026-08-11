@@ -110,6 +110,38 @@ async def test_vectorize_media_reindexes_mismatched_version_without_retagging(
 
 
 @pytest.mark.asyncio
+async def test_missing_legacy_media_is_marked_current_and_not_retried(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import nonebot_plugin_ai_groupmate as plugin_module
+
+    media = SimpleNamespace(
+        media_id=42,
+        file_path="missing.png",
+        description="已经丢失的旧表情包",
+        vectorized=True,
+        embedding_version=0,
+    )
+    session = FakeSession(media)
+
+    @asynccontextmanager
+    async def fake_get_session():
+        yield session
+
+    monkeypatch.setattr(plugin_module, "get_session", fake_get_session)
+    monkeypatch.setattr(plugin_module, "pic_dir", tmp_path)
+    monkeypatch.setattr(plugin_module.DB, "enabled", True)
+    monkeypatch.setattr(plugin_module.DB, "media_embedding_version", 3)
+
+    result = await plugin_module._process_media_vectorization(media.media_id)
+
+    assert result == "missing"
+    assert media.vectorized is True
+    assert media.embedding_version == 3
+
+
+@pytest.mark.asyncio
 async def test_vectorize_media_uses_configured_concurrency(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -153,6 +185,53 @@ async def test_vectorize_media_uses_configured_concurrency(
     await plugin_module._vectorize_media_impl()
 
     assert max_active == 3
+
+
+@pytest.mark.asyncio
+async def test_vectorize_media_summarizes_missing_legacy_files(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import nonebot_plugin_ai_groupmate as plugin_module
+
+    class DiscoverySession:
+        def __init__(self) -> None:
+            self.execute_count = 0
+
+        async def execute(self, _statement: Any) -> FakeResult:
+            self.execute_count += 1
+            return FakeResult([] if self.execute_count == 1 else [1, 2])
+
+        async def commit(self) -> None:
+            return None
+
+    @asynccontextmanager
+    async def fake_get_session():
+        yield DiscoverySession()
+
+    async def fake_process(_media_id: int) -> str:
+        return "missing"
+
+    warning_messages: list[str] = []
+    info_messages: list[str] = []
+    fake_logger = SimpleNamespace(
+        debug=lambda _message: None,
+        info=info_messages.append,
+        warning=warning_messages.append,
+    )
+    monkeypatch.setattr(plugin_module, "get_session", fake_get_session)
+    monkeypatch.setattr(plugin_module, "logger", fake_logger)
+    monkeypatch.setattr(plugin_module.DB, "enabled", True)
+    monkeypatch.setattr(plugin_module, "_process_media_vectorization", fake_process)
+    monkeypatch.setattr(plugin_module.plugin_config, "media_vectorize_batch_size", 10)
+    monkeypatch.setattr(plugin_module.plugin_config, "media_vectorize_min_references", 1)
+    monkeypatch.setattr(plugin_module.plugin_config, "media_vectorize_concurrency", 3)
+
+    await plugin_module._vectorize_media_impl()
+
+    assert warning_messages == [
+        "本轮跳过 2 个文件缺失的历史表情包，已停止后续重建重试"
+    ]
+    assert info_messages[-1] == "本轮图片处理完成：成功 0，跳过 2，失败待重试 0"
 
 
 @pytest.mark.asyncio

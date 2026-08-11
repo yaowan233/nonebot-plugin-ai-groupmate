@@ -1578,12 +1578,17 @@ async def _process_media_vectorization(media_id: int) -> str:
             return "failed"
 
         if img_data_uri is None:
+            if needs_reindex:
+                # 旧集合已不再参与检索，原图缺失时也无法生成当前格式的向量。
+                # 将版本推进到当前值，避免每轮重复扫描并逐条刷 Warning。
+                await _mark_media_vectorized(
+                    media_id,
+                    embedding_version=active_embedding_version,
+                )
+                return "missing"
             logger.warning(f"文件不存在: {file_path}")
-            # 新图片不再反复尝试；旧向量则保留旧版本，方便文件恢复后重试。
-            if not needs_reindex:
-                await _mark_media_vectorized(media_id)
-                return "skipped"
-            return "failed"
+            await _mark_media_vectorized(media_id)
+            return "skipped"
 
         if needs_reindex:
             try:
@@ -1730,9 +1735,16 @@ async def _vectorize_media_impl():
             return await _process_media_vectorization(media_id)
 
     results = await asyncio.gather(*(process_one(media_id) for media_id in media_ids))
+    missing_count = results.count("missing")
+    if missing_count:
+        logger.warning(
+            f"本轮跳过 {missing_count} 个文件缺失的历史表情包，"
+            "已停止后续重建重试"
+        )
     logger.info(
         f"本轮图片处理完成：成功 {results.count('indexed')}，"
-        f"跳过 {results.count('skipped')}，失败待重试 {results.count('failed')}"
+        f"跳过 {results.count('skipped') + missing_count}，"
+        f"失败待重试 {results.count('failed')}"
     )
 
 
