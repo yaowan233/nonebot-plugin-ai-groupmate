@@ -56,7 +56,12 @@ from .utils import (
 )
 from .webui import register_usage_webui
 from .config import Config, create_tagging_llm
-from .memory import DB, MEDIA_EMBEDDING_VERSION as MEDIA_EMBEDDING_VERSION
+from .memory import (
+    DB,
+    MEDIA_EMBEDDING_VERSION as MEDIA_EMBEDDING_VERSION,
+    EmbeddingProviderUnavailableError,
+    CollectionEmbeddingConfigMismatchError,
+)
 from .concurrency import agent_run_gate, maintenance_gate, background_image_gate
 from .reply_guard import set_latest_request_id
 from .agent.reaction import is_onebot_context
@@ -122,9 +127,31 @@ async def _load_webui_runtime_config() -> None:
         async with get_session() as db_session:
             changed_fields = await load_runtime_config_overrides(db_session)
         _refresh_runtime_resources(changed_fields)
-        if changed_fields & RESTART_REQUIRED_FIELDS:
+        has_restart_required_changes = bool(
+            changed_fields & RESTART_REQUIRED_FIELDS
+        )
+        if has_restart_required_changes:
             await DB.reconfigure()
+            # reconfigure 已经让连接资源使用当前运行配置。集合兼容性是独立
+            # 状态，不能继续借用 restart baseline 表示，否则校验失败后把
+            # WebUI 配置恢复为旧值会错误清除“等待重启”。
             mark_restart_fields_applied()
+        if DB.enabled:
+            try:
+                await DB.check_collections()
+            except CollectionEmbeddingConfigMismatchError:
+                logger.error(
+                    "启动时 Qdrant 集合校验失败，相关向量操作已拒绝；"
+                    "请根据上方日志中的当前配置和 collection 配置人工重建向量"
+                )
+            except EmbeddingProviderUnavailableError:
+                logger.warning(
+                    "启动时 Embedding API 暂时不可用，文本向量操作将在首次使用时重试"
+                )
+            except Exception:
+                logger.exception(
+                    "启动时 Qdrant 集合校验暂时失败，将在首次向量操作时重试"
+                )
         if changed_fields:
             logger.info(
                 f"已加载 WebUI 配置覆盖项，变更字段数={len(changed_fields)}"

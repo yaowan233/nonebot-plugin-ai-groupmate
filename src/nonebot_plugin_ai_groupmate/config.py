@@ -95,6 +95,8 @@ class ScopedConfig(BaseModel):
     qdrant_api_key: str = ""
     embedding_api_key: str = ""
     embedding_base_url: str = ""
+    embedding_model: str = "BAAI/bge-m3"
+    embedding_dimension: int = Field(default=1024, ge=1)
     rerank_api_url: str = ""
     rerank_api_key: str = ""
 

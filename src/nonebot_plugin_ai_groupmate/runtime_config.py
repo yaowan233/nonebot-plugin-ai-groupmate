@@ -21,6 +21,8 @@ RESTART_REQUIRED_FIELDS = frozenset({
     "qdrant_api_key",
     "embedding_api_key",
     "embedding_base_url",
+    "embedding_model",
+    "embedding_dimension",
     "meme_embedding_mode",
     "rerank_api_url",
     "rerank_api_key",

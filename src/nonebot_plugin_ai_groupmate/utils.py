@@ -14,7 +14,7 @@ from sqlalchemy import Select, Update
 from nonebot_plugin_orm import AsyncSession
 
 from .model import ChatHistory, ChatHistorySchema
-from .memory import DB
+from .memory import DB, CollectionEmbeddingConfigMismatchError
 
 
 def generate_file_hash(file_data: bytes) -> str:
@@ -377,6 +377,8 @@ async def insert_vectors_with_retry(
         try:
             await DB.batch_insert(contexts, session_id)
             return
+        except CollectionEmbeddingConfigMismatchError:
+            raise
         except Exception as e:
             if attempt == max_retries - 1:
                 raise
