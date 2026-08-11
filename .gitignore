@@ -6,3 +6,4 @@ CLAUDE.md
 .idea/
 evals/results/
 evals/batch-runs/
+.env
