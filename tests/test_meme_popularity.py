@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 import uuid
 import datetime
+from io import BytesIO
 from types import SimpleNamespace
 
 import pytest
+from PIL import Image, ImageDraw
 
 
 @pytest.mark.asyncio
@@ -15,6 +17,7 @@ async def test_group_usage_counts_exclude_other_groups_and_bot_sends():
     from nonebot_plugin_ai_groupmate.model import ChatHistory, MediaStorage
     from nonebot_plugin_ai_groupmate.agent.meme_tools import (
         _get_group_favorite_memes,
+        _get_recent_sent_meme_ids,
         _get_group_meme_usage_counts,
         _prepare_meme_context_review,
     )
@@ -84,6 +87,7 @@ async def test_group_usage_counts_exclude_other_groups_and_bot_sends():
             [popular_id, occasional_id],
         )
         favorites = await _get_group_favorite_memes(db_session, session_id)
+        recent_ids = await _get_recent_sent_meme_ids(db_session, session_id)
         review_candidates, review_counts, favorite_ids = (
             await _prepare_meme_context_review(
                 db_session,
@@ -98,6 +102,7 @@ async def test_group_usage_counts_exclude_other_groups_and_bot_sends():
         occasional_id: 1,
     }
     assert favorites == [(popular_id, 3)]
+    assert recent_ids == {popular_id, occasional_id}
     assert {media_id for media_id, _ in review_candidates} == {
         popular_id,
         occasional_id,
@@ -402,6 +407,90 @@ async def test_explicit_meme_request_preserves_original_text_in_multimodal_fallb
 
 
 @pytest.mark.asyncio
+async def test_search_meme_deduplicates_same_picture_before_model_selection(
+    tmp_path,
+    monkeypatch,
+):
+    from nonebot_plugin_ai_groupmate.agent import meme_tools
+
+    base_image = Image.new("RGB", (120, 80), "white")
+    draw = ImageDraw.Draw(base_image)
+    draw.rectangle((8, 8, 55, 60), fill="navy")
+    draw.ellipse((65, 15, 110, 65), fill="gold")
+    other_image = Image.new("RGB", (120, 80), "black")
+    ImageDraw.Draw(other_image).polygon(
+        [(10, 70), (60, 5), (110, 70)],
+        fill="white",
+    )
+    base_image.save(tmp_path / "same.png")
+    base_image.resize((240, 160)).save(
+        tmp_path / "same.jpg",
+        quality=75,
+    )
+    other_image.save(tmp_path / "other.png")
+    media = [
+        SimpleNamespace(media_id=1, file_path="same.png", description="PNG 版本"),
+        SimpleNamespace(media_id=2, file_path="same.jpg", description="JPEG 版本"),
+        SimpleNamespace(media_id=3, file_path="other.png", description="另一张图"),
+    ]
+
+    class FakeResult:
+        def scalars(self):
+            return self
+
+        def all(self):
+            return media
+
+    class FakeSession:
+        async def execute(self, _statement):
+            return FakeResult()
+
+        async def commit(self):
+            return None
+
+    async def no_recent(*_args, **_kwargs):
+        return set()
+
+    async def fake_search(*_args, **_kwargs):
+        return [(1, 0.9), (2, 0.85), (3, 0.8)]
+
+    async def fake_prepare(*_args, **_kwargs):
+        return [(1, "PNG 版本"), (2, "JPEG 版本"), (3, "另一张图")], {}, set()
+
+    async def approve_all(*_args, **_kwargs):
+        return [(1, 0.95), (2, 0.94), (3, 0.9)]
+
+    monkeypatch.setattr(meme_tools, "_get_recent_sent_meme_ids", no_recent)
+    monkeypatch.setattr(meme_tools.DB, "search_meme_candidates", fake_search)
+    monkeypatch.setattr(meme_tools, "_prepare_meme_context_review", fake_prepare)
+    monkeypatch.setattr(
+        meme_tools,
+        "_rerank_meme_candidates_for_context",
+        approve_all,
+    )
+    approved: set[int] = set()
+    tool = meme_tools.create_search_meme_tool(
+        FakeSession(),
+        "group-1",
+        None,
+        model=object(),
+        history=[],
+        approved_meme_ids=approved,
+        default_match_type="content",
+        pic_dir=tmp_path,
+    )
+
+    result = json.loads(await tool.ainvoke({
+        "description": "东方表情包",
+        "match_type": "content",
+    }))
+
+    assert [image["pic_id"] for image in result["images"]] == [1, 3]
+    assert result["count"] == 2
+    assert approved == {1, 3}
+
+
+@pytest.mark.asyncio
 async def test_send_meme_rejects_an_id_outside_current_approval(tmp_path):
     from nonebot_plugin_ai_groupmate.agent import meme_tools
 
@@ -473,6 +562,15 @@ async def test_send_meme_honors_multi_send_limit_and_uses_distinct_ids(
         staticmethod(lambda *, raw: FakeOutgoingMessage(raw)),
     )
 
+    async def no_recent_memes(*_args, **_kwargs):
+        return set()
+
+    monkeypatch.setattr(
+        meme_tools,
+        "_get_recent_sent_meme_ids",
+        no_recent_memes,
+    )
+
     session = FakeSession()
     approved = {1, 2, 3}
     send_tool = meme_tools.create_send_meme_tool(
@@ -485,10 +583,15 @@ async def test_send_meme_honors_multi_send_limit_and_uses_distinct_ids(
     )
 
     first = json.loads(await send_tool.ainvoke({"pic_id": "1"}))
+    # 模拟模型再次搜索后把同一候选重新加入审核集合；发送工具仍应硬去重。
+    approved.add(1)
+    repeated = json.loads(await send_tool.ainvoke({"pic_id": "1"}))
     second = json.loads(await send_tool.ainvoke({"pic_id": "2"}))
     blocked = json.loads(await send_tool.ainvoke({"pic_id": "3"}))
 
     assert first["status"] == "sent"
+    assert repeated["status"] == "skipped"
+    assert "已经发送过" in repeated["message"]
     assert second["status"] == "sent"
     assert blocked["status"] == "skipped"
     assert blocked["max_sends"] == 2
@@ -496,3 +599,135 @@ async def test_send_meme_honors_multi_send_limit_and_uses_distinct_ids(
     assert approved == {3}
     assert len(session.added) == 2
     assert session.commit_count == 2
+
+
+@pytest.mark.asyncio
+async def test_send_meme_rechecks_images_recently_sent_by_group_members(
+    tmp_path,
+    monkeypatch,
+):
+    from nonebot_plugin_ai_groupmate.agent import meme_tools
+
+    class FakeSession:
+        async def execute(self, _statement):
+            raise AssertionError("最近图片已命中时不应继续读取图片记录")
+
+    async def recently_sent(*_args, **_kwargs):
+        return {42}
+
+    monkeypatch.setattr(
+        meme_tools,
+        "_get_recent_sent_meme_ids",
+        recently_sent,
+    )
+    approved = {42}
+    send_tool = meme_tools.create_send_meme_tool(
+        FakeSession(),
+        "group-1",
+        pic_dir=tmp_path,
+        bot_name="bot",
+        approved_meme_ids=approved,
+        max_sends=2,
+    )
+
+    result = json.loads(await send_tool.ainvoke({"pic_id": "42"}))
+
+    assert result["status"] == "skipped"
+    assert "刚刚在群里出现过" in result["message"]
+    assert approved == set()
+
+
+@pytest.mark.asyncio
+async def test_send_meme_rejects_same_picture_with_different_file_encoding(
+    tmp_path,
+    monkeypatch,
+):
+    from nonebot_plugin_ai_groupmate.agent import meme_tools
+
+    image = Image.new("RGB", (120, 80), "white")
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((8, 8, 55, 60), fill="navy")
+    draw.ellipse((65, 15, 110, 65), fill="gold")
+    png_buffer = BytesIO()
+    jpeg_buffer = BytesIO()
+    image.save(png_buffer, format="PNG")
+    image.resize((240, 160)).save(jpeg_buffer, format="JPEG", quality=75)
+    (tmp_path / "same.png").write_bytes(png_buffer.getvalue())
+    (tmp_path / "same.jpg").write_bytes(jpeg_buffer.getvalue())
+
+    pictures = iter([
+        SimpleNamespace(
+            media_id=1,
+            file_path="same.png",
+            description="PNG 版本",
+        ),
+        SimpleNamespace(
+            media_id=2,
+            file_path="same.jpg",
+            description="JPEG 版本",
+        ),
+    ])
+
+    class FakeResult:
+        def __init__(self, picture):
+            self.picture = picture
+
+        def scalar(self):
+            return self.picture
+
+    class FakeSession:
+        def __init__(self):
+            self.added = []
+
+        async def execute(self, _statement):
+            return FakeResult(next(pictures))
+
+        async def commit(self):
+            return None
+
+        def add(self, record):
+            self.added.append(record)
+
+    sent_images: list[bytes] = []
+
+    class FakeOutgoingMessage:
+        def __init__(self, raw: bytes):
+            self.raw = raw
+
+        async def send(self, target=None):
+            sent_images.append(self.raw)
+            return SimpleNamespace(msg_ids=[{"message_id": len(sent_images)}])
+
+    async def no_recent_memes(*_args, **_kwargs):
+        return set()
+
+    monkeypatch.setattr(
+        meme_tools,
+        "_get_recent_sent_meme_ids",
+        no_recent_memes,
+    )
+    monkeypatch.setattr(
+        meme_tools.UniMessage,
+        "image",
+        staticmethod(lambda *, raw: FakeOutgoingMessage(raw)),
+    )
+    approved = {1, 2}
+    session = FakeSession()
+    send_tool = meme_tools.create_send_meme_tool(
+        session,
+        "group-1",
+        pic_dir=tmp_path,
+        bot_name="bot",
+        approved_meme_ids=approved,
+        max_sends=2,
+    )
+
+    first = json.loads(await send_tool.ainvoke({"pic_id": "1"}))
+    duplicate = json.loads(await send_tool.ainvoke({"pic_id": "2"}))
+
+    assert first["status"] == "sent"
+    assert duplicate["status"] == "skipped"
+    assert "画面重复" in duplicate["message"]
+    assert len(sent_images) == 1
+    assert approved == set()
+    assert len(session.added) == 1

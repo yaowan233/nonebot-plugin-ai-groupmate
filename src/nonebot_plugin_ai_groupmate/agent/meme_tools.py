@@ -3,10 +3,12 @@ import json
 import random
 import asyncio
 import traceback
+from io import BytesIO
 from typing import Any, Literal
 from pathlib import Path
 from collections.abc import Callable, Sequence
 
+from PIL import Image
 from pydantic import Field, BaseModel
 from sqlalchemy import Select, desc, func
 from nonebot.log import logger
@@ -30,6 +32,7 @@ MEME_CONTEXT_RELEVANCE_THRESHOLD = 0.4
 MEME_CONTENT_RELEVANCE_THRESHOLD = 0.6
 MEME_CONTEXT_RERANK_TIMEOUT_SECONDS = 20.0
 MAX_MEME_SEND_COUNT = 5
+MEME_PERCEPTUAL_HASH_DISTANCE = 6
 MemeSearchType = Literal["context", "content", "random"]
 
 
@@ -43,6 +46,76 @@ class MemeContextReview(BaseModel):
     candidates: list[MemeContextCandidateScore] = Field(default_factory=list)
 
 
+def _meme_perceptual_hash(image_data: bytes) -> int | None:
+    """计算对缩放和常见格式转换稳定的 64 位差值哈希。"""
+    try:
+        with Image.open(BytesIO(image_data)) as source:
+            source.seek(0)
+            rgba = source.convert("RGBA")
+            background = Image.new("RGBA", rgba.size, "white")
+            grayscale = Image.alpha_composite(background, rgba).convert("L")
+            resized = grayscale.resize((9, 8), Image.Resampling.LANCZOS)
+            get_pixels = getattr(resized, "get_flattened_data", resized.getdata)
+            pixels = list(get_pixels())
+    except Exception:
+        return None
+
+    value = 0
+    for row in range(8):
+        offset = row * 9
+        for column in range(8):
+            value = (value << 1) | int(
+                pixels[offset + column] > pixels[offset + column + 1]
+            )
+    return value
+
+
+def _perceptual_hashes_match(left: int, right: int) -> bool:
+    return (left ^ right).bit_count() <= MEME_PERCEPTUAL_HASH_DISTANCE
+
+
+def _meme_perceptual_hash_from_file(file_path: Path) -> int | None:
+    try:
+        return _meme_perceptual_hash(file_path.read_bytes())
+    except OSError:
+        return None
+
+
+async def _deduplicate_meme_pic_ids(
+    pic_ids: Sequence[int],
+    media_map: dict[int, MediaStorage],
+    pic_dir: Path | None,
+) -> list[int]:
+    """在向量召回后按实际画面折叠不同文件格式或尺寸的重复图片。"""
+    if pic_dir is None or len(pic_ids) < 2:
+        return list(pic_ids)
+
+    hashes = await asyncio.gather(*(
+        asyncio.to_thread(
+            _meme_perceptual_hash_from_file,
+            pic_dir / media_map[pic_id].file_path,
+        )
+        if pic_id in media_map
+        else asyncio.sleep(0, result=None)
+        for pic_id in pic_ids
+    ))
+    unique_ids: list[int] = []
+    unique_hashes: list[int] = []
+    for pic_id, perceptual_hash in zip(pic_ids, hashes):
+        if perceptual_hash is not None and any(
+            _perceptual_hashes_match(perceptual_hash, previous_hash)
+            for previous_hash in unique_hashes
+        ):
+            continue
+        unique_ids.append(pic_id)
+        if perceptual_hash is not None:
+            unique_hashes.append(perceptual_hash)
+
+    if len(unique_ids) != len(pic_ids):
+        logger.info(f"表情包候选画面去重: {len(pic_ids)} -> {len(unique_ids)}")
+    return unique_ids
+
+
 async def _get_recent_sent_meme_ids(
     db_session,
     session_id: str,
@@ -53,7 +126,7 @@ async def _get_recent_sent_meme_ids(
         Select(ChatHistory.media_id)
         .where(
             ChatHistory.session_id == session_id,
-            ChatHistory.content_type == "bot",
+            ChatHistory.content_type.in_(("image", "bot")),
             ChatHistory.media_id.is_not(None),
         )
         .order_by(desc(ChatHistory.created_at))
@@ -484,6 +557,7 @@ def create_search_meme_tool(
     allow_context_fallback: bool = False,
     default_match_type: MemeSearchType = "context",
     explicit_request_text: str | None = None,
+    pic_dir: Path | None = None,
 ):
     """
     创建一个带数据库会话的表情包搜索工具
@@ -631,6 +705,11 @@ def create_search_meme_tool(
                 Select(MediaStorage).where(MediaStorage.media_id.in_(pic_ids))
             )
             media_map = {media.media_id: media for media in result.scalars().all()}
+            pic_ids = await _deduplicate_meme_pic_ids(
+                pic_ids,
+                media_map,
+                pic_dir,
+            )
             images_info = []
             for pic_id in pic_ids:
                 if pic := media_map.get(int(pic_id)):
@@ -708,6 +787,8 @@ def create_send_meme_tool(
 
     max_sends = max(1, min(int(max_sends), MAX_MEME_SEND_COUNT))
     sent_count = 0
+    sent_meme_ids: set[int] = set()
+    sent_perceptual_hashes: list[int] = []
 
     @tool("send_meme_image")
     async def send_meme_image(pic_id: str) -> str:
@@ -739,6 +820,15 @@ def create_send_meme_tool(
                     "message": f"发送表情包失败: 无法从 pic_id 中提取有效数字: {pic_id!r}",
                 }, ensure_ascii=False)
             selected_pic_id = int(match.group())
+            if selected_pic_id in sent_meme_ids:
+                if approved_meme_ids is not None:
+                    approved_meme_ids.discard(selected_pic_id)
+                return json.dumps({
+                    "status": "skipped",
+                    "message": "本轮已经发送过这张表情包，请选择不同的 pic_id。",
+                    "sent_count": sent_count,
+                    "max_sends": max_sends,
+                }, ensure_ascii=False)
             if (
                 approved_meme_ids is not None
                 and selected_pic_id not in approved_meme_ids
@@ -746,6 +836,22 @@ def create_send_meme_tool(
                 return json.dumps({
                     "status": "failed",
                     "message": "发送表情包失败：该图片未通过本轮搜索审核，请先重新搜索。",
+                }, ensure_ascii=False)
+
+            # 搜索到实际发送之间可能有群友刚好发出相同图片，因此发送前重新
+            # 查询一次全群最近图片；这也覆盖多个请求先后选择同一候选的情况。
+            recent_meme_ids = await _get_recent_sent_meme_ids(
+                db_session,
+                session_id,
+            )
+            if selected_pic_id in recent_meme_ids:
+                if approved_meme_ids is not None:
+                    approved_meme_ids.discard(selected_pic_id)
+                return json.dumps({
+                    "status": "skipped",
+                    "message": "这张表情包刚刚在群里出现过，请选择不同的 pic_id。",
+                    "sent_count": sent_count,
+                    "max_sends": max_sends,
                 }, ensure_ascii=False)
             logger.info(f"使用指定的图片ID: {selected_pic_id}")
 
@@ -775,6 +881,22 @@ def create_send_meme_tool(
             description = pic.description
             media_id = pic.media_id
             media_file_path = pic.file_path
+            perceptual_hash = await asyncio.to_thread(
+                _meme_perceptual_hash,
+                pic_data,
+            )
+            if perceptual_hash is not None and any(
+                _perceptual_hashes_match(perceptual_hash, previous_hash)
+                for previous_hash in sent_perceptual_hashes
+            ):
+                if approved_meme_ids is not None:
+                    approved_meme_ids.discard(selected_pic_id)
+                return json.dumps({
+                    "status": "skipped",
+                    "message": "这张图片与本轮已经发送的表情包画面重复，请选择不同候选。",
+                    "sent_count": sent_count,
+                    "max_sends": max_sends,
+                }, ensure_ascii=False)
 
             if request_id is not None and not await is_request_active(
                 session_id, request_id
@@ -805,6 +927,9 @@ def create_send_meme_tool(
             db_session.add(chat_history)
             if approved_meme_ids is not None:
                 approved_meme_ids.discard(selected_pic_id)
+            sent_meme_ids.add(selected_pic_id)
+            if perceptual_hash is not None:
+                sent_perceptual_hashes.append(perceptual_hash)
             sent_count += 1
             logger.info(f"id:{res.msg_ids}\n发送表情包: {description}")
             return json.dumps({

@@ -987,6 +987,7 @@ async def create_chat_graph(
         allow_context_fallback=meme_required or proactive_meme_only,
         default_match_type="content" if meme_required else "context",
         explicit_request_text=explicit_meme_request_text,
+        pic_dir=pic_dir,
     )
     send_meme_tool = create_send_meme_tool(
         db_session,
