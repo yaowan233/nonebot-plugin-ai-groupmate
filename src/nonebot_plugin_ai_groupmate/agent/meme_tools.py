@@ -4,7 +4,7 @@ import random
 import asyncio
 import traceback
 from io import BytesIO
-from typing import Any, Literal
+from typing import Any, Literal, cast
 from pathlib import Path
 from collections.abc import Callable, Sequence
 
@@ -55,8 +55,11 @@ def _meme_perceptual_hash(image_data: bytes) -> int | None:
             background = Image.new("RGBA", rgba.size, "white")
             grayscale = Image.alpha_composite(background, rgba).convert("L")
             resized = grayscale.resize((9, 8), Image.Resampling.LANCZOS)
-            get_pixels = getattr(resized, "get_flattened_data", resized.getdata)
-            pixels = list(get_pixels())
+            pixels = [
+                cast(int, resized.getpixel((column, row)))
+                for row in range(8)
+                for column in range(9)
+            ]
     except Exception:
         return None
 
