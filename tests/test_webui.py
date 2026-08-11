@@ -286,6 +286,39 @@ def test_settings_page_groups_all_fields_and_never_renders_secrets():
     assert "测试连接" in html
 
 
+def test_settings_page_renders_unset_dimension_as_blank():
+    from nonebot_plugin_ai_groupmate.config import ScopedConfig
+    from nonebot_plugin_ai_groupmate.settings_ui import render_settings_page
+
+    html = render_settings_page(
+        ScopedConfig(embedding_dimension=None),
+        ScopedConfig(),
+        overridden_fields=set(),
+        pending_restart_fields=set(),
+        dashboard_path="/ai-groupmate/usage",
+        settings_path="/ai-groupmate/usage/settings",
+    )
+    # 未配置维度渲染为空白，不出现字面量 "None"。
+    assert 'data-setting="embedding_dimension"' in html
+    assert 'value="None"' not in html
+
+
+def test_blank_embedding_dimension_submission_is_treated_as_unset():
+    from nonebot_plugin_ai_groupmate.config import ScopedConfig
+    from nonebot_plugin_ai_groupmate.runtime_config import (
+        preview_runtime_config_update,
+    )
+
+    # WebUI 提交空白输入时值为 ""，应转换为 None（保持未配置语义）。
+    candidate = ScopedConfig.model_validate({"embedding_dimension": ""})
+    assert candidate.embedding_dimension is None
+
+    candidate, _overrides, _changed = preview_runtime_config_update({
+        "embedding_dimension": "",
+    })
+    assert candidate.embedding_dimension is None
+
+
 def test_runtime_config_update_is_validated_and_bootstrap_fields_are_blocked():
     from pydantic import ValidationError
 

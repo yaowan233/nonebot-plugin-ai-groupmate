@@ -35,6 +35,16 @@ class FakeAsyncClient:
         return self.response
 
 
+def make_bad_request_error(message: str):
+    """构造 openai.BadRequestError（响应类型需为 httpx.Response）。"""
+    import httpx
+    import openai
+
+    request = httpx.Request("POST", "http://test")
+    response = httpx.Response(400, request=request)
+    return openai.BadRequestError(message, response=response, body=None)
+
+
 @pytest.fixture
 def memory_module():
     from nonebot_plugin_ai_groupmate import memory
@@ -965,6 +975,7 @@ async def test_text_collections_use_configured_embedding_dimension(
     operator = make_operator(memory_module)
     operator.text_only = True
     operator.chat_col = "chat_collection"
+    operator.configured_embedding_dimension = 1536
     operator.text_embedding_dimension = 1536
     operator._init_lock = asyncio.Lock()
     create_calls: list[dict[str, Any]] = []
@@ -996,14 +1007,14 @@ async def test_text_collections_use_configured_embedding_dimension(
 @pytest.mark.asyncio
 async def test_text_embedding_rejects_unexpected_dimension(memory_module: Any):
     operator = make_operator(memory_module)
+    operator.configured_embedding_dimension = 1024
     operator.text_embedding_dimension = 1024
     operator.emb_model = "test-model"
-    embedding_requests = 0
+    embedding_requests: list[dict[str, Any]] = []
 
     class FakeEmbeddings:
-        async def create(self, **_kwargs: Any):
-            nonlocal embedding_requests
-            embedding_requests += 1
+        async def create(self, **kwargs: Any):
+            embedding_requests.append(kwargs)
             return SimpleNamespace(
                 data=[SimpleNamespace(embedding=[0.5] * 1536)]
             )
@@ -1015,28 +1026,70 @@ async def test_text_embedding_rejects_unexpected_dimension(memory_module: Any):
     with pytest.raises(memory_module.CollectionEmbeddingConfigMismatchError):
         await operator._get_text_embedding("hello again")
 
-    assert embedding_requests == 1
+    assert len(embedding_requests) == 1
+    assert embedding_requests[0]["dimensions"] == 1024
 
 
 @pytest.mark.asyncio
 async def test_wrong_embedding_dimension_does_not_create_collections(
     memory_module: Any,
 ):
+    """配置了维度但探测返回不匹配 → 拒绝建集合。"""
     operator = make_operator(memory_module)
     operator.text_only = True
     operator.chat_col = "chat_collection"
+    operator.configured_embedding_dimension = 1536
     operator.text_embedding_dimension = 1536
     operator._init_lock = asyncio.Lock()
     qdrant_calls: list[str] = []
-    embedding_requests = 0
+    embedding_requests: list[dict[str, Any]] = []
 
     class FakeEmbeddings:
-        async def create(self, **_kwargs: Any):
-            nonlocal embedding_requests
-            embedding_requests += 1
+        async def create(self, **kwargs: Any):
+            embedding_requests.append(kwargs)
             return SimpleNamespace(
                 data=[SimpleNamespace(embedding=[0.5] * 1024)]
             )
+
+    class FakeQdrantClient:
+        async def collection_exists(self, _collection_name: str) -> bool:
+            qdrant_calls.append("collection_exists")
+            return False
+
+        async def create_collection(self, **_kwargs: Any) -> None:
+            qdrant_calls.append("create_collection")
+
+        async def create_payload_index(self, **_kwargs: Any) -> None:
+            return None
+
+    operator.emb_client = SimpleNamespace(embeddings=FakeEmbeddings())
+    operator.client = FakeQdrantClient()
+
+    with pytest.raises(memory_module.CollectionEmbeddingConfigMismatchError):
+        await operator._ensure_collections()
+
+    assert len(embedding_requests) == 1
+    assert embedding_requests[0]["dimensions"] == 1536
+    assert qdrant_calls == []
+
+
+@pytest.mark.asyncio
+async def test_unsupported_dimensions_override_does_not_create_collections(
+    memory_module: Any,
+):
+    """配置了维度但 provider 拒绝 dimensions 参数 → 配置错误，不建集合。"""
+    operator = make_operator(memory_module)
+    operator.text_only = True
+    operator.chat_col = "chat_collection"
+    operator.configured_embedding_dimension = 1536
+    operator._init_lock = asyncio.Lock()
+    qdrant_calls: list[str] = []
+    embedding_requests: list[dict[str, Any]] = []
+
+    class FakeEmbeddings:
+        async def create(self, **kwargs: Any):
+            embedding_requests.append(kwargs)
+            raise make_bad_request_error("Unsupported parameter: dimensions")
 
     class FakeQdrantClient:
         async def collection_exists(self, _collection_name: str) -> bool:
@@ -1051,18 +1104,270 @@ async def test_wrong_embedding_dimension_does_not_create_collections(
 
     with pytest.raises(memory_module.CollectionEmbeddingConfigMismatchError):
         await operator._ensure_collections()
-    with pytest.raises(memory_module.CollectionEmbeddingConfigMismatchError):
-        await operator._ensure_collections()
 
-    assert embedding_requests == 1
+    assert len(embedding_requests) == 1
     assert qdrant_calls == []
+    # 永久拒绝：后续请求直接抛错。
+    with pytest.raises(memory_module.CollectionEmbeddingConfigMismatchError):
+        await operator._get_text_embedding("hello")
+    assert len(embedding_requests) == 1
 
 
 @pytest.mark.asyncio
+async def test_probe_uses_configured_dimension(memory_module: Any):
+    """配置了 embedding_dimension 时，探测请求携带 dimensions。"""
+    operator = make_operator(memory_module)
+    operator.configured_embedding_dimension = 1024
+    operator.text_embedding_dimension = 1024
+    operator.emb_model = "test-model"
+    embedding_requests: list[dict[str, Any]] = []
+
+    class FakeEmbeddings:
+        async def create(self, **kwargs: Any):
+            embedding_requests.append(kwargs)
+            return SimpleNamespace(
+                data=[SimpleNamespace(embedding=[0.5] * 1024)]
+            )
+
+    operator.emb_client = SimpleNamespace(embeddings=FakeEmbeddings())
+
+    await operator._probe_text_embedding_dimension()
+
+    assert operator._text_embedding_probe_done is True
+    assert len(embedding_requests) == 1
+    assert embedding_requests[0]["dimensions"] == 1024
+
+
+@pytest.mark.asyncio
+async def test_probe_uses_model_default_dimension(memory_module: Any):
+    """未配置 embedding_dimension 时，探测不带 dimensions 并取默认维度。"""
+    operator = make_operator(memory_module)
+    operator.configured_embedding_dimension = None
+    operator.emb_model = "test-model"
+    embedding_requests: list[dict[str, Any]] = []
+
+    class FakeEmbeddings:
+        async def create(self, **kwargs: Any):
+            embedding_requests.append(kwargs)
+            return SimpleNamespace(
+                data=[SimpleNamespace(embedding=[0.5] * 4096)]
+            )
+
+    operator.emb_client = SimpleNamespace(embeddings=FakeEmbeddings())
+
+    await operator._probe_text_embedding_dimension()
+
+    assert operator._text_embedding_probe_done is True
+    assert operator.text_embedding_dimension == 4096
+    assert len(embedding_requests) == 1
+    assert "dimensions" not in embedding_requests[0]
+
+
+@pytest.mark.asyncio
+async def test_probe_rejects_bad_request(memory_module: Any):
+    """配置了维度但 provider 拒绝 dimensions 参数 → 配置错误。"""
+    operator = make_operator(memory_module)
+    operator.configured_embedding_dimension = 1024
+    operator.emb_model = "test-model"
+
+    class FakeEmbeddings:
+        async def create(self, **_kwargs: Any):
+            raise make_bad_request_error("Unsupported parameter: dimensions")
+
+    operator.emb_client = SimpleNamespace(embeddings=FakeEmbeddings())
+
+    with pytest.raises(memory_module.CollectionEmbeddingConfigMismatchError) as exc_info:
+        await operator._probe_text_embedding_dimension()
+
+    assert "dimensions" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_probe_bad_request_without_dimension_hints_at_model_config(
+    memory_module: Any,
+):
+    """未配置维度时 400 不归咎于 dimensions，提示检查模型名/接口配置。"""
+    operator = make_operator(memory_module)
+    operator.configured_embedding_dimension = None
+    operator.emb_model = "bad-model-name"
+
+    class FakeEmbeddings:
+        async def create(self, **_kwargs: Any):
+            raise make_bad_request_error("Model not found: bad-model-name")
+
+    operator.emb_client = SimpleNamespace(embeddings=FakeEmbeddings())
+
+    with pytest.raises(memory_module.CollectionEmbeddingConfigMismatchError) as exc_info:
+        await operator._probe_text_embedding_dimension()
+
+    message = str(exc_info.value)
+    assert "embedding_model" in message
+    assert "embedding_base_url" in message
+    assert "dimensions" not in message
+
+
+@pytest.mark.asyncio
+async def test_probe_transient_failure_is_soft(memory_module: Any):
+    """探测遇到瞬态故障 → provider 不可用，不建集合。"""
+    operator = make_operator(memory_module)
+    operator.configured_embedding_dimension = 1024
+    operator.emb_model = "test-model"
+
+    class FakeEmbeddings:
+        async def create(self, **_kwargs: Any):
+            raise ConnectionError("temporary outage")
+
+    operator.emb_client = SimpleNamespace(embeddings=FakeEmbeddings())
+
+    with pytest.raises(memory_module.EmbeddingProviderUnavailableError):
+        await operator._probe_text_embedding_dimension()
+
+    assert operator._text_embedding_probe_done is False
+
+
+@pytest.mark.asyncio
+async def test_probe_unconfigured_transient_failure_is_soft(memory_module: Any):
+    """未配置维度时探测遇瞬态故障 → 同样软失败。"""
+    operator = make_operator(memory_module)
+    operator.configured_embedding_dimension = None
+    operator.emb_model = "test-model"
+
+    class FakeEmbeddings:
+        async def create(self, **_kwargs: Any):
+            raise ConnectionError("temporary outage")
+
+    operator.emb_client = SimpleNamespace(embeddings=FakeEmbeddings())
+
+    with pytest.raises(memory_module.EmbeddingProviderUnavailableError):
+        await operator._probe_text_embedding_dimension()
+
+
+@pytest.mark.asyncio
+async def test_get_text_embedding_uses_configured_dimension(memory_module: Any):
+    """配置了维度 → 文本 embedding 请求携带 dimensions。"""
+    operator = make_operator(memory_module)
+    operator.configured_embedding_dimension = 1024
+    operator.text_embedding_dimension = 1024
+    operator.emb_model = "test-model"
+    embedding_requests: list[dict[str, Any]] = []
+
+    class FakeEmbeddings:
+        async def create(self, **kwargs: Any):
+            embedding_requests.append(kwargs)
+            return SimpleNamespace(
+                data=[SimpleNamespace(embedding=[0.5] * 1024)]
+            )
+
+    operator.emb_client = SimpleNamespace(embeddings=FakeEmbeddings())
+
+    result = await operator._get_text_embedding("hello")
+
+    assert result is not None
+    assert embedding_requests == [{
+        "input": ["hello"],
+        "model": "test-model",
+        "dimensions": 1024,
+    }]
+
+
+@pytest.mark.asyncio
+async def test_get_text_embedding_omits_dimensions_when_not_configured(
+    memory_module: Any,
+):
+    """未配置维度 → 文本 embedding 请求不带 dimensions，按默认维度校验。"""
+    operator = make_operator(memory_module)
+    operator.configured_embedding_dimension = None
+    operator.text_embedding_dimension = 4096
+    operator.emb_model = "test-model"
+    embedding_requests: list[dict[str, Any]] = []
+
+    class FakeEmbeddings:
+        async def create(self, **kwargs: Any):
+            embedding_requests.append(kwargs)
+            return SimpleNamespace(
+                data=[SimpleNamespace(embedding=[0.5] * 4096)]
+            )
+
+    operator.emb_client = SimpleNamespace(embeddings=FakeEmbeddings())
+
+    result = await operator._get_text_embedding("hello")
+
+    assert result is not None
+    assert len(result) == 4096
+    assert embedding_requests == [{"input": ["hello"], "model": "test-model"}]
+
+
+@pytest.mark.asyncio
+async def test_get_batch_text_embeddings_uses_configured_dimension(
+    memory_module: Any,
+):
+    """配置了维度 → 批量文本 embedding 请求携带 dimensions。"""
+    operator = make_operator(memory_module)
+    operator.configured_embedding_dimension = 1536
+    operator.text_embedding_dimension = 1536
+    operator.emb_model = "test-model"
+    embedding_requests: list[dict[str, Any]] = []
+
+    class FakeEmbeddings:
+        async def create(self, **kwargs: Any):
+            embedding_requests.append(kwargs)
+            return SimpleNamespace(
+                data=[
+                    SimpleNamespace(embedding=[0.5] * kwargs["dimensions"])
+                    for _ in kwargs["input"]
+                ]
+            )
+
+    operator.emb_client = SimpleNamespace(embeddings=FakeEmbeddings())
+
+    embeddings = await operator._get_batch_text_embeddings(["one", "two"])
+
+    assert len(embeddings) == 2
+    assert embedding_requests == [{
+        "input": ["one", "two"],
+        "model": "test-model",
+        "dimensions": 1536,
+    }]
+
+
+@pytest.mark.asyncio
+async def test_get_batch_text_embeddings_omits_dimensions_when_not_configured(
+    memory_module: Any,
+):
+    """未配置维度 → 批量文本 embedding 请求不带 dimensions。"""
+    operator = make_operator(memory_module)
+    operator.configured_embedding_dimension = None
+    operator.text_embedding_dimension = 4096
+    operator.emb_model = "test-model"
+    embedding_requests: list[dict[str, Any]] = []
+
+    class FakeEmbeddings:
+        async def create(self, **kwargs: Any):
+            embedding_requests.append(kwargs)
+            return SimpleNamespace(
+                data=[
+                    SimpleNamespace(embedding=[0.5] * 4096)
+                    for _ in kwargs["input"]
+                ]
+            )
+
+    operator.emb_client = SimpleNamespace(embeddings=FakeEmbeddings())
+
+    embeddings = await operator._get_batch_text_embeddings(["one", "two"])
+
+    assert len(embeddings) == 2
+    assert embedding_requests == [{
+        "input": ["one", "two"],
+        "model": "test-model",
+    }]
+
+
+
 async def test_embedding_probe_outage_is_soft_failure(memory_module: Any):
     operator = make_operator(memory_module)
     operator.text_only = True
     operator.chat_col = "chat_collection"
+    operator.configured_embedding_dimension = None
     operator._init_lock = asyncio.Lock()
     probe_attempts = 0
     created_collections: list[str] = []
@@ -1086,10 +1391,13 @@ async def test_embedding_probe_outage_is_soft_failure(memory_module: Any):
     operator.emb_client = SimpleNamespace(embeddings=FakeEmbeddings())
     operator.client = FakeQdrantClient()
 
-    await operator._ensure_collections({operator.chat_col})
+    # 探测失败应传播不可用状态，让调用方在访问文本集合前停止；
+    # 不能静默跳过建集合后继续（后续会对着不存在的集合发 Qdrant 请求）。
+    with pytest.raises(memory_module.EmbeddingProviderUnavailableError):
+        await operator._ensure_collections({operator.chat_col})
 
     assert probe_attempts == 1
-    assert created_collections == [operator.chat_col]
+    assert created_collections == []
 
 
 @pytest.mark.asyncio
@@ -1135,14 +1443,11 @@ async def test_multimodal_media_remains_available_when_text_embedding_is_unavail
     operator.client = FakeQdrantClient()
     operator._get_qwen_vl_independent_pair = get_qwen_vl_independent_pair
 
-    await operator._ensure_collections({operator.chat_col})
-
+    # 文本 embedding 不可用不影响多模态媒体功能（其内部只建多模态集合，
+    # 不触发文本维度探测）。
     assert await operator.insert_media(1, "data:image/png;base64,AAAA", "描述")
-    assert embedding_requests == 1
-    assert created_collections == [
-        operator.chat_col,
-        operator.media_multivector_col,
-    ]
+    assert embedding_requests == 0
+    assert created_collections == [operator.media_multivector_col]
     assert upsert_collections == [operator.media_multivector_col]
 
 
@@ -1152,6 +1457,7 @@ async def test_insert_chat_stores_vector_from_configured_model(memory_module: An
     operator.enabled = True
     operator.chat_col = "chat_collection"
     operator.emb_model = "Qwen/Qwen3-Embedding-0.6B"
+    operator.configured_embedding_dimension = 1536
     operator.text_embedding_dimension = 1536
     embedding_requests: list[dict[str, Any]] = []
     upsert_calls: list[dict[str, Any]] = []
@@ -1179,9 +1485,40 @@ async def test_insert_chat_stores_vector_from_configured_model(memory_module: An
     assert embedding_requests == [{
         "input": ["hello"],
         "model": "Qwen/Qwen3-Embedding-0.6B",
+        "dimensions": 1536,
     }]
     assert len(upsert_calls) == 1
     assert len(upsert_calls[0]["points"][0].vector) == 1536
+
+
+@pytest.mark.asyncio
+async def test_batch_text_embedding_uses_configured_dimension(memory_module: Any):
+    operator = make_operator(memory_module)
+    operator.emb_model = "Qwen/Qwen3-Embedding-0.6B"
+    operator.configured_embedding_dimension = 1536
+    operator.text_embedding_dimension = 1536
+    embedding_requests: list[dict[str, Any]] = []
+
+    class FakeEmbeddings:
+        async def create(self, **kwargs: Any):
+            embedding_requests.append(kwargs)
+            return SimpleNamespace(
+                data=[
+                    SimpleNamespace(embedding=[0.5] * 1536)
+                    for _ in kwargs["input"]
+                ]
+            )
+
+    operator.emb_client = SimpleNamespace(embeddings=FakeEmbeddings())
+
+    embeddings = await operator._get_batch_text_embeddings(["one", "two"])
+
+    assert len(embeddings) == 2
+    assert embedding_requests == [{
+        "input": ["one", "two"],
+        "model": "Qwen/Qwen3-Embedding-0.6B",
+        "dimensions": 1536,
+    }]
 
 
 @pytest.mark.asyncio

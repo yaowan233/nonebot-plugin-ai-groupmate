@@ -235,6 +235,8 @@ def _display_environment_value(field_name: str, value: Any) -> str:
         return "环境变量中已配置" if value else "环境变量中未配置"
     if isinstance(value, bool):
         return "开启" if value else "关闭"
+    if value is None:
+        return "未配置"
     if value == "":
         return "空"
     return str(value)
@@ -294,6 +296,12 @@ def _render_field(
         control = (
             f'<input type="number" step="{step}" data-setting="{key}" '
             f'value="{escape(str(value))}" />'
+        )
+    elif value is None and field_name.endswith("_dimension"):
+        # 可空数值字段（如 embedding_dimension）值为 None 时渲染为空白，
+        # 避免显示字面量 "None" 导致保存时解析失败。
+        control = (
+            f'<input type="number" step="1" data-setting="{key}" />'
         )
     else:
         control = (

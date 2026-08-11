@@ -1,6 +1,6 @@
 from typing import Any, Literal
 
-from pydantic import Field, BaseModel, SecretStr
+from pydantic import Field, BaseModel, SecretStr, field_validator
 from langchain_openai import ChatOpenAI
 
 
@@ -96,7 +96,22 @@ class ScopedConfig(BaseModel):
     embedding_api_key: str = ""
     embedding_base_url: str = ""
     embedding_model: str = "BAAI/bge-m3"
-    embedding_dimension: int = Field(default=1024, ge=1)
+    # 请求是否携带 dimensions 参数及文本向量维度。
+    # 不填（None）：请求不带 dimensions，使用模型默认输出维度，兼容
+    #   不支持 dimensions 参数的 provider（如硅基流动的 BAAI/bge-m3）。
+    # 填写：请求携带 dimensions=<该值>，要求模型/provider 支持该参数
+    #   （如硅基流动的 Qwen/Qwen3-Embedding-8B，可指定 1024 等维度）。
+    #   若模型不支持 dimensions 参数，启动探测会报配置错误。
+    embedding_dimension: int | None = Field(default=None, ge=1)
+
+    @field_validator("embedding_dimension", mode="before")
+    @classmethod
+    def _blank_embedding_dimension_to_none(cls, value: Any) -> Any:
+        # WebUI 提交空白输入时值为 ""，转换为 None 以保持"未配置"语义。
+        if isinstance(value, str) and value.strip() == "":
+            return None
+        return value
+
     rerank_api_url: str = ""
     rerank_api_key: str = ""
 
