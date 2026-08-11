@@ -44,7 +44,6 @@ def memory_module():
 
 def make_operator(memory_module: Any):
     operator = object.__new__(memory_module.VectorDBOperator)
-    operator.media_col = "media_collection"
     operator.media_multivector_col = "media_collection_v3"
     return operator
 
@@ -76,16 +75,13 @@ async def test_ensure_collections_creates_named_media_vectors(memory_module: Any
             return collection_name != "media_collection_v3"
 
         async def get_collection(self, collection_name: str) -> Any:
-            size = (
-                memory_module.MEDIA_VECTOR_SIZE
-                if collection_name == "media_collection"
-                else operator.text_embedding_dimension
-            )
             return SimpleNamespace(
                 config=SimpleNamespace(
                     metadata={},
                     params=SimpleNamespace(
-                        vectors=SimpleNamespace(size=size),
+                        vectors=SimpleNamespace(
+                            size=operator.text_embedding_dimension,
+                        ),
                     ),
                 ),
             )
@@ -309,40 +305,18 @@ def test_meme_results_exclude_recent_ids_before_fallback(
     assert result == [3, 4, 1]
 
 
-def test_meme_search_routes_use_rrf_and_reward_cross_route_hits(
-    memory_module: Any,
-):
-    primary = [
-        SimpleNamespace(id=1, score=0.9),
-        SimpleNamespace(id=2, score=0.8),
-    ]
-    legacy = [
-        SimpleNamespace(id=2, score=0.95),
-        SimpleNamespace(id=3, score=0.9),
-    ]
-
-    result = memory_module.VectorDBOperator._merge_meme_search_routes(
-        primary,
-        legacy,
-    )
-
-    assert [media_id for media_id, _ in result] == [2, 1, 3]
-
-
-def test_weighted_meme_routes_combine_text_visual_and_legacy_hits(
+def test_weighted_meme_routes_combine_text_and_visual_hits(
     memory_module: Any,
 ):
     text = [SimpleNamespace(id=1, score=0.9), SimpleNamespace(id=2, score=0.8)]
     visual = [SimpleNamespace(id=3, score=0.95), SimpleNamespace(id=1, score=0.7)]
-    legacy = [SimpleNamespace(id=4, score=0.9)]
 
     result = memory_module.VectorDBOperator._merge_weighted_meme_search_routes([
         (text, 1.0),
         (visual, memory_module.MEME_CONTEXT_VISUAL_ROUTE_WEIGHT),
-        (legacy, memory_module.MEME_LEGACY_ROUTE_WEIGHT),
     ])
 
-    assert [media_id for media_id, _ in result] == [1, 2, 3, 4]
+    assert [media_id for media_id, _ in result] == [1, 2, 3]
 
 
 def test_meme_search_expands_dragon_image_jargon(memory_module: Any):
@@ -384,55 +358,26 @@ async def test_meme_search_embeds_expanded_jargon(memory_module: Any):
     assert "用户原始搜索：发个龙图" in embedded_texts[0]
 
 
-def test_legacy_route_reserves_independent_candidates_in_review_window(
-    memory_module: Any,
-):
-    primary = [SimpleNamespace(id=media_id) for media_id in range(1, 21)]
-    legacy = [SimpleNamespace(id=media_id) for media_id in range(101, 106)]
-    candidates = [
-        (media_id, 1.0 / (memory_module.MEME_RRF_K + rank))
-        for rank, media_id in enumerate(range(1, 21), start=1)
-    ] + [
-        (media_id, memory_module.MEME_LEGACY_ROUTE_WEIGHT / (
-            memory_module.MEME_RRF_K + rank
-        ))
-        for rank, media_id in enumerate(range(101, 106), start=1)
-    ]
-
-    result = memory_module.VectorDBOperator._reserve_meme_route_candidates(
-        candidates,
-        legacy,
-        exclude_ids={int(point.id) for point in primary},
-        quota=3,
-        window=15,
-    )
-
-    assert [media_id for media_id, _ in result[:12]] == list(range(1, 13))
-    assert [media_id for media_id, _ in result[12:15]] == [101, 102, 103]
-    assert sorted(media_id for media_id, _ in result) == sorted(
-        media_id for media_id, _ in candidates
-    )
-
-
 @pytest.mark.asyncio
-async def test_media_route_timeout_keeps_successful_routes(
+async def test_full_primary_media_route_skips_visual_fallback(
     memory_module: Any,
-    monkeypatch: pytest.MonkeyPatch,
 ):
     operator = make_operator(memory_module)
+    query_calls: list[str] = []
 
     class FakeQdrantClient:
         async def query_points(self, **kwargs: Any) -> Any:
-            if kwargs["collection_name"] == "media_collection":
+            query_calls.append(kwargs["using"])
+            if kwargs.get("using") == memory_module.MEDIA_IMAGE_VECTOR:
                 await asyncio.Event().wait()
-            return SimpleNamespace(points=[SimpleNamespace(id=1, score=0.9)])
+            return SimpleNamespace(
+                points=[
+                    SimpleNamespace(id=index, score=1.0 / index)
+                    for index in range(1, 6)
+                ]
+            )
 
     operator.client = FakeQdrantClient()
-    monkeypatch.setattr(
-        memory_module,
-        "MEME_QDRANT_ROUTE_TIMEOUT_SECONDS",
-        0.01,
-    )
 
     result = await operator._search_media_routes(
         [0.1] * memory_module.MEDIA_VECTOR_SIZE,
@@ -442,6 +387,36 @@ async def test_media_route_timeout_keeps_successful_routes(
 
     assert result
     assert result[0][0] == 1
+    assert query_calls == [memory_module.MEDIA_TEXT_VECTOR]
+
+
+@pytest.mark.asyncio
+async def test_short_primary_media_route_uses_visual_fallback(memory_module: Any):
+    operator = make_operator(memory_module)
+    query_calls: list[str] = []
+
+    class FakeQdrantClient:
+        async def query_points(self, **kwargs: Any) -> Any:
+            using = kwargs["using"]
+            query_calls.append(using)
+            point_id = 1 if using == memory_module.MEDIA_TEXT_VECTOR else 2
+            return SimpleNamespace(
+                points=[SimpleNamespace(id=point_id, score=0.9)]
+            )
+
+    operator.client = FakeQdrantClient()
+
+    result = await operator._search_media_routes(
+        [0.1] * memory_module.MEDIA_VECTOR_SIZE,
+        vector_name=memory_module.MEDIA_TEXT_VECTOR,
+        limit=5,
+    )
+
+    assert {media_id for media_id, _ in result} == {1, 2}
+    assert query_calls == [
+        memory_module.MEDIA_TEXT_VECTOR,
+        memory_module.MEDIA_IMAGE_VECTOR,
+    ]
 
 
 @pytest.mark.asyncio
@@ -507,13 +482,10 @@ async def test_search_meme_uses_larger_candidate_pool_and_recent_exclusion(
     class FakeQdrantClient:
         async def query_points(self, **kwargs: Any) -> Any:
             query_calls.append(kwargs)
-            if kwargs["collection_name"] == "media_collection":
-                return SimpleNamespace(points=[])
             return SimpleNamespace(
                 points=[
-                    SimpleNamespace(id=1, score=0.9),
-                    SimpleNamespace(id=2, score=0.8),
-                    SimpleNamespace(id=3, score=0.7),
+                    SimpleNamespace(id=index, score=1.0 / index)
+                    for index in range(1, kwargs["limit"] + 1)
                 ]
             )
 
@@ -529,16 +501,12 @@ async def test_search_meme_uses_larger_candidate_pool_and_recent_exclusion(
     result = await operator.search_meme("无奈", limit=2, exclude_ids={1})
 
     assert result == [2, 3]
-    assert len(query_calls) == 3
+    assert len(query_calls) == 1
     assert query_calls[0]["collection_name"] == "media_collection_v3"
     assert query_calls[0]["using"] == memory_module.MEDIA_TEXT_VECTOR
     assert query_calls[0]["limit"] == memory_module.MEME_SEARCH_POOL_SIZE
     assert query_calls[0]["with_payload"] is False
     assert query_calls[0]["timeout"] == 8
-    assert query_calls[1]["collection_name"] == "media_collection_v3"
-    assert query_calls[1]["using"] == memory_module.MEDIA_IMAGE_VECTOR
-    assert query_calls[2]["collection_name"] == "media_collection"
-    assert "using" not in query_calls[2]
 
 
 # ================= text 模式（meme_embedding_mode="text"） =================
@@ -824,16 +792,6 @@ async def test_chat_collection_mismatch_does_not_block_multimodal_media(
                     },
                     SimpleNamespace(size=1024),
                 )
-            if collection_name == operator.media_col:
-                return collection_info(
-                    {
-                        memory_module.EMBEDDING_MODEL_METADATA_KEY:
-                            memory_module.QWEN_VL_EMBEDDING_MODEL,
-                        memory_module.EMBEDDING_DIMENSION_METADATA_KEY:
-                            memory_module.MEDIA_VECTOR_SIZE,
-                    },
-                    SimpleNamespace(size=memory_module.MEDIA_VECTOR_SIZE),
-                )
             return collection_info(
                 {
                     memory_module.EMBEDDING_MODEL_METADATA_KEY:
@@ -857,18 +815,15 @@ async def test_chat_collection_mismatch_does_not_block_multimodal_media(
         await operator._ensure_collections({operator.chat_col})
 
     await operator._ensure_collections(
-        {operator.media_col, operator.media_multivector_col},
+        {operator.media_multivector_col},
         validate_text_embedding=False,
     )
 
-    assert operator._get_ready_collections() == {
-        operator.media_col,
-        operator.media_multivector_col,
-    }
+    assert operator._get_ready_collections() == {operator.media_multivector_col}
 
 
 @pytest.mark.asyncio
-async def test_legacy_media_mismatch_does_not_block_v3_insert_or_search(
+async def test_multimodal_insert_and_search_only_use_v3_collection(
     memory_module: Any,
 ):
     operator = make_operator(memory_module)
@@ -882,23 +837,8 @@ async def test_legacy_media_mismatch_does_not_block_v3_insert_or_search(
     query_collections: list[str] = []
 
     class FakeQdrantClient:
-        async def collection_exists(self, collection_name: str) -> bool:
-            return collection_name == operator.media_col
-
-        async def get_collection(self, collection_name: str) -> Any:
-            assert collection_name == operator.media_col
-            return SimpleNamespace(
-                config=SimpleNamespace(
-                    metadata={
-                        memory_module.EMBEDDING_MODEL_METADATA_KEY:
-                            memory_module.QWEN_VL_EMBEDDING_MODEL,
-                        memory_module.EMBEDDING_DIMENSION_METADATA_KEY: 1024,
-                    },
-                    params=SimpleNamespace(
-                        vectors=SimpleNamespace(size=1024),
-                    ),
-                ),
-            )
+        async def collection_exists(self, _collection_name: str) -> bool:
+            return False
 
         async def create_collection(self, **kwargs: Any) -> None:
             created_collections.append(kwargs["collection_name"])
@@ -922,12 +862,6 @@ async def test_legacy_media_mismatch_does_not_block_v3_insert_or_search(
     operator.client = FakeQdrantClient()
     operator._get_qwen_vl_independent_pair = get_qwen_vl_independent_pair
     operator._get_qwen_vl_embedding = get_qwen_vl_embedding
-
-    with pytest.raises(memory_module.CollectionEmbeddingConfigMismatchError):
-        await operator._ensure_collections(
-            {operator.media_col},
-            validate_text_embedding=False,
-        )
 
     assert await operator.insert_media(1, "data:image/png;base64,AAAA", "描述")
     candidates = await operator.search_meme_candidates("无奈")
@@ -1565,9 +1499,10 @@ async def test_ensure_collections_creates_chat_and_multimodal_collections(
 
     await operator._ensure_collections()
 
-    assert "chat_collection" in create_calls
-    assert operator.media_col in create_calls
-    assert operator.media_multivector_col in create_calls
+    assert set(create_calls) == {
+        "chat_collection",
+        operator.media_multivector_col,
+    }
 
 
 @pytest.mark.asyncio

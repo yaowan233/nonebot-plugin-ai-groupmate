@@ -39,11 +39,8 @@ EMBEDDING_DIMENSION_METADATA_KEY = "embedding_dimension"
 MEDIA_TEXT_VECTOR_SIZE = 1024
 MEME_SEARCH_POOL_SIZE = 50
 MEME_RRF_K = 60
-MEME_LEGACY_ROUTE_WEIGHT = 0.35
 MEME_CONTEXT_VISUAL_ROUTE_WEIGHT = 0.85
 MEME_CONTENT_VISUAL_ROUTE_WEIGHT = 0.65
-MEME_LEGACY_ROUTE_QUOTA = 3
-MEME_LEGACY_ROUTE_WINDOW = 15
 MEME_QDRANT_ROUTE_TIMEOUT_SECONDS = 8.0
 MEME_GROUP_USAGE_WEIGHT = 0.35
 MEME_GROUP_USAGE_MIN_USES = 2
@@ -134,8 +131,6 @@ class VectorDBOperator:
         )
 
         self.chat_col = "chat_collection"
-        # v2 及更早版本的图文融合向量，迁移期间继续作为回退召回源。
-        self.media_col = "media_collection"
         # v3 将描述文本和原图拆成独立向量，避免视觉信息稀释梗和台词。
         self.media_multivector_col = "media_collection_v3"
         # text 模式：纯文本向量集合（BGE-M3，1024 维）
@@ -260,22 +255,14 @@ class VectorDBOperator:
                 {"": self.text_embedding_dimension},
             ))
         else:
-            specs.extend((
-                (
-                    self.media_col,
-                    QWEN_VL_EMBEDDING_MODEL,
-                    MEDIA_VECTOR_SIZE,
-                    {"": MEDIA_VECTOR_SIZE},
-                ),
-                (
-                    self.media_multivector_col,
-                    QWEN_VL_EMBEDDING_MODEL,
-                    MEDIA_VECTOR_SIZE,
-                    {
-                        MEDIA_TEXT_VECTOR: MEDIA_VECTOR_SIZE,
-                        MEDIA_IMAGE_VECTOR: MEDIA_VECTOR_SIZE,
-                    },
-                ),
+            specs.append((
+                self.media_multivector_col,
+                QWEN_VL_EMBEDDING_MODEL,
+                MEDIA_VECTOR_SIZE,
+                {
+                    MEDIA_TEXT_VECTOR: MEDIA_VECTOR_SIZE,
+                    MEDIA_IMAGE_VECTOR: MEDIA_VECTOR_SIZE,
+                },
             ))
         return specs
 
@@ -352,24 +339,6 @@ class VectorDBOperator:
             error = errors.get(collection_name)
             if error is not None:
                 raise error
-
-    async def _legacy_media_collection_available(self) -> bool:
-        """确认旧融合向量集合可作为可选召回路线使用。"""
-        if self.text_only:
-            return False
-        if self.media_col in self._get_collection_validation_errors():
-            return False
-        try:
-            await self._ensure_collections(
-                {self.media_col},
-                validate_text_embedding=False,
-            )
-        except (CollectionEmbeddingConfigMismatchError, CollectionMetadataBackfillError):
-            return False
-        except Exception as exc:
-            logger.warning(f"旧媒体融合向量集合校验失败，跳过该路线: {exc}")
-            return False
-        return True
 
     async def _validate_collection(
         self,
@@ -576,7 +545,6 @@ class VectorDBOperator:
             await self._ensure_collections(
                 {self.chat_col, self.media_multivector_col},
             )
-            await self._legacy_media_collection_available()
 
     async def _probe_text_embedding_dimension(self) -> None:
         if getattr(self, "_text_embedding_probe_done", False):
@@ -1090,7 +1058,7 @@ class VectorDBOperator:
     def _merge_weighted_meme_search_routes(
         routes: Sequence[tuple[Sequence[models.ScoredPoint], float]],
     ) -> list[tuple[int, float]]:
-        """使用加权 RRF 合并任意数量的文本、视觉与兼容召回路线。"""
+        """使用加权 RRF 合并文本与视觉召回路线。"""
         merged: dict[int, float] = {}
         for points, weight in routes:
             for rank, point in enumerate(points, start=1):
@@ -1099,74 +1067,6 @@ class VectorDBOperator:
                     weight / (MEME_RRF_K + rank)
                 )
         return sorted(merged.items(), key=lambda item: item[1], reverse=True)
-
-    @staticmethod
-    def _merge_meme_search_routes(
-        primary_points: Sequence[models.ScoredPoint],
-        legacy_points: Sequence[models.ScoredPoint],
-    ) -> list[tuple[int, float]]:
-        """使用加权 RRF 合并独立向量与旧融合向量召回。"""
-        return VectorDBOperator._merge_weighted_meme_search_routes([
-            (primary_points, 1.0),
-            (legacy_points, MEME_LEGACY_ROUTE_WEIGHT),
-        ])
-
-    @staticmethod
-    def _reserve_meme_route_candidates(
-        candidates: Sequence[tuple[int, float]],
-        route_points: Sequence[models.ScoredPoint],
-        *,
-        exclude_ids: Collection[int],
-        quota: int,
-        window: int,
-    ) -> list[tuple[int, float]]:
-        """在靠前窗口为互补路线保留少量独立候选。"""
-        ranked = list(candidates)
-        if not ranked or not route_points or quota <= 0 or window <= 0:
-            return ranked
-
-        excluded = set(exclude_ids)
-        route_only_ids = [
-            int(point.id)
-            for point in route_points
-            if int(point.id) not in excluded
-        ]
-        if not route_only_ids:
-            return ranked
-
-        window_size = min(window, len(ranked))
-        head = ranked[:window_size]
-        route_only_set = set(route_only_ids)
-        existing_ids = {
-            media_id for media_id, _ in head if media_id in route_only_set
-        }
-        needed = max(0, quota - len(existing_ids))
-        if needed == 0:
-            return ranked
-
-        score_by_id = dict(ranked)
-        promoted_ids: list[int] = []
-        for media_id in route_only_ids:
-            if (
-                media_id in score_by_id
-                and media_id not in existing_ids
-                and media_id not in promoted_ids
-            ):
-                promoted_ids.append(media_id)
-                if len(promoted_ids) >= needed:
-                    break
-        if not promoted_ids:
-            return ranked
-
-        promoted_set = set(promoted_ids)
-        retained_head = [item for item in head if item[0] not in promoted_set]
-        retained_head = retained_head[:window_size - len(promoted_ids)]
-        new_head = retained_head + [
-            (media_id, score_by_id[media_id]) for media_id in promoted_ids
-        ]
-        new_head_ids = {media_id for media_id, _ in new_head}
-        tail = [item for item in ranked if item[0] not in new_head_ids]
-        return new_head + tail
 
     @staticmethod
     def apply_group_usage_boost(
@@ -1207,74 +1107,55 @@ class VectorDBOperator:
         vector_name: str,
         limit: int,
         visual_route_weight: float = MEME_CONTEXT_VISUAL_ROUTE_WEIGHT,
-        include_legacy: bool = True,
     ) -> list[tuple[int, float]]:
-        query_specs: list[tuple[str, str | None, float, str]] = [
-            (self.media_multivector_col, vector_name, 1.0, "独立媒体向量"),
-        ]
-        if vector_name == MEDIA_TEXT_VECTOR:
-            # Qwen VL 的文本和图片向量位于同一语义空间。文字搜图时同时查询
-            # 原图视觉向量，才能召回描述中漏写的角色、外观、物体与构图。
-            query_specs.append((
-                self.media_multivector_col,
-                MEDIA_IMAGE_VECTOR,
-                visual_route_weight,
-                "跨模态视觉向量",
-            ))
-        if include_legacy:
-            query_specs.append((
-                self.media_col,
-                None,
-                MEME_LEGACY_ROUTE_WEIGHT,
-                "旧媒体融合向量",
-            ))
-
-        calls = []
-        for collection_name, using, _, _ in query_specs:
+        async def query_route(
+            using: str,
+            *,
+            label: str,
+        ) -> Sequence[models.ScoredPoint] | None:
             kwargs = {
-                "collection_name": collection_name,
+                "collection_name": self.media_multivector_col,
                 "query": vector,
                 "limit": limit,
                 "with_payload": False,
                 "timeout": math.ceil(MEME_QDRANT_ROUTE_TIMEOUT_SECONDS),
+                "using": using,
             }
-            if using is not None:
-                kwargs["using"] = using
-            calls.append(asyncio.wait_for(
-                self.client.query_points(**kwargs),
-                timeout=MEME_QDRANT_ROUTE_TIMEOUT_SECONDS + 1.0,
-            ))
-        results = await asyncio.gather(*calls, return_exceptions=True)
-
-        routes: list[tuple[Sequence[models.ScoredPoint], float]] = []
-        primary_ids: set[int] = set()
-        legacy_points: Sequence[models.ScoredPoint] = []
-        for (collection_name, _, weight, label), result in zip(query_specs, results):
-            if isinstance(result, BaseException):
+            try:
+                result = await asyncio.wait_for(
+                    self.client.query_points(**kwargs),
+                    timeout=MEME_QDRANT_ROUTE_TIMEOUT_SECONDS + 1.0,
+                )
+            except Exception as error:
                 error_detail = (
                     f"超过 {MEME_QDRANT_ROUTE_TIMEOUT_SECONDS:.1f}s"
-                    if isinstance(result, TimeoutError)
-                    else str(result).strip() or repr(result)
+                    if isinstance(error, TimeoutError)
+                    else str(error).strip() or repr(error)
                 )
-                logger.warning(
-                    f"{label}检索失败，跳过该路线: {error_detail}"
-                )
-                continue
-            points = result.points if result else []
-            routes.append((points, weight))
-            if collection_name == self.media_col:
-                legacy_points = points
-            else:
-                primary_ids.update(int(point.id) for point in points)
+                logger.warning(f"{label}检索失败，跳过该路线: {error_detail}")
+                return None
+            return result.points if result else []
 
-        merged = self._merge_weighted_meme_search_routes(routes)
-        return self._reserve_meme_route_candidates(
-            merged,
-            legacy_points,
-            exclude_ids=primary_ids,
-            quota=MEME_LEGACY_ROUTE_QUOTA,
-            window=MEME_LEGACY_ROUTE_WINDOW,
-        )
+        primary_points = await query_route(vector_name, label="独立媒体向量")
+        if primary_points is None:
+            # 同一集合的另一条向量路线大概率会遇到相同的存储超时，避免把一次
+            # 失败请求串成两次完整超时。
+            return []
+
+        routes: list[tuple[Sequence[models.ScoredPoint], float]] = [
+            (primary_points, 1.0),
+        ]
+        if vector_name == MEDIA_TEXT_VECTOR and len(primary_points) < limit:
+            # 文本向量通常已能返回完整候选池，此时直接结束，避免每次搜图都被
+            # 较大的视觉向量索引拖慢。仅当主路线正常完成但候选不足时才用视觉
+            # 向量补齐，保留小集合和稀疏集合下的跨模态召回能力。
+            visual_points = await query_route(
+                MEDIA_IMAGE_VECTOR,
+                label="跨模态视觉向量",
+            )
+            if visual_points is not None:
+                routes.append((visual_points, visual_route_weight))
+        return self._merge_weighted_meme_search_routes(routes)
 
     @classmethod
     def _diversify_meme_candidates(
@@ -1358,7 +1239,6 @@ class VectorDBOperator:
             self._primary_media_collection_names(),
             validate_text_embedding=False,
         )
-        include_legacy = await self._legacy_media_collection_available()
         vector = await self._get_qwen_vl_embedding(
             text=expanded_description,
             instruct=MEME_TEXT_QUERY_INSTRUCT,
@@ -1375,7 +1255,6 @@ class VectorDBOperator:
                 if strict_content_match
                 else MEME_CONTEXT_VISUAL_ROUTE_WEIGHT
             ),
-            include_legacy=include_legacy,
         )
 
     async def search_similar_meme(
@@ -1398,7 +1277,6 @@ class VectorDBOperator:
             self._primary_media_collection_names(),
             validate_text_embedding=False,
         )
-        include_legacy = await self._legacy_media_collection_available()
 
         target_vector = await self._get_qwen_vl_embedding(image_source=file_path)
         if not target_vector:
@@ -1412,7 +1290,6 @@ class VectorDBOperator:
             target_vector,
             vector_name=MEDIA_IMAGE_VECTOR,
             limit=query_limit,
-            include_legacy=include_legacy,
         )
         if not candidates:
             return []

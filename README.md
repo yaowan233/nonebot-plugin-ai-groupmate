@@ -94,6 +94,24 @@
 
 </details>
 
+### 从旧版本升级
+
+表情包多向量集合 `media_collection_v3` 从 `v2.1.1` 开始引入。升级前请按当前版本和向量化模式确认迁移路径：
+
+| 当前版本/模式 | 升级方式 |
+|:--|:--|
+| `v2.1.1` 至 `v2.1.10`，且使用 `multimodal` 模式 | 等待日志中的“待重建旧表情包”为 0、确认 `media_collection_v3` 已完成重建后，可直接升级。 |
+| `v2.1.0` 及更早版本，且使用 `multimodal` 模式 | 先升级到 `v2.1.10`，保留旧 `media_collection` 并等待 v3 重建完成，再升级到最新版。不要跨过该迁移步骤。 |
+| `v2.1.7` 及更高版本，且始终使用 `text` 模式 | 保持 `meme_embedding_mode=text` 时可直接升级，继续使用 `media_collection_text`。切换到 `multimodal` 仍需重新向量化。 |
+
+可用下面的命令确认 v3 集合存在并查看向量数量（请按实际地址修改 Qdrant URL）：
+
+```bash
+curl http://127.0.0.1:6333/collections/media_collection_v3
+```
+
+迁移依赖原始表情包文件和可用的 Qwen 向量接口。如果旧文件已经丢失，对应数据无法重建到 v3；此时不要删除旧集合，也不要升级到不再读取 `media_collection` 的版本。完成升级并确认搜索正常后，旧 `media_collection` 才可以删除。
+
 
 ## ⚙️ 配置
 
