@@ -132,20 +132,19 @@ async def _load_webui_runtime_config() -> None:
         )
         if has_restart_required_changes:
             await DB.reconfigure()
-        collections_checked = not DB.enabled
+            # reconfigure 已经让连接资源使用当前运行配置。集合兼容性是独立
+            # 状态，不能继续借用 restart baseline 表示，否则校验失败后把
+            # WebUI 配置恢复为旧值会错误清除“等待重启”。
+            mark_restart_fields_applied()
         if DB.enabled:
             try:
                 await DB.check_collections()
-                collections_checked = True
             except CollectionEmbeddingConfigMismatchError:
                 logger.error(
                     "启动时 Qdrant 集合校验失败，相关向量操作已拒绝；"
                     "请根据上方日志中的当前配置和 collection 配置人工重建向量"
                 )
             except EmbeddingProviderUnavailableError:
-                # 连接配置已由 reconfigure 应用；临时探针失败不应让 WebUI
-                # 永久显示等待重启，文本向量操作会在后续请求中重试。
-                collections_checked = True
                 logger.warning(
                     "启动时 Embedding API 暂时不可用，文本向量操作将在首次使用时重试"
                 )
@@ -153,8 +152,6 @@ async def _load_webui_runtime_config() -> None:
                 logger.exception(
                     "启动时 Qdrant 集合校验暂时失败，将在首次向量操作时重试"
                 )
-        if has_restart_required_changes and collections_checked:
-            mark_restart_fields_applied()
         if changed_fields:
             logger.info(
                 f"已加载 WebUI 配置覆盖项，变更字段数={len(changed_fields)}"

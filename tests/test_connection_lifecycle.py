@@ -47,11 +47,11 @@ async def test_startup_reconfigures_vector_db_for_persisted_meme_mode(
 
     await plugin._load_webui_runtime_config()
 
-    assert calls == ["reconfigure", "check_collections", "marked"]
+    assert calls == ["reconfigure", "marked", "check_collections"]
 
 
 @pytest.mark.asyncio
-async def test_startup_keeps_restart_marker_when_collection_check_fails(
+async def test_startup_marks_restart_fields_when_collection_check_fails(
     monkeypatch: pytest.MonkeyPatch,
 ):
     import nonebot_plugin_ai_groupmate as plugin
@@ -90,7 +90,7 @@ async def test_startup_keeps_restart_marker_when_collection_check_fails(
 
     await plugin._load_webui_runtime_config()
 
-    assert calls == ["reconfigure", "check_collections"]
+    assert calls == ["reconfigure", "marked", "check_collections"]
 
 
 @pytest.mark.asyncio
@@ -133,7 +133,7 @@ async def test_startup_marks_restart_fields_when_embedding_provider_is_unavailab
 
     await plugin._load_webui_runtime_config()
 
-    assert calls == ["reconfigure", "check_collections", "marked"]
+    assert calls == ["reconfigure", "marked", "check_collections"]
 
 
 @pytest.mark.asyncio

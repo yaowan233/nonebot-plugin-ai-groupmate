@@ -107,7 +107,7 @@ SETTING_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     ),
     (
         "搜索与向量库",
-        "联网搜索立即生效；Qdrant、Embedding 与 Rerank 连接配置重启后生效；注意：修改 Embedding 模型或者维度后需要人工重建向量。",
+        "联网搜索立即生效；Qdrant 服务端须为 1.16 或更高版本；Qdrant、Embedding 与 Rerank 连接配置重启后生效；注意：修改 Embedding 模型或者维度后需要人工重建向量。",
         (
             "tavily_api_key",
             "qdrant_uri",

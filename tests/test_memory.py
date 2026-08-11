@@ -633,6 +633,46 @@ async def test_existing_collection_without_metadata_is_backfilled(
 
 
 @pytest.mark.asyncio
+async def test_legacy_text_collection_without_metadata_rejects_changed_model(
+    memory_module: Any,
+):
+    operator = make_operator(memory_module)
+    operator.text_only = True
+    operator.chat_col = "chat_collection"
+    operator.media_text_col = memory_module.MEDIA_TEXT_COL
+    operator.emb_model = "new-model-with-same-dimension"
+    operator._init_lock = asyncio.Lock()
+    update_calls: list[dict[str, Any]] = []
+
+    class FakeQdrantClient:
+        async def collection_exists(self, _collection_name: str) -> bool:
+            return True
+
+        async def get_collection(self, _collection_name: str) -> Any:
+            return SimpleNamespace(
+                config=SimpleNamespace(
+                    metadata=None,
+                    params=SimpleNamespace(
+                        vectors=SimpleNamespace(
+                            size=operator.text_embedding_dimension,
+                        ),
+                    ),
+                ),
+            )
+
+        async def update_collection(self, **kwargs: Any) -> bool:
+            update_calls.append(kwargs)
+            return True
+
+    operator.client = FakeQdrantClient()
+
+    with pytest.raises(memory_module.CollectionEmbeddingConfigMismatchError):
+        await operator._ensure_collections({operator.chat_col})
+
+    assert update_calls == []
+
+
+@pytest.mark.asyncio
 async def test_metadata_backfill_failure_is_retryable(memory_module: Any):
     operator = make_operator(memory_module)
     operator.text_only = True

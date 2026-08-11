@@ -153,7 +153,7 @@
 | ai_groupmate__tagging_api_format | 否 | `openai` | 图片标注接口格式，可选 `openai` / `anthropic` |
 | ai_groupmate__qwen_token | 否 | 无 | 兼容旧配置的 DashScope API Key；新配置推荐使用 `llm_api_key` |
 | ai_groupmate__base_model | 否 | 无 | 兼容旧配置的默认模型名；新配置推荐使用 `chat_model` |
-| ai_groupmate__qdrant_uri | 否 | 无 | Qdrant 地址，不填则禁用表情包、RAG 等向量功能 |
+| ai_groupmate__qdrant_uri | 否 | 无 | Qdrant 地址，不填则禁用表情包、RAG 等向量功能；要求 Qdrant 服务端版本不低于 `1.16` |
 | ai_groupmate__qdrant_api_key | 否 | 无 | Qdrant API Key（使用 Qdrant Cloud 时需要） |
 | ai_groupmate__embedding_api_key | 否 | 无 | Embedding API Key，启用 Qdrant 时必填（推荐硅基流动，免费） |
 | ai_groupmate__embedding_base_url | 否 | 无 | Embedding Base URL，启用 Qdrant 时必填（推荐硅基流动，免费）。填根地址如 `https://api.siliconflow.cn/v1`，也可填完整路径 `…/v1/embeddings`（插件会自动去重） |
@@ -163,7 +163,9 @@
 | ai_groupmate__rerank_api_url | 否 | 无 | Rerank API URL，启用 Qdrant 时使用（推荐硅基流动，免费） |
 | ai_groupmate__rerank_api_key | 否 | 无 | Rerank API Key，启用 Qdrant 时使用（推荐硅基流动，免费） |
 
-修改 `embedding_model` 或 `embedding_dimension` 前，请自行重建聊天与纯文本表情包的 Qdrant 向量。插件不会迁移既有向量。
+向量功能要求 Qdrant 服务端版本不低于 `1.16`，因为插件使用 collection metadata 记录并校验 Embedding 模型与维度。
+
+修改 `embedding_model` 或 `embedding_dimension` 前，请自行重建聊天与纯文本表情包的 Qdrant 向量。插件不会迁移既有向量；旧文本集合缺少 metadata 且当前模型不是历史默认的 `BAAI/bge-m3` 时，插件会拒绝使用该集合，避免混用不同模型生成的向量。
 
 如果多个插件共用 `nonebot-plugin-orm`，建议同时将 SQLAlchemy 连接池设为快速失败，避免外部插件耗尽连接时每条消息卡住 30 秒：
 

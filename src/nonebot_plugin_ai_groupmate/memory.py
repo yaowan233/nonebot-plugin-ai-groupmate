@@ -21,6 +21,7 @@ plugin_config = get_runtime_config()
 
 QWEN_VL_EMBEDDING_MODEL = "qwen3-vl-embedding"
 MEDIA_VECTOR_SIZE = 2560
+LEGACY_TEXT_EMBEDDING_MODEL = "BAAI/bge-m3"
 # SQL 中的 embedding_version 同时标识向量结构和当前表情包向量化模式。
 # 两种模式使用不同版本，并在模式切换时按“不等于当前版本”重新入库。
 MEDIA_MULTIMODAL_EMBEDDING_VERSION = 3
@@ -92,7 +93,7 @@ class VectorDBOperator:
     media_embedding_version: int = MEDIA_MULTIMODAL_EMBEDDING_VERSION
     media_text_col = MEDIA_TEXT_COL
     text_embedding_dimension: int = MEDIA_TEXT_VECTOR_SIZE
-    emb_model: str = "BAAI/bge-m3"
+    emb_model: str = LEGACY_TEXT_EMBEDDING_MODEL
     _collection_validation_errors: dict[
         str, CollectionEmbeddingConfigMismatchError
     ] | None = None
@@ -161,8 +162,14 @@ class VectorDBOperator:
         )
         self.qwen_http_client = httpx.AsyncClient(timeout=60.0)
         self.emb_model = (
-            str(getattr(plugin_config, "embedding_model", "BAAI/bge-m3")).strip()
-            or "BAAI/bge-m3"
+            str(
+                getattr(
+                    plugin_config,
+                    "embedding_model",
+                    LEGACY_TEXT_EMBEDDING_MODEL,
+                )
+            ).strip()
+            or LEGACY_TEXT_EMBEDDING_MODEL
         )
         self.text_embedding_dimension = int(
             getattr(
@@ -396,6 +403,17 @@ class VectorDBOperator:
                     current_config,
                     collection_config,
                     "旧集合向量维度或名称不匹配，未写入新 metadata",
+                )
+            if (
+                collection_name in self._text_collection_names()
+                and expected_model != LEGACY_TEXT_EMBEDDING_MODEL
+            ):
+                self._reject_collection(
+                    collection_name,
+                    current_config,
+                    collection_config,
+                    "旧文本集合缺少 Embedding metadata，无法确认其模型；"
+                    "当前模型不是历史默认模型，未写入新 metadata",
                 )
             try:
                 result = await self.client.update_collection(

@@ -278,6 +278,7 @@ def test_settings_page_groups_all_fields_and_never_renders_secrets():
     assert "1536" in html
     assert 'data-setting="embedding_model"' in html
     assert 'data-setting="embedding_dimension"' in html
+    assert "Qdrant 服务端须为 1.16 或更高版本" in html
     assert "Qdrant、Embedding 与 Rerank 连接配置重启后生效" in html
     assert "已配置，留空保持不变" in html
     assert "网页覆盖" in html
