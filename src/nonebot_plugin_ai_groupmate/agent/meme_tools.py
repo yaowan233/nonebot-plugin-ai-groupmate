@@ -6,7 +6,8 @@ import traceback
 from io import BytesIO
 from typing import Any, Literal, cast
 from pathlib import Path
-from collections.abc import Callable, Sequence
+from functools import lru_cache
+from collections.abc import Mapping, Callable, Sequence, Collection
 
 from PIL import Image
 from pydantic import Field, BaseModel
@@ -20,7 +21,7 @@ from ..model import ChatHistory, MediaStorage, ChatHistorySchema
 from ..memory import DB, expand_meme_search_terms
 from ..reply_guard import is_request_active
 
-RECENT_MEME_EXCLUSION_COUNT = 20
+RECENT_MEME_EXCLUSION_COUNT = 10
 MEME_SEARCH_CANDIDATE_LIMIT = 50
 MEME_RESULT_COUNT = 5
 GROUP_FAVORITE_POOL_SIZE = 20
@@ -77,22 +78,44 @@ def _perceptual_hashes_match(left: int, right: int) -> bool:
     return (left ^ right).bit_count() <= MEME_PERCEPTUAL_HASH_DISTANCE
 
 
-def _meme_perceptual_hash_from_file(file_path: Path) -> int | None:
+@lru_cache(maxsize=4096)
+def _cached_meme_perceptual_hash_from_file(
+    file_path: str,
+    file_size: int,
+    modified_ns: int,
+) -> int | None:
+    # 文件大小和修改时间参与缓存键；图片被替换时会自动重新计算。
+    del file_size, modified_ns
     try:
-        return _meme_perceptual_hash(file_path.read_bytes())
+        return _meme_perceptual_hash(Path(file_path).read_bytes())
     except OSError:
         return None
 
 
+def _meme_perceptual_hash_from_file(file_path: Path) -> int | None:
+    try:
+        stat = file_path.stat()
+    except OSError:
+        return None
+    return _cached_meme_perceptual_hash_from_file(
+        str(file_path),
+        stat.st_size,
+        stat.st_mtime_ns,
+    )
+
+
 async def _deduplicate_meme_pic_ids(
     pic_ids: Sequence[int],
-    media_map: dict[int, MediaStorage],
+    media_map: Mapping[int, Any],
     pic_dir: Path | None,
+    *,
+    exclude_ids: Collection[int] = (),
 ) -> list[int]:
-    """在向量召回后按实际画面折叠不同文件格式或尺寸的重复图片。"""
-    if pic_dir is None or len(pic_ids) < 2:
-        return list(pic_ids)
+    """按实际画面排除近期图片并折叠不同格式或尺寸的重复候选。"""
+    if pic_dir is None:
+        return [pic_id for pic_id in pic_ids if pic_id not in exclude_ids]
 
+    all_ids = list(dict.fromkeys([*exclude_ids, *pic_ids]))
     hashes = await asyncio.gather(*(
         asyncio.to_thread(
             _meme_perceptual_hash_from_file,
@@ -100,14 +123,23 @@ async def _deduplicate_meme_pic_ids(
         )
         if pic_id in media_map
         else asyncio.sleep(0, result=None)
-        for pic_id in pic_ids
+        for pic_id in all_ids
     ))
+    hash_by_id = dict(zip(all_ids, hashes))
+    excluded_hashes = [
+        perceptual_hash
+        for media_id in exclude_ids
+        if (perceptual_hash := hash_by_id.get(media_id)) is not None
+    ]
     unique_ids: list[int] = []
     unique_hashes: list[int] = []
-    for pic_id, perceptual_hash in zip(pic_ids, hashes):
+    for pic_id in pic_ids:
+        if pic_id in exclude_ids:
+            continue
+        perceptual_hash = hash_by_id.get(pic_id)
         if perceptual_hash is not None and any(
             _perceptual_hashes_match(perceptual_hash, previous_hash)
-            for previous_hash in unique_hashes
+            for previous_hash in [*excluded_hashes, *unique_hashes]
         ):
             continue
         unique_ids.append(pic_id)
@@ -115,7 +147,9 @@ async def _deduplicate_meme_pic_ids(
             unique_hashes.append(perceptual_hash)
 
     if len(unique_ids) != len(pic_ids):
-        logger.info(f"表情包候选画面去重: {len(pic_ids)} -> {len(unique_ids)}")
+        logger.info(
+            f"表情包候选近期排除/画面去重: {len(pic_ids)} -> {len(unique_ids)}"
+        )
     return unique_ids
 
 
@@ -384,9 +418,15 @@ def _select_group_aware_meme_ids(
     limit: int = MEME_RESULT_COUNT,
 ) -> list[int]:
     """在通过语境审核的候选中融合群热度，并保留至多一个探索位。"""
-    if not candidates:
+    fresh_candidates = [
+        item for item in candidates if item[0] not in recent_ids
+    ]
+    if not fresh_candidates:
         return []
-    ranked_candidates = DB.apply_group_usage_boost(candidates, usage_counts)
+    ranked_candidates = DB.apply_group_usage_boost(
+        fresh_candidates,
+        usage_counts,
+    )
     favorite_pool = [
         item
         for item in ranked_candidates
@@ -428,9 +468,11 @@ def _select_content_meme_ids(
     limit: int = MEME_RESULT_COUNT,
 ) -> list[int]:
     """按内容硬条件找图时保持语义/视觉排名，不让随机探索和群热度覆盖它。"""
-    fresh = [media_id for media_id, _ in candidates if media_id not in recent_ids]
-    recent = [media_id for media_id, _ in candidates if media_id in recent_ids]
-    return (fresh + recent)[:limit]
+    return [
+        media_id
+        for media_id, _ in candidates
+        if media_id not in recent_ids
+    ][:limit]
 
 
 def create_similar_meme_tool(
@@ -616,6 +658,11 @@ def create_search_meme_tool(
                 limit=query_limit,
                 strict_content_match=effective_match_type == "content",
             )
+            # 最近 10 条群图片是硬排除项，不再在候选不足时回填。这样用户
+            # 连续要求“再发”时不会重新审核并发送上一轮刚出现过的图片。
+            candidates = [
+                item for item in candidates if item[0] not in recent_ids
+            ]
             review_candidates, usage_counts, favorite_ids = (
                 await _prepare_meme_context_review(
                     db_session,
@@ -705,13 +752,16 @@ def create_search_meme_tool(
                 )
 
             result = await db_session.execute(
-                Select(MediaStorage).where(MediaStorage.media_id.in_(pic_ids))
+                Select(MediaStorage).where(
+                    MediaStorage.media_id.in_([*pic_ids, *recent_ids])
+                )
             )
             media_map = {media.media_id: media for media in result.scalars().all()}
             pic_ids = await _deduplicate_meme_pic_ids(
                 pic_ids,
                 media_map,
                 pic_dir,
+                exclude_ids=recent_ids,
             )
             images_info = []
             for pic_id in pic_ids:

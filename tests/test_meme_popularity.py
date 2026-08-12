@@ -147,7 +147,7 @@ def test_group_favorite_cannot_bypass_context_review():
     assert selected == [1]
 
 
-def test_content_selection_preserves_match_ranking_without_random_favorite():
+def test_content_selection_preserves_ranking_and_hard_excludes_recent_ids():
     from nonebot_plugin_ai_groupmate.agent import meme_tools
 
     selected = meme_tools._select_content_meme_ids(
@@ -156,7 +156,21 @@ def test_content_selection_preserves_match_ranking_without_random_favorite():
         limit=3,
     )
 
-    assert selected == [8, 99, 7]
+    assert selected == [8, 99]
+
+
+def test_group_aware_selection_hard_excludes_recent_ids():
+    from nonebot_plugin_ai_groupmate.agent import meme_tools
+
+    selected = meme_tools._select_group_aware_meme_ids(
+        [(1, 0.9), (2, 0.8), (3, 0.7)],
+        {},
+        set(),
+        {1, 2},
+        limit=3,
+    )
+
+    assert selected == [3]
 
 
 @pytest.mark.asyncio
@@ -488,6 +502,38 @@ async def test_search_meme_deduplicates_same_picture_before_model_selection(
     assert [image["pic_id"] for image in result["images"]] == [1, 3]
     assert result["count"] == 2
     assert approved == {1, 3}
+
+
+@pytest.mark.asyncio
+async def test_meme_candidates_visually_exclude_recent_different_media_id(
+    tmp_path,
+):
+    from nonebot_plugin_ai_groupmate.agent import meme_tools
+
+    image = Image.new("RGB", (120, 80), "white")
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((8, 8, 55, 60), fill="navy")
+    draw.ellipse((65, 15, 110, 65), fill="gold")
+    image.save(tmp_path / "recent.png")
+    image.resize((240, 160)).save(
+        tmp_path / "candidate.jpg",
+        quality=75,
+    )
+    Image.new("RGB", (120, 80), "black").save(tmp_path / "fresh.png")
+    media_map = {
+        10: SimpleNamespace(media_id=10, file_path="recent.png"),
+        20: SimpleNamespace(media_id=20, file_path="candidate.jpg"),
+        30: SimpleNamespace(media_id=30, file_path="fresh.png"),
+    }
+
+    result = await meme_tools._deduplicate_meme_pic_ids(
+        [20, 30],
+        media_map,
+        tmp_path,
+        exclude_ids={10},
+    )
+
+    assert result == [30]
 
 
 @pytest.mark.asyncio
