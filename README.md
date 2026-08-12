@@ -176,7 +176,7 @@ curl http://127.0.0.1:6333/collections/media_collection_v3
 | ai_groupmate__embedding_api_key | 否 | 无 | Embedding API Key，启用 Qdrant 时必填（推荐硅基流动，免费） |
 | ai_groupmate__embedding_base_url | 否 | 无 | Embedding Base URL，启用 Qdrant 时必填（推荐硅基流动，免费）。填根地址如 `https://api.siliconflow.cn/v1`，也可填完整路径 `…/v1/embeddings`（插件会自动去重） |
 | ai_groupmate__embedding_model | 否 | `BAAI/bge-m3` | 文本 Embedding 模型名称，用于聊天 RAG 和 `text` 表情包模式。 |
-| ai_groupmate__embedding_dimension | 否 | `1024` | 文本 Embedding 向量维度，用于聊天 RAG 和 `text` 表情包模式。 |
+| ai_groupmate__embedding_dimension | 否 | 无 | 文本 Embedding 向量维度。模型不支持维度参数或使用模型默认输出维度时无需填写。 |
 | ai_groupmate__meme_embedding_mode | 否 | `multimodal` | 表情包向量化模式。`multimodal`：qwen3-vl-embedding 生成描述+原图双向量（需配 `qwen_token`，支持图找图）；`text`：仅用描述文本向量化（无需 `qwen_token`，图找图不可用） |
 | ai_groupmate__rerank_api_url | 否 | 无 | Rerank API URL，启用 Qdrant 时使用（推荐硅基流动，免费） |
 | ai_groupmate__rerank_api_key | 否 | 无 | Rerank API Key，启用 Qdrant 时使用（推荐硅基流动，免费） |

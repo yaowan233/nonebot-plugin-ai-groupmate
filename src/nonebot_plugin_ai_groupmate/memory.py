@@ -11,7 +11,7 @@ from typing import Any, NoReturn
 from collections.abc import Sequence, Collection
 
 import httpx
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, BadRequestError
 from nonebot.log import logger
 from qdrant_client import AsyncQdrantClient, models
 
@@ -89,7 +89,11 @@ class VectorDBOperator:
     effective_meme_embedding_mode: str = "multimodal"
     media_embedding_version: int = MEDIA_MULTIMODAL_EMBEDDING_VERSION
     media_text_col = MEDIA_TEXT_COL
+    # 文本向量维度：由探测确定（配置了 embedding_dimension 则为其值，
+    # 否则为模型默认输出维度），用于创建集合与校验。
     text_embedding_dimension: int = MEDIA_TEXT_VECTOR_SIZE
+    # 用户配置的 embedding_dimension；None 表示不携带 dimensions 参数。
+    configured_embedding_dimension: int | None = None
     emb_model: str = LEGACY_TEXT_EMBEDDING_MODEL
     _collection_validation_errors: dict[
         str, CollectionEmbeddingConfigMismatchError
@@ -166,12 +170,18 @@ class VectorDBOperator:
             ).strip()
             or LEGACY_TEXT_EMBEDDING_MODEL
         )
-        self.text_embedding_dimension = int(
-            getattr(
-                plugin_config,
-                "embedding_dimension",
-                MEDIA_TEXT_VECTOR_SIZE,
-            )
+        configured_dimension = getattr(
+            plugin_config,
+            "embedding_dimension",
+            None,
+        )
+        self.configured_embedding_dimension = (
+            int(configured_dimension) if configured_dimension else None
+        )
+        # 未探测前先用配置值（若配置了）；探测后会覆盖为实际维度。
+        self.text_embedding_dimension = (
+            self.configured_embedding_dimension
+            or MEDIA_TEXT_VECTOR_SIZE
         )
 
         # 3. Rerank API 配置
@@ -478,17 +488,22 @@ class VectorDBOperator:
             if requested_names <= ready_collections:
                 return
 
+            # 探测文本向量维度（仅在涉及文本集合时）。失败时传播不可用
+            # 状态，让调用方在访问文本集合前停止（而非静默跳过创建后对
+            # 不存在的集合发 Qdrant 请求，产生硬错误）。多模态集合不受
+            # 影响：仅当请求本身涉及文本集合时才需要探测。
             if (
                 validate_text_embedding
                 and needs_text_embedding
                 and getattr(self, "emb_client", None) is not None
             ):
-                try:
-                    await self._probe_text_embedding_dimension()
-                except EmbeddingProviderUnavailableError:
-                    # 探针失败通常是临时网络/API 故障；让实际文本调用走原有
-                    # 降级逻辑，且不要阻断多模态 collection 的初始化。
-                    pass
+                await self._probe_text_embedding_dimension()
+
+            # probe 可能更新了 text_embedding_dimension（未配置维度时取
+            # 模型默认输出维度），重建 specs 以使用探测后的实际维度；
+            # 否则会按旧的 1024 默认值创建/校验集合，schema 与后续
+            # embedding upsert 不匹配。
+            collection_specs = self._active_collection_specs()
 
             for collection_name, model, dimension, expected_schema in collection_specs:
                 if collection_name not in requested_names:
@@ -547,24 +562,54 @@ class VectorDBOperator:
             )
 
     async def _probe_text_embedding_dimension(self) -> None:
+        """探测文本向量维度，仅在创建文本集合前调用一次。
+
+        配置了 embedding_dimension 时：携带 dimensions 请求，返回维度必须
+        与配置一致，否则视为配置错误（模型不支持 dimensions 或配置有误）。
+        未配置时：不携带 dimensions，使用模型默认输出维度建集合。
+        """
         if getattr(self, "_text_embedding_probe_done", False):
             return
         try:
-            response = await self.emb_client.embeddings.create(
-                input=["embedding dimension validation probe"],
-                model=self.emb_model,
-            )
-            if not response.data:
-                raise ValueError("Embedding API 返回空结果")
-            self._validate_text_embedding_dimension(response.data[0].embedding)
+            if self.configured_embedding_dimension is not None:
+                response = await self.emb_client.embeddings.create(
+                    input=["embedding dimension validation probe"],
+                    model=self.emb_model,
+                    dimensions=self.configured_embedding_dimension,
+                )
+                if not response.data:
+                    raise ValueError("Embedding API 返回空结果")
+                self._validate_text_embedding_dimension(response.data[0].embedding)
+            else:
+                response = await self.emb_client.embeddings.create(
+                    input=["embedding dimension validation probe"],
+                    model=self.emb_model,
+                )
+                if not response.data:
+                    raise ValueError("Embedding API 返回空结果")
+                self.text_embedding_dimension = len(response.data[0].embedding)
             self._text_embedding_probe_done = True
         except CollectionEmbeddingConfigMismatchError:
             raise
+        except BadRequestError as exc:
+            # 400：请求参数不被接受。配置了维度时通常是 dimensions 不受该
+            # 模型支持；未配置维度时请求不带 dimensions，更可能是模型名
+            # 或接口配置错误，按场景给出不同提示。
+            if self.configured_embedding_dimension is not None:
+                message = (
+                    "Embedding 请求被拒绝（400）：该模型可能不支持 dimensions 参数，"
+                    "请移除 ai_groupmate__embedding_dimension 配置或更换模型。"
+                )
+            else:
+                message = (
+                    "Embedding 请求被拒绝（400）：请检查 ai_groupmate__embedding_model "
+                    "模型名与 ai_groupmate__embedding_base_url 接口配置是否正确。"
+                )
+            self._reject_validation(f"{message}详情: {exc}")
         except Exception as exc:
             logger.error(
                 "Embedding API 暂时不可用，跳过本次文本向量维度探针: "
-                f"model={self.emb_model!r}, dimension={self.text_embedding_dimension}, "
-                f"error={exc}"
+                f"model={self.emb_model!r}, error={exc}"
             )
             raise EmbeddingProviderUnavailableError(str(exc)) from exc
 
@@ -583,13 +628,23 @@ class VectorDBOperator:
             "请删除并人工重建向量"
         )
 
+    def _embedding_request_kwargs(self, input: list[str]) -> dict[str, Any]:
+        """构造 embedding 请求参数；配置了 embedding_dimension 才携带。
+
+        未配置时请求不带 dimensions，使用模型默认输出维度（兼容不支持
+        dimensions 参数的 provider，如硅基流动的 BAAI/bge-m3）。
+        """
+        kwargs: dict[str, Any] = {"input": input, "model": self.emb_model}
+        if self.configured_embedding_dimension is not None:
+            kwargs["dimensions"] = self.configured_embedding_dimension
+        return kwargs
+
     async def _get_text_embedding(self, text: str) -> list[float] | None:
         """调用 API 获取配置的文本 Dense 向量。"""
         self._raise_if_validation_rejected()
         try:
             resp = await self.emb_client.embeddings.create(
-                input=[text],
-                model=self.emb_model
+                **self._embedding_request_kwargs([text]),
             )
             return self._validate_text_embedding_dimension(resp.data[0].embedding)
         except CollectionEmbeddingConfigMismatchError:
@@ -945,8 +1000,7 @@ class VectorDBOperator:
 
                 # 发送分片请求
                 resp = await self.emb_client.embeddings.create(
-                    input=chunk,
-                    model=self.emb_model
+                    **self._embedding_request_kwargs(chunk),
                 )
 
                 # 收集结果
