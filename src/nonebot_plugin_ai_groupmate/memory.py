@@ -7,7 +7,9 @@ import base64
 import random
 import asyncio
 import mimetypes
+import unicodedata
 from typing import Any, NoReturn
+from datetime import datetime, timedelta
 from collections.abc import Sequence, Collection
 
 import httpx
@@ -37,6 +39,16 @@ EMBEDDING_MODEL_METADATA_KEY = "embedding_model"
 EMBEDDING_DIMENSION_METADATA_KEY = "embedding_dimension"
 # 默认维度用于兼容未设置 embedding_dimension 的旧配置和测试替身。
 MEDIA_TEXT_VECTOR_SIZE = 1024
+CHAT_SEARCH_CANDIDATE_LIMIT = 40
+CHAT_RERANK_POOL_SIZE = 12
+CHAT_SEARCH_RESULT_LIMIT = 5
+CHAT_RRF_K = 60
+CHAT_LEXICAL_ROUTE_WEIGHT = 0.9
+CHAT_RECENCY_ROUTE_WEIGHT = 0.35
+CHAT_RECENCY_QUERY_PATTERN = re.compile(
+    r"(?:刚才|最近|近期|今天|昨天|前天|本周|上周|这个月|本月|上个月|最新|上次)"
+)
+CHAT_TIMESTAMP_PATTERN = re.compile(r"\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]")
 MEME_SEARCH_POOL_SIZE = 50
 MEME_RRF_K = 60
 MEME_CONTEXT_VISUAL_ROUTE_WEIGHT = 0.85
@@ -67,6 +79,75 @@ class EmbeddingProviderUnavailableError(RuntimeError):
 
 class CollectionMetadataBackfillError(RuntimeError):
     """Raised when a legacy collection cannot be marked with its embedding space."""
+
+
+def expand_chat_search_query(query: str, *, now: datetime | None = None) -> str:
+    """把常见相对时间词展开成聊天记录中实际存在的日期字符串。"""
+    normalized_query = query.strip()
+    if not normalized_query:
+        return normalized_query
+
+    current = now or datetime.now()
+    current_date = current.date()
+    ranges: list[str] = []
+
+    for term, days_ago in (("前天", 2), ("昨天", 1), ("今天", 0)):
+        if term in normalized_query:
+            target = current_date - timedelta(days=days_ago)
+            ranges.append(f"{term}={target.isoformat()}")
+
+    if "本周" in normalized_query:
+        start = current_date - timedelta(days=current_date.weekday())
+        ranges.append(f"本周={start.isoformat()}至{current_date.isoformat()}")
+    if "上周" in normalized_query:
+        this_week = current_date - timedelta(days=current_date.weekday())
+        start = this_week - timedelta(days=7)
+        end = this_week - timedelta(days=1)
+        ranges.append(f"上周={start.isoformat()}至{end.isoformat()}")
+
+    month_start = current_date.replace(day=1)
+    if "这个月" in normalized_query or "本月" in normalized_query:
+        ranges.append(f"本月={month_start.isoformat()}至{current_date.isoformat()}")
+    if "上个月" in normalized_query:
+        previous_month_end = month_start - timedelta(days=1)
+        previous_month_start = previous_month_end.replace(day=1)
+        ranges.append(
+            f"上个月={previous_month_start.isoformat()}至"
+            f"{previous_month_end.isoformat()}"
+        )
+
+    if not ranges:
+        return normalized_query
+    return f"{normalized_query}\n检索时间范围：{'；'.join(ranges)}"
+
+
+def _normalize_chat_search_text(text: str) -> str:
+    return " ".join(unicodedata.normalize("NFKC", text).lower().split())
+
+
+def _chat_search_terms(text: str) -> set[str]:
+    """生成适合中英文混合群聊的轻量关键词集合。"""
+    normalized = _normalize_chat_search_text(text)
+    terms = set(re.findall(r"[a-z0-9_]+", normalized))
+    for sequence in re.findall(r"[\u3400-\u9fff]+", normalized):
+        if len(sequence) == 1:
+            terms.add(sequence)
+            continue
+        if len(sequence) <= 8:
+            terms.add(sequence)
+        terms.update(sequence[index:index + 2] for index in range(len(sequence) - 1))
+    return terms
+
+
+def _chat_context_created_at(text: str, fallback: int) -> int:
+    """从上下文最后一条消息读取真实时间，旧格式则使用入库时间。"""
+    matches = CHAT_TIMESTAMP_PATTERN.findall(text)
+    if not matches:
+        return fallback
+    try:
+        return int(datetime.strptime(matches[-1], "%Y-%m-%d %H:%M:%S").timestamp())
+    except ValueError:
+        return fallback
 
 
 def expand_meme_search_terms(description: str) -> str:
@@ -818,25 +899,33 @@ class VectorDBOperator:
         return vectors[0], vectors[1]
 
 
-    async def _rerank(self, query: str, docs: list[str]) -> list[str]:
-        """调用 Rerank API 对结果精排"""
+    async def _rerank(
+        self,
+        query: str,
+        docs: list[str],
+        *,
+        limit: int = CHAT_SEARCH_RESULT_LIMIT,
+    ) -> list[str]:
+        """可选地调用 Rerank API；未配置或失败时保留本地融合排序。"""
         if not docs:
             return []
 
-        # 如果只有一条，没必要 Rerank
-        if len(docs) == 1:
-            return docs
+        docs = docs[:CHAT_RERANK_POOL_SIZE]
+        if len(docs) == 1 or not str(getattr(self, "rerank_url", "")).strip():
+            return docs[:limit]
 
         try:
             headers = {
-                "Authorization": f"Bearer {self.rerank_key}",
                 "Content-Type": "application/json"
             }
+            rerank_key = str(getattr(self, "rerank_key", "")).strip()
+            if rerank_key:
+                headers["Authorization"] = f"Bearer {rerank_key}"
             payload = {
                 "model": "BAAI/bge-reranker-v2-m3",
                 "query": query,
                 "documents": docs,
-                "top_n": 5  # 只取前5最相关的
+                "top_n": min(limit, len(docs)),
             }
 
             async with httpx.AsyncClient(timeout=30.0) as client:
@@ -844,15 +933,121 @@ class VectorDBOperator:
                 resp.raise_for_status()
                 results = resp.json().get("results", [])
 
-                # 按相关性分数排序
-                results.sort(key=lambda x: x["relevance_score"], reverse=True)
-
-                # 返回排序后的文本
-                return [docs[item["index"]] for item in results]
+                ranked: list[str] = []
+                seen_indexes: set[int] = set()
+                for item in sorted(
+                    results,
+                    key=lambda value: float(value.get("relevance_score", 0.0)),
+                    reverse=True,
+                ):
+                    index = item.get("index")
+                    if (
+                        isinstance(index, int)
+                        and 0 <= index < len(docs)
+                        and index not in seen_indexes
+                    ):
+                        ranked.append(docs[index])
+                        seen_indexes.add(index)
+                for index, doc in enumerate(docs):
+                    if len(ranked) >= limit:
+                        break
+                    if index not in seen_indexes:
+                        ranked.append(doc)
+                return ranked[:limit]
         except Exception as e:
-            logger.error(f"Rerank API Error: {e}")
-            # 降级策略：如果 Rerank 挂了，直接返回前 5 条
-            return docs[:5]
+            logger.warning(f"Rerank API 不可用，使用本地融合排序: {type(e).__name__}")
+            return docs[:limit]
+
+    @staticmethod
+    def _rank_chat_candidates(query: str, points: Sequence[Any]) -> list[str]:
+        """用 dense、关键词和按需时效三条路线做加权 RRF。"""
+        records: list[dict[str, Any]] = []
+        seen_texts: set[str] = set()
+        for dense_rank, point in enumerate(points, start=1):
+            payload = getattr(point, "payload", None)
+            if not isinstance(payload, dict):
+                continue
+            text = payload.get("text")
+            if not isinstance(text, str) or not text.strip():
+                continue
+            normalized_text = _normalize_chat_search_text(text)
+            if normalized_text in seen_texts:
+                continue
+            seen_texts.add(normalized_text)
+            created_at = payload.get("created_at", 0)
+            try:
+                timestamp = int(created_at)
+            except (TypeError, ValueError):
+                timestamp = 0
+            records.append({
+                "text": text.strip(),
+                "normalized_text": normalized_text,
+                "dense_rank": dense_rank,
+                "created_at": timestamp,
+                "terms": _chat_search_terms(text),
+            })
+
+        if not records:
+            return []
+
+        query_terms = _chat_search_terms(query)
+        document_frequency = {
+            term: sum(term in record["terms"] for record in records)
+            for term in query_terms
+        }
+        term_weights = {
+            term: math.log((len(records) + 1) / (frequency + 1)) + 1.0
+            for term, frequency in document_frequency.items()
+        }
+        total_query_weight = sum(term_weights.values()) or 1.0
+        original_query = query.split("\n检索时间范围：", 1)[0]
+        normalized_phrase = _normalize_chat_search_text(original_query)
+
+        lexical_scores: dict[int, float] = {}
+        for index, record in enumerate(records):
+            overlap = query_terms & record["terms"]
+            score = sum(term_weights[term] for term in overlap) / total_query_weight
+            if len(normalized_phrase) >= 2 and normalized_phrase in record["normalized_text"]:
+                score += 0.5
+            lexical_scores[index] = score
+
+        fused_scores = {
+            index: 1.0 / (CHAT_RRF_K + int(record["dense_rank"]))
+            for index, record in enumerate(records)
+        }
+        lexical_route = sorted(
+            (index for index, score in lexical_scores.items() if score > 0),
+            key=lambda index: (
+                -lexical_scores[index],
+                int(records[index]["dense_rank"]),
+            ),
+        )
+        for lexical_rank, index in enumerate(lexical_route, start=1):
+            fused_scores[index] += (
+                CHAT_LEXICAL_ROUTE_WEIGHT / (CHAT_RRF_K + lexical_rank)
+            )
+
+        if CHAT_RECENCY_QUERY_PATTERN.search(original_query):
+            recency_route = sorted(
+                range(len(records)),
+                key=lambda index: (
+                    -int(records[index]["created_at"]),
+                    int(records[index]["dense_rank"]),
+                ),
+            )
+            for recency_rank, index in enumerate(recency_route, start=1):
+                fused_scores[index] += (
+                    CHAT_RECENCY_ROUTE_WEIGHT / (CHAT_RRF_K + recency_rank)
+                )
+
+        ranked_indexes = sorted(
+            range(len(records)),
+            key=lambda index: (
+                -fused_scores[index],
+                int(records[index]["dense_rank"]),
+            ),
+        )
+        return [str(records[index]["text"]) for index in ranked_indexes]
 
     # ================= 聊天记录功能 (RAG) =================
 
@@ -881,23 +1076,22 @@ class VectorDBOperator:
         )
 
     async def search_chat(self, query: str, session_id: str) -> str:
-        """
-        RAG 搜索核心逻辑 (适配 query_points 接口)
-        """
+        """在当前会话中召回并融合排序相关历史片段。"""
         if not self.enabled:
             return "未找到相关历史记录"
+        normalized_query = query.strip()
+        if not normalized_query:
+            return "未找到相关历史记录"
         await self._ensure_collections({self.chat_col})
-        # 1. 获取向量
-        vector = await self._get_text_embedding(query)
+        expanded_query = expand_chat_search_query(normalized_query)
+        vector = await self._get_text_embedding(expanded_query)
         if not vector:
             return "无法连接记忆库"
 
-        # 2. Qdrant 向量搜索
-        # 使用 query_points() 接口
         search_result = await self.client.query_points(
             collection_name=self.chat_col,
-            query=vector,               # <--- 对应文档: If list[float] - use as dense vector
-            query_filter=models.Filter( # <--- 对应文档: 参数名是 query_filter
+            query=vector,
+            query_filter=models.Filter(
                 must=[
                     models.FieldCondition(
                         key="session_id",
@@ -905,22 +1099,28 @@ class VectorDBOperator:
                     )
                 ]
             ),
-            limit=20
+            limit=CHAT_SEARCH_CANDIDATE_LIMIT,
+            with_payload=True,
         )
 
-        # 注意：query_points 返回的是 QueryResponse
-        # 它的结构通常包含 points 列表
         if not search_result or not search_result.points:
             return "未找到相关历史记录"
 
-        # 提取文本内容
-        # search_result.points 是 ScoredPoint 的列表
-        candidates = [point.payload["text"] for point in search_result.points if point.payload and "text" in point.payload]
-
-        # 3. Rerank 重排序
-        best_texts = await self._rerank(query, candidates)
-
-        return "\n".join(best_texts)
+        candidates = self._rank_chat_candidates(
+            expanded_query,
+            search_result.points,
+        )
+        best_texts = await self._rerank(
+            expanded_query,
+            candidates,
+            limit=CHAT_SEARCH_RESULT_LIMIT,
+        )
+        if not best_texts:
+            return "未找到相关历史记录"
+        return "\n\n".join(
+            f"【相关历史片段 {index}】\n{text}"
+            for index, text in enumerate(best_texts, start=1)
+        )
 
     # ================= 表情包功能 (Image Search) =================
 
@@ -1041,8 +1241,12 @@ class VectorDBOperator:
             return
 
         if len(vectors) != len(texts):
-            logger.error(f"向量数量({len(vectors)})与文本数量({len(texts)})不匹配，跳过本批次")
-            return
+            message = (
+                f"向量数量({len(vectors)})与文本数量({len(texts)})不匹配，"
+                "保留消息等待重试"
+            )
+            logger.error(message)
+            raise EmbeddingProviderUnavailableError(message)
 
         # 2. 构造 Qdrant Points
         points = []
@@ -1055,7 +1259,7 @@ class VectorDBOperator:
                 payload={
                     "session_id": session_id,
                     "text": text,
-                    "created_at": current_time
+                    "created_at": _chat_context_created_at(text, current_time),
                 }
             ))
 

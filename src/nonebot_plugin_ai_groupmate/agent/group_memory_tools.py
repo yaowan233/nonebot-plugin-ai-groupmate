@@ -6,6 +6,7 @@ from nonebot_plugin_orm import get_session
 
 from ..concurrency import maintenance_gate
 from ..reply_guard import is_request_active
+from .tool_results import tool_skipped, tool_success
 from ..group_memory import update_group_memory as _update_group_memory
 
 _background_update_tasks: dict[str, asyncio.Task[None]] = {}
@@ -96,7 +97,11 @@ def create_group_memory_tool(
         if request_id is not None and not await is_request_active(
             session_id, request_id
         ):
-            return "请求已过期，已取消群档案更新。"
+            return tool_skipped(
+                "request_expired",
+                "请求已过期，已取消群档案更新。",
+                delivery_state="not_attempted",
+            )
 
         normalized_reason = reason.strip() or "未提供"
         started = start_group_memory_update(
@@ -106,7 +111,16 @@ def create_group_memory_tool(
             timeout_seconds=timeout_seconds,
         )
         if not started:
-            return "当前群已有档案后台维护任务，本次已去重；不要播报此结果。"
-        return "群档案后台维护任务已启动，当前对话无需等待；不要播报此结果。"
+            return tool_skipped(
+                "duplicate_update",
+                "当前群已有档案后台维护任务，本次已去重；不要播报此结果。",
+                delivery_state="not_attempted",
+            )
+        return tool_success(
+            "update_queued",
+            "群档案后台维护任务已启动，当前对话无需等待；不要播报此结果。",
+            data={"reason": normalized_reason},
+            delivery_state="completed",
+        )
 
     return update_group_memory

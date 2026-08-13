@@ -8,6 +8,8 @@ from nonebot.adapters import Bot, Event
 from nonebot_plugin_uninfo import QryItrface
 from nonebot_plugin_alconna import Target
 
+from .tool_results import tool_failure, tool_success
+
 
 @dataclass(frozen=True)
 class AgentToolContext:
@@ -157,14 +159,28 @@ def create_agent_skill_loader_tool(
         """
         skill = skill_map.get(skill_name.strip())
         if skill is None:
-            available = ", ".join(skill_map)
-            return f"未找到技能: {skill_name}。可用技能: {available}"
+            return tool_failure(
+                "skill_not_found",
+                f"未找到技能 {skill_name!r}。",
+                retryable=True,
+                data={"available_skills": list(skill_map)},
+            )
 
         prompt = skill.prompt
         if callable(prompt):
             prompt = prompt(context)
         if inspect.isawaitable(prompt):
             prompt = await prompt
-        return str(prompt).strip()
+        normalized_prompt = str(prompt).strip()
+        if not normalized_prompt:
+            return tool_failure(
+                "empty_skill_prompt",
+                f"技能 {skill_name!r} 没有可用说明。",
+            )
+        return tool_success(
+            "skill_loaded",
+            f"已加载技能 {skill_name!r}。",
+            data={"skill_name": skill.name.strip(), "instructions": normalized_prompt},
+        )
 
     return load_agent_skill

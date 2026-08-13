@@ -118,9 +118,10 @@ class MemeSendArgs(BaseModel):
 
 
 class MuteArgs(BaseModel):
-    target_user_name: str = Field(description="聊天记录中的目标用户昵称")
     duration_seconds: int = Field(description="禁言时长，单位秒")
     reason: str = Field(description="禁言原因")
+    target_user_id: str | None = Field(default=None, description="目标用户 ID，已知时优先使用")
+    target_user_name: str | None = Field(default=None, description="目标用户昵称，不知道 ID 时使用")
 
 
 @dataclass(frozen=True)
@@ -153,7 +154,8 @@ SKILL_PROMPTS = {
         "检索过去聊天事实，这类问题必须使用 search_context_tools。"
     ),
     "moderation_tools": (
-        "仅在具备管理员权限时使用 mute_user。用户请求禁言自己可以执行；时长按秒准确换算。"
+        "仅在 bot 具备管理员权限时使用 mute_user；请求者无需是管理员。已知目标用户 ID 时"
+        "优先传 target_user_id，同名且无法确认时先询问；用户请求禁言自己可以执行；时长按秒准确换算。"
     ),
 }
 
@@ -181,10 +183,115 @@ TOOL_SPECS = {
 }
 
 
-def _json_text(value: Any) -> str:
+def _fixture_tool_result(
+    name: str,
+    value: Any,
+    *,
+    side_effect: bool,
+) -> str:
     if isinstance(value, str):
-        return value
-    return json.dumps(value, ensure_ascii=False, default=str)
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, dict) and parsed.get("schema_version") == 1:
+            return value
+    return json.dumps(
+        {
+            "schema_version": 1,
+            "ok": True,
+            "status": "succeeded",
+            "reason_code": "fixture_completed",
+            "message": f"模拟工具 {name} 执行成功。",
+            "retryable": False,
+            **({"delivery_state": "completed"} if side_effect else {}),
+            "data": {"result": value},
+        },
+        ensure_ascii=False,
+        default=str,
+    )
+
+
+def _fixture_tool_failure(
+    reason_code: str,
+    message: str,
+    *,
+    retryable: bool = False,
+    delivery_state: str | None = None,
+) -> str:
+    return json.dumps(
+        {
+            "schema_version": 1,
+            "ok": False,
+            "status": "failed",
+            "reason_code": reason_code,
+            "message": message,
+            "retryable": retryable,
+            **(
+                {"delivery_state": delivery_state}
+                if delivery_state is not None
+                else {}
+            ),
+        },
+        ensure_ascii=False,
+    )
+
+
+def _fixture_tool_skipped(
+    reason_code: str,
+    message: str,
+    *,
+    delivery_state: str | None = None,
+) -> str:
+    return json.dumps(
+        {
+            "schema_version": 1,
+            "ok": False,
+            "status": "skipped",
+            "reason_code": reason_code,
+            "message": message,
+            "retryable": False,
+            **(
+                {"delivery_state": delivery_state}
+                if delivery_state is not None
+                else {}
+            ),
+        },
+        ensure_ascii=False,
+    )
+
+
+def _parse_fixture_tool_result(content: str) -> dict[str, Any] | None:
+    """Mirror production protocol parsing without importing the NoneBot plugin."""
+    if content.strip().lower() == "sent":
+        return {"status": "succeeded", "ok": True}
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    status = parsed.get("status")
+    if status == "sent":
+        return {**parsed, "status": "succeeded", "ok": True}
+    legacy_success = parsed.get("success")
+    if isinstance(legacy_success, bool):
+        return {
+            **parsed,
+            "status": "succeeded" if legacy_success else "failed",
+            "ok": legacy_success,
+        }
+    if status not in {"succeeded", "skipped", "failed"}:
+        return None
+    return parsed
+
+
+def _fixture_tool_result_status(content: str) -> str | None:
+    parsed = _parse_fixture_tool_result(content)
+    if parsed is None:
+        return None
+    status = parsed.get("status")
+    return status if status in {"succeeded", "skipped", "failed"} else None
 
 
 def _message_text(message: AIMessage) -> str:
@@ -351,7 +458,11 @@ class FixtureToolRuntime:
                 return "工具超时"
 
             if fixture_key in self.fixtures:
-                result = _json_text(self.fixtures[fixture_key])
+                result = _fixture_tool_result(
+                    name,
+                    self.fixtures[fixture_key],
+                    side_effect=name in SIDE_EFFECT_TOOL_NAMES,
+                )
                 trace["status"] = "ok"
                 trace["result"] = result
                 return result
@@ -372,15 +483,30 @@ class FixtureToolRuntime:
     def _default_result(name: str, args: dict[str, Any]) -> str:
         if name == "load_agent_skill":
             skill_name = str(args.get("skill_name", ""))
-            return SKILL_PROMPTS.get(skill_name, f"未知技能：{skill_name}")
+            prompt = SKILL_PROMPTS.get(skill_name)
+            if prompt is None:
+                return _fixture_tool_failure(
+                    "skill_not_found",
+                    f"未知技能：{skill_name}",
+                    retryable=True,
+                )
+            return _fixture_tool_result(
+                name,
+                {"skill_name": skill_name, "instructions": prompt},
+                side_effect=False,
+            )
         if name == "finish":
             return ""
         if name in SIDE_EFFECT_TOOL_NAMES:
-            return json.dumps(
-                {"status": "sent", "message": f"模拟执行 {name} 成功"},
-                ensure_ascii=False,
+            return _fixture_tool_result(
+                name,
+                {"args": args},
+                side_effect=True,
             )
-        return f"评测 fixture 未配置：{name}，参数={args!r}"
+        return _fixture_tool_failure(
+            "fixture_missing",
+            f"评测 fixture 未配置：{name}，参数={args!r}",
+        )
 
 
 def load_dataset(path: Path = DATASET_PATH) -> dict[str, Any]:

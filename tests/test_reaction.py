@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -190,9 +191,11 @@ async def test_reaction_tool_applies_to_the_current_numeric_message(monkeypatch)
         cast(Event, event),
     )
 
-    result = await tool.ainvoke({"mood": "like"})
+    result = json.loads(await tool.ainvoke({"mood": "like"}))
 
-    assert "已对当前触发消息" in result
+    assert result["status"] == "succeeded"
+    assert result["delivery_state"] == "completed"
+    assert "已对当前触发消息" in result["message"]
     assert calls[0]["message_id"] is None
     assert calls[0]["event"] is event
     assert len(added) == 1

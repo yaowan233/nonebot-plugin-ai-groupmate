@@ -15,6 +15,7 @@ from nonebot_plugin_alconna import UniMessage
 
 from ..model import ChatHistory, UserRelation
 from ..reply_guard import is_request_active
+from .tool_results import tool_failure, tool_skipped, tool_success
 
 
 def create_report_tool(
@@ -40,12 +41,15 @@ def create_report_tool(
         包含：个人在本群的统计、性格分析、全群排行榜以及Bot的好感度回顾。
         """
         if not user_id:
-            return "当前没有可用于生成报告的用户信息。"
+            return tool_failure(
+                "missing_user",
+                "当前没有可用于生成报告的用户信息。",
+            )
 
         if request_id is not None and not await is_request_active(
             session_id, request_id
         ):
-            return "请求已过期，已取消发送。"
+            return tool_skipped("request_expired", "请求已过期，已取消生成报告素材。")
 
         try:
             logger.info(f"开始生成用户 {user_name} 在群 {session_id} 的年度报告...")
@@ -60,7 +64,10 @@ def create_report_tool(
             all_msgs = (await db_session.execute(stmt)).scalars().all()
 
             if not all_msgs:
-                return "用户本群今年暂无可用于年度报告的数据。请调用 reply_user 简短告知用户生成不了报告。"
+                return tool_failure(
+                    "no_report_data",
+                    "用户本群今年暂无可用于年度报告的数据，请简短告知用户。",
+                )
 
             text_msgs = [
                 m.content for m in all_msgs if m.content_type == "text" and m.content
@@ -150,7 +157,7 @@ def create_report_tool(
 
             relation_desc = f"好感度: {favorability} (满分100), 印象标签: {', '.join(impression_tags)}"
             samples_text = "\n".join(samples)
-            return f"""【年度报告素材】
+            report_content = f"""【年度报告素材】
 请根据以下素材生成完整年度报告，并调用 `reply_user(next_step="end")` 发送给用户；不要再调用年度报告工具。
 
 【写作要求】
@@ -180,11 +187,26 @@ def create_report_tool(
 【用户发言样本】
 {samples_text}
 """
+            return tool_success(
+                "report_material_ready",
+                "年度报告素材已准备完成。",
+                data={
+                    "year": current_year,
+                    "user_id": str(user_id),
+                    "content": report_content,
+                },
+            )
 
-        except Exception as e:
-            logger.error(f"收集年度报告素材失败: {e}")
-            print(traceback.format_exc())
-            return f"收集年度报告素材出错: {e}"
+        except Exception as error:
+            logger.error(
+                "收集年度报告素材失败: "
+                f"error_type={type(error).__name__}\n{traceback.format_exc()}"
+            )
+            return tool_failure(
+                "report_generation_failed",
+                "收集年度报告素材失败。",
+                retryable=True,
+            )
 
     return generate_and_send_annual_report
 
@@ -216,12 +238,20 @@ def create_relation_tool(
         当用户的言行让你产生情绪波动，或者你发现旧的印象不再准确时调用。
         """
         if not user_id:
-            return "当前没有可更新画像的用户信息。"
+            return tool_failure(
+                "missing_user",
+                "当前没有可更新画像的用户信息。",
+                delivery_state="not_attempted",
+            )
 
         if request_id is not None and not await is_request_active(
             session_id, request_id
         ):
-            return "请求已过期，已取消更新。"
+            return tool_skipped(
+                "request_expired",
+                "请求已过期，已取消更新。",
+                delivery_state="not_attempted",
+            )
 
         def normalize_tags(value: list[str] | str | None) -> list[str]:
             if value is None:
@@ -298,7 +328,11 @@ def create_relation_tool(
                     session_id, request_id
                 ):
                     await session.rollback()
-                    return "请求已过期，已取消更新。"
+                    return tool_skipped(
+                        "request_expired",
+                        "请求已过期，已取消更新。",
+                        delivery_state="not_attempted",
+                    )
 
                 await session.commit()
 
@@ -352,14 +386,28 @@ def create_relation_tool(
                 )
                 logger.info(f"用户[{user_name}]画像更新: {log_msg}")
 
-                return (
-                    f"画像已更新。当前好感度: {favorability}，当前标签: {current_tags}"
+                return tool_success(
+                    "impression_updated",
+                    "用户画像已更新。",
+                    data={
+                        "old_score": old_score,
+                        "score_change": final_change,
+                        "favorability": favorability,
+                        "tags": current_tags,
+                    },
+                    delivery_state="completed",
                 )
 
-            except Exception as e:
-                logger.error(f"关系更新失败: {e}")
-                print(traceback.format_exc())
-                return f"数据库错误: {str(e)}"
-        return None
+            except Exception as error:
+                logger.error(
+                    "关系更新失败: "
+                    f"error_type={type(error).__name__}\n{traceback.format_exc()}"
+                )
+                return tool_failure(
+                    "impression_update_failed",
+                    "用户画像更新失败。",
+                    retryable=True,
+                    delivery_state="not_attempted",
+                )
 
     return update_user_impression

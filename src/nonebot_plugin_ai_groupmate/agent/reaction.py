@@ -9,6 +9,7 @@ from nonebot_plugin_alconna import message_reaction
 
 from ..model import ChatHistory
 from ..reply_guard import is_request_active
+from .tool_results import tool_failure, tool_skipped, tool_success
 
 ReactionMood = Literal[
     "like",
@@ -157,7 +158,11 @@ def create_reaction_tool(
         if request_id is not None and not await is_request_active(
             session_id, request_id
         ):
-            return "请求已过期，已取消表情回复。"
+            return tool_skipped(
+                "request_expired",
+                "请求已过期，已取消表情回复。",
+                delivery_state="not_attempted",
+            )
 
         mood_key = str(mood).strip()
         mood_emojis = REACTION_EMOJI_MAP.get(mood_key)
@@ -173,34 +178,59 @@ def create_reaction_tool(
         reaction_emojis = [item for item in reaction_emojis if item]
 
         if not reaction_emojis:
-            supported = ", ".join(REACTION_EMOJI_MAP)
-            return f"表情回复失败: 未知 mood {mood_key!r}，可选值: {supported}"
+            return tool_failure(
+                "invalid_mood",
+                f"未知 mood {mood_key!r}。",
+                retryable=True,
+                data={"supported_moods": list(REACTION_EMOJI_MAP)},
+                delivery_state="not_attempted",
+            )
 
         if bot is None or event is None:
-            return "表情回复失败: 缺少 bot/event 上下文，无法调用 alconna message_reaction。"
+            return tool_failure(
+                "missing_context",
+                "缺少 bot/event 上下文，无法添加表情回复。",
+                delivery_state="not_attempted",
+            )
         if not is_onebot_context(bot, event):
-            return "表情回复失败: 当前适配器不是 OneBot，不支持消息表情回复。"
+            return tool_failure(
+                "adapter_unsupported",
+                "当前适配器不是 OneBot，不支持消息表情回复。",
+                delivery_state="not_attempted",
+            )
 
         message_id = _normalize_reaction_message_id(target_msg_id)
         if message_id and not _is_supported_onebot_reaction_message_id(message_id):
             logger.info(
                 f"跳过表情回复：当前 OneBot reaction 接口不支持非数字消息 ID {message_id!r}"
             )
-            return "表情回复跳过: 目标消息 ID 不是数字，底层 OneBot reaction 接口不支持。"
+            return tool_skipped(
+                "unsupported_message_id",
+                "目标消息 ID 不是数字，底层 OneBot reaction 接口不支持。",
+                delivery_state="not_attempted",
+            )
         if not message_id:
             event_message_id = _get_event_message_id()
             if not _is_supported_onebot_reaction_message_id(event_message_id):
                 logger.info(
                     f"跳过表情回复：当前 OneBot reaction 接口不支持非数字消息 ID {event_message_id!r}"
                 )
-                return "表情回复跳过: 当前平台的消息 ID 不是数字，底层 OneBot reaction 接口不支持。"
+                return tool_skipped(
+                    "unsupported_message_id",
+                    "当前平台的消息 ID 不是数字，底层 OneBot reaction 接口不支持。",
+                    delivery_state="not_attempted",
+                )
         if not message_id:
             logger.debug("未指定表情回复目标消息，使用当前触发事件的消息 id")
 
         if request_id is not None and not await is_request_active(
             session_id, request_id
         ):
-            return "请求已过期，已取消表情回复。"
+            return tool_skipped(
+                "request_expired",
+                "请求已过期，已取消表情回复。",
+                delivery_state="not_attempted",
+            )
 
         async def _apply_reaction(
             reaction_emoji: str, target_message_id: str | None
@@ -240,9 +270,26 @@ def create_reaction_tool(
             logger.info(
                 f"已对{reacted_message_desc} {action}表情回复 mood={mood_key}, emoji={reaction_emoji_text}"
             )
-            return f"已对{reacted_message_desc} {action}表情回复 mood={mood_key}, emoji={reaction_emoji_text}"
-        except Exception as e:
-            logger.error(f"表情回复工具执行失败: {e}")
-            return f"表情回复失败: {e}"
+            return tool_success(
+                "reaction_updated",
+                f"已对{reacted_message_desc}{action}表情回复。",
+                data={
+                    "target_message_id": message_id,
+                    "mood": mood_key,
+                    "emojis": reaction_emojis,
+                    "deleted": delete,
+                },
+                delivery_state="completed",
+            )
+        except Exception as error:
+            logger.warning(
+                "表情回复工具执行失败: "
+                f"error_type={type(error).__name__}"
+            )
+            return tool_failure(
+                "reaction_failed",
+                "表情回复接口调用失败；操作结果可能未知，请勿立即重试。",
+                delivery_state="unknown",
+            )
 
     return add_message_reaction

@@ -1,3 +1,4 @@
+import json
 import asyncio
 from uuid import uuid4
 
@@ -52,10 +53,14 @@ async def test_group_memory_tool_queues_agent_requested_update(monkeypatch):
         timeout_seconds=45,
     )
 
-    result = await memory_tool.ainvoke({"reason": "形成了新的群内梗"})
+    result = json.loads(
+        await memory_tool.ainvoke({"reason": "形成了新的群内梗"})
+    )
 
     assert calls == [("group-1", "小助手", "形成了新的群内梗", 45)]
-    assert "无需等待" in result
+    assert result["status"] == "succeeded"
+    assert result["delivery_state"] == "completed"
+    assert "无需等待" in result["message"]
 
 
 @pytest.mark.asyncio

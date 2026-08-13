@@ -321,7 +321,7 @@ async def test_explicit_dragon_image_request_expands_jargon_for_search_and_revie
         "match_type": "content",
     }))
 
-    assert result["success"] is True
+    assert result["status"] == "succeeded"
     assert search_queries == review_queries
     assert "黑白熊猫头" in search_queries[0]
     assert "不是动物龙" in search_queries[0]
@@ -407,10 +407,10 @@ async def test_explicit_meme_request_preserves_original_text_in_multimodal_fallb
         "match_type": "content",
     }))
 
-    assert result["success"] is True
-    assert result["match_type"] == "content"
-    assert result["images"][0]["pic_id"] == 1
-    assert "回退" in result["note"]
+    assert result["status"] == "succeeded"
+    assert result["data"]["match_type"] == "content"
+    assert result["data"]["images"][0]["pic_id"] == 1
+    assert "回退" in result["data"]["note"]
     assert approved == {1}
     assert search_calls == [
         (
@@ -499,8 +499,8 @@ async def test_search_meme_deduplicates_same_picture_before_model_selection(
         "match_type": "content",
     }))
 
-    assert [image["pic_id"] for image in result["images"]] == [1, 3]
-    assert result["count"] == 2
+    assert [image["pic_id"] for image in result["data"]["images"]] == [1, 3]
+    assert result["data"]["count"] == 2
     assert approved == {1, 3}
 
 
@@ -635,12 +635,12 @@ async def test_send_meme_honors_multi_send_limit_and_uses_distinct_ids(
     second = json.loads(await send_tool.ainvoke({"pic_id": "2"}))
     blocked = json.loads(await send_tool.ainvoke({"pic_id": "3"}))
 
-    assert first["status"] == "sent"
+    assert first["status"] == "succeeded"
     assert repeated["status"] == "skipped"
     assert "已经发送过" in repeated["message"]
-    assert second["status"] == "sent"
+    assert second["status"] == "succeeded"
     assert blocked["status"] == "skipped"
-    assert blocked["max_sends"] == 2
+    assert blocked["data"]["max_sends"] == 2
     assert sends == [b"image-1", b"image-2"]
     assert approved == {3}
     assert len(session.added) == 2
@@ -771,7 +771,7 @@ async def test_send_meme_rejects_same_picture_with_different_file_encoding(
     first = json.loads(await send_tool.ainvoke({"pic_id": "1"}))
     duplicate = json.loads(await send_tool.ainvoke({"pic_id": "2"}))
 
-    assert first["status"] == "sent"
+    assert first["status"] == "succeeded"
     assert duplicate["status"] == "skipped"
     assert "画面重复" in duplicate["message"]
     assert len(sent_images) == 1

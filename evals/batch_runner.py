@@ -28,6 +28,10 @@ from .runner import (
     score_execution,
     _build_system_prompt,
     parse_judge_response,
+    _fixture_tool_failure,
+    _fixture_tool_skipped,
+    _parse_fixture_tool_result,
+    _fixture_tool_result_status,
     build_judge_request_messages,
 )
 
@@ -419,12 +423,7 @@ def _side_effect_key(name: str, args: dict[str, Any]) -> str:
 
 
 def _tool_result_status(content: str) -> str | None:
-    try:
-        value = json.loads(content)
-    except (TypeError, json.JSONDecodeError):
-        return None
-    status = value.get("status") if isinstance(value, dict) else None
-    return status if status in {"sent", "skipped", "failed"} else None
+    return _fixture_tool_result_status(content)
 
 
 async def _invoke_fixture_tool(
@@ -436,11 +435,14 @@ async def _invoke_fixture_tool(
 ) -> tuple[str, bool]:
     spec = TOOL_SPECS.get(name)
     if spec is None:
-        return f"未知工具: {name}", False
+        return _fixture_tool_failure("unknown_tool", f"未知工具：{name}。"), False
     try:
         validated = spec.args_schema.model_validate(args).model_dump(exclude_none=True)
     except ValidationError as error:
-        return f"工具参数错误: {error}", False
+        return _fixture_tool_failure(
+            "invalid_arguments",
+            f"工具参数错误：{error}",
+        ), False
     try:
         result = await asyncio.wait_for(
             runtime._invoke(name, validated),
@@ -448,7 +450,11 @@ async def _invoke_fixture_tool(
         )
         return result, False
     except asyncio.TimeoutError:
-        return "工具执行超时，请根据已有信息决定是否重试或换一种方式。", True
+        return _fixture_tool_failure(
+            "tool_timeout",
+            "工具执行超时，请根据已有信息决定是否重试或换一种方式。",
+            retryable=True,
+        ), True
 
 
 async def _apply_agent_body(
@@ -533,7 +539,10 @@ async def _apply_agent_body(
                 {
                     "role": "tool",
                     "tool_call_id": tool_call_id,
-                    "content": "工具调用已达本轮上限，未执行此调用。",
+                    "content": _fixture_tool_skipped(
+                        "tool_limit_reached",
+                        "工具调用已达本轮上限，未执行此调用。",
+                    ),
                 }
             )
             continue
@@ -554,7 +563,10 @@ async def _apply_agent_body(
             )
         }
         if name not in visible_names:
-            result = f"工具 {name} 当前未启用；请先调用 load_agent_skill 读取对应技能。"
+            result = _fixture_tool_skipped(
+                "tool_not_enabled",
+                f"工具 {name} 当前未启用；请先调用 load_agent_skill 读取对应技能。",
+            )
             session["messages"].append(
                 {"role": "tool", "tool_call_id": tool_call_id, "content": result}
             )
@@ -566,7 +578,11 @@ async def _apply_agent_body(
                     {
                         "role": "tool",
                         "tool_call_id": tool_call_id,
-                        "content": "本轮已经发送过消息了。如果想发送更多，请等待下一轮。",
+                        "content": _fixture_tool_skipped(
+                            "reply_limit_reached",
+                            "本轮已经发送过消息了。如果想发送更多，请等待下一轮。",
+                            delivery_state="not_attempted",
+                        ),
                     }
                 )
                 continue
@@ -585,7 +601,11 @@ async def _apply_agent_body(
                     {
                         "role": "tool",
                         "tool_call_id": tool_call_id,
-                        "content": "相同的副作用请求已经执行过，已跳过重复执行。",
+                        "content": _fixture_tool_skipped(
+                            "duplicate_side_effect",
+                            "相同的副作用请求已经执行过，已跳过重复执行。",
+                            delivery_state="not_attempted",
+                        ),
                     }
                 )
                 continue
@@ -600,21 +620,37 @@ async def _apply_agent_body(
             session["tool_timeout_count"] += 1
             session["tool_timeout_names"].append(name)
             if effect_key is not None:
+                result = _fixture_tool_failure(
+                    "tool_timeout",
+                    "副作用工具执行超时，投递结果未知；为避免重复操作，"
+                    "本轮必须停止且不得重试。",
+                    delivery_state="unknown",
+                )
                 session["completed_side_effect_keys"].append(effect_key)
                 called_finish = True
                 if name == "reply_user":
                     reply_requires_continuation = False
         status = _tool_result_status(result)
-        if effect_key is not None and not timed_out and status not in {"failed", "skipped"}:
+        parsed_result = _parse_fixture_tool_result(result)
+        delivery_unknown = (
+            effect_key is not None
+            and isinstance(parsed_result, dict)
+            and parsed_result.get("delivery_state") == "unknown"
+        )
+        if effect_key is not None and not timed_out and (
+            status == "succeeded" or delivery_unknown
+        ):
             session["completed_side_effect_keys"].append(effect_key)
+        if delivery_unknown:
+            called_finish = True
         if name == "reply_user":
-            if timed_out and effect_key is not None:
+            if delivery_unknown:
                 reply_requires_continuation = False
             elif timed_out or status == "failed":
                 reply_requires_continuation = True
             else:
                 reply_requires_continuation = args.get("next_step") == "continue"
-        if name == "load_agent_skill":
+        if name == "load_agent_skill" and status != "failed":
             skill_name = str(args.get("skill_name", "")).strip()
             if skill_name in tools_by_skill and skill_name not in session["active_skills"]:
                 session["active_skills"].append(skill_name)
@@ -622,14 +658,10 @@ async def _apply_agent_body(
             {
                 "role": "tool",
                 "tool_call_id": tool_call_id,
-                "content": (
-                    "副作用工具执行超时，投递结果未知；为避免重复操作，本轮必须停止且不得重试。"
-                    if timed_out and effect_key is not None
-                    else result
-                ),
+                "content": result,
             }
         )
-        if timed_out and effect_key is not None:
+        if delivery_unknown:
             break
 
     should_end = (

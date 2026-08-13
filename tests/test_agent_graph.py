@@ -529,6 +529,87 @@ async def test_timed_out_side_effect_ends_run_without_retry():
 
 
 @pytest.mark.asyncio
+async def test_unknown_delivery_side_effect_ends_run_without_retry():
+    from nonebot_plugin_ai_groupmate.agent.graph import build_chat_graph
+
+    calls: list[str] = []
+
+    @tool("send_meme_image")
+    async def send_meme_image(pic_id: str) -> str:
+        """Report that dispatch started but its outcome is unknown."""
+        calls.append(pic_id)
+        return json.dumps({
+            "schema_version": 1,
+            "ok": False,
+            "status": "failed",
+            "reason_code": "delivery_failed",
+            "message": "发送结果未知。",
+            "retryable": False,
+            "delivery_state": "unknown",
+        })
+
+    @tool("finish")
+    def finish() -> str:
+        """End this test graph."""
+        return ""
+
+    repeated_call = {"name": "send_meme_image", "args": {"pic_id": "42"}}
+    model = _ToolSpyModel(
+        [
+            AIMessage(content="", tool_calls=[{**repeated_call, "id": "send-1"}]),
+            AIMessage(content="", tool_calls=[{**repeated_call, "id": "send-2"}]),
+            AIMessage(content="", tool_calls=[{"name": "finish", "args": {}, "id": "finish-1"}]),
+        ]
+    )
+    graph = build_chat_graph(model, [send_meme_image, finish], "system")
+
+    result = await graph.ainvoke(_state(AIMessage(content="placeholder")))
+
+    assert calls == ["42"]
+    assert model.invoke_count == 1
+    assert result["called_finish"] == 1
+    assert len(result["completed_side_effect_keys"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_raised_side_effect_error_ends_run_without_retry():
+    from nonebot_plugin_ai_groupmate.agent.graph import build_chat_graph
+
+    calls: list[str] = []
+
+    @tool("send_meme_image")
+    async def send_meme_image(pic_id: str) -> str:
+        """Raise after dispatch may have started."""
+        calls.append(pic_id)
+        raise RuntimeError("provider disconnected")
+
+    @tool("finish")
+    def finish() -> str:
+        """End this test graph."""
+        return ""
+
+    repeated_call = {"name": "send_meme_image", "args": {"pic_id": "42"}}
+    model = _ToolSpyModel(
+        [
+            AIMessage(content="", tool_calls=[{**repeated_call, "id": "send-1"}]),
+            AIMessage(content="", tool_calls=[{**repeated_call, "id": "send-2"}]),
+            AIMessage(content="", tool_calls=[{"name": "finish", "args": {}, "id": "finish-1"}]),
+        ]
+    )
+    graph = build_chat_graph(model, [send_meme_image, finish], "system")
+
+    result = await graph.ainvoke(_state(AIMessage(content="placeholder")))
+
+    assert calls == ["42"]
+    assert model.invoke_count == 1
+    assert result["called_finish"] == 1
+    assert len(result["completed_side_effect_keys"]) == 1
+    tool_result = json.loads(result["messages"][-1].content)
+    assert tool_result["retryable"] is False
+    assert tool_result["delivery_state"] == "unknown"
+
+
+@pytest.mark.asyncio
 async def test_failed_side_effect_can_be_retried():
     from nonebot_plugin_ai_groupmate.agent.graph import build_chat_graph
 

@@ -17,6 +17,12 @@ from langchain_core.runnables import RunnableConfig
 
 from ..reply_guard import is_request_active
 from .prompt_cache import normalize_system_messages
+from .tool_results import (
+    tool_failure,
+    tool_skipped,
+    parse_tool_result,
+    tool_result_status,
+)
 
 MAX_REPLY_COUNT = 5
 MAX_TOOL_COUNT = 20
@@ -28,7 +34,6 @@ EMPTY_RESPONSE_RETRY_PROMPT = (
 )
 SIDE_EFFECT_TOOL_NAMES = frozenset({
     "add_message_reaction",
-    "generate_and_send_annual_report",
     "mute_user",
     "recall_message",
     "reply_user",
@@ -272,12 +277,7 @@ async def _build_extra_content_message(
 
 
 def _tool_result_status(content: str) -> str | None:
-    try:
-        parsed = json.loads(content)
-    except (TypeError, json.JSONDecodeError):
-        return None
-    status = parsed.get("status") if isinstance(parsed, dict) else None
-    return status if status in {"sent", "skipped", "failed"} else None
+    return tool_result_status(content)
 
 
 def _truncate_tool_content(content: str, max_chars: int) -> tuple[str, bool]:
@@ -665,7 +665,10 @@ def _make_tool_node(
 
             if tool_count >= MAX_TOOL_COUNT:
                 results.append(ToolMessage(
-                    content="工具调用已达本轮上限，未执行此调用。",
+                    content=tool_skipped(
+                        "tool_limit_reached",
+                        "工具调用已达本轮上限，未执行此调用。",
+                    ),
                     tool_call_id=tool_call_id,
                 ))
                 continue
@@ -701,15 +704,23 @@ def _make_tool_node(
                 break
 
             if request_id and not await is_request_active(session_id, request_id):
-                results.append(ToolMessage(content="请求已过期，已取消执行", tool_call_id=tool_call_id))
+                results.append(ToolMessage(
+                    content=tool_skipped(
+                        "request_expired",
+                        "请求已过期，已取消执行。",
+                    ),
+                    tool_call_id=tool_call_id,
+                ))
                 continue
 
             if name == "reply_user":
                 if has_pending_tool_work:
                     results.append(ToolMessage(
-                        content=(
+                        content=tool_skipped(
+                            "pending_tool_work",
                             "本轮还有工具工作未完成，未发送这条提前确认。"
-                            "请先完成操作并检查结果，再在下一轮回复用户。"
+                            "请先完成操作并检查结果，再在下一轮回复用户。",
+                            delivery_state="not_attempted",
                         ),
                         tool_call_id=tool_call_id,
                     ))
@@ -719,7 +730,11 @@ def _make_tool_node(
                     continue
                 if reply_this_round >= MAX_REPLY_PER_ROUND:
                     results.append(ToolMessage(
-                        content="本轮已经发送过消息了。如果你想发送更多，请等待下一轮。",
+                        content=tool_skipped(
+                            "reply_limit_reached",
+                            "本轮已经发送过消息了。如果你想发送更多，请等待下一轮。",
+                            delivery_state="not_attempted",
+                        ),
                         tool_call_id=tool_call_id,
                     ))
                     continue
@@ -732,7 +747,11 @@ def _make_tool_node(
             if name == "add_message_reaction":
                 if reaction_this_round >= MAX_REACTION_PER_ROUND:
                     results.append(ToolMessage(
-                        content="本轮表情回复已经够多了，避免刷屏。",
+                        content=tool_skipped(
+                            "reaction_limit_reached",
+                            "本轮表情回复已经够多了，避免刷屏。",
+                            delivery_state="not_attempted",
+                        ),
                         tool_call_id=tool_call_id,
                     ))
                     continue
@@ -744,14 +763,24 @@ def _make_tool_node(
             }
             if name not in visible_tool_names:
                 results.append(ToolMessage(
-                    content=f"工具 {name} 当前未启用；请先调用 load_agent_skill 读取对应技能。",
+                    content=tool_failure(
+                        "tool_not_enabled",
+                        f"工具 {name} 当前未启用；请先调用 load_agent_skill 读取对应技能。",
+                        retryable=True,
+                    ),
                     tool_call_id=tool_call_id,
                 ))
                 continue
 
             tool = tools_by_name.get(name)
             if tool is None:
-                results.append(ToolMessage(content=f"未知工具: {name}", tool_call_id=tool_call_id))
+                results.append(ToolMessage(
+                    content=tool_failure(
+                        "unknown_tool",
+                        f"未知工具：{name}。",
+                    ),
+                    tool_call_id=tool_call_id,
+                ))
                 continue
 
             effect_key: str | None = None
@@ -760,7 +789,11 @@ def _make_tool_node(
                 if effect_key in completed_side_effect_keys:
                     side_effect_duplicate_count += 1
                     results.append(ToolMessage(
-                        content="相同的副作用请求已经执行过，已跳过重复执行。",
+                        content=tool_skipped(
+                            "duplicate_side_effect",
+                            "相同的副作用请求已经执行过，已跳过重复执行。",
+                            delivery_state="not_attempted",
+                        ),
                         tool_call_id=tool_call_id,
                     ))
                     if name == "reply_user":
@@ -802,11 +835,18 @@ def _make_tool_node(
                         f"delivery_unknown={delivery_unknown}"
                     )
                     results.append(ToolMessage(
-                        content=(
-                            "副作用工具执行超时，投递结果未知；为避免重复操作，"
-                            "本轮必须停止且不得重试。"
-                            if delivery_unknown
-                            else "工具执行超时，请根据已有信息决定是否重试或换一种方式。"
+                        content=tool_failure(
+                            "tool_timeout",
+                            (
+                                "副作用工具执行超时，投递结果未知；为避免重复操作，"
+                                "本轮必须停止且不得重试。"
+                                if delivery_unknown
+                                else "工具执行超时，请根据已有信息决定是否重试或换一种方式。"
+                            ),
+                            retryable=not delivery_unknown,
+                            delivery_state=(
+                                "unknown" if delivery_unknown else None
+                            ),
                         ),
                         tool_call_id=tool_call_id,
                     ))
@@ -816,28 +856,33 @@ def _make_tool_node(
                 elapsed_ms = (time.perf_counter() - started_at) * 1000
                 tool_content, extra_content = _normalize_tool_result(result)
                 tool_status = _tool_result_status(tool_content)
+                parsed_tool_result = parse_tool_result(tool_content)
+                delivery_unknown = (
+                    effect_key is not None
+                    and isinstance(parsed_tool_result, dict)
+                    and parsed_tool_result.get("delivery_state") == "unknown"
+                )
                 if name == "search_meme_image" and required_side_effect_tool:
-                    try:
-                        search_result = json.loads(tool_content)
-                    except (TypeError, json.JSONDecodeError):
-                        search_result = None
+                    search_result = parsed_tool_result
                     if (
                         isinstance(search_result, dict)
-                        and search_result.get("success") is False
+                        and search_result.get("status") == "failed"
                         and search_result.get("reason_code") == "no_candidates"
                     ):
                         required_side_effect_unavailable = True
                     elif (
                         isinstance(search_result, dict)
-                        and search_result.get("success") is True
+                        and search_result.get("status") == "succeeded"
                     ):
-                        images = search_result.get("images")
+                        search_data = search_result.get("data")
+                        search_data = search_data if isinstance(search_data, dict) else {}
+                        images = search_data.get("images")
                         available_count = (
                             len(images) if isinstance(images, list) else 0
                         )
                         try:
                             available_count = int(
-                                search_result.get("count", available_count)
+                                search_data.get("count", available_count)
                             )
                         except (TypeError, ValueError):
                             pass
@@ -848,7 +893,8 @@ def _make_tool_node(
                             )
                 if (
                     name == required_side_effect_tool
-                    and tool_status == "sent"
+                    and tool_status == "succeeded"
+                    and not delivery_unknown
                 ):
                     required_side_effect_success_count += 1
                     required_side_effect_completed = (
@@ -858,8 +904,15 @@ def _make_tool_node(
                     if required_side_effect_completed:
                         # 必需动作已经达到目标次数，不再让模型补发解释文字。
                         called_finish += 1
-                if effect_key is not None and tool_status not in {"failed", "skipped"}:
+                if effect_key is not None and (
+                    tool_status == "succeeded" or delivery_unknown
+                ):
                     completed_side_effect_keys.append(effect_key)
+                if delivery_unknown:
+                    # The tool returned normally but could not determine whether the
+                    # platform accepted the side effect. Treat it like a timeout after
+                    # dispatch: consuming the idempotency key is safer than retrying.
+                    called_finish += 1
                 tool_content, truncated = _truncate_tool_content(
                     tool_content,
                     limits.tool_result_max_chars,
@@ -868,14 +921,17 @@ def _make_tool_node(
                     tool_result_truncation_count += 1
                 results.append(ToolMessage(content=tool_content, tool_call_id=tool_call_id))
                 if name == "reply_user":
-                    reply_requires_continuation = (
-                        args.get("next_step") == "continue"
-                        if tool_status in {None, "sent"}
-                        else False
-                    )
-                    if tool_status == "failed":
+                    if delivery_unknown:
+                        reply_requires_continuation = False
+                    elif tool_status == "failed":
                         reply_requires_continuation = True
-                if name == "load_agent_skill":
+                    else:
+                        reply_requires_continuation = (
+                            args.get("next_step") == "continue"
+                            if tool_status in {None, "succeeded"}
+                            else False
+                        )
+                if name == "load_agent_skill" and tool_status != "failed":
                     skill_name = str(args.get("skill_name", "")).strip()
                     if skill_name in tools_by_skill and skill_name not in active_skills:
                         active_skills.append(skill_name)
@@ -892,10 +948,41 @@ def _make_tool_node(
                     f"duration_ms={elapsed_ms:.0f} status={tool_status or 'unknown'} "
                     f"truncated={truncated}"
                 )
+                if delivery_unknown:
+                    logger.warning(
+                        f"[AgentTrace] 副作用投递结果未知，结束本轮 "
+                        f"session={session_id} tool={name}"
+                    )
+                    break
             except Exception as e:
-                logger.error(f"[Agent] 工具执行失败 {name}: {e}")
+                logger.error(
+                    f"[Agent] 工具执行失败 {name}: error_type={type(e).__name__}"
+                )
                 await _rollback_after_tool_failure(db_session)
-                results.append(ToolMessage(content=f"工具执行出错: {e}", tool_call_id=tool_call_id))
+                delivery_unknown = effect_key is not None
+                if effect_key is not None:
+                    # An unexpected exception gives the executor no reliable signal
+                    # about whether a side effect reached the platform.
+                    completed_side_effect_keys.append(effect_key)
+                    called_finish += 1
+                    if name == "reply_user":
+                        reply_requires_continuation = False
+                results.append(ToolMessage(
+                    content=tool_failure(
+                        "tool_execution_failed",
+                        (
+                            "副作用工具执行出错，投递结果未知；为避免重复操作，"
+                            "本轮必须停止且不得重试。"
+                            if delivery_unknown
+                            else "工具执行出错。"
+                        ),
+                        retryable=not delivery_unknown,
+                        delivery_state=("unknown" if delivery_unknown else None),
+                    ),
+                    tool_call_id=tool_call_id,
+                ))
+                if delivery_unknown:
+                    break
 
         return {
             "messages": results,

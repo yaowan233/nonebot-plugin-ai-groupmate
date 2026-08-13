@@ -79,7 +79,9 @@ async def test_runner_executes_skill_fixture_and_scores_trace():
         "calculate_expression",
         "reply_user",
     ]
-    assert result["tool_traces"][1]["result"] == "560"
+    calculation_result = json.loads(result["tool_traces"][1]["result"])
+    assert calculation_result["status"] == "succeeded"
+    assert calculation_result["data"]["result"] == "560"
     assert result["response_text"] == "结果是 560"
 
 

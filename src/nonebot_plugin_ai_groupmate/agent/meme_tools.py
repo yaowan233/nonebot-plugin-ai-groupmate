@@ -20,6 +20,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from ..model import ChatHistory, MediaStorage, ChatHistorySchema
 from ..memory import DB, expand_meme_search_terms
 from ..reply_guard import is_request_active
+from .tool_results import tool_failure, tool_skipped, tool_success
 
 RECENT_MEME_EXCLUSION_COUNT = 10
 MEME_SEARCH_CANDIDATE_LIMIT = 50
@@ -502,7 +503,7 @@ def create_similar_meme_tool(
         if request_id is not None and not await is_request_active(
             session_id, request_id
         ):
-            return "请求已过期，已取消搜索。"
+            return tool_skipped("request_expired", "请求已过期，已取消相似图片搜索。")
 
         logger.info("正在搜索相似图片...")
 
@@ -527,13 +528,19 @@ def create_similar_meme_tool(
             msg = result.scalar_one_or_none()
 
             if not msg:
-                return "本群近期没有发送过图片，无法进行相似搜索。"
+                return tool_failure(
+                    "source_image_not_found",
+                    "本群近期没有发送过可用于相似搜索的图片。",
+                )
 
             stmt = Select(MediaStorage).where(MediaStorage.media_id == msg.media_id)
             media_obj = (await db_session.execute(stmt)).scalar_one_or_none()
 
             if not media_obj or not media_obj.file_path:
-                return "无法找到原图文件，无法进行分析。"
+                return tool_failure(
+                    "source_file_not_found",
+                    "无法找到原图文件，不能进行相似搜索。",
+                )
 
             source_media_id = msg.media_id
             source_file_path = media_obj.file_path
@@ -549,7 +556,10 @@ def create_similar_meme_tool(
 
             if not pic_ids:
                 logger.info(f"未找到相似图片, source_id: {source_media_id}")
-                return "没有搜索到相似图片"
+                return tool_failure(
+                    "no_candidates",
+                    "没有搜索到相似图片。",
+                )
 
             images_info = []
             stmt = Select(MediaStorage).where(MediaStorage.media_id.in_(pic_ids))
@@ -571,21 +581,26 @@ def create_similar_meme_tool(
                     int(item["pic_id"]) for item in images_info
                 )
 
-            return json.dumps(
-                {
-                    "success": True,
+            return tool_success(
+                "meme_candidates_found",
+                "已找到相似表情包候选，请根据 pic_id 调用 send_meme_image 发送。",
+                data={
                     "source_media_id": source_media_id,
                     "images": images_info,
                     "count": len(images_info),
-                    "note": "请根据 pic_id 调用 send_meme_image 发送",
                 },
-                ensure_ascii=False,
-                indent=2,
             )
 
-        except Exception as e:
-            logger.error(f"相似图片搜索失败: {e}")
-            return f"搜索出错: {e}"
+        except Exception as error:
+            logger.error(
+                "相似图片搜索失败: "
+                f"error_type={type(error).__name__}\n{traceback.format_exc()}"
+            )
+            return tool_failure(
+                "meme_search_failed",
+                "相似图片搜索失败。",
+                retryable=True,
+            )
 
     return search_similar_meme_by_pic
 
@@ -627,7 +642,7 @@ def create_search_meme_tool(
         if request_id is not None and not await is_request_active(
             session_id, request_id
         ):
-            return "请求已过期，已取消搜索。"
+            return tool_skipped("request_expired", "请求已过期，已取消表情包搜索。")
 
         try:
             effective_match_type = match_type or default_match_type
@@ -730,7 +745,10 @@ def create_search_meme_tool(
             if request_id is not None and not await is_request_active(
                 session_id, request_id
             ):
-                return "请求已过期，已取消搜索。"
+                return tool_skipped(
+                    "request_expired",
+                    "请求已过期，已取消表情包搜索。",
+                )
 
             if not pic_ids:
                 logger.info(
@@ -741,14 +759,13 @@ def create_search_meme_tool(
                     if effective_match_type == "content"
                     else "没有候选通过当前对话的相关性审核，建议不要发表情包"
                 )
-                return json.dumps(
-                    {
-                        "success": False,
+                return tool_failure(
+                    "no_candidates",
+                    reason,
+                    data={
                         "images": [],
-                        "reason_code": "no_candidates",
                         "reason": reason,
                     },
-                    ensure_ascii=False,
                 )
 
             result = await db_session.execute(
@@ -777,13 +794,12 @@ def create_search_meme_tool(
                     )
 
             if not images_info:
-                return json.dumps(
-                    {
-                        "success": False,
+                return tool_failure(
+                    "no_candidates",
+                    "表情包候选去重后为空。",
+                    data={
                         "images": [],
-                        "reason_code": "no_candidates",
                     },
-                    ensure_ascii=False,
                 )
 
             if approved_meme_ids is not None:
@@ -800,24 +816,25 @@ def create_search_meme_tool(
                 result_note = "用户未指定内容条件，已返回语义候选与本群常用候选"
             else:
                 result_note = "候选已按当前对话或用户指定内容审核，请选择最匹配的一张"
-            return json.dumps(
-                {
-                    "success": True,
+            return tool_success(
+                "meme_candidates_found",
+                result_note,
+                data={
                     "match_type": effective_match_type,
                     "images": images_info,
                     "count": len(images_info),
                     "note": result_note,
                 },
-                ensure_ascii=False,
-                indent=2,
             )
 
-        except Exception as e:
-            logger.error(f"表情包搜索失败: {repr(e)}")
+        except Exception as error:
+            logger.error(f"表情包搜索失败: {type(error).__name__}")
             logger.error(traceback.format_exc())
-            return json.dumps(
-                {"success": False, "images": [], "error": str(e) or "未知错误"},
-                ensure_ascii=False,
+            return tool_failure(
+                "meme_search_failed",
+                "表情包搜索失败。",
+                retryable=True,
+                data={"images": []},
             )
 
     return search_meme_image
@@ -854,42 +871,51 @@ def create_send_meme_tool(
         """
         nonlocal sent_count
         if sent_count >= max_sends:
-            return json.dumps({
-                "status": "skipped",
-                "message": f"本轮最多发送 {max_sends} 张表情包，已达到上限。",
-                "sent_count": sent_count,
-                "max_sends": max_sends,
-            }, ensure_ascii=False)
+            return tool_skipped(
+                "send_limit_reached",
+                f"本轮最多发送 {max_sends} 张表情包，已达到上限。",
+                data={"sent_count": sent_count, "max_sends": max_sends},
+                delivery_state="not_attempted",
+            )
         if request_id is not None and not await is_request_active(
             session_id, request_id
         ):
-            return "请求已过期，已取消发送。"
+            return tool_skipped(
+                "request_expired",
+                "请求已过期，已取消发送。",
+                delivery_state="not_attempted",
+            )
 
+        send_started = False
         try:
             match = re.search(r"\d+", pic_id)
             if not match:
-                return json.dumps({
-                    "status": "failed",
-                    "message": f"发送表情包失败: 无法从 pic_id 中提取有效数字: {pic_id!r}",
-                }, ensure_ascii=False)
+                return tool_failure(
+                    "invalid_pic_id",
+                    f"无法从 pic_id {pic_id!r} 中提取有效数字。",
+                    retryable=True,
+                    delivery_state="not_attempted",
+                )
             selected_pic_id = int(match.group())
             if selected_pic_id in sent_meme_ids:
                 if approved_meme_ids is not None:
                     approved_meme_ids.discard(selected_pic_id)
-                return json.dumps({
-                    "status": "skipped",
-                    "message": "本轮已经发送过这张表情包，请选择不同的 pic_id。",
-                    "sent_count": sent_count,
-                    "max_sends": max_sends,
-                }, ensure_ascii=False)
+                return tool_skipped(
+                    "duplicate_meme",
+                    "本轮已经发送过这张表情包，请选择不同的 pic_id。",
+                    data={"sent_count": sent_count, "max_sends": max_sends},
+                    delivery_state="not_attempted",
+                )
             if (
                 approved_meme_ids is not None
                 and selected_pic_id not in approved_meme_ids
             ):
-                return json.dumps({
-                    "status": "failed",
-                    "message": "发送表情包失败：该图片未通过本轮搜索审核，请先重新搜索。",
-                }, ensure_ascii=False)
+                return tool_failure(
+                    "candidate_not_approved",
+                    "该图片未通过本轮搜索审核，请先重新搜索。",
+                    retryable=True,
+                    delivery_state="not_attempted",
+                )
 
             # 搜索到实际发送之间可能有群友刚好发出相同图片，因此发送前重新
             # 查询一次全群最近图片；这也覆盖多个请求先后选择同一候选的情况。
@@ -900,12 +926,12 @@ def create_send_meme_tool(
             if selected_pic_id in recent_meme_ids:
                 if approved_meme_ids is not None:
                     approved_meme_ids.discard(selected_pic_id)
-                return json.dumps({
-                    "status": "skipped",
-                    "message": "这张表情包刚刚在群里出现过，请选择不同的 pic_id。",
-                    "sent_count": sent_count,
-                    "max_sends": max_sends,
-                }, ensure_ascii=False)
+                return tool_skipped(
+                    "recently_used",
+                    "这张表情包刚刚在群里出现过，请选择不同的 pic_id。",
+                    data={"sent_count": sent_count, "max_sends": max_sends},
+                    delivery_state="not_attempted",
+                )
             logger.info(f"使用指定的图片ID: {selected_pic_id}")
 
             pic = (
@@ -916,19 +942,21 @@ def create_send_meme_tool(
 
             if not pic:
                 logger.warning(f"图片记录不存在: {selected_pic_id}")
-                return json.dumps({
-                    "status": "failed",
-                    "message": "图片记录不存在",
-                }, ensure_ascii=False)
+                return tool_failure(
+                    "image_record_not_found",
+                    "图片记录不存在。",
+                    delivery_state="not_attempted",
+                )
 
             pic_path = pic_dir / pic.file_path
 
             if not pic_path.exists():
                 logger.warning(f"图片文件不存在: {pic_path}")
-                return json.dumps({
-                    "status": "failed",
-                    "message": "图片文件不存在",
-                }, ensure_ascii=False)
+                return tool_failure(
+                    "image_file_not_found",
+                    "图片文件不存在。",
+                    delivery_state="not_attempted",
+                )
 
             pic_data = pic_path.read_bytes()
             description = pic.description
@@ -944,33 +972,45 @@ def create_send_meme_tool(
             ):
                 if approved_meme_ids is not None:
                     approved_meme_ids.discard(selected_pic_id)
-                return json.dumps({
-                    "status": "skipped",
-                    "message": "这张图片与本轮已经发送的表情包画面重复，请选择不同候选。",
-                    "sent_count": sent_count,
-                    "max_sends": max_sends,
-                }, ensure_ascii=False)
+                return tool_skipped(
+                    "duplicate_visual",
+                    "这张图片与本轮已经发送的表情包画面重复，请选择不同候选。",
+                    data={"sent_count": sent_count, "max_sends": max_sends},
+                    delivery_state="not_attempted",
+                )
 
             if request_id is not None and not await is_request_active(
                 session_id, request_id
             ):
-                return "请求已过期，已取消发送。"
+                return tool_skipped(
+                    "request_expired",
+                    "请求已过期，已取消发送。",
+                    delivery_state="not_attempted",
+                )
 
             # All ORM values needed after the send have been copied above.
             # Release the read transaction before waiting on the adapter.
             await db_session.commit()
             message = UniMessage.image(raw=pic_data)
+            send_started = True
             res = await (
                 message.send(target=send_target)
                 if send_target is not None
                 else message.send()
             )
+            msg_id = "unknown"
+            if res.msg_ids:
+                raw_msg_id = res.msg_ids[-1].get("message_id") or res.msg_ids[-1].get(
+                    "msg_id"
+                )
+                if raw_msg_id is not None:
+                    msg_id = str(raw_msg_id)
             chat_history = ChatHistory(
                 session_id=session_id,
                 user_id=bot_name,
                 content_type="bot",
                 content=(
-                    f"id: {res.msg_ids[-1]['message_id']}\n"
+                    f"id: {msg_id}\n"
                     f"发送了图片，图片描述是: {description}\n"
                     f"图片文件: {media_file_path}"
                 ),
@@ -985,19 +1025,33 @@ def create_send_meme_tool(
                 sent_perceptual_hashes.append(perceptual_hash)
             sent_count += 1
             logger.info(f"id:{res.msg_ids}\n发送表情包: {description}")
-            return json.dumps({
-                "status": "sent",
-                "message": f"已成功发送表情包: {description}",
-                "sent_count": sent_count,
-                "max_sends": max_sends,
-                "remaining": max_sends - sent_count,
-            }, ensure_ascii=False)
+            return tool_success(
+                "meme_sent",
+                "已成功发送表情包。",
+                data={
+                    "pic_id": selected_pic_id,
+                    "message_id": msg_id,
+                    "description": description,
+                    "sent_count": sent_count,
+                    "max_sends": max_sends,
+                    "remaining": max_sends - sent_count,
+                },
+                delivery_state="completed",
+            )
 
-        except Exception as e:
-            logger.error(f"发送表情包失败: {e}")
-            return json.dumps({
-                "status": "failed",
-                "message": f"发送表情包失败: {str(e)}",
-            }, ensure_ascii=False)
+        except Exception as error:
+            logger.warning(
+                "发送表情包失败: "
+                f"error_type={type(error).__name__}, send_started={send_started}"
+            )
+            return tool_failure(
+                "meme_send_failed",
+                (
+                    "表情包发送失败；投递结果可能未知，请勿立即重试。"
+                    if send_started
+                    else "表情包发送失败。"
+                ),
+                delivery_state="unknown" if send_started else "not_attempted",
+            )
 
     return send_meme_image

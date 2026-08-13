@@ -8,6 +8,7 @@ from nonebot_plugin_alconna import Target, UniMessage
 
 from ..model import ChatHistory
 from ..reply_guard import is_request_active
+from .tool_results import tool_failure, tool_skipped, tool_success
 
 
 def create_private_message_tool(
@@ -22,14 +23,14 @@ def create_private_message_tool(
 ):
     async def _resolve_group_member(
         target_user_id: str | None, target_name: str | None
-    ) -> tuple[str | None, str | None]:
+    ) -> tuple[str | None, str | None, str | None]:
         if interface is None:
-            return None, "缺少群成员接口，无法确认私聊目标。"
+            return None, "missing_member_context", "缺少群成员接口，无法确认私聊目标。"
 
         target_user_id = str(target_user_id or "").strip()
         target_name = str(target_name or "").strip()
         if not target_user_id and not target_name:
-            return None, "缺少私聊目标，请提供 target_user_id 或 target_name。"
+            return None, "missing_target", "缺少私聊目标，请提供 target_user_id 或 target_name。"
 
         members = group_members
         if members is None:
@@ -37,7 +38,7 @@ def create_private_message_tool(
                 members = await interface.get_members(SceneType.GROUP, session_id)
             except Exception as e:
                 logger.warning(f"获取群成员失败，无法主动私聊: {e}")
-                return None, "获取群成员失败，无法确认私聊目标。"
+                return None, "member_lookup_failed", "获取群成员失败，无法确认私聊目标。"
 
         name_to_id: dict[str, str] = {}
         member_ids: set[str] = set()
@@ -56,17 +57,17 @@ def create_private_message_tool(
 
         if target_user_id:
             if target_user_id not in member_ids:
-                return None, "目标用户不在当前群内，已拒绝主动私聊。"
+                return None, "target_not_found", "目标用户不在当前群内，已拒绝主动私聊。"
             if bot_id is not None and target_user_id == str(bot_id):
-                return None, "不能给自己发送私聊。"
-            return target_user_id, None
+                return None, "cannot_message_self", "不能给自己发送私聊。"
+            return target_user_id, None, None
 
         resolved_id = name_to_id.get(target_name)
         if not resolved_id:
-            return None, f"找不到群成员 {target_name!r}。"
+            return None, "target_not_found", f"找不到群成员 {target_name!r}。"
         if bot_id is not None and resolved_id == str(bot_id):
-            return None, "不能给自己发送私聊。"
-        return resolved_id, None
+            return None, "cannot_message_self", "不能给自己发送私聊。"
+        return resolved_id, None, None
 
     @tool("send_private_message")
     async def send_private_message(
@@ -90,15 +91,31 @@ def create_private_message_tool(
         if request_id is not None and not await is_request_active(
             session_id, request_id
         ):
-            return "请求已过期，已取消主动私聊。"
+            return tool_skipped(
+                "request_expired",
+                "请求已过期，已取消主动私聊。",
+                delivery_state="not_attempted",
+            )
 
         content = str(content or "").strip()
         if not content:
-            return "主动私聊内容为空，未发送。"
+            return tool_failure(
+                "empty_content",
+                "主动私聊内容为空，未发送。",
+                delivery_state="not_attempted",
+            )
 
-        target_id, error = await _resolve_group_member(target_user_id, target_name)
+        target_id, reason_code, error = await _resolve_group_member(
+            target_user_id,
+            target_name,
+        )
         if error or not target_id:
-            return f"主动私聊失败: {error}"
+            return tool_failure(
+                reason_code or "target_resolution_failed",
+                error or "无法确认主动私聊目标。",
+                retryable=reason_code in {"missing_target", "target_not_found"},
+                delivery_state="not_attempted",
+            )
 
         latest_private_msg = (
             (
@@ -116,7 +133,11 @@ def create_private_message_tool(
             .first()
         )
         if latest_private_msg and latest_private_msg.content.endswith(content):
-            return "检测到重复私聊内容，已跳过发送。"
+            return tool_skipped(
+                "duplicate_message",
+                "检测到重复私聊内容，已跳过发送。",
+                delivery_state="not_attempted",
+            )
 
         try:
             # Do not retain the duplicate-check transaction while waiting for
@@ -154,10 +175,22 @@ def create_private_message_tool(
             logger.info(
                 f"已主动私聊用户 {target_id}，reason={reason or '未填写原因'}"
             )
-            return f"已主动私聊用户 {target_id}。"
-        except Exception as e:
-            logger.error(f"主动私聊发送失败: {e}")
+            return tool_success(
+                "private_message_sent",
+                f"已主动私聊用户 {target_id}。",
+                data={"target_user_id": target_id, "message_id": msg_id},
+                delivery_state="completed",
+            )
+        except Exception as error:
+            logger.warning(
+                "主动私聊发送失败: "
+                f"target_id={target_id}, error_type={type(error).__name__}"
+            )
             await db_session.rollback()
-            return f"主动私聊发送失败: {e}"
+            return tool_failure(
+                "send_failed",
+                "主动私聊发送失败；投递结果可能未知，请勿立即重试。",
+                delivery_state="unknown",
+            )
 
     return send_private_message

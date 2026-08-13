@@ -147,8 +147,9 @@ async def split_chat_into_context_groups(
         db_session: AsyncSession,
         session_id: str,
         max_time_gap: timedelta = timedelta(hours=1),
-        max_token_count: int = 700,
-        max_messages: int = 50,
+        max_token_count: int = 450,
+        max_messages: int = 24,
+        overlap_messages: int = 2,
 ) -> list[list[ChatHistory]]:
     """
     将一个会话内的聊天记录智能切分为多个上下文组
@@ -159,6 +160,7 @@ async def split_chat_into_context_groups(
         max_time_gap: 最大时间间隔，超过此间隔视为新对话上下文
         max_token_count: 单个上下文组的最大token数
         max_messages: 单个上下文组的最大消息数
+        overlap_messages: 因长度切分时保留的上下文消息数；时间断层不重叠
 
     返回:
         切分后的对话组列表，每组是ChatHistory对象列表
@@ -189,29 +191,39 @@ async def split_chat_into_context_groups(
         # 计算当前消息的token数量
         message_tokens = estimate_token_count(message.content)
 
-        # 检查是否需要开始新的组
-        start_new_group = False
-
-        # 条件1: 时间间隔过大
-        if (
-                last_message_time
-                and (message.created_at - last_message_time) > max_time_gap
-        ):
-            start_new_group = True
-
-        # 条件2: token超限
-        elif current_token_count + message_tokens > max_token_count:
-            start_new_group = True
-
-        # 条件3: 消息数超限
-        elif len(current_group) >= max_messages:
-            start_new_group = True
+        time_gap_exceeded = bool(
+            last_message_time
+            and (message.created_at - last_message_time) > max_time_gap
+        )
+        token_limit_exceeded = (
+            current_token_count + message_tokens > max_token_count
+        )
+        message_limit_exceeded = len(current_group) >= max_messages
+        start_new_group = (
+            time_gap_exceeded
+            or token_limit_exceeded
+            or message_limit_exceeded
+        )
 
         # 如果满足任一条件，保存当前组并开始新组
         if start_new_group and current_group:
             context_groups.append(current_group)
-            current_group = []
-            current_token_count = 0
+            overlap = (
+                []
+                if time_gap_exceeded or overlap_messages <= 0
+                else current_group[-overlap_messages:]
+            )
+            overlap_token_count = sum(
+                estimate_token_count(item.content) for item in overlap
+            )
+            while overlap and (
+                overlap_token_count + message_tokens > max_token_count
+                or len(overlap) + 1 > max_messages
+            ):
+                removed = overlap.pop(0)
+                overlap_token_count -= estimate_token_count(removed.content)
+            current_group = list(overlap)
+            current_token_count = overlap_token_count
 
         # 添加当前消息到当前组
         current_group.append(message)
@@ -244,7 +256,7 @@ async def process_and_vectorize_session_chats(
         db_session: AsyncSession,
         session_id: str,
         max_time_gap: timedelta = timedelta(hours=1),
-        max_token_count: int = 1000,
+        max_token_count: int = 450,
         chunk_size: int = 100,
         commit_interval: int = 500,
 ) -> dict | None:

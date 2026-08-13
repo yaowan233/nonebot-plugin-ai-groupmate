@@ -182,7 +182,8 @@ async def test_reply_releases_database_connection_before_adapter_send(monkeypatc
         await reply_tool.ainvoke({"content": "hello", "next_step": "end"})
     )
 
-    assert result["status"] == "sent"
+    assert result["status"] == "succeeded"
+    assert result["delivery_state"] == "completed"
     assert events == ["query", "commit", "send", "add"]
 
 

@@ -1,5 +1,4 @@
 import re
-import json
 import difflib
 import datetime
 from typing import Any, Literal
@@ -14,6 +13,7 @@ from nonebot_plugin_alconna import Target, UniMessage
 
 from ..model import ChatHistory
 from ..reply_guard import is_request_active
+from .tool_results import tool_failure, tool_skipped, tool_success
 
 
 def create_reply_tool(
@@ -65,12 +65,6 @@ def create_reply_tool(
             deduped.append(line)
         return "\n".join(deduped)
 
-    def _result(status: Literal["sent", "skipped", "failed"], message: str) -> str:
-        return json.dumps(
-            {"status": status, "message": message},
-            ensure_ascii=False,
-        )
-
     @tool("reply_user")
     async def reply_user(
         content: str,
@@ -87,18 +81,27 @@ def create_reply_tool(
         if request_id is not None and not await is_request_active(
             session_id, request_id
         ):
-            return _result("skipped", "请求已过期，已取消发送。")
+            return tool_skipped(
+                "request_expired",
+                "请求已过期，已取消发送。",
+                delivery_state="not_attempted",
+            )
 
         if not content or not content.strip():
-            return _result("failed", "内容为空，未发送。")
+            return tool_failure(
+                "empty_content",
+                "内容为空，未发送。",
+                delivery_state="not_attempted",
+            )
 
         if repeat_text is not None:
             expected = _normalize_text(repeat_text)
             actual = _normalize_text(content)
             if actual != expected or next_step != "end":
-                return _result(
-                    "failed",
+                return tool_failure(
+                    "repeat_constraint_violation",
                     "当前是复读队形：只能原样复读并结束，或者调用 finish 保持沉默。",
+                    delivery_state="not_attempted",
                 )
             # 使用识别到的原文，避免模型添加不可见空白或改变换行。
             content = repeat_text
@@ -136,7 +139,11 @@ def create_reply_tool(
                     logger.info(
                         f"检测到近义重复回复(相似度={similarity:.2f})，已自动跳过"
                     )
-                    return _result("skipped", "检测到重复回复，已跳过发送。")
+                    return tool_skipped(
+                        "duplicate_reply",
+                        "检测到重复回复，已跳过发送。",
+                        delivery_state="not_attempted",
+                    )
 
             # The duplicate-check query has finished.  Sending through the
             # adapter can block, so release its pooled connection first.
@@ -212,7 +219,11 @@ def create_reply_tool(
             if request_id is not None and not await is_request_active(
                 session_id, request_id
             ):
-                return _result("skipped", "请求已过期，已取消发送。")
+                return tool_skipped(
+                    "request_expired",
+                    "请求已过期，已取消发送。",
+                    delivery_state="not_attempted",
+                )
 
             outgoing = message or UniMessage.text(content)
             res = await (
@@ -230,10 +241,19 @@ def create_reply_tool(
             )
             db_session.add(chat_history)
             logger.info(f"Bot已回复: {content}")
-            return _result("sent", "消息已发送。")
-        except Exception as e:
-            logger.error(f"发送消息异常: {e}")
+            return tool_success(
+                "message_sent",
+                "消息已发送。",
+                data={"message_id": str(msg_id)},
+                delivery_state="completed",
+            )
+        except Exception as error:
+            logger.warning(f"发送消息异常: error_type={type(error).__name__}")
             await db_session.rollback()
-            return _result("failed", f"发送失败: {e}")
+            return tool_failure(
+                "send_failed",
+                "消息发送失败；投递结果可能未知，请勿立即重试。",
+                delivery_state="unknown",
+            )
 
     return reply_user

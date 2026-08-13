@@ -8,6 +8,7 @@ from nonebot_plugin_alconna import message_recall
 
 from ..model import ChatHistory
 from ..reply_guard import is_request_active
+from .tool_results import tool_failure, tool_skipped, tool_success
 
 SELF_RECALL_WINDOW = datetime.timedelta(minutes=5)
 
@@ -64,27 +65,52 @@ def create_recall_message_tool(
         if request_id is not None and not await is_request_active(
             session_id, request_id
         ):
-            return "请求已过期，已取消撤回。"
+            return tool_skipped(
+                "request_expired",
+                "请求已过期，已取消撤回。",
+                delivery_state="not_attempted",
+            )
 
         if bot is None or event is None:
-            return "撤回失败: 缺少 bot/event 上下文。"
+            return tool_failure(
+                "missing_context",
+                "撤回失败：缺少 bot/event 上下文。",
+                delivery_state="not_attempted",
+            )
 
         target_msg_id = str(target_msg_id or "").strip()
         if not target_msg_id or target_msg_id == "system":
-            return "撤回失败: 缺少有效的目标消息 ID。"
+            return tool_failure(
+                "invalid_message_id",
+                "撤回失败：缺少有效的目标消息 ID。",
+                delivery_state="not_attempted",
+            )
 
         history = await _find_history_by_message_id(target_msg_id)
         if history is None:
-            return "撤回失败: 没有在当前群历史中找到这条消息。"
+            return tool_failure(
+                "message_not_found",
+                "撤回失败：没有在当前群历史中找到这条消息。",
+                retryable=True,
+                delivery_state="not_attempted",
+            )
 
         is_bot_message = (
             history.content_type == "bot" and str(history.user_id) == str(bot_name)
         )
         if not has_admin_permission:
             if not is_bot_message:
-                return "撤回失败: bot 不是管理员，只能撤回自己发送的消息。"
+                return tool_failure(
+                    "permission_denied",
+                    "bot 不是管理员，只能撤回自己发送的消息。",
+                    delivery_state="not_attempted",
+                )
             if datetime.datetime.now() - history.created_at > SELF_RECALL_WINDOW:
-                return "撤回失败: bot 不是管理员，只能撤回自己 5 分钟内发送的消息。"
+                return tool_failure(
+                    "recall_window_expired",
+                    "bot 不是管理员，只能撤回自己 5 分钟内发送的消息。",
+                    delivery_state="not_attempted",
+                )
 
         try:
             # The history lookup is complete.  Recalling through OneBot is
@@ -93,10 +119,21 @@ def create_recall_message_tool(
             await message_recall(message_id=target_msg_id, event=event, bot=bot)
         except ValueError as e:
             logger.warning(f"撤回消息失败，消息 ID 不被当前适配器支持: {target_msg_id} {e}")
-            return "撤回失败: 当前适配器不支持这个消息 ID 格式。"
-        except Exception as e:
-            logger.error(f"撤回消息失败: {e}")
-            return f"撤回失败: {e}"
+            return tool_failure(
+                "unsupported_message_id",
+                "撤回失败：当前适配器不支持这个消息 ID 格式。",
+                delivery_state="not_attempted",
+            )
+        except Exception as error:
+            logger.warning(
+                "撤回消息失败: "
+                f"message_id={target_msg_id}, error_type={type(error).__name__}"
+            )
+            return tool_failure(
+                "recall_failed",
+                "撤回接口调用失败；操作结果可能未知，请勿立即重试。",
+                delivery_state="unknown",
+            )
 
         action_scope = "管理员撤回" if has_admin_permission else "撤回自己消息"
         chat_history = ChatHistory(
@@ -114,6 +151,11 @@ def create_recall_message_tool(
         logger.info(
             f"已执行{action_scope}: message_id={target_msg_id}, reason={reason or '未填写原因'}"
         )
-        return f"已撤回消息 {target_msg_id}。"
+        return tool_success(
+            "message_recalled",
+            f"已撤回消息 {target_msg_id}。",
+            data={"message_id": target_msg_id, "scope": action_scope},
+            delivery_state="completed",
+        )
 
     return recall_message

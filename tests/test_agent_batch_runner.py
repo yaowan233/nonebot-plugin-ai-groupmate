@@ -119,7 +119,9 @@ async def test_batch_runner_advances_agent_in_dependent_waves(tmp_path):
         result_paths=[second_result],
     )
     third = _read_request(progress["request_files"][0])
-    assert third["body"]["messages"][-1]["content"] == "560"
+    calculation_result = json.loads(third["body"]["messages"][-1]["content"])
+    assert calculation_result["status"] == "succeeded"
+    assert calculation_result["data"]["result"] == "560"
 
     third_result = _write_result(
         tmp_path / "result-3.jsonl",

@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 
@@ -58,7 +60,8 @@ async def test_registered_agent_skill_can_be_loaded_on_demand():
 
         loader = create_agent_skill_loader_tool(skills, _context(AgentToolContext))
         assert loader is not None
-        result = await loader.ainvoke({"skill_name": "score_report"})
-        assert result == "full prompt for group-1"
+        result = json.loads(await loader.ainvoke({"skill_name": "score_report"}))
+        assert result["status"] == "succeeded"
+        assert result["data"]["instructions"] == "full prompt for group-1"
     finally:
         clear_registered_agent_tools()
