@@ -1,9 +1,60 @@
+import hashlib
 from typing import Any
+from urllib.parse import urlparse
 from collections.abc import Sequence
 
 from langchain_core.messages import BaseMessage, SystemMessage
 
 CACHE_CONTROL = {"type": "ephemeral"}
+
+
+def is_openrouter_base_url(base_url: str) -> bool:
+    """Return whether the configured chat endpoint is OpenRouter."""
+    hostname = (urlparse(base_url.strip()).hostname or "").lower()
+    return hostname == "openrouter.ai" or hostname.endswith(".openrouter.ai")
+
+
+def should_use_explicit_prompt_cache(
+    *,
+    enabled: bool,
+    api_format: str,
+    base_url: str,
+    model: str,
+) -> bool:
+    """Select providers where our block-level cache marker is supported."""
+    if not enabled:
+        return False
+    if api_format.strip().lower() == "anthropic":
+        return True
+
+    hostname = (urlparse(base_url.strip()).hostname or "").lower()
+    if hostname == "dashscope.aliyuncs.com":
+        return True
+    if not is_openrouter_base_url(base_url):
+        return False
+
+    # OpenRouter translates Anthropic-style cache_control blocks for Gemini and
+    # also accepts them for Claude models exposed through Chat Completions.
+    normalized_model = model.strip().lower().lstrip("~")
+    return normalized_model.startswith(("google/gemini", "anthropic/"))
+
+
+def build_openrouter_request_kwargs(
+    base_url: str,
+    session_id: str,
+) -> dict[str, Any]:
+    """Build a privacy-preserving sticky-routing key for an OpenRouter call."""
+    if not is_openrouter_base_url(base_url):
+        return {}
+    digest = hashlib.blake2s(
+        str(session_id).encode("utf-8"),
+        digest_size=16,
+    ).hexdigest()
+    return {
+        "extra_body": {
+            "session_id": f"ai-groupmate-{digest}",
+        }
+    }
 
 
 def _cacheable_text_block(text: str) -> list[str | dict[str, Any]]:

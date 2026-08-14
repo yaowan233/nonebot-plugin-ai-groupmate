@@ -5,7 +5,7 @@ import asyncio
 import hashlib
 from typing import Any, Annotated, TypedDict
 from dataclasses import dataclass
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 from nonebot.log import logger
 from langchain.tools import ToolRuntime
@@ -166,15 +166,24 @@ def _log_llm_cache_usage(response: AIMessage) -> dict[str, int]:
         (
             ("usage_metadata", "input_token_details", "cache_creation"),
             ("usage_metadata", "input_token_details", "cache_creation_input_tokens"),
+            ("usage_metadata", "input_token_details", "cache_write"),
+            ("usage_metadata", "input_token_details", "cache_write_tokens"),
             ("usage_metadata", "input_tokens_details", "cache_creation_input_tokens"),
+            ("usage_metadata", "input_tokens_details", "cache_write_tokens"),
             ("response_metadata", "token_usage", "prompt_tokens_details", "cache_creation_input_tokens"),
+            ("response_metadata", "token_usage", "prompt_tokens_details", "cache_write_tokens"),
             ("response_metadata", "token_usage", "input_tokens_details", "cache_creation_input_tokens"),
+            ("response_metadata", "token_usage", "input_tokens_details", "cache_write_tokens"),
             ("response_metadata", "token_usage", "cache_creation_input_tokens"),
             ("response_metadata", "token_usage", "cache_write_input_tokens"),
+            ("response_metadata", "token_usage", "cache_write_tokens"),
             ("token_usage", "prompt_tokens_details", "cache_creation_input_tokens"),
+            ("token_usage", "prompt_tokens_details", "cache_write_tokens"),
             ("token_usage", "input_tokens_details", "cache_creation_input_tokens"),
+            ("token_usage", "input_tokens_details", "cache_write_tokens"),
             ("token_usage", "cache_creation_input_tokens"),
             ("token_usage", "cache_write_input_tokens"),
+            ("token_usage", "cache_write_tokens"),
         ),
     )
 
@@ -431,6 +440,7 @@ def _make_agent_node(
     system_prompt: str | Sequence[BaseMessage],
     tools_by_skill: dict[str, list[BaseTool]],
     limits: AgentRunLimits,
+    request_kwargs_factory: Callable[[str], dict[str, Any]] | None = None,
 ) -> Any:
     system_messages = normalize_system_messages(system_prompt)
     bound_models: dict[tuple[str, ...], Any] = {}
@@ -462,8 +472,13 @@ def _make_agent_node(
             call_number += 1
             started_at = time.perf_counter()
             try:
+                request_kwargs = (
+                    request_kwargs_factory(str(state["session_id"]))
+                    if request_kwargs_factory is not None
+                    else {}
+                )
                 response: AIMessage = await asyncio.wait_for(
-                    bound_model.ainvoke(call_messages),
+                    bound_model.ainvoke(call_messages, **request_kwargs),
                     timeout=limits.llm_timeout_seconds,
                 )
             except asyncio.TimeoutError:
@@ -1059,6 +1074,7 @@ def build_chat_graph(
     image_summarizer: Any | None = None,
     required_side_effect_tool: str | None = None,
     required_side_effect_count: int = 1,
+    request_kwargs_factory: Callable[[str], dict[str, Any]] | None = None,
 ) -> Any:
     tools_by_name: dict[str, BaseTool] = {t.name: t for t in tools}
     base_tools = list(base_tools) if base_tools is not None else list(tools)
@@ -1066,7 +1082,17 @@ def build_chat_graph(
     limits = limits or AgentRunLimits()
 
     builder = StateGraph(AgentState)
-    builder.add_node("agent", _make_agent_node(model, base_tools, system_prompt, tools_by_skill, limits))
+    builder.add_node(
+        "agent",
+        _make_agent_node(
+            model,
+            base_tools,
+            system_prompt,
+            tools_by_skill,
+            limits,
+            request_kwargs_factory,
+        ),
+    )
     builder.add_node(
         "tools",
         _make_tool_node(

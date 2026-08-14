@@ -51,6 +51,7 @@ def extract_cache_creation_tokens(callback: Any) -> int:
         "cache_creation_input_tokens",
         "prompt_tokens_cache_creation",
         "cache_write_input_tokens",
+        "cache_write_tokens",
     ):
         value = getattr(callback, attr, None)
         if isinstance(value, int | float):

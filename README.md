@@ -135,6 +135,7 @@ curl http://127.0.0.1:6333/collections/media_collection_v3
 | ai_groupmate__chat_temperature | 否 | `0.7` | 主聊天模型温度 |
 | ai_groupmate__chat_api_format | 否 | `openai` | 主聊天接口格式，可选 `openai` / `anthropic` |
 | ai_groupmate__chat_multimodal | 否 | `true` | 主聊天模型是否支持图片输入；若使用纯文本模型请设为 `false`，将跳过图片上传只发文本 |
+| ai_groupmate__chat_explicit_prompt_cache | 否 | `true` | 为支持的接口添加显式 Prompt 缓存断点；支持 DashScope、Anthropic，以及 OpenRouter 上的 Gemini/Claude，并自动使用匿名群级粘性路由 |
 | ai_groupmate__vision_model | 否 | 无 | 图片回读辅助模型（如 `qwen-vl-max`）；主模型不支持图片时用它总结工具返回的图片内容，留空则跳过图片回读 |
 | ai_groupmate__vision_api_key | 否 | 无 | 图片回读辅助模型专用 API Key，留空则使用 `llm_api_key` / `qwen_token` |
 | ai_groupmate__vision_base_url | 否 | 无 | 图片回读辅助模型专用 Base URL，留空则使用 `llm_base_url` |

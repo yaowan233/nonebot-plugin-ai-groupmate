@@ -66,7 +66,12 @@ from .custom_tools import (
     create_agent_skill_loader_tool,
     build_registered_agent_extensions,
 )
-from .prompt_cache import build_system_messages, add_ephemeral_cache_marker
+from .prompt_cache import (
+    build_system_messages,
+    add_ephemeral_cache_marker,
+    build_openrouter_request_kwargs,
+    should_use_explicit_prompt_cache,
+)
 from .recall_tools import create_recall_message_tool
 from .private_tools import create_private_message_tool
 from .profile_tools import create_report_tool, create_relation_tool
@@ -139,12 +144,19 @@ configure_concurrency(
 
 
 def _use_explicit_prompt_cache() -> bool:
-    if not plugin_config.chat_explicit_prompt_cache:
-        return False
-    if plugin_config.chat_api_format == "anthropic":
-        return True
     base_url = plugin_config.chat_base_url or plugin_config.llm_base_url
-    return "dashscope.aliyuncs.com" in base_url
+    model = plugin_config.chat_model or plugin_config.base_model
+    return should_use_explicit_prompt_cache(
+        enabled=plugin_config.chat_explicit_prompt_cache,
+        api_format=plugin_config.chat_api_format,
+        base_url=base_url,
+        model=model,
+    )
+
+
+def _chat_request_kwargs(session_id: str) -> dict[str, Any]:
+    base_url = plugin_config.chat_base_url or plugin_config.llm_base_url
+    return build_openrouter_request_kwargs(base_url, session_id)
 
 
 def _chat_supports_images() -> bool:
@@ -1241,6 +1253,7 @@ async def create_chat_graph(
         image_summarizer=summarize_image_content if not supports_images else None,
         required_side_effect_tool=("send_meme_image" if meme_required else None),
         required_side_effect_count=meme_send_count if meme_required else 1,
+        request_kwargs_factory=_chat_request_kwargs,
     )
     return graph, agent_tools, dynamic_context
 
@@ -1719,7 +1732,12 @@ async def choice_response_strategy(
 
 if __name__ == "__main__":
     model = create_chat_llm(plugin_config)
-    graph = build_chat_graph(model, tools, "你是一个助手，请调用工具回复用户。")
+    graph = build_chat_graph(
+        model,
+        tools,
+        "你是一个助手，请调用工具回复用户。",
+        request_kwargs_factory=_chat_request_kwargs,
+    )
     result = asyncio.run(
         graph.ainvoke({
             "messages": [HumanMessage(content="今天上海的天气怎么样")],
