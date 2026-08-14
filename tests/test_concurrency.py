@@ -302,7 +302,9 @@ async def test_small_pool_survives_many_slow_agent_runs(tmp_path):
         f"sqlite+aiosqlite:///{database_path}",
         pool_size=2,
         max_overflow=0,
-        pool_timeout=0.05,
+        # Windows CI 上首次 SQLite checkout 偶尔超过 50ms；测试关注的是
+        # 慢 I/O 期间连接是否已归还，而不是把调度抖动当成连接池耗尽。
+        pool_timeout=0.5,
     )
     session_factory = async_sessionmaker(engine)
     gate = ConcurrencyGate("small-pool-agent", 4)

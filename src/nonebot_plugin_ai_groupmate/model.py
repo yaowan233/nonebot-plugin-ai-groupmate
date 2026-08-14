@@ -1,7 +1,7 @@
 from datetime import datetime
 
 from pydantic import BaseModel
-from sqlalchemy import JSON, Float, Index, String, Boolean
+from sqlalchemy import JSON, Float, Index, String, Boolean, Integer
 from sqlalchemy.orm import Mapped, mapped_column
 from nonebot_plugin_orm import Model
 
@@ -40,6 +40,7 @@ class ChatHistory(Model):
     user_name: Mapped[str]
     media_id: Mapped[int | None]  # 媒体消息专用
     vectorized: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    vectorized_version: Mapped[int] = mapped_column(Integer, default=0, index=True)
 
     __table_args__ = (
         # 覆盖 group_memory 更新查询: WHERE session_id=? AND created_at>? AND content_type IN (...)
@@ -146,6 +147,7 @@ class ChatHistorySchema(BaseModel):
     user_name: str
     media_id: int | None = None
     vectorized: bool | None = False
+    vectorized_version: int = 0
 
     class Config:
         from_attributes = True  # ✅ 允许从 ORM 对象创建

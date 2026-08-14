@@ -6,11 +6,13 @@ import uuid
 import base64
 import random
 import asyncio
+import hashlib
 import mimetypes
 import unicodedata
 from typing import Any, NoReturn
 from datetime import datetime, timedelta
-from collections.abc import Sequence, Collection
+from collections import Counter
+from collections.abc import Mapping, Sequence, Collection
 
 import httpx
 from openai import AsyncOpenAI, BadRequestError
@@ -39,9 +41,15 @@ EMBEDDING_MODEL_METADATA_KEY = "embedding_model"
 EMBEDDING_DIMENSION_METADATA_KEY = "embedding_dimension"
 # 默认维度用于兼容未设置 embedding_dimension 的旧配置和测试替身。
 MEDIA_TEXT_VECTOR_SIZE = 1024
+CHAT_COLLECTION = "chat_collection_v2"
+CHAT_DENSE_VECTOR = "dense"
+CHAT_SPARSE_VECTOR = "lexical"
+CHAT_INDEX_VERSION = 2
 CHAT_SEARCH_CANDIDATE_LIMIT = 40
 CHAT_RERANK_POOL_SIZE = 12
 CHAT_SEARCH_RESULT_LIMIT = 5
+CHAT_RESULT_FRAGMENT_MAX_CHARS = 800
+CHAT_RESULT_TOTAL_MAX_CHARS = 3200
 CHAT_RRF_K = 60
 CHAT_LEXICAL_ROUTE_WEIGHT = 0.9
 CHAT_RECENCY_ROUTE_WEIGHT = 0.35
@@ -49,6 +57,7 @@ CHAT_RECENCY_QUERY_PATTERN = re.compile(
     r"(?:刚才|最近|近期|今天|昨天|前天|本周|上周|这个月|本月|上个月|最新|上次)"
 )
 CHAT_TIMESTAMP_PATTERN = re.compile(r"\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]")
+CHAT_DATE_PATTERN = re.compile(r"(?<!\d)(\d{4}-\d{2}-\d{2})(?!\d)")
 MEME_SEARCH_POOL_SIZE = 50
 MEME_RRF_K = 60
 MEME_CONTEXT_VISUAL_ROUTE_WEIGHT = 0.85
@@ -121,6 +130,69 @@ def expand_chat_search_query(query: str, *, now: datetime | None = None) -> str:
     return f"{normalized_query}\n检索时间范围：{'；'.join(ranges)}"
 
 
+def parse_chat_search_time_range(
+    query: str,
+    *,
+    now: datetime | None = None,
+) -> tuple[int, int] | None:
+    """把明确时间条件转换为本地时区 Unix 时间范围。"""
+    normalized_query = query.strip()
+    if not normalized_query:
+        return None
+
+    current = now or datetime.now()
+    current_date = current.date()
+    ranges: list[tuple[datetime, datetime]] = []
+
+    dates = CHAT_DATE_PATTERN.findall(normalized_query)
+    if dates:
+        try:
+            parsed_dates = [datetime.strptime(value, "%Y-%m-%d") for value in dates[:2]]
+        except ValueError:
+            parsed_dates = []
+        if parsed_dates:
+            start = parsed_dates[0]
+            end_date = parsed_dates[-1]
+            ranges.append((
+                start,
+                end_date + timedelta(days=1) - timedelta(seconds=1),
+            ))
+    for term, days_ago in (("前天", 2), ("昨天", 1), ("今天", 0)):
+        if term not in normalized_query:
+            continue
+        start = datetime.combine(
+            current_date - timedelta(days=days_ago),
+            datetime.min.time(),
+        )
+        end = current if days_ago == 0 else start + timedelta(days=1) - timedelta(seconds=1)
+        ranges.append((start, end))
+    if "上周" in normalized_query:
+        this_week = current_date - timedelta(days=current_date.weekday())
+        start = datetime.combine(this_week - timedelta(days=7), datetime.min.time())
+        end = datetime.combine(this_week, datetime.min.time()) - timedelta(seconds=1)
+        ranges.append((start, end))
+    if "本周" in normalized_query:
+        week_start = current_date - timedelta(days=current_date.weekday())
+        start = datetime.combine(week_start, datetime.min.time())
+        ranges.append((start, current))
+    if "上个月" in normalized_query:
+        month_start = current_date.replace(day=1)
+        previous_month_end = month_start - timedelta(days=1)
+        previous_month_start = previous_month_end.replace(day=1)
+        start = datetime.combine(previous_month_start, datetime.min.time())
+        end = datetime.combine(month_start, datetime.min.time()) - timedelta(seconds=1)
+        ranges.append((start, end))
+    if "这个月" in normalized_query or "本月" in normalized_query:
+        start = datetime.combine(current_date.replace(day=1), datetime.min.time())
+        ranges.append((start, current))
+
+    if not ranges:
+        return None
+    start = min(value[0] for value in ranges)
+    end = max(value[1] for value in ranges)
+    return int(start.timestamp()), int(end.timestamp())
+
+
 def _normalize_chat_search_text(text: str) -> str:
     return " ".join(unicodedata.normalize("NFKC", text).lower().split())
 
@@ -137,6 +209,25 @@ def _chat_search_terms(text: str) -> set[str]:
             terms.add(sequence)
         terms.update(sequence[index:index + 2] for index in range(len(sequence) - 1))
     return terms
+
+
+def _chat_sparse_vector(text: str) -> models.SparseVector:
+    """用稳定哈希生成轻量稀疏词项向量，支持中英文精确召回。"""
+    term_counts = Counter(_chat_search_terms(text))
+    values_by_index: dict[int, float] = {}
+    for term, count in term_counts.items():
+        index = int.from_bytes(
+            hashlib.blake2s(term.encode("utf-8"), digest_size=4).digest(),
+            "big",
+        )
+        values_by_index[index] = values_by_index.get(index, 0.0) + (
+            1.0 + math.log(max(count, 1))
+        )
+    indexes = sorted(values_by_index)
+    return models.SparseVector(
+        indices=indexes,
+        values=[values_by_index[index] for index in indexes],
+    )
 
 
 def _chat_context_created_at(text: str, fallback: int) -> int:
@@ -169,6 +260,7 @@ class VectorDBOperator:
     text_only: bool = False
     effective_meme_embedding_mode: str = "multimodal"
     media_embedding_version: int = MEDIA_MULTIMODAL_EMBEDDING_VERSION
+    chat_col = CHAT_COLLECTION
     media_text_col = MEDIA_TEXT_COL
     # 文本向量维度：由探测确定（配置了 embedding_dimension 则为其值，
     # 否则为模型默认输出维度），用于创建集合与校验。
@@ -215,7 +307,7 @@ class VectorDBOperator:
             timeout=60
         )
 
-        self.chat_col = "chat_collection"
+        self.chat_col = CHAT_COLLECTION
         # v3 将描述文本和原图拆成独立向量，避免视觉信息稀释梗和台词。
         self.media_multivector_col = "media_collection_v3"
         # text 模式：纯文本向量集合（BGE-M3，1024 维）
@@ -330,12 +422,17 @@ class VectorDBOperator:
     def _active_collection_specs(
         self,
     ) -> list[tuple[str, str, int, dict[str, int]]]:
+        chat_schema = (
+            {CHAT_DENSE_VECTOR: self.text_embedding_dimension}
+            if self.chat_col == CHAT_COLLECTION
+            else {"": self.text_embedding_dimension}
+        )
         specs = [
             (
                 self.chat_col,
                 self.emb_model,
                 self.text_embedding_dimension,
-                {"": self.text_embedding_dimension},
+                chat_schema,
             )
         ]
         if self.text_only:
@@ -421,6 +518,18 @@ class VectorDBOperator:
             self._collection_validation_errors = errors
         return errors
 
+    async def _ensure_chat_payload_indexes(self) -> None:
+        for field_name, field_schema in (
+            ("session_id", models.PayloadSchemaType.KEYWORD),
+            ("start_at", models.PayloadSchemaType.INTEGER),
+            ("end_at", models.PayloadSchemaType.INTEGER),
+        ):
+            await self.client.create_payload_index(
+                collection_name=self.chat_col,
+                field_name=field_name,
+                field_schema=field_schema,
+            )
+
     def _raise_if_collections_rejected(
         self,
         collection_names: Collection[str],
@@ -442,6 +551,13 @@ class VectorDBOperator:
         metadata = getattr(getattr(info, "config", None), "metadata", None)
         metadata = dict(metadata) if isinstance(metadata, dict) else {}
         vector_schema = self._collection_vector_schema(info)
+        params = getattr(getattr(info, "config", None), "params", None)
+        sparse_vectors = getattr(params, "sparse_vectors", None)
+        sparse_vector_names = (
+            {str(name) for name in sparse_vectors}
+            if isinstance(sparse_vectors, dict)
+            else set()
+        )
         current_config = {
             **self._embedding_metadata(expected_model, expected_dimension),
             "vector_schema": expected_schema,
@@ -450,6 +566,9 @@ class VectorDBOperator:
             "metadata": metadata,
             "vector_schema": vector_schema,
         }
+        if collection_name == CHAT_COLLECTION:
+            current_config["sparse_vectors"] = {CHAT_SPARSE_VECTOR}
+            collection_config["sparse_vectors"] = sparse_vector_names
 
         embedding_metadata_keys = {
             EMBEDDING_MODEL_METADATA_KEY,
@@ -521,6 +640,10 @@ class VectorDBOperator:
             actual_model != expected_model
             or actual_dimension != expected_dimension
             or vector_schema != expected_schema
+            or (
+                collection_name == CHAT_COLLECTION
+                and CHAT_SPARSE_VECTOR not in sparse_vector_names
+            )
         ):
             self._reject_collection(
                 collection_name,
@@ -598,6 +721,8 @@ class VectorDBOperator:
                         dimension,
                         expected_schema,
                     )
+                    if collection_name == CHAT_COLLECTION:
+                        await self._ensure_chat_payload_indexes()
                     ready_collections.add(collection_name)
                     continue
 
@@ -614,18 +739,27 @@ class VectorDBOperator:
                         )
                         for vector_name, vector_size in expected_schema.items()
                     }
-                await self.client.create_collection(
-                    collection_name=collection_name,
-                    vectors_config=vectors_config,
-                    metadata=self._embedding_metadata(model, dimension),
-                )
+                create_kwargs: dict[str, Any] = {
+                    "collection_name": collection_name,
+                    "vectors_config": vectors_config,
+                    "metadata": self._embedding_metadata(model, dimension),
+                }
+                if collection_name == CHAT_COLLECTION:
+                    create_kwargs["sparse_vectors_config"] = {
+                        CHAT_SPARSE_VECTOR: models.SparseVectorParams(
+                            modifier=models.Modifier.IDF,
+                        )
+                    }
+                await self.client.create_collection(**create_kwargs)
                 if collection_name == self.chat_col:
-                    # 创建 session_id 索引 (加速过滤)
-                    await self.client.create_payload_index(
-                        collection_name=self.chat_col,
-                        field_name="session_id",
-                        field_schema=models.PayloadSchemaType.KEYWORD
-                    )
+                    if collection_name == CHAT_COLLECTION:
+                        await self._ensure_chat_payload_indexes()
+                    else:
+                        await self.client.create_payload_index(
+                            collection_name=self.chat_col,
+                            field_name="session_id",
+                            field_schema=models.PayloadSchemaType.KEYWORD,
+                        )
                 logger.info(
                     f"Qdrant集合 {collection_name} 已创建，Embedding metadata="
                     f"{self._embedding_metadata(model, dimension)!r}"
@@ -963,6 +1097,7 @@ class VectorDBOperator:
         """用 dense、关键词和按需时效三条路线做加权 RRF。"""
         records: list[dict[str, Any]] = []
         seen_texts: set[str] = set()
+        seen_msg_id_sets: list[set[int]] = []
         for dense_rank, point in enumerate(points, start=1):
             payload = getattr(point, "payload", None)
             if not isinstance(payload, dict):
@@ -973,7 +1108,25 @@ class VectorDBOperator:
             normalized_text = _normalize_chat_search_text(text)
             if normalized_text in seen_texts:
                 continue
+            raw_msg_ids = payload.get("msg_ids", [])
+            msg_ids = {
+                int(value)
+                for value in raw_msg_ids
+                if isinstance(value, int) or (isinstance(value, str) and value.isdigit())
+            } if isinstance(raw_msg_ids, list) else set()
+            if len(msg_ids) >= 2 and any(
+                len(existing) >= 2
+                and (
+                    len(msg_ids & existing)
+                    / max(min(len(msg_ids), len(existing)), 1)
+                    >= 0.75
+                )
+                for existing in seen_msg_id_sets
+            ):
+                continue
             seen_texts.add(normalized_text)
+            if msg_ids:
+                seen_msg_id_sets.append(msg_ids)
             created_at = payload.get("created_at", 0)
             try:
                 timestamp = int(created_at)
@@ -1049,7 +1202,75 @@ class VectorDBOperator:
         )
         return [str(records[index]["text"]) for index in ranked_indexes]
 
+    @staticmethod
+    def _trim_chat_fragment(query: str, text: str) -> str:
+        """保留命中行附近的少量上下文，限制 RAG 注入体积。"""
+        normalized_text = text.strip()
+        if len(normalized_text) <= CHAT_RESULT_FRAGMENT_MAX_CHARS:
+            return normalized_text
+
+        lines = [line.strip() for line in normalized_text.splitlines() if line.strip()]
+        if not lines:
+            return normalized_text[:CHAT_RESULT_FRAGMENT_MAX_CHARS].rstrip()
+        query_terms = _chat_search_terms(query)
+        line_scores = [
+            len(query_terms & _chat_search_terms(line))
+            for line in lines
+        ]
+        center = max(range(len(lines)), key=lambda index: line_scores[index])
+        selected_indexes = [center]
+        radius = 1
+        while True:
+            candidates = []
+            if center - radius >= 0:
+                candidates.append(center - radius)
+            if center + radius < len(lines):
+                candidates.append(center + radius)
+            if not candidates:
+                break
+            proposed = sorted(selected_indexes + candidates)
+            proposed_text = "\n".join(lines[index] for index in proposed)
+            if len(proposed_text) > CHAT_RESULT_FRAGMENT_MAX_CHARS:
+                break
+            selected_indexes = proposed
+            radius += 1
+        fragment = "\n".join(lines[index] for index in sorted(selected_indexes))
+        return fragment[:CHAT_RESULT_FRAGMENT_MAX_CHARS].rstrip()
+
     # ================= 聊天记录功能 (RAG) =================
+
+    @staticmethod
+    def _chat_point_id(session_id: str, msg_ids: Sequence[int], text: str) -> str:
+        identity = (
+            f"{CHAT_INDEX_VERSION}\0{session_id}\0"
+            f"{','.join(str(value) for value in msg_ids)}\0{text}"
+        )
+        return str(uuid.uuid5(uuid.NAMESPACE_URL, identity))
+
+    @staticmethod
+    def _chat_time_filter(
+        session_id: str,
+        time_range: tuple[int, int] | None,
+    ) -> models.Filter:
+        must: list[models.Condition] = [
+            models.FieldCondition(
+                key="session_id",
+                match=models.MatchValue(value=session_id),
+            )
+        ]
+        if time_range is not None:
+            range_start, range_end = time_range
+            must.extend([
+                models.FieldCondition(
+                    key="start_at",
+                    range=models.Range(lte=range_end),
+                ),
+                models.FieldCondition(
+                    key="end_at",
+                    range=models.Range(gte=range_start),
+                ),
+            ])
+        return models.Filter(must=must)
 
     async def insert_chat(self, text: str, session_id: str):
         """插入新的聊天记录"""
@@ -1058,18 +1279,29 @@ class VectorDBOperator:
         if not vector:
             return
 
-        point_id = str(uuid.uuid4())
+        current_time = int(time.time())
+        point_id = self._chat_point_id(session_id, (), text)
 
+        point_vector: Any = vector
+        if self.chat_col == CHAT_COLLECTION:
+            point_vector = {
+                CHAT_DENSE_VECTOR: vector,
+                CHAT_SPARSE_VECTOR: _chat_sparse_vector(text),
+            }
         await self.client.upsert(
             collection_name=self.chat_col,
             points=[
                 models.PointStruct(
                     id=point_id,
-                    vector=vector,
+                    vector=point_vector,
                     payload={
                         "session_id": session_id,
                         "text": text,
-                        "created_at": int(time.time())
+                        "created_at": current_time,
+                        "start_at": current_time,
+                        "end_at": current_time,
+                        "msg_ids": [],
+                        "index_version": CHAT_INDEX_VERSION,
                     }
                 )
             ]
@@ -1084,24 +1316,45 @@ class VectorDBOperator:
             return "未找到相关历史记录"
         await self._ensure_collections({self.chat_col})
         expanded_query = expand_chat_search_query(normalized_query)
+        time_range = parse_chat_search_time_range(normalized_query)
         vector = await self._get_text_embedding(expanded_query)
         if not vector:
             return "无法连接记忆库"
 
-        search_result = await self.client.query_points(
-            collection_name=self.chat_col,
-            query=vector,
-            query_filter=models.Filter(
-                must=[
-                    models.FieldCondition(
-                        key="session_id",
-                        match=models.MatchValue(value=session_id)
-                    )
-                ]
-            ),
-            limit=CHAT_SEARCH_CANDIDATE_LIMIT,
-            with_payload=True,
-        )
+        query_filter = self._chat_time_filter(session_id, time_range)
+        if self.chat_col == CHAT_COLLECTION:
+            sparse_query = _chat_sparse_vector(normalized_query)
+            prefetch: list[models.Prefetch] = [
+                models.Prefetch(
+                    query=vector,
+                    using=CHAT_DENSE_VECTOR,
+                    filter=query_filter,
+                    limit=CHAT_SEARCH_CANDIDATE_LIMIT,
+                )
+            ]
+            if sparse_query.indices:
+                prefetch.append(models.Prefetch(
+                    query=sparse_query,
+                    using=CHAT_SPARSE_VECTOR,
+                    filter=query_filter,
+                    limit=CHAT_SEARCH_CANDIDATE_LIMIT,
+                ))
+            search_result = await self.client.query_points(
+                collection_name=self.chat_col,
+                prefetch=prefetch,
+                query=models.FusionQuery(fusion=models.Fusion.RRF),
+                query_filter=query_filter,
+                limit=CHAT_SEARCH_CANDIDATE_LIMIT,
+                with_payload=True,
+            )
+        else:
+            search_result = await self.client.query_points(
+                collection_name=self.chat_col,
+                query=vector,
+                query_filter=query_filter,
+                limit=CHAT_SEARCH_CANDIDATE_LIMIT,
+                with_payload=True,
+            )
 
         if not search_result or not search_result.points:
             return "未找到相关历史记录"
@@ -1117,9 +1370,24 @@ class VectorDBOperator:
         )
         if not best_texts:
             return "未找到相关历史记录"
+        fragments: list[str] = []
+        total_chars = 0
+        for text in best_texts:
+            fragment = self._trim_chat_fragment(normalized_query, text)
+            if not fragment:
+                continue
+            remaining = CHAT_RESULT_TOTAL_MAX_CHARS - total_chars
+            if remaining <= 0:
+                break
+            fragment = fragment[:remaining].rstrip()
+            if fragment:
+                fragments.append(fragment)
+                total_chars += len(fragment)
+        if not fragments:
+            return "未找到相关历史记录"
         return "\n\n".join(
             f"【相关历史片段 {index}】\n{text}"
-            for index, text in enumerate(best_texts, start=1)
+            for index, text in enumerate(fragments, start=1)
         )
 
     # ================= 表情包功能 (Image Search) =================
@@ -1221,7 +1489,13 @@ class VectorDBOperator:
             logger.error(f"Batch Embedding API Error: {e}")
             return []
 
-    async def batch_insert(self, texts: list[str], session_id: str):
+    async def batch_insert(
+        self,
+        texts: list[str],
+        session_id: str,
+        *,
+        payloads: Sequence[Mapping[str, Any]] | None = None,
+    ) -> None:
         """
         批量插入聊天记录 (用于 utils.py 中的历史数据向量化)
         """
@@ -1252,14 +1526,41 @@ class VectorDBOperator:
         points = []
         current_time = int(time.time())
 
-        for text, vector in zip(texts, vectors):
+        normalized_payloads = list(payloads or [{} for _ in texts])
+        if len(normalized_payloads) != len(texts):
+            raise ValueError("聊天向量 payload 数量必须与文本数量一致")
+
+        for text, vector, extra_payload in zip(
+            texts,
+            vectors,
+            normalized_payloads,
+        ):
+            raw_msg_ids = extra_payload.get("msg_ids", [])
+            msg_ids = [
+                int(value)
+                for value in raw_msg_ids
+                if isinstance(value, int) or (isinstance(value, str) and value.isdigit())
+            ] if isinstance(raw_msg_ids, Sequence) and not isinstance(raw_msg_ids, str) else []
+            start_at = int(extra_payload.get("start_at", current_time))
+            end_at = int(extra_payload.get("end_at", start_at))
+            point_vector: Any = vector
+            if self.chat_col == CHAT_COLLECTION:
+                point_vector = {
+                    CHAT_DENSE_VECTOR: vector,
+                    CHAT_SPARSE_VECTOR: _chat_sparse_vector(text),
+                }
             points.append(models.PointStruct(
-                id=str(uuid.uuid4()),  # 生成 UUID
-                vector=vector,
+                id=self._chat_point_id(session_id, msg_ids, text),
+                vector=point_vector,
                 payload={
                     "session_id": session_id,
                     "text": text,
-                    "created_at": _chat_context_created_at(text, current_time),
+                    "created_at": end_at,
+                    "start_at": start_at,
+                    "end_at": end_at,
+                    "msg_ids": msg_ids,
+                    "participants": list(extra_payload.get("participants", [])),
+                    "index_version": CHAT_INDEX_VERSION,
                 }
             ))
 

@@ -10,11 +10,15 @@ import tiktoken
 from PIL import Image
 from tqdm import tqdm
 from nonebot import logger
-from sqlalchemy import Select, Update
+from sqlalchemy import Select, Update, or_, and_
 from nonebot_plugin_orm import AsyncSession
 
 from .model import ChatHistory, ChatHistorySchema
-from .memory import DB, CollectionEmbeddingConfigMismatchError
+from .memory import (
+    DB,
+    CHAT_INDEX_VERSION,
+    CollectionEmbeddingConfigMismatchError,
+)
 
 
 def generate_file_hash(file_data: bytes) -> str:
@@ -165,21 +169,68 @@ async def split_chat_into_context_groups(
     返回:
         切分后的对话组列表，每组是ChatHistory对象列表
     """
-    # 获取该会话的所有消息
+    eligible_message_filter = or_(
+        ChatHistory.content_type == "text",
+        and_(
+            ChatHistory.content_type == "bot",
+            ChatHistory.media_id.is_(None),
+            ~ChatHistory.content.startswith("id: system\n"),
+        ),
+    )
+    # 只读取需要按当前 RAG 版本入库的真实文本，图片和工具动作不进入聊天索引。
     query = (
         Select(ChatHistory)
         .where(ChatHistory.session_id == session_id)
-        .where(ChatHistory.vectorized.is_(False))
+        .where(eligible_message_filter)
+        .where(ChatHistory.vectorized_version < CHAT_INDEX_VERSION)
         .order_by(ChatHistory.created_at)
     )
 
-    all_messages = (await db_session.execute(query)).scalars().all()
+    pending_messages = list((await db_session.execute(query)).scalars().all())
+    if not pending_messages:
+        return []
+
+    # 增量批次首块携带上一批最后两条真实文本，避免代词和短回复跨批失去语境。
+    first_pending_id = pending_messages[0].msg_id
+    overlap_query = (
+        Select(ChatHistory)
+        .where(ChatHistory.session_id == session_id)
+        .where(eligible_message_filter)
+        .where(ChatHistory.msg_id < first_pending_id)
+        .order_by(ChatHistory.msg_id.desc())
+        .limit(max(overlap_messages, 0))
+    )
+    previous_messages = list(
+        (await db_session.execute(overlap_query)).scalars().all()
+    )
+    previous_messages = [
+        message for message in previous_messages
+        if message.msg_id < first_pending_id
+    ]
+    all_messages = list(reversed(previous_messages)) + pending_messages
     # ✅ 转成 Pydantic 模型（一次性完全脱离数据库）
     all_messages = [ChatHistorySchema.model_validate(m) for m in all_messages]
 
-
-    if not all_messages:
-        return []
+    # 单条超长消息也必须切分；否则它会绕过组级 token 上限，污染召回和 Prompt。
+    expanded_messages: list[ChatHistorySchema] = []
+    content_token_limit = max(64, max_token_count - 40)
+    encoder = get_encoder()
+    all_messages = [message for message in all_messages if _is_rag_text_message(message)]
+    for message in all_messages:
+        clean_content = _rag_message_content(message)
+        if not clean_content:
+            continue
+        message = message.model_copy(update={"content": clean_content})
+        token_ids = encoder.encode(clean_content)
+        if len(token_ids) <= content_token_limit:
+            expanded_messages.append(message)
+            continue
+        for start in range(0, len(token_ids), content_token_limit):
+            chunk_content = encoder.decode(token_ids[start:start + content_token_limit])
+            expanded_messages.append(
+                message.model_copy(update={"content": chunk_content})
+            )
+    all_messages = expanded_messages
 
     # 初始化结果和当前组
     context_groups = []
@@ -252,6 +303,25 @@ def estimate_token_count(text: str) -> int:
         return len(text)  # 最后的保底
 
 
+def _is_rag_text_message(message: ChatHistory | ChatHistorySchema) -> bool:
+    if message.content_type == "text":
+        return True
+    return bool(
+        message.content_type == "bot"
+        and message.media_id is None
+        and not message.content.startswith("id: system\n")
+    )
+
+
+def _rag_message_content(message: ChatHistory | ChatHistorySchema) -> str:
+    lines = message.content.strip().splitlines()
+    if lines and lines[0].startswith("id:"):
+        lines.pop(0)
+    if lines and lines[0].startswith("回复id:"):
+        lines.pop(0)
+    return "\n".join(lines).strip()
+
+
 async def process_and_vectorize_session_chats(
         db_session: AsyncSession,
         session_id: str,
@@ -302,19 +372,34 @@ async def process_and_vectorize_session_chats(
 
         # 准备当前批次的数据
         batch_contexts = []
+        batch_payloads = []
         batch_msg_ids = []
 
         for group in chunk:
             context_text, msg_ids = combine_messages_into_context(group)
             batch_contexts.append(context_text)
-            batch_msg_ids.extend(msg_ids)
+            batch_payloads.append({
+                "msg_ids": msg_ids,
+                "start_at": int(group[0].created_at.timestamp()),
+                "end_at": int(group[-1].created_at.timestamp()),
+                "participants": sorted({message.user_name for message in group}),
+            })
+            batch_msg_ids.extend(
+                message.msg_id
+                for message in group
+                if getattr(message, "vectorized_version", 0) < CHAT_INDEX_VERSION
+            )
 
         if not batch_contexts:
             continue
 
         # 3. 批量插入向量到 Milvus（带重试）
         try:
-            await insert_vectors_with_retry(batch_contexts, session_id)
+            await insert_vectors_with_retry(
+                batch_contexts,
+                session_id,
+                payloads=batch_payloads,
+            )
         except Exception as e:
             logger.error(
                 f"批量向量化失败 (chunk {i}-{i + chunk_size}): {str(e)}\n{traceback.format_exc()}"
@@ -364,7 +449,7 @@ def combine_messages_into_context(
         # 确保所有关系和延迟加载的字段都已加载
         msg_id = msg.msg_id
         sender_name = msg.user_name
-        content = msg.content
+        content = _rag_message_content(msg)
         created_at = msg.created_at
 
         # 格式化时间（现在所有数据都已加载到内存）
@@ -380,6 +465,7 @@ def combine_messages_into_context(
 async def insert_vectors_with_retry(
         contexts: list[str],
         session_id: str,
+        payloads: list[dict] | None = None,
         max_retries: int = 3
 ) -> None:
     """
@@ -387,7 +473,7 @@ async def insert_vectors_with_retry(
     """
     for attempt in range(max_retries):
         try:
-            await DB.batch_insert(contexts, session_id)
+            await DB.batch_insert(contexts, session_id, payloads=payloads)
             return
         except CollectionEmbeddingConfigMismatchError:
             raise
@@ -459,6 +545,6 @@ async def mark_messages_as_vectorized_batch(db_session: AsyncSession, msg_ids: l
     await db_session.execute(
         Update(ChatHistory)
         .where(ChatHistory.msg_id.in_(msg_ids))
-        .values(vectorized=True)
+        .values(vectorized=True, vectorized_version=CHAT_INDEX_VERSION)
     )
     await db_session.commit()

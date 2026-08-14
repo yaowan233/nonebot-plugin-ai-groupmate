@@ -104,6 +104,8 @@
 | `v2.1.0` 及更早版本，且使用 `multimodal` 模式 | 先升级到 `v2.1.10`，保留旧 `media_collection` 并等待 v3 重建完成，再升级到最新版。不要跨过该迁移步骤。 |
 | `v2.1.7` 及更高版本，且始终使用 `text` 模式 | 保持 `meme_embedding_mode=text` 时可直接升级，继续使用 `media_collection_text`。切换到 `multimodal` 仍需重新向量化。 |
 
+新版聊天 RAG 会创建 `chat_collection_v2`，并在启动后于后台从 SQL 历史记录重建干净的 Dense + 稀疏混合索引。升级前需要先执行 `nb orm upgrade`；旧 `chat_collection` 会保留且不会阻塞 Bot 启动。待日志显示历史会话向量化完成、RAG 查询正常后，可按需人工删除旧集合。
+
 可用下面的命令确认 v3 集合存在并查看向量数量（请按实际地址修改 Qdrant URL）：
 
 ```bash

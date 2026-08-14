@@ -98,6 +98,12 @@ pic_dir.mkdir(parents=True, exist_ok=True)
 relation_backup_dir = plugin_data_dir / "relation_backups"
 plugin_config = get_runtime_config()
 MAX_WORDCLOUD_DAYS = 3650
+RAG_IDLE_VECTORIZE_SECONDS = 90.0
+RAG_MAINTENANCE_RETRY_SECONDS = 30.0
+RAG_BACKFILL_START_DELAY_SECONDS = 30.0
+_rag_vectorization_tasks: dict[str, asyncio.Task[None]] = {}
+_rag_last_activity: dict[str, float] = {}
+_rag_backfill_task: asyncio.Task[None] | None = None
 with open(Path(__file__).parent / "stop_words.txt", encoding="utf-8") as f:
     stop_words = f.read().splitlines() + ["id", "回复"]
 
@@ -152,6 +158,7 @@ async def _load_webui_runtime_config() -> None:
                 logger.exception(
                     "启动时 Qdrant 集合校验暂时失败，将在首次向量操作时重试"
                 )
+            _start_rag_backfill_task()
         if changed_fields:
             logger.info(
                 f"已加载 WebUI 配置覆盖项，变更字段数={len(changed_fields)}"
@@ -164,6 +171,13 @@ async def _load_webui_runtime_config() -> None:
 
 @get_driver().on_shutdown
 async def _close_vector_resources() -> None:
+    tasks = list(_rag_vectorization_tasks.values())
+    if _rag_backfill_task is not None:
+        tasks.append(_rag_backfill_task)
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
     await DB.close()
 
 
@@ -774,6 +788,8 @@ async def handle_message(
     if is_text and not is_new_text_message:
         logger.info(f"检测到重复入站消息，跳过回复 - session: {session.scene.id}")
         return
+    if is_new_text_message:
+        _schedule_rag_vectorization(session.scene.id)
 
     # ========== 步骤2: 决定是否回复（在图片处理前判断） ==========
     plain_text = event.get_plaintext()
@@ -1447,10 +1463,118 @@ async def _(
     await UniMessage.image(raw=image_bytes).send(reply_to=True)
 
 
+def _consume_rag_task(session_id: str, task: asyncio.Task[None]) -> None:
+    if _rag_vectorization_tasks.get(session_id) is task:
+        _rag_vectorization_tasks.pop(session_id, None)
+    try:
+        task.exception()
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        logger.exception(f"会话 {session_id} 自主向量化任务异常")
+
+
+async def _run_idle_rag_vectorization(session_id: str) -> None:
+    while DB.enabled:
+        last_activity = _rag_last_activity.get(session_id, time.monotonic())
+        delay = RAG_IDLE_VECTORIZE_SECONDS - (time.monotonic() - last_activity)
+        if delay > 0:
+            await asyncio.sleep(delay)
+            continue
+
+        handled_activity = _rag_last_activity.get(session_id, last_activity)
+        async with maintenance_gate.slot(wait=False) as admitted:
+            if not admitted:
+                await asyncio.sleep(RAG_MAINTENANCE_RETRY_SECONDS)
+                continue
+            try:
+                async with get_session() as vector_session:
+                    result = await process_and_vectorize_session_chats(
+                        vector_session,
+                        session_id,
+                    )
+                if result:
+                    logger.info(
+                        f"自主向量化会话 {session_id} 完成，"
+                        f"处理 {result['processed_groups']}/{result['total_groups']} 组"
+                    )
+                    if result["failed_groups"]:
+                        logger.warning(
+                            f"自主向量化会话 {session_id} 尚有 "
+                            f"{result['failed_groups']} 组失败，稍后重试"
+                        )
+                        await asyncio.sleep(RAG_MAINTENANCE_RETRY_SECONDS)
+                        continue
+            except Exception:
+                logger.exception(f"自主向量化会话 {session_id} 失败，稍后重试")
+                await asyncio.sleep(RAG_MAINTENANCE_RETRY_SECONDS)
+                continue
+
+        if _rag_last_activity.get(session_id, handled_activity) > handled_activity:
+            continue
+        _rag_last_activity.pop(session_id, None)
+        return
+
+
+def _schedule_rag_vectorization(session_id: str) -> None:
+    if not DB.enabled:
+        return
+    _rag_last_activity[session_id] = time.monotonic()
+    existing = _rag_vectorization_tasks.get(session_id)
+    if existing is not None and not existing.done():
+        return
+    task = asyncio.create_task(
+        _run_idle_rag_vectorization(session_id),
+        name=f"ai-groupmate-rag:{session_id}",
+    )
+    _rag_vectorization_tasks[session_id] = task
+    task.add_done_callback(
+        lambda completed, current_session=session_id: _consume_rag_task(
+            current_session,
+            completed,
+        )
+    )
+
+
+def _consume_rag_backfill_task(task: asyncio.Task[None]) -> None:
+    global _rag_backfill_task
+    if _rag_backfill_task is task:
+        _rag_backfill_task = None
+    try:
+        task.exception()
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        logger.exception("RAG 历史后台回填任务异常")
+
+
+def _start_rag_backfill_task() -> None:
+    global _rag_backfill_task
+    if not DB.enabled or (
+        _rag_backfill_task is not None and not _rag_backfill_task.done()
+    ):
+        return
+    _rag_backfill_task = asyncio.create_task(
+        _run_delayed_rag_backfill(),
+        name="ai-groupmate-rag-backfill",
+    )
+    _rag_backfill_task.add_done_callback(_consume_rag_backfill_task)
+
+
+async def _run_delayed_rag_backfill() -> None:
+    # 避开 Bot 启动、适配器连接和数据库迁移的高峰，防止争抢小连接池。
+    await asyncio.sleep(RAG_BACKFILL_START_DELAY_SECONDS)
+    await _run_rag_backfill()
+
+
 @scheduler.scheduled_job(
-    "interval", minutes=60, max_instances=1, coalesce=True, id="vectorize_chat"
+    "interval", hours=6, max_instances=1, coalesce=True, id="vectorize_chat"
 )
 async def vectorize_message_history():
+    await _run_rag_backfill()
+
+
+async def _run_rag_backfill() -> None:
     if not DB.enabled:
         logger.debug("Qdrant 未启用，跳过会话向量化任务")
         return
