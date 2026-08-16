@@ -61,7 +61,7 @@ SETTING_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     ),
     (
         "Google Vertex AI",
-        "chat/tagging/vision 选择 Vertex 时共用；服务账号路径优先，其次是 Vertex API Key，均留空时使用 ADC。",
+        "chat/tagging/vision 选择 Vertex 时共用；API Key 使用无需项目 ID 的 Express Mode，服务账号或 ADC 使用标准模式。",
         (
             "vertex_project",
             "vertex_location",

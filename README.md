@@ -136,9 +136,9 @@ curl http://127.0.0.1:6333/collections/media_collection_v3
 | ai_groupmate__chat_api_format | 否 | `openai` | 主聊天接口格式，可选 `openai` / `anthropic` / `vertex` |
 | ai_groupmate__chat_multimodal | 否 | `true` | 主聊天模型是否支持图片输入；若使用纯文本模型请设为 `false`，将跳过图片上传只发文本 |
 | ai_groupmate__chat_explicit_prompt_cache | 否 | `true` | 为支持的接口添加显式 Prompt 缓存断点；支持 DashScope、Anthropic，以及 OpenRouter 上的 Gemini/Claude，并自动使用匿名群级粘性路由 |
-| ai_groupmate__vertex_project | Vertex 时推荐 | 无 | Google Cloud 项目 ID；留空时由 ADC / `GOOGLE_CLOUD_PROJECT` 自动发现 |
-| ai_groupmate__vertex_location | 否 | `global` | Vertex AI 区域，模型不支持 `global` 时改为项目已开放的区域 |
-| ai_groupmate__vertex_api_key | 否 | 无 | Vertex AI 专用 API Key；服务账号路径已配置时忽略此项 |
+| ai_groupmate__vertex_project | 标准 Vertex 时推荐 | 无 | Google Cloud 项目 ID；ADC / 服务账号模式使用，Express Mode API Key 不需要 |
+| ai_groupmate__vertex_location | 否 | `global` | ADC / 服务账号模式的 Vertex AI 区域；Express Mode API Key 下忽略 |
+| ai_groupmate__vertex_api_key | 否 | 无 | Vertex AI Express Mode API Key；也可使用 `GOOGLE_CLOUD_API_KEY` 环境变量，服务账号路径已配置时忽略 |
 | ai_groupmate__vertex_credentials_path | 否 | 无 | 容器内服务账号 JSON 路径；留空时使用 Application Default Credentials (ADC) |
 | ai_groupmate__vision_model | 否 | 无 | 图片回读辅助模型（如 `qwen-vl-max`）；主模型不支持图片时用它总结工具返回的图片内容，留空则跳过图片回读 |
 | ai_groupmate__vision_api_key | 否 | 无 | 图片回读辅助模型专用 API Key，留空则使用 `llm_api_key` / `qwen_token` |
@@ -233,6 +233,18 @@ AI_GROUPMATE__VERTEX_CREDENTIALS_PATH=/app/secrets/vertex-service-account.json
 `GOOGLE_APPLICATION_CREDENTIALS`、Workload Identity 或运行环境已有的 ADC。插件会自动
 刷新 OAuth 凭据。若从 OpenRouter 迁移，`google/gemini-...` 模型名也会自动移除
 `google/` 前缀；`CHAT_API_KEY` 和 `CHAT_BASE_URL` 在 Vertex 模式下不会使用。
+
+Vertex AI Express Mode API Key 不需要项目 ID 和区域：
+
+```dotenv
+AI_GROUPMATE__CHAT_API_FORMAT=vertex
+AI_GROUPMATE__CHAT_MODEL=gemini-3.7-flash
+GOOGLE_CLOUD_API_KEY=AIza...
+```
+
+也可以把同一个 Key 填入 `AI_GROUPMATE__VERTEX_API_KEY`。插件检测到 API Key 后会
+使用 Express Mode，并忽略 `VERTEX_PROJECT` 和 `VERTEX_LOCATION`；认证优先级为
+服务账号 JSON → Vertex API Key → ADC。
 
 固定知识示例（将群号和入群方式替换为自己的信息）：
 

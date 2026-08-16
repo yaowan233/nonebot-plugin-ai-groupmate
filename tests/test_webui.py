@@ -365,7 +365,7 @@ def test_runtime_config_update_is_validated_and_bootstrap_fields_are_blocked():
     } <= RESTART_REQUIRED_FIELDS
 
 
-def test_connection_error_redacts_configured_secrets():
+def test_connection_error_redacts_configured_secrets(monkeypatch):
     from nonebot_plugin_ai_groupmate.webui import _safe_connection_error
     from nonebot_plugin_ai_groupmate.config import ScopedConfig
 
@@ -375,6 +375,14 @@ def test_connection_error_redacts_configured_secrets():
         config,
     )
     assert "sk-secret-value" not in detail
+    assert "***" in detail
+
+    monkeypatch.setenv("GOOGLE_CLOUD_API_KEY", "google-secret-value")
+    detail = _safe_connection_error(
+        RuntimeError("request failed with google-secret-value"),
+        config,
+    )
+    assert "google-secret-value" not in detail
     assert "***" in detail
 
 

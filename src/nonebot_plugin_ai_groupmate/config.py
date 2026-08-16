@@ -192,22 +192,38 @@ def create_vertex_llm(
         "model": _vertex_model_name(model),
         "vertexai": True,
         "temperature": temperature,
-        "location": cfg.vertex_location or "global",
     }
-    if cfg.vertex_project:
-        kwargs["project"] = cfg.vertex_project
 
     if cfg.vertex_credentials_path:
         from google.oauth2 import service_account
 
-        kwargs["credentials"] = (
-            service_account.Credentials.from_service_account_file(
-                cfg.vertex_credentials_path,
-                scopes=["https://www.googleapis.com/auth/cloud-platform"],
-            )
+        credentials = service_account.Credentials.from_service_account_file(
+            cfg.vertex_credentials_path,
+            scopes=["https://www.googleapis.com/auth/cloud-platform"],
         )
-    elif cfg.vertex_api_key:
-        kwargs["api_key"] = SecretStr(cfg.vertex_api_key)
+        kwargs["credentials"] = credentials
+        project = cfg.vertex_project or credentials.project_id
+        if project:
+            kwargs["project"] = project
+        kwargs["location"] = cfg.vertex_location or "global"
+    else:
+        import os
+
+        api_key = (
+            cfg.vertex_api_key
+            or os.getenv("GOOGLE_CLOUD_API_KEY", "")
+            or os.getenv("GOOGLE_API_KEY", "")
+            or os.getenv("GEMINI_API_KEY", "")
+        )
+        if api_key:
+            # Vertex AI Express Mode 的 API key 已绑定 Express 项目。这里不能
+            # 同时传 project/location，否则 google-genai 会切换到标准 Vertex
+            # 认证流程并尝试加载 ADC。
+            kwargs["api_key"] = SecretStr(api_key)
+        else:
+            if cfg.vertex_project:
+                kwargs["project"] = cfg.vertex_project
+            kwargs["location"] = cfg.vertex_location or "global"
 
     if max_tokens is not None:
         kwargs["max_tokens"] = max_tokens
