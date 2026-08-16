@@ -21,6 +21,8 @@ def _state(message: AIMessage, *, tool_count: int = 0) -> "AgentState":
         "reply_requires_continuation": False,
         "reaction_this_round": 0,
         "called_finish": 0,
+        "llm_input_tokens": 0,
+        "llm_output_tokens": 0,
         "llm_cached_tokens": 0,
         "llm_cache_creation_tokens": 0,
         "llm_call_count": 0,
@@ -145,6 +147,32 @@ async def test_invalid_image_error_retries_with_text_only_messages():
     )
     assert result["image_input_disabled"] is True
     assert result["llm_call_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_agent_tracks_provider_usage_without_openai_callback():
+    from nonebot_plugin_ai_groupmate.agent.graph import (
+        AgentRunLimits,
+        _make_agent_node,
+    )
+
+    model = _ToolSpyModel([
+        AIMessage(
+            content="done",
+            usage_metadata={
+                "input_tokens": 120,
+                "output_tokens": 30,
+                "total_tokens": 150,
+            },
+        )
+    ])
+    agent_node = _make_agent_node(model, [], "system", {}, AgentRunLimits())
+
+    result = await agent_node(_state(AIMessage(content="question")))
+
+    assert result["llm_input_tokens"] == 120
+    assert result["llm_output_tokens"] == 30
+    assert result["llm_total_tokens"] == 150
 
 
 @pytest.mark.asyncio

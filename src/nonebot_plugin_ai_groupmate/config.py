@@ -53,8 +53,17 @@ class ScopedConfig(BaseModel):
     chat_api_key: str = ""
     chat_base_url: str = ""
     chat_temperature: float = 0.7
-    chat_api_format: str = "openai"  # "openai" 或 "anthropic"
+    chat_api_format: Literal["openai", "anthropic", "vertex"] = "openai"
     chat_multimodal: bool = True  # 主聊天模型是否支持图片输入
+
+    # === Google Vertex AI（chat/tagging/vision 共用） ===
+    # 凭据优先级：vertex_credentials_path > vertex_api_key > ADC。
+    # ADC 可通过 GOOGLE_APPLICATION_CREDENTIALS、Workload Identity 或
+    # `gcloud auth application-default login` 提供。
+    vertex_project: str = ""
+    vertex_location: str = "global"
+    vertex_api_key: str = ""
+    vertex_credentials_path: str = ""
 
     # === 快速决策模型（Gatekeeper） ===
     flash_model: str = "qwen-flash"
@@ -75,14 +84,14 @@ class ScopedConfig(BaseModel):
     tagging_api_key: str = ""
     tagging_base_url: str = ""
     tagging_temperature: float = 0.01
-    tagging_api_format: str = "openai"  # "openai" 或 "anthropic"
+    tagging_api_format: Literal["openai", "anthropic", "vertex"] = "openai"
 
     # === 图片回读辅助模型（主模型不支持图片时，用它对工具返回的图片做内容总结） ===
     vision_model: str = ""
     vision_api_key: str = ""
     vision_base_url: str = ""
     vision_temperature: float = 0.01
-    vision_api_format: str = "openai"  # "openai" 或 "anthropic"
+    vision_api_format: Literal["openai", "anthropic", "vertex"] = "openai"
     vision_input_cost_per_million: float = 0.0
     vision_output_cost_per_million: float = 0.0
 
@@ -154,7 +163,60 @@ def create_chat_openai(
     return ChatOpenAI(**kwargs)
 
 
+def _vertex_model_name(model: str) -> str:
+    """Accept an OpenRouter Gemini name when migrating to direct Vertex AI."""
+    normalized = model.strip()
+    if normalized.lower().startswith("google/"):
+        return normalized.split("/", 1)[1]
+    return normalized
+
+
+def create_vertex_llm(
+    cfg: ScopedConfig,
+    role: str = "chat",
+    temperature: float | None = None,
+    max_tokens: int | None = None,
+) -> Any:
+    """Create a Gemini chat model backed by Vertex AI with renewable auth."""
+    from langchain_google_genai import ChatGoogleGenerativeAI
+
+    model = getattr(cfg, f"{role}_model") or cfg.base_model
+    if not model:
+        raise ValueError(f"{role}_model 未配置")
+    if temperature is None:
+        temperature = getattr(cfg, f"{role}_temperature", 0.7)
+    if max_tokens is None:
+        max_tokens = getattr(cfg, f"{role}_max_tokens", None)
+
+    kwargs: dict[str, Any] = {
+        "model": _vertex_model_name(model),
+        "vertexai": True,
+        "temperature": temperature,
+        "location": cfg.vertex_location or "global",
+    }
+    if cfg.vertex_project:
+        kwargs["project"] = cfg.vertex_project
+
+    if cfg.vertex_credentials_path:
+        from google.oauth2 import service_account
+
+        kwargs["credentials"] = (
+            service_account.Credentials.from_service_account_file(
+                cfg.vertex_credentials_path,
+                scopes=["https://www.googleapis.com/auth/cloud-platform"],
+            )
+        )
+    elif cfg.vertex_api_key:
+        kwargs["api_key"] = SecretStr(cfg.vertex_api_key)
+
+    if max_tokens is not None:
+        kwargs["max_tokens"] = max_tokens
+    return ChatGoogleGenerativeAI(**kwargs)
+
+
 def create_chat_llm(cfg: ScopedConfig) -> Any:
+    if cfg.chat_api_format == "vertex":
+        return create_vertex_llm(cfg, "chat")
     if cfg.chat_api_format == "anthropic":
         from langchain_anthropic import ChatAnthropic
 
@@ -174,6 +236,8 @@ def create_chat_llm(cfg: ScopedConfig) -> Any:
 
 
 def create_tagging_llm(cfg: ScopedConfig) -> Any:
+    if cfg.tagging_api_format == "vertex":
+        return create_vertex_llm(cfg, "tagging", max_tokens=1024)
     if cfg.tagging_api_format == "anthropic":
         from langchain_anthropic import ChatAnthropic
 
@@ -193,6 +257,8 @@ def create_tagging_llm(cfg: ScopedConfig) -> Any:
 
 
 def create_vision_llm(cfg: ScopedConfig) -> Any:
+    if cfg.vision_api_format == "vertex":
+        return create_vertex_llm(cfg, "vision", max_tokens=1024)
     if cfg.vision_api_format == "anthropic":
         from langchain_anthropic import ChatAnthropic
 

@@ -124,6 +124,8 @@ async def test_agent_node_forwards_provider_request_kwargs():
         "reply_requires_continuation": False,
         "reaction_this_round": 0,
         "called_finish": 0,
+        "llm_input_tokens": 0,
+        "llm_output_tokens": 0,
         "llm_cached_tokens": 0,
         "llm_cache_creation_tokens": 0,
         "llm_call_count": 0,

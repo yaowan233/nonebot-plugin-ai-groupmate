@@ -67,6 +67,8 @@ class AgentState(TypedDict):
     reply_requires_continuation: bool
     reaction_this_round: int
     called_finish: int
+    llm_input_tokens: int
+    llm_output_tokens: int
     llm_cached_tokens: int
     llm_cache_creation_tokens: int
     llm_call_count: int
@@ -459,6 +461,8 @@ def _make_agent_node(
         full: list[BaseMessage] = system_messages + list(state["messages"])
         call_messages = full
         call_number = state.get("llm_call_count", 0)
+        input_tokens = state.get("llm_input_tokens", 0)
+        output_tokens = state.get("llm_output_tokens", 0)
         total_tokens = state.get("llm_total_tokens", 0)
         cached_tokens = state.get("llm_cached_tokens", 0)
         cache_creation_tokens = state.get("llm_cache_creation_tokens", 0)
@@ -514,6 +518,8 @@ def _make_agent_node(
                 [*call_messages, response]
             )
             total_tokens += budget_tokens
+            input_tokens += usage["input_tokens"]
+            output_tokens += usage["output_tokens"]
             cached_tokens += usage["cached_tokens"]
             cache_creation_tokens += usage["cache_creation_tokens"]
             logger.info(
@@ -547,6 +553,8 @@ def _make_agent_node(
             "reply_this_round": 0,
             "reply_requires_continuation": False,
             "called_finish": 0,
+            "llm_input_tokens": input_tokens,
+            "llm_output_tokens": output_tokens,
             "llm_cached_tokens": cached_tokens,
             "llm_cache_creation_tokens": cache_creation_tokens,
             "llm_call_count": call_number,

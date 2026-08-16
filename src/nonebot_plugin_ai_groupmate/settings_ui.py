@@ -60,6 +60,16 @@ SETTING_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         ),
     ),
     (
+        "Google Vertex AI",
+        "chat/tagging/vision 选择 Vertex 时共用；服务账号路径优先，其次是 Vertex API Key，均留空时使用 ADC。",
+        (
+            "vertex_project",
+            "vertex_location",
+            "vertex_api_key",
+            "vertex_credentials_path",
+        ),
+    ),
+    (
         "快速决策模型",
         "用于 Gatekeeper 判断消息是否值得回复。",
         (
@@ -173,6 +183,10 @@ _DIRECT_LABELS = {
     "agent_tool_result_max_chars": "工具结果最大字符数",
     "chat_explicit_prompt_cache": "启用显式 Prompt 缓存",
     "chat_multimodal": "主模型支持图片",
+    "vertex_project": "Google Cloud 项目 ID",
+    "vertex_location": "Vertex 区域",
+    "vertex_api_key": "Vertex API Key",
+    "vertex_credentials_path": "服务账号 JSON 路径",
     "tavily_api_key": "Tavily API Key",
     "qdrant_uri": "Qdrant 地址",
     "qdrant_api_key": "Qdrant API Key",
@@ -284,6 +298,7 @@ def _render_field(
             f'<select data-setting="{key}">'
             f'<option value="openai" {"selected" if value == "openai" else ""}>OpenAI 兼容</option>'
             f'<option value="anthropic" {"selected" if value == "anthropic" else ""}>Anthropic</option>'
+            f'<option value="vertex" {"selected" if value == "vertex" else ""}>Google Vertex AI</option>'
             "</select>"
         )
     elif field_name == "personality_setting":

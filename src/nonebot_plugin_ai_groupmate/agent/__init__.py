@@ -155,6 +155,8 @@ def _use_explicit_prompt_cache() -> bool:
 
 
 def _chat_request_kwargs(session_id: str) -> dict[str, Any]:
+    if plugin_config.chat_api_format != "openai":
+        return {}
     base_url = plugin_config.chat_base_url or plugin_config.llm_base_url
     return build_openrouter_request_kwargs(base_url, session_id)
 
@@ -451,6 +453,8 @@ async def _run_scheduled_agent_task(
                         "reply_requires_continuation": False,
                         "reaction_this_round": 0,
                         "called_finish": 0,
+                        "llm_input_tokens": 0,
+                        "llm_output_tokens": 0,
                         "llm_cached_tokens": 0,
                         "llm_cache_creation_tokens": 0,
                         "llm_call_count": 0,
@@ -1582,6 +1586,8 @@ async def choice_response_strategy(
             "reply_requires_continuation": False,
             "reaction_this_round": 0,
             "called_finish": 0,
+            "llm_input_tokens": 0,
+            "llm_output_tokens": 0,
             "llm_cached_tokens": 0,
             "llm_cache_creation_tokens": 0,
             "llm_call_count": 0,
@@ -1611,9 +1617,22 @@ async def choice_response_strategy(
             logger.warning("Agent 完成后发现数据库事务未回滚，先恢复 session 再提交本轮结果")
             await _safe_rollback(db_session)
         _log_agent_run_summary(session_id, graph_result)
+        chat_prompt_tokens = max(
+            int(cb.prompt_tokens or 0),
+            int(graph_result.get("llm_input_tokens", 0) or 0),
+        )
+        chat_completion_tokens = max(
+            int(cb.completion_tokens or 0),
+            int(graph_result.get("llm_output_tokens", 0) or 0),
+        )
+        chat_total_tokens = max(
+            int(cb.total_tokens or 0),
+            int(graph_result.get("llm_total_tokens", 0) or 0),
+            chat_prompt_tokens + chat_completion_tokens,
+        )
         logger.info(
-            f"[Token用量] 输入={cb.prompt_tokens} 输出={cb.completion_tokens} "
-            f"总计={cb.total_tokens} 费用≈${cb.total_cost:.4f}"
+            f"[Token用量] 输入={chat_prompt_tokens} 输出={chat_completion_tokens} "
+            f"总计={chat_total_tokens} 费用≈${cb.total_cost:.4f}"
         )
         cached_tokens = max(
             extract_cached_tokens(cb),
@@ -1634,8 +1653,8 @@ async def choice_response_strategy(
             else plugin_config.chat_long_cached_input_cost_per_million
         )
         chat_estimated_cost = estimate_cost(
-            prompt_tokens=int(cb.prompt_tokens or 0),
-            completion_tokens=int(cb.completion_tokens or 0),
+            prompt_tokens=chat_prompt_tokens,
+            completion_tokens=chat_completion_tokens,
             cached_tokens=cached_tokens,
             cache_creation_tokens=cache_creation_tokens,
             callback_cost=float(cb.total_cost or 0.0),
@@ -1679,11 +1698,11 @@ async def choice_response_strategy(
             user_name=user_name,
             model=usage_model,
             request_id=request_id,
-            prompt_tokens=int(cb.prompt_tokens or 0) + vision_metrics.prompt_tokens,
-            completion_tokens=int(cb.completion_tokens or 0) + vision_metrics.completion_tokens,
+            prompt_tokens=chat_prompt_tokens + vision_metrics.prompt_tokens,
+            completion_tokens=chat_completion_tokens + vision_metrics.completion_tokens,
             cached_tokens=cached_tokens,
             cache_creation_tokens=cache_creation_tokens,
-            total_tokens=int(cb.total_tokens or 0) + vision_metrics.total_tokens,
+            total_tokens=chat_total_tokens + vision_metrics.total_tokens,
             estimated_cost=estimated_cost,
             agent_llm_calls=int(graph_result.get("llm_call_count", 0) or 0) + vision_metrics.calls,
             agent_tool_calls=int(graph_result.get("tool_count", 0) or 0),
@@ -1749,6 +1768,8 @@ if __name__ == "__main__":
             "reply_requires_continuation": False,
             "reaction_this_round": 0,
             "called_finish": 0,
+            "llm_input_tokens": 0,
+            "llm_output_tokens": 0,
             "llm_cached_tokens": 0,
             "llm_cache_creation_tokens": 0,
             "llm_call_count": 0,

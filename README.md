@@ -133,14 +133,18 @@ curl http://127.0.0.1:6333/collections/media_collection_v3
 | ai_groupmate__chat_api_key | 否 | 无 | 主聊天模型专用 API Key，留空则使用 `llm_api_key` / `qwen_token` |
 | ai_groupmate__chat_base_url | 否 | 无 | 主聊天模型专用 Base URL，留空则使用 `llm_base_url` |
 | ai_groupmate__chat_temperature | 否 | `0.7` | 主聊天模型温度 |
-| ai_groupmate__chat_api_format | 否 | `openai` | 主聊天接口格式，可选 `openai` / `anthropic` |
+| ai_groupmate__chat_api_format | 否 | `openai` | 主聊天接口格式，可选 `openai` / `anthropic` / `vertex` |
 | ai_groupmate__chat_multimodal | 否 | `true` | 主聊天模型是否支持图片输入；若使用纯文本模型请设为 `false`，将跳过图片上传只发文本 |
 | ai_groupmate__chat_explicit_prompt_cache | 否 | `true` | 为支持的接口添加显式 Prompt 缓存断点；支持 DashScope、Anthropic，以及 OpenRouter 上的 Gemini/Claude，并自动使用匿名群级粘性路由 |
+| ai_groupmate__vertex_project | Vertex 时推荐 | 无 | Google Cloud 项目 ID；留空时由 ADC / `GOOGLE_CLOUD_PROJECT` 自动发现 |
+| ai_groupmate__vertex_location | 否 | `global` | Vertex AI 区域，模型不支持 `global` 时改为项目已开放的区域 |
+| ai_groupmate__vertex_api_key | 否 | 无 | Vertex AI 专用 API Key；服务账号路径已配置时忽略此项 |
+| ai_groupmate__vertex_credentials_path | 否 | 无 | 容器内服务账号 JSON 路径；留空时使用 Application Default Credentials (ADC) |
 | ai_groupmate__vision_model | 否 | 无 | 图片回读辅助模型（如 `qwen-vl-max`）；主模型不支持图片时用它总结工具返回的图片内容，留空则跳过图片回读 |
 | ai_groupmate__vision_api_key | 否 | 无 | 图片回读辅助模型专用 API Key，留空则使用 `llm_api_key` / `qwen_token` |
 | ai_groupmate__vision_base_url | 否 | 无 | 图片回读辅助模型专用 Base URL，留空则使用 `llm_base_url` |
 | ai_groupmate__vision_temperature | 否 | `0.01` | 图片回读辅助模型温度 |
-| ai_groupmate__vision_api_format | 否 | `openai` | 图片回读辅助接口格式，可选 `openai` / `anthropic` |
+| ai_groupmate__vision_api_format | 否 | `openai` | 图片回读辅助接口格式，可选 `openai` / `anthropic` / `vertex` |
 | ai_groupmate__vision_input_cost_per_million | 否 | `0` | 图片回读辅助模型每百万输入 Token 费用，用于 WebUI 成本统计 |
 | ai_groupmate__vision_output_cost_per_million | 否 | `0` | 图片回读辅助模型每百万输出 Token 费用，用于 WebUI 成本统计 |
 | ai_groupmate__agent_timeout_seconds | 否 | `180` | 单次 agent 总运行超时（秒） |
@@ -171,7 +175,7 @@ curl http://127.0.0.1:6333/collections/media_collection_v3
 | ai_groupmate__tagging_api_key | 否 | 无 | 图片标注模型专用 API Key |
 | ai_groupmate__tagging_base_url | 否 | 无 | 图片标注模型专用 Base URL |
 | ai_groupmate__tagging_temperature | 否 | `0.01` | 图片标注模型温度 |
-| ai_groupmate__tagging_api_format | 否 | `openai` | 图片标注接口格式，可选 `openai` / `anthropic` |
+| ai_groupmate__tagging_api_format | 否 | `openai` | 图片标注接口格式，可选 `openai` / `anthropic` / `vertex` |
 | ai_groupmate__qwen_token | 否 | 无 | 兼容旧配置的 DashScope API Key；新配置推荐使用 `llm_api_key` |
 | ai_groupmate__base_model | 否 | 无 | 兼容旧配置的默认模型名；新配置推荐使用 `chat_model` |
 | ai_groupmate__qdrant_uri | 否 | 无 | Qdrant 地址，不填则禁用表情包、RAG 等向量功能；要求 Qdrant 服务端版本不低于 `1.16` |
@@ -213,6 +217,22 @@ AI_GROUPMATE__BOT_NAME=bot
 AI_GROUPMATE__LLM_API_KEY=sk-xxxx
 AI_GROUPMATE__CHAT_MODEL=qwen3.5-plus
 ```
+
+Vertex AI 主模型示例（推荐使用服务账号或其他 ADC，不要把 JSON 内容写进 `.env`）：
+
+```dotenv
+AI_GROUPMATE__CHAT_API_FORMAT=vertex
+AI_GROUPMATE__CHAT_MODEL=gemini-3.7-flash
+AI_GROUPMATE__VERTEX_PROJECT=your-google-cloud-project
+AI_GROUPMATE__VERTEX_LOCATION=global
+AI_GROUPMATE__VERTEX_CREDENTIALS_PATH=/app/secrets/vertex-service-account.json
+```
+
+把服务账号 JSON 只读挂载到上述容器路径，并授予服务账号 `Vertex AI User`
+（`roles/aiplatform.user`）角色。也可以不设置 `VERTEX_CREDENTIALS_PATH`，改用
+`GOOGLE_APPLICATION_CREDENTIALS`、Workload Identity 或运行环境已有的 ADC。插件会自动
+刷新 OAuth 凭据。若从 OpenRouter 迁移，`google/gemini-...` 模型名也会自动移除
+`google/` 前缀；`CHAT_API_KEY` 和 `CHAT_BASE_URL` 在 Vertex 模式下不会使用。
 
 固定知识示例（将群号和入群方式替换为自己的信息）：
 
