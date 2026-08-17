@@ -1,4 +1,3 @@
-import os
 import asyncio
 import secrets
 from html import escape
@@ -138,14 +137,6 @@ def _safe_connection_error(error: Exception, config: ScopedConfig) -> str:
     message = str(error)
     for field_name in SECRET_FIELDS:
         secret_value = str(getattr(config, field_name, "") or "")
-        if secret_value:
-            message = message.replace(secret_value, "***")
-    for environment_name in (
-        "GOOGLE_CLOUD_API_KEY",
-        "GOOGLE_API_KEY",
-        "GEMINI_API_KEY",
-    ):
-        secret_value = os.getenv(environment_name, "")
         if secret_value:
             message = message.replace(secret_value, "***")
     message = " ".join(message.split())

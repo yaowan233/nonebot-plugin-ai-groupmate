@@ -86,44 +86,33 @@ def test_vertex_service_account_credentials_take_precedence(monkeypatch):
     assert "api_key" not in captured
 
 
-def test_google_cloud_api_key_selects_express_mode(monkeypatch):
-    import langchain_google_genai
+def test_nonebot_dotenv_vertex_api_key_is_loaded_directly(tmp_path):
+    from nonebot.config import BaseSettings
 
-    from nonebot_plugin_ai_groupmate.config import ScopedConfig, create_chat_llm
+    from nonebot_plugin_ai_groupmate.config import Config
 
-    captured = {}
-
-    class FakeVertexModel:
-        def __init__(self, **kwargs):
-            captured.update(kwargs)
-
-    monkeypatch.setattr(
-        langchain_google_genai,
-        "ChatGoogleGenerativeAI",
-        FakeVertexModel,
+    dotenv = tmp_path / ".env"
+    dotenv.write_text(
+        "AI_GROUPMATE__CHAT_API_FORMAT=vertex\n"
+        "AI_GROUPMATE__VERTEX_API_KEY=dotenv-express-key\n",
+        encoding="utf-8",
     )
-    monkeypatch.setenv("GOOGLE_CLOUD_API_KEY", "express-key")
-    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
-    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    values = BaseSettings._settings_build_values(
+        Config,
+        {},
+        env_file=dotenv,
+        env_file_encoding="utf-8",
+        env_nested_delimiter="__",
+    )
+    config = Config.model_validate(values)
 
-    create_chat_llm(ScopedConfig(
-        chat_api_format="vertex",
-        chat_model="gemini-3.7-flash",
-        vertex_project="must-be-ignored",
-        vertex_location="global",
-    ))
-
-    assert captured["api_key"] == SecretStr("express-key")
-    assert "project" not in captured
-    assert "location" not in captured
+    assert config.ai_groupmate.chat_api_format == "vertex"
+    assert config.ai_groupmate.vertex_api_key == "dotenv-express-key"
 
 
-def test_vertex_express_model_constructs_without_adc(monkeypatch):
+def test_vertex_express_model_constructs_without_adc():
     from nonebot_plugin_ai_groupmate.config import ScopedConfig, create_chat_llm
 
-    monkeypatch.delenv("GOOGLE_CLOUD_API_KEY", raising=False)
-    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
-    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     model = create_chat_llm(ScopedConfig(
         chat_api_format="vertex",
         chat_model="gemini-3.7-flash",
@@ -156,9 +145,6 @@ def test_vertex_tagging_and_vision_have_output_limit(monkeypatch):
         "ChatGoogleGenerativeAI",
         FakeVertexModel,
     )
-    monkeypatch.delenv("GOOGLE_CLOUD_API_KEY", raising=False)
-    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
-    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     cfg = ScopedConfig(
         tagging_api_format="vertex",
         vision_api_format="vertex",

@@ -207,14 +207,7 @@ def create_vertex_llm(
             kwargs["project"] = project
         kwargs["location"] = cfg.vertex_location or "global"
     else:
-        import os
-
-        api_key = (
-            cfg.vertex_api_key
-            or os.getenv("GOOGLE_CLOUD_API_KEY", "")
-            or os.getenv("GOOGLE_API_KEY", "")
-            or os.getenv("GEMINI_API_KEY", "")
-        )
+        api_key = cfg.vertex_api_key
         if api_key:
             # Vertex AI Express Mode 的 API key 已绑定 Express 项目。这里不能
             # 同时传 project/location，否则 google-genai 会切换到标准 Vertex

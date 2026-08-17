@@ -138,7 +138,7 @@ curl http://127.0.0.1:6333/collections/media_collection_v3
 | ai_groupmate__chat_explicit_prompt_cache | 否 | `true` | 为支持的接口添加显式 Prompt 缓存断点；支持 DashScope、Anthropic，以及 OpenRouter 上的 Gemini/Claude，并自动使用匿名群级粘性路由 |
 | ai_groupmate__vertex_project | 标准 Vertex 时推荐 | 无 | Google Cloud 项目 ID；ADC / 服务账号模式使用，Express Mode API Key 不需要 |
 | ai_groupmate__vertex_location | 否 | `global` | ADC / 服务账号模式的 Vertex AI 区域；Express Mode API Key 下忽略 |
-| ai_groupmate__vertex_api_key | 否 | 无 | Vertex AI Express Mode API Key；也可使用 `GOOGLE_CLOUD_API_KEY` 环境变量，服务账号路径已配置时忽略 |
+| ai_groupmate__vertex_api_key | Express Mode 必填 | 无 | Vertex AI Express Mode API Key，可直接写入 NoneBot 的 `.env`；服务账号路径已配置时忽略 |
 | ai_groupmate__vertex_credentials_path | 否 | 无 | 容器内服务账号 JSON 路径；留空时使用 Application Default Credentials (ADC) |
 | ai_groupmate__vision_model | 否 | 无 | 图片回读辅助模型（如 `qwen-vl-max`）；主模型不支持图片时用它总结工具返回的图片内容，留空则跳过图片回读 |
 | ai_groupmate__vision_api_key | 否 | 无 | 图片回读辅助模型专用 API Key，留空则使用 `llm_api_key` / `qwen_token` |
@@ -239,12 +239,18 @@ Vertex AI Express Mode API Key 不需要项目 ID 和区域：
 ```dotenv
 AI_GROUPMATE__CHAT_API_FORMAT=vertex
 AI_GROUPMATE__CHAT_MODEL=gemini-3.7-flash
-GOOGLE_CLOUD_API_KEY=AIza...
+# 将 Google 官方示例中 GOOGLE_CLOUD_API_KEY 对应的 Key 值填在这里
+AI_GROUPMATE__VERTEX_API_KEY=AIza...
 ```
 
-也可以把同一个 Key 填入 `AI_GROUPMATE__VERTEX_API_KEY`。插件检测到 API Key 后会
-使用 Express Mode，并忽略 `VERTEX_PROJECT` 和 `VERTEX_LOCATION`；认证优先级为
-服务账号 JSON → Vertex API Key → ADC。
+如果 Google 控制台或官方示例将 Express Mode Key 称为 `GOOGLE_CLOUD_API_KEY`，
+直接把它的**值**填给 `AI_GROUPMATE__VERTEX_API_KEY` 即可；不需要再配置一个名为
+`GOOGLE_CLOUD_API_KEY` 的环境变量。把上述插件配置直接写入 NoneBot 项目使用的
+`.env` 即可，也不需要在 Docker Compose 中额外声明 `environment`，或配置 Project
+ID、Location、服务账号。插件检测到该 Key 后会使用 Express Mode，并忽略
+`VERTEX_PROJECT` 和 `VERTEX_LOCATION`；认证优先级为服务账号 JSON → Vertex API
+Key → ADC。`AI_GROUPMATE__CHAT_API_KEY` 是其他接口使用的聊天模型 Key，在 Vertex
+模式下不会读取。
 
 固定知识示例（将群号和入群方式替换为自己的信息）：
 

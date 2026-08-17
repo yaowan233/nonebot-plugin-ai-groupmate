@@ -15,7 +15,7 @@ from collections import Counter
 from collections.abc import Mapping, Sequence, Collection
 
 import httpx
-from openai import AsyncOpenAI, BadRequestError
+from openai import AsyncOpenAI, RateLimitError, BadRequestError
 from nonebot.log import logger
 from qdrant_client import AsyncQdrantClient, models
 
@@ -62,7 +62,8 @@ MEME_SEARCH_POOL_SIZE = 50
 MEME_RRF_K = 60
 MEME_CONTEXT_VISUAL_ROUTE_WEIGHT = 0.85
 MEME_CONTENT_VISUAL_ROUTE_WEIGHT = 0.65
-MEME_QDRANT_ROUTE_TIMEOUT_SECONDS = 8.0
+MEME_QDRANT_ROUTE_TIMEOUT_SECONDS = 20.0
+MEME_QDRANT_HNSW_EF = 16
 MEME_GROUP_USAGE_WEIGHT = 0.35
 MEME_GROUP_USAGE_MIN_USES = 2
 MEME_SAMPLE_RANK_SCALE = 18.0
@@ -76,6 +77,15 @@ MEME_DRAGON_IMAGE_JARGON_EXPLANATION = (
     "常搭配文字并以‘某某龙’命名；不是动物龙、卡通龙、龙图案、龙图标或末影龙。"
 )
 MEME_DRAGON_IMAGE_JARGON_PATTERN = re.compile(r"龙图(?!案|标|像|腾)")
+
+# 聊天记忆回填会连续发送大批量 Embedding 请求。每个上下文最多
+# 约 450 tokens，因此 20 条 / 1.5 秒的最坏速率约为 36 万 TPM，为
+# SiliconFlow 公开的最低 50 万 Embedding TPM 留出实时检索余量。
+TEXT_EMBEDDING_BATCH_SIZE = 20
+TEXT_EMBEDDING_BATCH_MIN_INTERVAL_SECONDS = 1.5
+TEXT_EMBEDDING_RATE_LIMIT_MAX_RETRIES = 4
+TEXT_EMBEDDING_RATE_LIMIT_BASE_DELAY_SECONDS = 15.0
+TEXT_EMBEDDING_RATE_LIMIT_MAX_DELAY_SECONDS = 60.0
 
 
 class CollectionEmbeddingConfigMismatchError(RuntimeError):
@@ -279,6 +289,8 @@ class VectorDBOperator:
 
     def _configure(self) -> None:
         self._init_lock = asyncio.Lock()
+        self._embedding_batch_lock = asyncio.Lock()
+        self._embedding_last_batch_request_at = 0.0
         self._ready_collections: set[str] = set()
         self._collection_validation_errors = {}
         self._text_embedding_validation_error = None
@@ -1451,43 +1463,114 @@ class VectorDBOperator:
 
     async def _get_batch_text_embeddings(self, texts: list[str]) -> list[list[float]]:
         """
-        批量调用 API 获取文本向量 (自动处理 Batch Size 限制)
+        批量调用 API 获取文本向量。
+
+        对大规模回填进行串行限速；触发 429 时只重试当前子批次，
+        不会丢弃已经成功的向量并从头重做整个批次。
         """
         if not texts:
             return []
         self._raise_if_validation_rejected()
 
-        # 硅基流动限制单次 max=64，我们设为 50 以保万无一失
-        API_BATCH_LIMIT = 50
-        all_embeddings = []
+        batch_lock = getattr(self, "_embedding_batch_lock", None)
+        if batch_lock is None:
+            batch_lock = asyncio.Lock()
+            self._embedding_batch_lock = batch_lock
 
-        try:
-            # 循环切片处理：range(0, 总数, 步长)
-            for i in range(0, len(texts), API_BATCH_LIMIT):
-                chunk = texts[i: i + API_BATCH_LIMIT]
+        all_embeddings: list[list[float]] = []
+        async with batch_lock:
+            for offset in range(0, len(texts), TEXT_EMBEDDING_BATCH_SIZE):
+                chunk = texts[offset: offset + TEXT_EMBEDDING_BATCH_SIZE]
 
-                # 发送分片请求
-                resp = await self.emb_client.embeddings.create(
-                    **self._embedding_request_kwargs(chunk),
-                )
-
-                # 收集结果
-                # resp.data 是按顺序返回的，直接 extend 即可
-                chunk_embeddings = []
-                for data in resp.data:
-                    embedding = self._validate_text_embedding_dimension(
-                        data.embedding
+                for attempt in range(TEXT_EMBEDDING_RATE_LIMIT_MAX_RETRIES + 1):
+                    last_request_at = getattr(
+                        self,
+                        "_embedding_last_batch_request_at",
+                        0.0,
                     )
-                    chunk_embeddings.append(embedding)
-                all_embeddings.extend(chunk_embeddings)
+                    remaining_interval = (
+                        TEXT_EMBEDDING_BATCH_MIN_INTERVAL_SECONDS
+                        - (time.monotonic() - last_request_at)
+                    )
+                    if remaining_interval > 0:
+                        await asyncio.sleep(remaining_interval)
 
-            return all_embeddings
+                    self._embedding_last_batch_request_at = time.monotonic()
+                    try:
+                        resp = await self.emb_client.embeddings.create(
+                            **self._embedding_request_kwargs(chunk),
+                        )
+                        break
+                    except RateLimitError as exc:
+                        if attempt >= TEXT_EMBEDDING_RATE_LIMIT_MAX_RETRIES:
+                            message = (
+                                "Embedding API 持续限流，已停止当前批次，"
+                                "保留消息等待后续重试"
+                            )
+                            logger.error(f"{message}: {exc}")
+                            raise EmbeddingProviderUnavailableError(message) from exc
 
-        except CollectionEmbeddingConfigMismatchError:
-            raise
-        except Exception as e:
-            logger.error(f"Batch Embedding API Error: {e}")
-            return []
+                        retry_after = self._embedding_rate_limit_retry_delay(
+                            exc,
+                            attempt,
+                        )
+                        logger.warning(
+                            "Embedding API 触发 TPM 限流，"
+                            f"{retry_after:.1f} 秒后仅重试当前子批次 "
+                            f"(size={len(chunk)}, "
+                            f"attempt={attempt + 1}/"
+                            f"{TEXT_EMBEDDING_RATE_LIMIT_MAX_RETRIES})"
+                        )
+                        await asyncio.sleep(retry_after)
+                    except CollectionEmbeddingConfigMismatchError:
+                        raise
+                    except Exception as exc:
+                        logger.error(f"Batch Embedding API Error: {exc}")
+                        raise EmbeddingProviderUnavailableError(str(exc)) from exc
+                else:  # pragma: no cover - for 循环总会 break 或 raise
+                    raise EmbeddingProviderUnavailableError(
+                        "Embedding API 子批次重试未完成"
+                    )
+
+                if len(resp.data) != len(chunk):
+                    message = (
+                        "Embedding API 返回向量数量异常: "
+                        f"expected={len(chunk)}, actual={len(resp.data)}"
+                    )
+                    logger.error(message)
+                    raise EmbeddingProviderUnavailableError(message)
+
+                for data in resp.data:
+                    all_embeddings.append(
+                        self._validate_text_embedding_dimension(data.embedding)
+                    )
+
+        return all_embeddings
+
+    @staticmethod
+    def _embedding_rate_limit_retry_delay(
+        error: RateLimitError,
+        attempt: int,
+    ) -> float:
+        """Return provider-directed or exponential 429 backoff delay."""
+        fallback = min(
+            TEXT_EMBEDDING_RATE_LIMIT_MAX_DELAY_SECONDS,
+            TEXT_EMBEDDING_RATE_LIMIT_BASE_DELAY_SECONDS * (2 ** attempt),
+        )
+        response = getattr(error, "response", None)
+        headers = getattr(response, "headers", {})
+        raw_retry_after = headers.get("retry-after") if headers else None
+        if isinstance(raw_retry_after, (str, int, float)):
+            try:
+                provider_delay = float(raw_retry_after)
+            except ValueError:
+                provider_delay = 0.0
+        else:
+            provider_delay = 0.0
+        return min(
+            TEXT_EMBEDDING_RATE_LIMIT_MAX_DELAY_SECONDS,
+            max(fallback, provider_delay),
+        )
 
     async def batch_insert(
         self,
@@ -1510,9 +1593,11 @@ class VectorDBOperator:
             vectors = await self._get_batch_text_embeddings(texts)
         except CollectionEmbeddingConfigMismatchError:
             raise
+        except EmbeddingProviderUnavailableError:
+            raise
         except Exception as e:
             logger.error(f"批量向量化失败: {e}")
-            return
+            raise EmbeddingProviderUnavailableError(str(e)) from e
 
         if len(vectors) != len(texts):
             message = (
@@ -1679,6 +1764,11 @@ class VectorDBOperator:
                 "with_payload": False,
                 "timeout": math.ceil(MEME_QDRANT_ROUTE_TIMEOUT_SECONDS),
                 "using": using,
+                "search_params": models.SearchParams(
+                    hnsw_ef=MEME_QDRANT_HNSW_EF,
+                    exact=False,
+                    indexed_only=True,
+                ),
             }
             try:
                 result = await asyncio.wait_for(

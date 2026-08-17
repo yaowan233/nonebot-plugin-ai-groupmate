@@ -17,6 +17,7 @@ from .model import ChatHistory, ChatHistorySchema
 from .memory import (
     DB,
     CHAT_INDEX_VERSION,
+    EmbeddingProviderUnavailableError,
     CollectionEmbeddingConfigMismatchError,
 )
 
@@ -476,6 +477,11 @@ async def insert_vectors_with_retry(
             await DB.batch_insert(contexts, session_id, payloads=payloads)
             return
         except CollectionEmbeddingConfigMismatchError:
+            raise
+        except EmbeddingProviderUnavailableError:
+            # memory.py 内部已对 429 按分钟窗口做了退避。
+            # 这里若再用 1/2 秒整批重试，只会重复消耗已成功的
+            # 子批次并再次撞限；交给后台调度器稍后重试。
             raise
         except Exception as e:
             if attempt == max_retries - 1:

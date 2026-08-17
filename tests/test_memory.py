@@ -45,6 +45,21 @@ def make_bad_request_error(message: str):
     return openai.BadRequestError(message, response=response, body=None)
 
 
+def make_rate_limit_error(
+    message: str = "TPM limit reached",
+    *,
+    retry_after: str | None = None,
+):
+    """Construct an openai.RateLimitError with optional retry headers."""
+    import httpx
+    import openai
+
+    request = httpx.Request("POST", "http://test")
+    headers = {"retry-after": retry_after} if retry_after is not None else {}
+    response = httpx.Response(429, request=request, headers=headers)
+    return openai.RateLimitError(message, response=response, body=None)
+
+
 @pytest.fixture
 def memory_module():
     from nonebot_plugin_ai_groupmate import memory
@@ -516,7 +531,11 @@ async def test_search_meme_uses_larger_candidate_pool_and_recent_exclusion(
     assert query_calls[0]["using"] == memory_module.MEDIA_TEXT_VECTOR
     assert query_calls[0]["limit"] == memory_module.MEME_SEARCH_POOL_SIZE
     assert query_calls[0]["with_payload"] is False
-    assert query_calls[0]["timeout"] == 8
+    assert query_calls[0]["timeout"] == 20
+    search_params = query_calls[0]["search_params"]
+    assert search_params.hnsw_ef == memory_module.MEME_QDRANT_HNSW_EF
+    assert search_params.exact is False
+    assert search_params.indexed_only is True
 
 
 # ================= text 模式（meme_embedding_mode="text"） =================
@@ -1360,6 +1379,84 @@ async def test_get_batch_text_embeddings_omits_dimensions_when_not_configured(
         "input": ["one", "two"],
         "model": "test-model",
     }]
+
+
+@pytest.mark.asyncio
+async def test_batch_text_embeddings_throttles_and_splits_large_backfill(
+    memory_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    operator = make_operator(memory_module)
+    operator.configured_embedding_dimension = None
+    operator.text_embedding_dimension = 4
+    operator.emb_model = "test-model"
+    embedding_requests: list[list[str]] = []
+    sleep_delays: list[float] = []
+
+    class FakeEmbeddings:
+        async def create(self, **kwargs: Any):
+            inputs = list(kwargs["input"])
+            embedding_requests.append(inputs)
+            return SimpleNamespace(
+                data=[SimpleNamespace(embedding=[0.5] * 4) for _ in inputs]
+            )
+
+    async def fake_sleep(delay: float) -> None:
+        sleep_delays.append(delay)
+
+    operator.emb_client = SimpleNamespace(embeddings=FakeEmbeddings())
+    monkeypatch.setattr(memory_module.asyncio, "sleep", fake_sleep)
+
+    texts = [f"text-{index}" for index in range(45)]
+    embeddings = await operator._get_batch_text_embeddings(texts)
+
+    assert len(embeddings) == len(texts)
+    assert [len(batch) for batch in embedding_requests] == [20, 20, 5]
+    assert len(sleep_delays) == 2
+    assert all(
+        0 < delay <= memory_module.TEXT_EMBEDDING_BATCH_MIN_INTERVAL_SECONDS
+        for delay in sleep_delays
+    )
+
+
+@pytest.mark.asyncio
+async def test_batch_text_embeddings_retries_only_rate_limited_sub_batch(
+    memory_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    operator = make_operator(memory_module)
+    operator.configured_embedding_dimension = None
+    operator.text_embedding_dimension = 4
+    operator.emb_model = "test-model"
+    calls = 0
+    sleep_delays: list[float] = []
+
+    class FakeEmbeddings:
+        async def create(self, **kwargs: Any):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise make_rate_limit_error(retry_after="30")
+            return SimpleNamespace(
+                data=[
+                    SimpleNamespace(embedding=[0.5] * 4)
+                    for _ in kwargs["input"]
+                ]
+            )
+
+    async def fake_sleep(delay: float) -> None:
+        sleep_delays.append(delay)
+
+    operator.emb_client = SimpleNamespace(embeddings=FakeEmbeddings())
+    monkeypatch.setattr(memory_module.asyncio, "sleep", fake_sleep)
+
+    texts = [f"text-{index}" for index in range(21)]
+    embeddings = await operator._get_batch_text_embeddings(texts)
+
+    assert len(embeddings) == len(texts)
+    # 第一个 20 条子批次成功后没有被重复请求；只重试最后 1 条。
+    assert calls == 3
+    assert 30.0 in sleep_delays
 
 
 
