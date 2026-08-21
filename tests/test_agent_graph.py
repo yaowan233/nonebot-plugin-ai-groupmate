@@ -83,6 +83,7 @@ class _ToolSpyModel:
         self.responses = iter(responses)
         self.bound_tool_names: list[tuple[str, ...]] = []
         self.invoke_count = 0
+        self.invoke_messages = []
 
     def bind_tools(self, tools):
         self.bound_tool_names.append(tuple(tool.name for tool in tools))
@@ -90,6 +91,7 @@ class _ToolSpyModel:
 
     async def ainvoke(self, messages):
         self.invoke_count += 1
+        self.invoke_messages.append(messages)
         return next(self.responses)
 
 
@@ -638,6 +640,44 @@ async def test_raised_side_effect_error_ends_run_without_retry():
 
 
 @pytest.mark.asyncio
+async def test_raised_tool_error_reports_safe_failure_reason_to_model():
+    from nonebot_plugin_ai_groupmate.agent.graph import build_chat_graph
+
+    @tool("lookup_data")
+    async def lookup_data() -> str:
+        """Raise an unexpected provider error."""
+        raise ConnectionError("authorization=secret-value")
+
+    @tool("finish")
+    def finish() -> str:
+        """End this test graph."""
+        return ""
+
+    model = _ToolSpyModel([
+        AIMessage(content="", tool_calls=[{
+            "name": "lookup_data",
+            "args": {},
+            "id": "lookup-1",
+        }]),
+        AIMessage(content="", tool_calls=[{
+            "name": "finish",
+            "args": {},
+            "id": "finish-1",
+        }]),
+    ])
+    graph = build_chat_graph(model, [lookup_data, finish], "system")
+
+    await graph.ainvoke(_state(AIMessage(content="placeholder")))
+
+    failure = json.loads(model.invoke_messages[1][-1].content)
+    assert failure["reason_code"] == "tool_execution_failed"
+    assert failure["retryable"] is True
+    assert failure["data"]["error_type"] == "ConnectionError"
+    assert "ConnectionError" in failure["message"]
+    assert "secret-value" not in model.invoke_messages[1][-1].content
+
+
+@pytest.mark.asyncio
 async def test_failed_side_effect_can_be_retried():
     from nonebot_plugin_ai_groupmate.agent.graph import build_chat_graph
 
@@ -889,14 +929,23 @@ async def test_long_tool_results_are_truncated_before_the_next_model_call():
 
 
 @pytest.mark.asyncio
-async def test_timed_out_tool_returns_control_to_the_model():
+async def test_timed_out_search_cannot_finish_without_replying_to_user():
     from nonebot_plugin_ai_groupmate.agent.graph import AgentRunLimits, build_chat_graph
+
+    replies: list[str] = []
+    generated_reply = "我刚才联网查询时超时了，你可以给我一个更短的关键词再试。"
 
     @tool("search_web")
     async def search_web(query: str) -> str:
         """Take too long for testing."""
         await asyncio.sleep(0.05)
         return query
+
+    @tool("reply_user")
+    async def reply_user(content: str, next_step: str = "end") -> str:
+        """Record the user-visible reply for testing."""
+        replies.append(content)
+        return next_step
 
     @tool("finish")
     def finish() -> str:
@@ -907,20 +956,84 @@ async def test_timed_out_tool_returns_control_to_the_model():
         [
             AIMessage(content="", tool_calls=[{"name": "search_web", "args": {"query": "x"}, "id": "search-1"}]),
             AIMessage(content="", tool_calls=[{"name": "finish", "args": {}, "id": "finish-1"}]),
+            AIMessage(content="", tool_calls=[{
+                "name": "reply_user",
+                "args": {"content": generated_reply, "next_step": "end"},
+                "id": "reply-1",
+            }]),
         ]
     )
     graph = build_chat_graph(
         model,
-        [search_web, finish],
+        [search_web, reply_user, finish],
         "system",
         limits=AgentRunLimits(tool_timeout_seconds=0.001),
     )
 
     result = await graph.ainvoke(_state(AIMessage(content="placeholder")))
 
-    assert model.invoke_count == 2
+    assert model.invoke_count == 3
     assert result["tool_timeout_count"] == 1
     assert result["tool_timeout_names"] == ["search_web"]
+    assert result["reply_count"] == 1
+    assert replies == [generated_reply]
+
+
+@pytest.mark.asyncio
+async def test_provider_reported_search_timeout_cannot_finish_without_replying():
+    from nonebot_plugin_ai_groupmate.agent.graph import build_chat_graph
+    from nonebot_plugin_ai_groupmate.agent.tool_results import tool_failure
+
+    replies: list[str] = []
+    generated_reply = "联网搜索刚才超时了，我可以换一组关键词继续帮你查。"
+
+    @tool("search_web")
+    async def search_web(query: str) -> str:
+        """Return a timeout already handled by the search provider wrapper."""
+        return tool_failure(
+            "timeout",
+            "联网搜索暂时超时，可以缩短关键词后重试一次。",
+            retryable=True,
+        )
+
+    @tool("reply_user")
+    async def reply_user(content: str, next_step: str = "end") -> str:
+        """Record the user-visible reply for testing."""
+        replies.append(content)
+        return next_step
+
+    @tool("finish")
+    def finish() -> str:
+        """End this test graph."""
+        return ""
+
+    model = _ToolSpyModel(
+        [
+            AIMessage(content="", tool_calls=[{
+                "name": "search_web",
+                "args": {"query": "x"},
+                "id": "search-1",
+            }]),
+            AIMessage(content="", tool_calls=[{
+                "name": "finish",
+                "args": {},
+                "id": "finish-1",
+            }]),
+            AIMessage(content="", tool_calls=[{
+                "name": "reply_user",
+                "args": {"content": generated_reply, "next_step": "end"},
+                "id": "reply-1",
+            }]),
+        ]
+    )
+    graph = build_chat_graph(model, [search_web, reply_user, finish], "system")
+
+    result = await graph.ainvoke(_state(AIMessage(content="placeholder")))
+
+    assert result["tool_timeout_count"] == 1
+    assert result["tool_timeout_names"] == ["search_web"]
+    assert result["reply_count"] == 1
+    assert replies == [generated_reply]
 
 
 @pytest.mark.asyncio

@@ -722,6 +722,27 @@ def _make_tool_node(
                         f"required_tool={required_side_effect_tool}"
                     )
                     continue
+                search_timed_out_without_reply = (
+                    reply_count == 0
+                    and any(
+                        tool_name.startswith("search_")
+                        for tool_name in tool_timeout_names
+                    )
+                )
+                if search_timed_out_without_reply:
+                    results.append(ToolMessage(
+                        content=tool_skipped(
+                            "reply_required_after_search_timeout",
+                            "搜索工具已经超时，不能静默结束。请结合当前对话和之前的"
+                            "结构化失败原因，自行组织合适的回复内容，并调用 "
+                            "reply_user 告知用户；不要编造搜索结果。",
+                        ),
+                        tool_call_id=tool_call_id,
+                    ))
+                    logger.warning(
+                        f"[AgentTrace] 拦截搜索超时后的静默结束 session={session_id}"
+                    )
+                    continue
                 called_finish += 1
                 results.append(ToolMessage(content="", tool_call_id=tool_call_id))
                 break
@@ -880,6 +901,14 @@ def _make_tool_node(
                 tool_content, extra_content = _normalize_tool_result(result)
                 tool_status = _tool_result_status(tool_content)
                 parsed_tool_result = parse_tool_result(tool_content)
+                provider_reported_timeout = (
+                    name.startswith("search_")
+                    and isinstance(parsed_tool_result, dict)
+                    and parsed_tool_result.get("reason_code") == "timeout"
+                )
+                if provider_reported_timeout:
+                    tool_timeout_count += 1
+                    tool_timeout_names.append(name)
                 delivery_unknown = (
                     effect_key is not None
                     and isinstance(parsed_tool_result, dict)
@@ -978,8 +1007,9 @@ def _make_tool_node(
                     )
                     break
             except Exception as e:
+                error_type = type(e).__name__
                 logger.error(
-                    f"[Agent] 工具执行失败 {name}: error_type={type(e).__name__}"
+                    f"[Agent] 工具执行失败 {name}: error_type={error_type}"
                 )
                 await _rollback_after_tool_failure(db_session)
                 delivery_unknown = effect_key is not None
@@ -994,12 +1024,16 @@ def _make_tool_node(
                     content=tool_failure(
                         "tool_execution_failed",
                         (
-                            "副作用工具执行出错，投递结果未知；为避免重复操作，"
-                            "本轮必须停止且不得重试。"
+                            f"副作用工具执行失败（{error_type}），投递结果未知；"
+                            "为避免重复操作，本轮必须停止且不得重试。"
                             if delivery_unknown
-                            else "工具执行出错。"
+                            else (
+                                f"工具执行失败（{error_type}）。"
+                                "可以根据错误类型改用其他方式或向用户说明失败。"
+                            )
                         ),
                         retryable=not delivery_unknown,
+                        data={"error_type": error_type},
                         delivery_state=("unknown" if delivery_unknown else None),
                     ),
                     tool_call_id=tool_call_id,
