@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import date, datetime
 
 from pydantic import BaseModel
 from sqlalchemy import JSON, Text, Float, Index, String, Boolean, Integer
@@ -180,6 +180,18 @@ class GroupModelConfig(Model):
     last_tested_at: Mapped[datetime | None]
     last_test_status: Mapped[str] = mapped_column(String(32), default="untested")
     version: Mapped[int] = mapped_column(default=1)
+
+
+class GlobalModelGroupUsage(Model):
+    """Current local-day public model reply usage for one group."""
+
+    group_id: Mapped[str] = mapped_column(primary_key=True)
+    usage_date: Mapped[date] = mapped_column(index=True)
+    used_count: Mapped[int] = mapped_column(Integer, default=0)
+    updated_at: Mapped[datetime] = mapped_column(
+        default=datetime.now,
+        onupdate=datetime.now,
+    )
 
 
 class ChatHistorySchema(BaseModel):

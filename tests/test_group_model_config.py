@@ -128,6 +128,24 @@ def test_group_provider_policy_blocks_internal_targets_unless_allowlisted():
     assert build_candidate_chat_config(internal_payload, allowed).chat_model == "model"
 
 
+def test_group_model_connection_requires_non_empty_response():
+    from types import SimpleNamespace
+
+    from nonebot_plugin_ai_groupmate.group_model_config import (
+        GroupModelConfigError,
+        validate_group_model_test_response,
+    )
+
+    validate_group_model_test_response(SimpleNamespace(content="OK"))
+    validate_group_model_test_response(
+        SimpleNamespace(content=[{"type": "text", "text": "OK"}])
+    )
+    with pytest.raises(GroupModelConfigError, match="空响应"):
+        validate_group_model_test_response(SimpleNamespace(content="  "))
+    with pytest.raises(GroupModelConfigError, match="空响应"):
+        validate_group_model_test_response(SimpleNamespace(content=[]))
+
+
 @pytest.mark.asyncio
 async def test_group_provider_resolution_rejects_private_dns_result(monkeypatch):
     import socket
@@ -202,6 +220,28 @@ def test_group_config_permission_accepts_admin_role(monkeypatch):
     assert group_api_commands.can_manage_group_config(typed_session, event)
     session.member.role.name = "member"
     assert not group_api_commands.can_manage_group_config(typed_session, event)
+
+
+def test_group_config_private_message_shows_remaining_minutes():
+    from nonebot_plugin_ai_groupmate import group_api_commands
+    from nonebot_plugin_ai_groupmate.group_api_relay import ConfigTicket
+
+    now = datetime.datetime(2026, 8, 25, 10, 0, tzinfo=datetime.timezone.utc)
+    ticket = ConfigTicket(
+        ticket_id="ticket-private-message",
+        config_url="https://mayumi.xyz/config/ticket-private-message#token=secret",
+        expires_at=now + datetime.timedelta(minutes=15),
+    )
+
+    message, validity_minutes = group_api_commands._build_ticket_private_message(
+        ticket,
+        now=now,
+    )
+
+    assert validity_minutes == 15
+    assert "约 15 分钟内有效" in message
+    assert "10:15:00" not in message
+    assert "配置码同样需要在有效期内提交" in message
 
 
 @pytest.mark.asyncio

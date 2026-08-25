@@ -16,6 +16,8 @@ SETTING_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         (
             "bot_name",
             "reply_probability",
+            "global_model_daily_group_limit_enabled",
+            "global_model_daily_group_limit",
             "repeat_probability",
             "proactive_reaction_probability",
             "proactive_meme_probability",
@@ -161,6 +163,8 @@ SETTING_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
 _DIRECT_LABELS = {
     "bot_name": "Bot 名称",
     "reply_probability": "随机回复概率",
+    "global_model_daily_group_limit_enabled": "启用每群每日公共模型额度",
+    "global_model_daily_group_limit": "每群每日公共模型额度（0 为不限）",
     "repeat_probability": "加入复读概率",
     "proactive_reaction_probability": "主动消息表情回应概率",
     "proactive_meme_probability": "主动表情包采样概率",

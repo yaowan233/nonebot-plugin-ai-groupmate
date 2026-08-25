@@ -122,6 +122,8 @@ curl http://127.0.0.1:6333/collections/media_collection_v3
 |:-----:|:----:|:----:|:----:|
 | ai_groupmate__bot_name | 否 | `"bot"` | bot 名 |
 | ai_groupmate__reply_probability | 否 | `0.01` | 群内主动发言概率 |
+| ai_groupmate__global_model_daily_group_limit_enabled | 否 | `true` | 是否启用每群每日公共主模型额度；关闭后不查询、不记录额度 |
+| ai_groupmate__global_model_daily_group_limit | 否 | `50` | 每个群每天可使用公共主模型的回复次数，按 Bot 本地时间零点重置；`0` 表示不限额，配置了群聊独立 API 的群不计入 |
 | ai_groupmate__repeat_probability | 否 | `0.15` | Bot 已在当前连续对话窗口参与，且至少两名不同群友连续发送同一句短文本后，Bot 对每条新跟读加入队形的概率 |
 | ai_groupmate__proactive_reaction_probability | 否 | `0.05` | 兼容旧配置；非定向群消息的主动 reaction 采样已停用，避免额外模型调用 |
 | ai_groupmate__proactive_meme_probability | 否 | `0.02` | 兼容旧配置；非定向群消息的主动表情包采样已停用，避免额外模型调用 |
@@ -136,7 +138,7 @@ curl http://127.0.0.1:6333/collections/media_collection_v3
 | ai_groupmate__chat_api_format | 否 | `openai` | 主聊天接口格式，可选 `openai` / `anthropic` / `vertex` |
 | ai_groupmate__chat_multimodal | 否 | `true` | 主聊天模型是否支持图片输入；若使用纯文本模型请设为 `false`，将跳过图片上传只发文本 |
 | ai_groupmate__chat_explicit_prompt_cache | 否 | `true` | 为支持的接口添加显式 Prompt 缓存断点；支持 DashScope、Anthropic，以及 OpenRouter 上的 Gemini/Claude，并自动使用匿名群级粘性路由 |
-| ai_groupmate__group_api_relay_url | 否 | 无 | 群 API 公网中转服务根地址；留空时禁用群管理员自助配置 |
+| ai_groupmate__group_api_relay_url | 否 | `https://mayumi.xyz` | 群 API 公网中转服务根地址；默认使用 Mayumi，也可覆盖为自建中转服务 |
 | ai_groupmate__group_api_relay_registration_token | 私有注册模式首次必填 | 无 | 中转服务签发的部署者注册码；服务器开放注册时留空，实例注册成功后也可移除 |
 | ai_groupmate__group_api_local_encryption_key | 否 | 自动生成 | 可选的 32 字节 Base64URL 本地主密钥；留空时在插件数据目录自动生成并持久化 |
 | ai_groupmate__group_api_relay_timeout_seconds | 否 | `15` | 调用中转服务的 HTTP 超时（秒） |
@@ -208,13 +210,13 @@ SQLALCHEMY_ENGINE_OPTIONS={"pool_size":5,"max_overflow":10,"pool_timeout":5,"poo
 
 用量 WebUI 默认地址为 `/ai-groupmate/usage`。升级数据库后，页面会额外展示每轮 agent 的 LLM/工具调用次数、平均耗时、工具超时、结果截断与副作用去重情况；旧记录会以 0 显示这些新增指标。
 
-页面右上角的“配置中心”可维护插件运行配置。使用前必须在环境变量中设置非空的 `AI_GROUPMATE__USAGE_WEBUI_TOKEN`，配置中心会使用独立的 HttpOnly Cookie 登录，不会在页面中回显 API Key。网页保存的值存入插件数据库，加载顺序为“代码默认值 → 环境变量 → 网页覆盖值”；可随时一键恢复环境变量配置。
+用量统计页及其 JSON 接口可直接访问，不需要 Token。页面右上角的“配置中心”可维护插件运行配置；配置中心使用前必须在环境变量中设置非空的 `AI_GROUPMATE__USAGE_WEBUI_TOKEN`，并通过独立的 HttpOnly Cookie 登录，不会在页面中回显 API Key。网页保存的值存入插件数据库，加载顺序为“代码默认值 → 环境变量 → 网页覆盖值”；可随时一键恢复环境变量配置。
 
 配置中心顶部的“群聊 API”页面可由 Bot 管理员按群 ID 新增、修改和删除独立主聊天模型，并可随独立 API 配置设置该群的主动发言概率。群级概率范围为 `0`～`0.1`，留空则跟随全局值；没有独立大模型 API 的群不能单独调整。新增或修改时会先测试模型连接，成功后立即生效；编辑已有记录时 API Key 留空会保留原 Key。列表与接口只返回脱敏信息，删除后该群立即恢复使用全局主聊天 API 和主动发言概率。启用配置中心后，插件也会自动生成本地群 API 加密密钥，因此即使不启用公网中转也可以使用这个管理页。
 
 针对内网部署 Bot 的群级自带模型 API（BYOK）能力已经完成端到端实现：群管理员可通过公网配置页取得一次性配置码，再私聊交给 Bot；插件会解密、测试并按群保存主模型配置。协议与部署说明见 [分群模型 API 中转配置设计](./docs/group-model-api-relay.md)。配套 FastAPI 中转服务位于 `../backend`，Mayumi 配置页位于 `../mayumi-front`；生产启用前仍需配置域名、HTTPS 与 Secret。
 
-启用插件端功能时，在 Bot 启动环境中配置：
+插件默认使用 `https://mayumi.xyz` 作为群 API 中转地址，不需要额外配置 URL。只有使用自建中转服务时才需要覆盖：
 
 ```dotenv
 AI_GROUPMATE__GROUP_API_RELAY_URL=https://relay.example.com
@@ -223,6 +225,8 @@ AI_GROUPMATE__GROUP_API_RELAY_REGISTRATION_TOKEN=replace-with-issued-token
 # 可选；建议生产环境显式限制群管理员可选的模型服务域名
 AI_GROUPMATE__GROUP_API_ALLOWED_PROVIDER_HOSTS=["api.openai.com","openrouter.ai","*.example-provider.com"]
 ```
+
+使用默认 Mayumi 公开注册服务时，不需要配置 `AI_GROUPMATE__GROUP_API_RELAY_REGISTRATION_TOKEN`。
 
 插件默认在数据目录生成 `group_api_local_encryption.key`。请把该文件与数据库一起持久化并备份；丢失后已经保存的群 API Key、实例令牌和私钥均无法恢复。使用 Secret 管理平台时，也可以继续显式设置本地主密钥：
 
@@ -298,7 +302,7 @@ AI_GROUPMATE__CHAT_MODEL=qwen3.7-plus
 
 ## 🎉 使用
 
-@bot 即可触发回复，也会以 `reply_probability` 的概率主动发言；配置了本群独立大模型 API 时，群管理员可覆盖此概率，但用户配置上限为 `0.1`。Bot 已在当前连续对话窗口参与、随后至少两名不同群友连续发送同一句短文本时，会按 `repeat_probability` 独立决定是否原样加入队形。reaction 和图片表情不再对未提及 Bot 的普通群消息主动采样；只有当前消息明确呼叫 Bot、回复 Bot、处于同一用户的连续对话窗口，或用户明确要求时，才会交给 Agent 选择或执行。
+@bot 即可触发回复，也会以 `reply_probability` 的概率主动发言；额度开关默认开启，未配置群聊独立 API 时，每群每天默认可使用公共主模型回复 50 次，额度按 Bot 本地时间零点重置。额度耗尽后，明确呼叫 Bot 会收到剩余等待时间和 `/配置群API` 引导，随机或主动回复会静默跳过；已配置本群独立大模型 API 的群不受该额度限制。可在管理界面关闭“启用每群每日公共模型额度”，关闭后不查询或记录额度。群管理员还可覆盖本群主动发言概率，但用户配置上限为 `0.1`。Bot 已在当前连续对话窗口参与、随后至少两名不同群友连续发送同一句短文本时，会按 `repeat_probability` 独立决定是否原样加入队形。reaction 和图片表情不再对未提及 Bot 的普通群消息主动采样；只有当前消息明确呼叫 Bot、回复 Bot、处于同一用户的连续对话窗口，或用户明确要求时，才会交给 Agent 选择或执行。
 
 ### 自定义 Agent Tools
 

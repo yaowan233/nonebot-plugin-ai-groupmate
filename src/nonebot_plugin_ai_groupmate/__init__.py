@@ -73,10 +73,17 @@ from .runtime_config import (
 )
 from .group_api_relay import delete_expired_pending_group_configs
 from .agent.reply_tools import create_reply_tool
+from .group_daily_quota import (
+    GroupDailyQuotaStatus,
+    consume_group_daily_quota,
+    get_group_daily_quota_status,
+    build_quota_exhausted_message,
+)
 from .group_model_config import (
     LOCAL_ENCRYPTION_KEY_FILENAME,
     LocalSecretCipher,
     LocalEncryptionKeyError,
+    has_group_model_config,
     load_group_model_configs,
     resolve_group_reply_probability,
     load_or_create_local_encryption_key,
@@ -136,8 +143,8 @@ register_usage_webui(
     on_config_change=_refresh_runtime_resources,
 )
 
-# Register the group-owned model configuration commands.  The relay feature is
-# disabled by default and the handlers report missing bootstrap configuration.
+# Register the group-owned model configuration commands. The public Mayumi
+# relay is the default; deployments can still override it with their own URL.
 from . import group_api_commands as group_api_commands
 
 
@@ -1061,6 +1068,39 @@ def _start_background_image_task(
     return True
 
 
+async def _send_group_quota_notice(
+    db_session,
+    *,
+    status: GroupDailyQuotaStatus,
+    request_id: str,
+    session: Uninfo,
+    interface: QryItrface,
+    bot_name: str,
+) -> None:
+    message = build_quota_exhausted_message(status)
+    reply_tool = create_reply_tool(
+        db_session,
+        session.scene.id,
+        request_id,
+        interface=interface,
+        send_target=Target(
+            id=session.scene.id,
+            private=False,
+            self_id=session.self_id,
+        ),
+        bot_name=bot_name,
+        parse_msg_meta=_parse_msg_meta,
+        group_members=[],
+    )
+    raw_result = await reply_tool.ainvoke(
+        {"content": message, "next_step": "end"}
+    )
+    result = json.loads(raw_result)
+    if not result.get("ok"):
+        logger.info(f"公共模型额度提示未发送: {result.get('message', raw_result)}")
+    await db_session.commit()
+
+
 async def handle_reply_logic(
     request_id: str,
     session: Uninfo,
@@ -1082,6 +1122,13 @@ async def handle_reply_logic(
 ):
     """处理回复逻辑"""
     is_private = session.scene.type == SceneType.PRIVATE
+    quota_limit = plugin_config.global_model_daily_group_limit
+    uses_global_model_quota = (
+        not is_private
+        and plugin_config.global_model_daily_group_limit_enabled
+        and quota_limit > 0
+        and not has_group_model_config(session.scene.id)
+    )
     try:
         if repeat_text is not None and not is_private:
             # 复读采样已经代表“加入队形”的决定，直接发送，避免模型二次犹豫或点评。
@@ -1126,6 +1173,15 @@ async def handle_reply_logic(
         # 获取最近几条用于 Flash 快速判断
         # 注意：Flash 模型是纯文本模型，它看不懂图片，所以这里我们只喂文本内容
         async with get_session() as history_session:
+            quota_status = (
+                await get_group_daily_quota_status(
+                    history_session,
+                    session.scene.id,
+                    quota_limit,
+                )
+                if uses_global_model_quota
+                else None
+            )
             recent_msgs = (
                 (
                     await history_session.execute(
@@ -1143,6 +1199,19 @@ async def handle_reply_logic(
             )
             recent_msgs = [ChatHistorySchema.model_validate(row) for row in recent_msgs[::-1]]
             await history_session.commit()
+
+        if quota_status is not None and not quota_status.allowed:
+            if is_tome:
+                async with get_session() as notice_session:
+                    await _send_group_quota_notice(
+                        notice_session,
+                        status=quota_status,
+                        request_id=request_id,
+                        session=session,
+                        interface=interface,
+                        bot_name=bot_name,
+                    )
+            return
 
         if not recent_msgs:
             return
@@ -1185,6 +1254,30 @@ async def handle_reply_logic(
         if not last_msg:
             logger.info("没有历史消息，跳过回复")
             return
+
+        # A group-level API bypasses the public quota. Re-check the active
+        # configuration here in case an administrator changed it while this
+        # request was waiting in the per-group queue.
+        if uses_global_model_quota and not has_group_model_config(
+            session.scene.id
+        ):
+            async with get_session() as quota_session:
+                quota_status = await consume_group_daily_quota(
+                    quota_session,
+                    session.scene.id,
+                    quota_limit,
+                )
+                if not quota_status.allowed:
+                    if is_tome:
+                        await _send_group_quota_notice(
+                            quota_session,
+                            status=quota_status,
+                            request_id=request_id,
+                            session=session,
+                            interface=interface,
+                            bot_name=bot_name,
+                        )
+                    return
 
         role_map: dict[str, str] = {}
         group_members: list[Any] | None = None

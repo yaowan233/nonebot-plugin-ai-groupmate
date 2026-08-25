@@ -119,6 +119,12 @@ def _relay_config(*, registration_token: str = "registration-token"):
     )
 
 
+def test_mayumi_is_the_default_group_api_relay():
+    from nonebot_plugin_ai_groupmate.config import ScopedConfig
+
+    assert ScopedConfig().group_api_relay_url == "https://mayumi.xyz"
+
+
 def test_config_code_normalization_rejects_short_or_ambiguous_codes():
     from nonebot_plugin_ai_groupmate.group_api_relay import (
         RelayTicketError,

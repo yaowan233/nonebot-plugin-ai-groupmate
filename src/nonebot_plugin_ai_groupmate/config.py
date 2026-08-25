@@ -7,6 +7,12 @@ from langchain_openai import ChatOpenAI
 class ScopedConfig(BaseModel):
     bot_name: str = "bot"
     reply_probability: float = 0.01
+    global_model_daily_group_limit_enabled: bool = True
+    global_model_daily_group_limit: int = Field(
+        default=50,
+        ge=0,
+        description="每个群每天可使用公共主模型的回复次数，0 表示不限制",
+    )
     repeat_probability: float = Field(default=0.15, ge=0.0, le=1.0)
     proactive_reaction_probability: float = Field(default=0.05, ge=0.0, le=1.0)
     proactive_meme_probability: float = Field(default=0.02, ge=0.0, le=1.0)
@@ -16,7 +22,7 @@ class ScopedConfig(BaseModel):
     usage_webui_path: str = "/ai-groupmate/usage"
     usage_webui_token: str = ""
     # === 分群模型 API 中转（启动配置） ===
-    group_api_relay_url: str = ""
+    group_api_relay_url: str = "https://mayumi.xyz"
     group_api_relay_registration_token: str = ""
     group_api_local_encryption_key: str = ""
     group_api_relay_timeout_seconds: float = Field(default=15.0, gt=0)

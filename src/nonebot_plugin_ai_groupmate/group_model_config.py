@@ -462,6 +462,22 @@ def build_candidate_chat_config(
     )
 
 
+def validate_group_model_test_response(response: object) -> None:
+    """Require a real, non-empty model response before accepting credentials."""
+    content = getattr(response, "content", None)
+    if isinstance(content, str) and content.strip():
+        return
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, str) and block.strip():
+                return
+            if isinstance(block, dict):
+                text = block.get("text") or block.get("content")
+                if isinstance(text, str) and text.strip():
+                    return
+    raise GroupModelConfigError("模型连接成功但返回了空响应")
+
+
 async def save_group_model_config(
     db_session: AsyncSession,
     *,

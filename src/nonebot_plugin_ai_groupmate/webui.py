@@ -3,7 +3,6 @@ import secrets
 import datetime
 from html import escape
 from typing import Any
-from urllib.parse import urlencode
 from collections.abc import Callable, Iterable
 
 from nonebot import logger, get_driver
@@ -40,6 +39,7 @@ from .group_model_config import (
     build_candidate_chat_config,
     get_group_model_config_detail,
     get_decrypted_group_model_config,
+    validate_group_model_test_response,
     validate_group_provider_resolution,
 )
 from .group_api_settings_ui import render_group_api_settings_page
@@ -108,12 +108,6 @@ def _agent_issue_summary(row: dict) -> str:
     return f'<span class="status warn">{" · ".join(issues)}</span>'
 
 
-def _token_ok(config: ScopedConfig, token: str | None) -> bool:
-    if not config.usage_webui_token:
-        return True
-    return bool(token) and secrets.compare_digest(token, config.usage_webui_token)
-
-
 def _settings_token_ok(config: ScopedConfig, request: Any) -> bool:
     expected = config.usage_webui_token
     supplied = request.cookies.get(SETTINGS_COOKIE_NAME, "")
@@ -142,10 +136,11 @@ async def _test_model_connection(role: str, config: ScopedConfig) -> None:
         model = create_chat_openai(config, role, max_tokens=8)
     else:
         raise ValueError("不支持测试这个模型角色")
-    await asyncio.wait_for(
+    response = await asyncio.wait_for(
         model.ainvoke([HumanMessage(content="请只回复 OK")]),
         timeout=min(config.agent_llm_timeout_seconds, 20.0),
     )
+    validate_group_model_test_response(response)
 
 
 def _safe_connection_error(
@@ -203,10 +198,6 @@ def _validate_group_id(value: Any) -> str:
     return group_id
 
 
-def _auth_query(config: ScopedConfig, token: str | None) -> str:
-    return urlencode({"token": token}) if config.usage_webui_token and token else ""
-
-
 def _render_table(headers: list[str], rows: list[list[str]]) -> str:
     head = "".join(f"<th>{escape(header)}</th>" for header in headers)
     body = "\n".join(
@@ -218,11 +209,9 @@ def _render_table(headers: list[str], rows: list[list[str]]) -> str:
     return f"<table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>"
 
 
-def _render_dashboard(data: dict, *, path: str, token: str | None, config: ScopedConfig) -> str:
+def _render_dashboard(data: dict, *, path: str) -> str:
     total = data["total"]
     agent = data["agent"]
-    auth_query = _auth_query(config, token)
-    auth_suffix = f"&{auth_query}" if auth_query else ""
     cache_rate = _fmt_ratio(total["cached_tokens"], total["prompt_tokens"])
     llm_per_run = _fmt_average(agent["llm_calls"], agent["runs"])
     tools_per_run = _fmt_average(agent["tool_calls"], agent["runs"])
@@ -451,9 +440,8 @@ def _render_dashboard(data: dict, *, path: str, token: str | None, config: Scope
         </label>
         <label>群/会话 ID <input name="session_id" value="{escape(data["filters"]["session_id"])}" placeholder="可选" /></label>
         <label>用户 ID <input name="user_id" value="{escape(data["filters"]["user_id"])}" placeholder="可选" /></label>
-        {f'<input type="hidden" name="token" value="{escape(token or "")}" />' if config.usage_webui_token else ""}
         <button type="submit">更新数据</button>
-        <div class="links">JSON：<a href="{escape(path)}/api?days={int(data["days"])}{auth_suffix}">{escape(path)}/api</a> · <a href="{escape(path)}/settings">配置中心</a></div>
+        <div class="links">JSON：<a href="{escape(path)}/api?days={int(data["days"])}">{escape(path)}/api</a> · <a href="{escape(path)}/settings">配置中心</a></div>
       </form>
     </div>
   </header>
@@ -600,22 +588,16 @@ def register_usage_webui(
         days: int = Query(7, ge=1, le=3650),
         session_id: str = "",
         user_id: str = "",
-        token: str | None = None,
     ):
-        if not _token_ok(config, token):
-            raise HTTPException(status_code=401, detail="invalid token")
         data = await _load_data(days, session_id, user_id)
-        return HTMLResponse(_render_dashboard(data, path=path, token=token, config=config))
+        return HTMLResponse(_render_dashboard(data, path=path))
 
     @app.get(api_path, response_class=JSONResponse, include_in_schema=False)
     async def usage_api(
         days: int = Query(7, ge=1, le=3650),
         session_id: str = "",
         user_id: str = "",
-        token: str | None = None,
     ):
-        if not _token_ok(config, token):
-            raise HTTPException(status_code=401, detail="invalid token")
         return JSONResponse(await _load_data(days, session_id, user_id))
 
     @app.get(settings_path, response_class=HTMLResponse, include_in_schema=False)

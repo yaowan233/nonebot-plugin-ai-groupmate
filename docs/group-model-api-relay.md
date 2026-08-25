@@ -467,6 +467,7 @@ version
 群 API Key、实例令牌和 RSA 私钥必须使用本地长期主密钥加密。建议新增环境变量：
 
 ```dotenv
+# 默认值为 https://mayumi.xyz；自建中转服务时才需要覆盖
 AI_GROUPMATE__GROUP_API_RELAY_URL=https://relay.example.com
 # 私有注册模式才需要
 AI_GROUPMATE__GROUP_API_RELAY_REGISTRATION_TOKEN=replace-me
@@ -591,6 +592,12 @@ def resolve_chat_config(group_id: str | None) -> ScopedConfig: ...
 - 删除配置后立即清除模型缓存并恢复全局主模型。
 
 页面及其 JSON 接口复用配置中心的 HttpOnly Cookie 登录。配置中心启用时，插件会在数据目录自动生成本地加密密钥，所以管理员入口不依赖公网中转服务。
+
+### 公共模型每日额度
+
+未配置群聊独立 API 时，主 Agent 使用 Bot 的公共模型，并按群记录每日回复次数。`global_model_daily_group_limit_enabled` 默认开启，`global_model_daily_group_limit` 默认为 `50`，两者都可在 Bot 管理员配置中心的“基础行为”中热修改；关闭开关后完全不查询、不记录额度，数值设为 `0` 同样表示不限额。日期和剩余等待时间均按 Bot 所在系统的本地时区计算，每天零点自动开始新额度。
+
+计数发生在 Gatekeeper 已决定回复、主 Agent 即将执行之前，一轮回复只计一次，不按该轮内部 LLM 调用次数累计；即使随后模型超时或报错也会保留本次计数。复读等不调用主模型的确定性回复不计数。额度耗尽时，明确呼叫 Bot 的消息会收到 `/配置群API` 和距离恢复的大致时间；随机、主动或连续对话采样静默跳过，避免在群内刷屏。只要本群独立 API 已成功保存并启用，该群就绕过公共额度。
 
 ## 错误处理
 

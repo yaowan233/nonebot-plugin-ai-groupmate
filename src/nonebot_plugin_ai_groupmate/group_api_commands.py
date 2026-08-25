@@ -1,4 +1,6 @@
+import math
 import asyncio
+import datetime
 from typing import cast
 from functools import lru_cache
 
@@ -15,6 +17,7 @@ from .config import create_chat_llm
 from .runtime_config import get_runtime_config
 from .group_api_relay import (
     RelayError,
+    ConfigTicket,
     GroupModelRelay,
     RelayTicketError,
     RelayPayloadError,
@@ -28,6 +31,7 @@ from .group_model_config import (
     delete_group_model_config,
     build_candidate_chat_config,
     get_group_model_config_summary,
+    validate_group_model_test_response,
     validate_group_provider_resolution,
 )
 
@@ -76,6 +80,33 @@ def _relay_error_message(error: RelayError) -> str:
     return "群 API 配置服务返回异常，请稍后重试。"
 
 
+def _build_ticket_private_message(
+    ticket: ConfigTicket,
+    *,
+    now: datetime.datetime | None = None,
+) -> tuple[str, int]:
+    expires_at = ticket.expires_at
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=datetime.timezone.utc)
+    if now is None:
+        now = datetime.datetime.now(datetime.timezone.utc)
+    elif now.tzinfo is None:
+        now = now.replace(tzinfo=datetime.timezone.utc)
+    remaining_seconds = (
+        expires_at.astimezone(datetime.timezone.utc)
+        - now.astimezone(datetime.timezone.utc)
+    ).total_seconds()
+    remaining_minutes = max(1, math.ceil(remaining_seconds / 60))
+    message = (
+        f"下面的群模型配置链接约 {remaining_minutes} 分钟内有效，请尽快打开：\n"
+        f"{ticket.config_url}\n\n"
+        "网页提交后会生成一次性配置码，请在当前私聊发送：\n"
+        "/提交群API <配置码>\n"
+        "配置码同样需要在有效期内提交，请勿直接发送 API Key。"
+    )
+    return message, remaining_minutes
+
+
 def _clear_group_chat_model_cache(group_id: str) -> None:
     from .agent import clear_group_chat_model_cache
 
@@ -89,10 +120,11 @@ async def _test_candidate_connection(payload) -> None:
         config.group_api_allowed_provider_hosts,
     )
     model = create_chat_llm(config)
-    await asyncio.wait_for(
+    response = await asyncio.wait_for(
         model.ainvoke([HumanMessage(content="请只回复 OK")]),
         timeout=min(config.agent_llm_timeout_seconds, 20.0),
     )
+    validate_group_model_test_response(response)
 
 
 configure_group_api = on_command(
@@ -144,7 +176,7 @@ async def _configure_group_api(
         await configure_group_api.finish(f"群 API 配置功能尚未启用：{error}")
         return
 
-    message = f"请在 {ticket.expires_at.strftime('%H:%M:%S')} 前打开下面的链接填写群模型配置：\n{ticket.config_url}\n\n网页提交后会生成一次性配置码，请在当前私聊发送：\n/提交群API <配置码>\n不要直接发送 API Key。"
+    message, validity_minutes = _build_ticket_private_message(ticket)
     try:
         await UniMessage.text(message).send(
             target=Target(
@@ -158,7 +190,9 @@ async def _configure_group_api(
         await configure_group_api.finish(
             "配置单已创建，但无法向你发送私聊。请先添加 Bot 好友后重新执行命令。"
         )
-    await configure_group_api.finish("配置链接已通过私聊发送，请勿在群内发送 API Key。")
+    await configure_group_api.finish(
+        f"配置链接已通过私聊发送，约 {validity_minutes} 分钟内有效，请勿在群内发送 API Key。"
+    )
 
 
 @submit_group_api.handle()
@@ -232,7 +266,7 @@ async def _submit_group_api(
             f"群 API 配置已应用但中转确认失败: ticket={redeemed.ticket_id[-6:]}"
         )
     await submit_group_api.finish(
-        f"群 {active.group_id} 的主聊天模型已更新为 {active.chat_model}。\n"
+        f"模型连接测试通过。群 {active.group_id} 的主聊天模型已更新为 {active.chat_model}。\n"
         + (
             "主动发言概率继续跟随 Bot 全局配置。"
             if active.reply_probability is None

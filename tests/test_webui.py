@@ -6,7 +6,6 @@ import pytest
 
 def test_dashboard_renders_agent_metrics():
     from nonebot_plugin_ai_groupmate.webui import _render_dashboard
-    from nonebot_plugin_ai_groupmate.config import ScopedConfig
 
     data = {
         "days": 7,
@@ -97,8 +96,6 @@ def test_dashboard_renders_agent_metrics():
     html = _render_dashboard(
         data,
         path="/ai-groupmate/usage",
-        token=None,
-        config=ScopedConfig(),
     )
 
     assert "运行与用量概览" in html
@@ -400,12 +397,25 @@ def test_settings_routes_require_login_and_apply_updates(monkeypatch):
         assert clear_secrets == {"llm_api_key"}
         return {"reply_probability", "llm_api_key"}, set()
 
+    async def fake_usage_data(*_args, **_kwargs):
+        return {"public": True}
+
     monkeypatch.setattr(
         webui_module,
         "get_driver",
         lambda: SimpleNamespace(server_app=app),
     )
     monkeypatch.setattr(webui_module, "get_session", fake_session)
+    monkeypatch.setattr(
+        webui_module,
+        "get_usage_dashboard_data",
+        fake_usage_data,
+    )
+    monkeypatch.setattr(
+        webui_module,
+        "_render_dashboard",
+        lambda _data, *, path: f"public dashboard at {path}",
+    )
     monkeypatch.setattr(webui_module, "save_runtime_config_updates", fake_save)
     webui_module.register_usage_webui(
         config,
@@ -413,6 +423,13 @@ def test_settings_routes_require_login_and_apply_updates(monkeypatch):
     )
 
     with TestClient(app) as client:
+        usage_page = client.get("/ai-groupmate/usage")
+        assert usage_page.status_code == 200
+        assert "public dashboard" in usage_page.text
+        usage_api = client.get("/ai-groupmate/usage/api")
+        assert usage_api.status_code == 200
+        assert usage_api.json() == {"public": True}
+
         login_page = client.get("/ai-groupmate/usage/settings")
         assert login_page.status_code == 200
         assert "请输入 WebUI 管理密码" in login_page.text
