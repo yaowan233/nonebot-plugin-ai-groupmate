@@ -24,6 +24,7 @@ def test_unaddressed_message_does_not_sample_proactive_reaction(monkeypatch):
         has_text=True,
         is_group=True,
         reaction_supported=True,
+        reply_probability=0.01,
     )
 
     assert result == (False, False, False)

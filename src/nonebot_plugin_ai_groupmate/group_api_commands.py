@@ -232,7 +232,12 @@ async def _submit_group_api(
             f"群 API 配置已应用但中转确认失败: ticket={redeemed.ticket_id[-6:]}"
         )
     await submit_group_api.finish(
-        f"群 {active.group_id} 的主聊天模型已更新为 {active.chat_model}。"
+        f"群 {active.group_id} 的主聊天模型已更新为 {active.chat_model}。\n"
+        + (
+            "主动发言概率继续跟随 Bot 全局配置。"
+            if active.reply_probability is None
+            else f"主动发言概率已设为 {active.reply_probability:.3g}（{active.reply_probability:.1%}）。"
+        )
     )
 
 
@@ -254,8 +259,13 @@ async def _show_group_api(
     if summary is None:
         await show_group_api.finish("当前群未配置独立主模型，将使用 Bot 全局配置。")
     fallback = "允许" if summary.allow_global_fallback else "禁止"
+    reply_probability = (
+        "跟随 Bot 全局配置"
+        if summary.reply_probability is None
+        else f"{summary.reply_probability:.3g}（{summary.reply_probability:.1%}）"
+    )
     await show_group_api.finish(
-        f"当前群主模型配置：\n接口格式：{summary.api_format}\n服务地址：{summary.provider_host}\n模型：{summary.chat_model}\n图片输入：{'开启' if summary.chat_multimodal else '关闭'}\n全局回退：{fallback}\n配置版本：{summary.version}\nAPI Key 已隐藏。"
+        f"当前群主模型配置：\n接口格式：{summary.api_format}\n服务地址：{summary.provider_host}\n模型：{summary.chat_model}\n图片输入：{'开启' if summary.chat_multimodal else '关闭'}\n主动发言概率：{reply_probability}\n全局回退：{fallback}\n配置版本：{summary.version}\nAPI Key 已隐藏。"
     )
 
 

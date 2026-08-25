@@ -727,6 +727,7 @@ def register_usage_webui(
                     api_key=submitted_api_key,
                     chat_model=raw_payload.get("chat_model", ""),
                     chat_multimodal=raw_payload.get("chat_multimodal", True),
+                    reply_probability=raw_payload.get("reply_probability"),
                     allow_global_fallback=False,
                     created_at=datetime.datetime.now(datetime.timezone.utc),
                 )

@@ -75,9 +75,9 @@ def render_group_api_settings_page(
   </style>
 </head>
 <body>
-  <header><div class="header-inner"><div><h1>群聊 API</h1><div class="subtitle">为指定群配置独立的主聊天模型。</div></div><nav><a href="{escape(settings_path)}">全局配置</a><a href="{escape(dashboard_path)}">运行概览</a></nav></div></header>
+  <header><div class="header-inner"><div><h1>群聊 API</h1><div class="subtitle">为指定群配置独立的主聊天模型和主动发言概率。</div></div><nav><a href="{escape(settings_path)}">全局配置</a><a href="{escape(dashboard_path)}">运行概览</a></nav></div></header>
   <main>
-    <div class="notice">未配置的群继续使用全局主聊天 API。独立配置只影响指定群；API Key 加密保存且不会回显，编辑时留空即可保留原 Key。</div>
+    <div class="notice">未配置独立大模型 API 的群继续使用全局主聊天 API 和主动发言概率。群级概率只能随独立 API 配置保存，最高为 0.1；API Key 加密保存且不会回显，编辑时留空即可保留原 Key。</div>
     <div class="layout">
       <section>
         <div class="section-head"><div><h2 id="form-title">新增群配置</h2><p>保存前会实际调用一次模型验证连接。</p></div></div>
@@ -104,6 +104,10 @@ def render_group_api_settings_page(
           <label>模型名称
             <input id="chat-model" name="chat_model" type="text" maxlength="256" required placeholder="例如：gpt-4.1-mini" />
           </label>
+          <label>主动发言概率
+            <input id="reply-probability" name="reply_probability" type="number" min="0" max="0.1" step="0.001" placeholder="留空跟随全局配置" />
+            <small>仅影响未呼叫 Bot 的普通群消息；0 表示关闭，最高 0.1（10%）。</small>
+          </label>
           <label class="switch"><input id="chat-multimodal" name="chat_multimodal" type="checkbox" checked /> 模型支持图片输入</label>
           <div class="form-actions"><button id="save" type="submit">测试并保存</button><button id="cancel" class="secondary" type="button" hidden>取消编辑</button></div>
           <p id="form-status" aria-live="polite"></p>
@@ -125,6 +129,7 @@ def render_group_api_settings_page(
       const baseUrl = document.getElementById("base-url");
       const apiKey = document.getElementById("api-key");
       const chatModel = document.getElementById("chat-model");
+      const replyProbability = document.getElementById("reply-probability");
       const multimodal = document.getElementById("chat-multimodal");
       const save = document.getElementById("save");
       const cancel = document.getElementById("cancel");
@@ -139,6 +144,7 @@ def render_group_api_settings_page(
         form.reset();
         groupId.disabled = false;
         baseUrl.value = defaults.openai;
+        replyProbability.value = "";
         document.getElementById("form-title").textContent = "新增群配置";
         document.getElementById("api-key-hint").textContent = "新建配置时必须填写；密钥不会回显。";
         apiKey.placeholder = "新建时必填";
@@ -156,6 +162,7 @@ def render_group_api_settings_page(
         apiKey.value = "";
         apiKey.placeholder = "留空保持原 Key";
         chatModel.value = item.chat_model;
+        replyProbability.value = item.reply_probability == null ? "" : String(item.reply_probability);
         multimodal.checked = item.chat_multimodal;
         document.getElementById("form-title").textContent = `编辑群 ${{item.group_id}}`;
         document.getElementById("api-key-hint").textContent = "已配置 API Key；留空将保留原 Key。";
@@ -167,11 +174,12 @@ def render_group_api_settings_page(
         document.getElementById("group-count").textContent = `${{groups.length}} 个群`;
         if (!groups.length) {{ list.innerHTML='<div class="empty">暂无独立群 API 配置</div>'; return; }}
         const table = document.createElement("table");
-        table.innerHTML = "<thead><tr><th>群 ID</th><th>接口</th><th>服务地址</th><th>模型</th><th>图片</th><th>版本</th><th>操作</th></tr></thead>";
+        table.innerHTML = "<thead><tr><th>群 ID</th><th>接口</th><th>服务地址</th><th>模型</th><th>主动发言</th><th>图片</th><th>版本</th><th>操作</th></tr></thead>";
         const body = document.createElement("tbody");
         groups.forEach(item => {{
           const row = document.createElement("tr");
-          const values = [item.group_id,item.api_format,item.provider_host,item.chat_model,item.chat_multimodal?"开启":"关闭",`v${{item.version}}`];
+          const probability = item.reply_probability == null ? "跟随全局" : `${{(item.reply_probability * 100).toFixed(1)}}%`;
+          const values = [item.group_id,item.api_format,item.provider_host,item.chat_model,probability,item.chat_multimodal?"开启":"关闭",`v${{item.version}}`];
           values.forEach((value,index) => {{ const cell=document.createElement("td"); if(index===0){{const code=document.createElement("code");code.textContent=value;cell.append(code);}}else{{cell.textContent=value;}} if(index===2)cell.className="provider"; row.append(cell); }});
           const actions = document.createElement("td");
           actions.className = "row-actions";
@@ -206,7 +214,8 @@ def render_group_api_settings_page(
         save.textContent = "正在测试…";
         setStatus("正在连接模型服务，成功后会自动保存…");
         try {{
-          const payload = {{group_id:editing || groupId.value.trim(),api_format:apiFormat.value,base_url:baseUrl.value.trim(),api_key:apiKey.value,chat_model:chatModel.value.trim(),chat_multimodal:multimodal.checked}};
+          const probabilityValue = replyProbability.value.trim();
+          const payload = {{group_id:editing || groupId.value.trim(),api_format:apiFormat.value,base_url:baseUrl.value.trim(),api_key:apiKey.value,chat_model:chatModel.value.trim(),reply_probability:probabilityValue === "" ? null : Number(probabilityValue),chat_multimodal:multimodal.checked}};
           const response = await fetch(apiPath, {{method:"POST",headers:{{"Content-Type":"application/json"}},body:JSON.stringify(payload)}});
           const data = await response.json();
           if (!response.ok) throw new Error(data.detail || "保存失败");

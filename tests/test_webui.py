@@ -476,6 +476,7 @@ def test_group_model_admin_routes_are_authenticated_and_never_return_api_key(
         api_key_configured=True,
         chat_model="group-model",
         chat_multimodal=False,
+        reply_probability=0.04,
         allow_global_fallback=False,
         updated_by="webui-admin",
         updated_at=now,
@@ -489,9 +490,11 @@ def test_group_model_admin_routes_are_authenticated_and_never_return_api_key(
         api_key="sk-existing-secret",
         chat_model="group-model",
         chat_multimodal=False,
+        reply_probability=0.04,
         version=2,
     )
     tested_keys: list[str] = []
+    tested_probabilities: list[float | None] = []
     cleared_groups: list[str] = []
 
     @asynccontextmanager
@@ -507,6 +510,7 @@ def test_group_model_admin_routes_are_authenticated_and_never_return_api_key(
 
     async def fake_test(payload, _config):
         tested_keys.append(payload.api_key)
+        tested_probabilities.append(payload.reply_probability)
 
     async def fake_save(
         _session,
@@ -526,6 +530,7 @@ def test_group_model_admin_routes_are_authenticated_and_never_return_api_key(
             api_key=payload.api_key,
             chat_model=payload.chat_model,
             chat_multimodal=payload.chat_multimodal,
+            reply_probability=payload.reply_probability,
             version=3,
         )
 
@@ -573,11 +578,13 @@ def test_group_model_admin_routes_are_authenticated_and_never_return_api_key(
         assert page.status_code == 200
         assert "群聊 API" in page.text
         assert "测试并保存" in page.text
+        assert "最高为 0.1" in page.text
         assert "sk-existing-secret" not in page.text
 
         listing = client.get(api_path)
         assert listing.status_code == 200
         assert listing.json()["groups"][0]["group_id"] == "10001"
+        assert listing.json()["groups"][0]["reply_probability"] == 0.04
         assert '"api_key":' not in listing.text
 
         created = client.post(
@@ -589,6 +596,7 @@ def test_group_model_admin_routes_are_authenticated_and_never_return_api_key(
                 "api_key": "sk-new-secret",
                 "chat_model": "group-model",
                 "chat_multimodal": False,
+                "reply_probability": 0.08,
             },
         )
         assert created.status_code == 200
@@ -603,10 +611,26 @@ def test_group_model_admin_routes_are_authenticated_and_never_return_api_key(
                 "api_key": "",
                 "chat_model": "group-model-v2",
                 "chat_multimodal": True,
+                "reply_probability": None,
             },
         )
         assert updated.status_code == 200
         assert tested_keys == ["sk-new-secret", "sk-existing-secret"]
+        assert tested_probabilities == [0.08, None]
+
+        invalid_probability = client.post(
+            api_path,
+            json={
+                "group_id": "10001",
+                "api_format": "openai",
+                "base_url": "https://provider.example/v1",
+                "api_key": "sk-new-secret",
+                "chat_model": "group-model",
+                "chat_multimodal": False,
+                "reply_probability": 0.1001,
+            },
+        )
+        assert invalid_probability.status_code == 422
 
         removed = client.delete(f"{api_path}/10001")
         assert removed.status_code == 200

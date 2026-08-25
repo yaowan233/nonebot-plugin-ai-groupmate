@@ -22,6 +22,7 @@ def test_unaddressed_message_does_not_sample_proactive_meme(monkeypatch):
         has_text=True,
         is_group=True,
         reaction_supported=True,
+        reply_probability=0.01,
     )
 
     assert result == (False, False, False)
@@ -43,9 +44,28 @@ def test_addressed_message_never_uses_proactive_sampling(monkeypatch):
         has_text=True,
         is_group=True,
         reaction_supported=True,
+        reply_probability=0.01,
     )
 
     assert result == (False, False, False)
+
+
+def test_group_reply_probability_controls_proactive_sampling(monkeypatch):
+    import nonebot_plugin_ai_groupmate as plugin
+
+    monkeypatch.setattr(plugin.random, "random", lambda: 0.075)
+
+    result = plugin._sample_proactive_reply_modes(
+        addressed=False,
+        continuous=False,
+        command_like=False,
+        has_text=True,
+        is_group=True,
+        reaction_supported=True,
+        reply_probability=0.08,
+    )
+
+    assert result == (True, False, False)
 
 
 @pytest.mark.asyncio

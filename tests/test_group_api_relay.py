@@ -73,6 +73,7 @@ class FakeRelayTransport:
             '"api_key":"sk-relay-secret",'
             '"chat_model":"relay-model",'
             '"chat_multimodal":true,'
+            '"reply_probability":0.08,'
             '"allow_global_fallback":false,'
             f'"created_at":"{datetime.datetime.now(datetime.timezone.utc).isoformat()}"'
             "}"
@@ -172,6 +173,7 @@ async def test_relay_register_ticket_redeem_and_ack_round_trip():
         assert redeemed.group_id == "group-relay-test"
         assert redeemed.payload.api_key == "sk-relay-secret"
         assert redeemed.payload.chat_model == "relay-model"
+        assert redeemed.payload.reply_probability == 0.08
 
         await relay.acknowledge(session, redeemed, outcome="applied")
         assert await session.get(PendingGroupConfig, transport.ticket_id) is None

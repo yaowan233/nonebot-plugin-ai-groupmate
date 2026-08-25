@@ -4,7 +4,11 @@ import pytest
 from sqlalchemy import delete
 
 
-def _payload(*, ticket_id: str = "ticket-1"):
+def _payload(
+    *,
+    ticket_id: str = "ticket-1",
+    reply_probability: float | None = 0.075,
+):
     from nonebot_plugin_ai_groupmate.group_model_config import GroupModelPayload
 
     return GroupModelPayload(
@@ -14,6 +18,7 @@ def _payload(*, ticket_id: str = "ticket-1"):
         api_key="sk-group-secret",
         chat_model="group-chat-model",
         chat_multimodal=False,
+        reply_probability=reply_probability,
         created_at=datetime.datetime.now(datetime.timezone.utc),
     )
 
@@ -94,6 +99,9 @@ def test_group_payload_normalizes_base_url_and_rejects_non_http():
             allow_global_fallback=True,
             created_at=datetime.datetime.now(datetime.timezone.utc),
         )
+    assert _payload(reply_probability=0.1).reply_probability == 0.1
+    with pytest.raises(ValidationError, match="less than or equal to 0.1"):
+        _payload(reply_probability=0.1001)
 
 
 def test_group_provider_policy_blocks_internal_targets_unless_allowlisted():
@@ -208,6 +216,7 @@ async def test_group_model_config_is_encrypted_persisted_and_resolved():
         save_group_model_config,
         list_group_model_configs,
         delete_group_model_config,
+        resolve_group_reply_probability,
         clear_active_group_model_configs,
         get_decrypted_group_model_config,
     )
@@ -219,6 +228,7 @@ async def test_group_model_config_is_encrypted_persisted_and_resolved():
         chat_model="global-model",
         chat_api_key="global-key",
         chat_base_url="https://global.example/v1",
+        reply_probability=0.02,
     )
 
     async with get_session() as session:
@@ -234,12 +244,15 @@ async def test_group_model_config_is_encrypted_persisted_and_resolved():
         row = await session.get(GroupModelConfig, group_id)
         assert row is not None
         assert "sk-group-secret" not in row.api_key_ciphertext
+        assert row.reply_probability == 0.075
         assert active.version == 1
+        assert active.reply_probability == 0.075
 
         admin_rows = await list_group_model_configs(session)
         admin_row = next(item for item in admin_rows if item.group_id == group_id)
         assert admin_row.base_url == "https://group-provider.example/v1"
         assert admin_row.api_key_configured is True
+        assert admin_row.reply_probability == 0.075
         assert "api_key" not in admin_row.model_dump()
         decrypted = await get_decrypted_group_model_config(
             session,
@@ -254,12 +267,15 @@ async def test_group_model_config_is_encrypted_persisted_and_resolved():
         assert resolved.chat_api_key == "sk-group-secret"
         assert resolved.chat_base_url == "https://group-provider.example/v1"
         assert resolved.chat_multimodal is False
+        assert resolve_group_reply_probability(group_id, global_config) == 0.075
 
         untouched = resolve_chat_config("another-group", global_config)
         assert untouched is global_config
+        assert resolve_group_reply_probability("another-group", global_config) == 0.02
 
         assert await delete_group_model_config(session, group_id) is True
         assert resolve_chat_config(group_id, global_config) is global_config
+        assert resolve_group_reply_probability(group_id, global_config) == 0.02
 
 
 @pytest.mark.asyncio

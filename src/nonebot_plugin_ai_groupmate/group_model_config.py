@@ -20,6 +20,7 @@ from .config import ScopedConfig
 LOCAL_CIPHERTEXT_VERSION = "v1"
 GROUP_API_KEY_PURPOSE_PREFIX = "ai-groupmate:group-api-key:"
 LOCAL_ENCRYPTION_KEY_FILENAME = "group_api_local_encryption.key"
+MAX_GROUP_REPLY_PROBABILITY = 0.1
 
 
 class GroupModelConfigError(RuntimeError):
@@ -42,6 +43,11 @@ class GroupModelPayload(BaseModel):
     api_key: str = Field(min_length=1, max_length=8192, repr=False)
     chat_model: str = Field(min_length=1, max_length=256)
     chat_multimodal: bool = True
+    reply_probability: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=MAX_GROUP_REPLY_PROBABILITY,
+    )
     allow_global_fallback: bool = False
     created_at: datetime.datetime
 
@@ -76,6 +82,7 @@ class ActiveGroupModelConfig(BaseModel):
     api_key: str = Field(repr=False)
     chat_model: str
     chat_multimodal: bool
+    reply_probability: float | None = None
     allow_global_fallback: bool = False
     version: int = 1
 
@@ -87,6 +94,7 @@ class GroupModelConfigSummary(BaseModel):
     provider_host: str
     chat_model: str
     chat_multimodal: bool
+    reply_probability: float | None = None
     allow_global_fallback: bool
     updated_by: str
     updated_at: datetime.datetime
@@ -313,6 +321,7 @@ def _active_from_row(
         ),
         chat_model=row.chat_model,
         chat_multimodal=row.chat_multimodal,
+        reply_probability=row.reply_probability,
         allow_global_fallback=row.allow_global_fallback,
         version=row.version,
     )
@@ -328,6 +337,7 @@ def _detail_from_row(row: GroupModelConfig) -> GroupModelConfigDetail:
         api_key_configured=bool(row.api_key_ciphertext),
         chat_model=row.chat_model,
         chat_multimodal=row.chat_multimodal,
+        reply_probability=row.reply_probability,
         allow_global_fallback=row.allow_global_fallback,
         updated_by=row.updated_by,
         updated_at=row.updated_at,
@@ -369,6 +379,28 @@ def clear_active_group_model_configs() -> None:
 
 def has_group_model_config(group_id: str) -> bool:
     return str(group_id) in _active_configs
+
+
+def resolve_group_reply_probability(
+    group_id: str | None,
+    global_config: ScopedConfig | None = None,
+) -> float:
+    """Resolve the proactive reply probability for one group.
+
+    A group override can only exist as part of an active group-owned model
+    configuration. Missing/disabled group configs continue to use the Bot
+    owner's global probability.
+    """
+
+    if global_config is None:
+        from .runtime_config import get_runtime_config
+
+        global_config = get_runtime_config()
+    if group_id:
+        group_config = _active_configs.get(str(group_id))
+        if group_config is not None and group_config.reply_probability is not None:
+            return group_config.reply_probability
+    return float(global_config.reply_probability)
 
 
 def resolve_chat_config(
@@ -423,6 +455,7 @@ def build_candidate_chat_config(
             api_key=payload.api_key,
             chat_model=payload.chat_model,
             chat_multimodal=payload.chat_multimodal,
+            reply_probability=payload.reply_probability,
             allow_global_fallback=payload.allow_global_fallback,
         ),
         global_config,
@@ -454,6 +487,7 @@ async def save_group_model_config(
             api_key_ciphertext=ciphertext,
             chat_model=payload.chat_model,
             chat_multimodal=payload.chat_multimodal,
+            reply_probability=payload.reply_probability,
             allow_global_fallback=payload.allow_global_fallback,
             updated_by=str(operator_id),
             updated_at=now,
@@ -469,6 +503,7 @@ async def save_group_model_config(
         row.api_key_ciphertext = ciphertext
         row.chat_model = payload.chat_model
         row.chat_multimodal = payload.chat_multimodal
+        row.reply_probability = payload.reply_probability
         row.allow_global_fallback = payload.allow_global_fallback
         row.updated_by = str(operator_id)
         row.updated_at = now
@@ -484,6 +519,7 @@ async def save_group_model_config(
         api_key=payload.api_key,
         chat_model=payload.chat_model,
         chat_multimodal=payload.chat_multimodal,
+        reply_probability=payload.reply_probability,
         allow_global_fallback=payload.allow_global_fallback,
         version=next_version,
     )

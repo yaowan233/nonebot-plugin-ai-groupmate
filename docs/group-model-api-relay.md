@@ -236,6 +236,7 @@ Content-Type: application/json
 | `api_key` | 是 | 只存在于浏览器内存和加密后载荷中 |
 | `chat_model` | 是 | 当前群主聊天模型名称 |
 | `chat_multimodal` | 否 | 主模型是否接收图片，默认开启 |
+| `reply_probability` | 否 | 本群主动发言概率，范围 `0`～`0.1`；`null` 或省略时跟随 Bot 全局配置 |
 | `allow_global_fallback` | 否 | 当前版本必须为 `false`；群 API 失败时不消耗 Bot 所有者的全局额度 |
 
 页面先读取目标实例的公开加密信息：
@@ -268,6 +269,7 @@ GET /v1/config-tickets/tkt_01J6EXAMPLE/public
   "api_key": "sk-example",
   "chat_model": "example-model",
   "chat_multimodal": true,
+  "reply_probability": 0.01,
   "allow_global_fallback": false,
   "created_at": "2026-08-24T12:05:00Z"
 }
@@ -453,6 +455,7 @@ base_url
 api_key_ciphertext
 chat_model
 chat_multimodal
+reply_probability nullable
 allow_global_fallback
 updated_by
 updated_at
@@ -581,6 +584,7 @@ def resolve_chat_config(group_id: str | None) -> ScopedConfig: ...
 配置中心的“群聊 API”页面提供同一份群配置的管理员入口：
 
 - 按群 ID 新增或编辑主聊天模型配置；
+- 随独立模型配置设置 `0`～`0.1` 的主动发言概率，留空跟随全局值；
 - API Key 不回显，编辑时留空保留原密钥；
 - 保存前解析目标地址并实际测试一次模型连接；
 - 列表只展示接口格式、服务主机、模型、图片能力和版本；

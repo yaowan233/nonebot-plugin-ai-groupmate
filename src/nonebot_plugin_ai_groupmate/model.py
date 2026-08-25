@@ -170,6 +170,7 @@ class GroupModelConfig(Model):
     api_key_ciphertext: Mapped[str] = mapped_column(Text)
     chat_model: Mapped[str]
     chat_multimodal: Mapped[bool] = mapped_column(Boolean, default=True)
+    reply_probability: Mapped[float | None] = mapped_column(Float, nullable=True)
     allow_global_fallback: Mapped[bool] = mapped_column(Boolean, default=False)
     updated_by: Mapped[str]
     updated_at: Mapped[datetime] = mapped_column(

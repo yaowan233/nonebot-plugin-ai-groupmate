@@ -78,6 +78,7 @@ from .group_model_config import (
     LocalSecretCipher,
     LocalEncryptionKeyError,
     load_group_model_configs,
+    resolve_group_reply_probability,
     load_or_create_local_encryption_key,
 )
 from .relation_maintenance import count_negative_relations, reset_negative_relations
@@ -286,6 +287,7 @@ def _sample_proactive_reply_modes(
     has_text: bool,
     is_group: bool,
     reaction_supported: bool,
+    reply_probability: float,
 ) -> tuple[bool, bool, bool]:
     """返回（普通回复、reaction 专用、图片表情专用）。
 
@@ -295,7 +297,7 @@ def _sample_proactive_reply_modes(
     """
     if addressed or continuous:
         return False, False, False
-    random_reply = random.random() < plugin_config.reply_probability
+    random_reply = random.random() < reply_probability
     return random_reply, False, False
 
 
@@ -826,6 +828,9 @@ async def handle_message(
             has_text=bool(stripped_plain_text),
             is_group=is_group,
             reaction_supported=is_onebot_context(bot, event),
+            reply_probability=resolve_group_reply_probability(
+                session.scene.id if is_group else None
+            ),
         )
     meme_required = (to_me or continuous_to_me) and _is_explicit_meme_request(stripped_plain_text)
     meme_send_count = _get_explicit_meme_send_count(stripped_plain_text) if meme_required else 1
