@@ -938,7 +938,7 @@ async def test_timed_out_search_cannot_finish_without_replying_to_user():
     @tool("search_web")
     async def search_web(query: str) -> str:
         """Take too long for testing."""
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0.5)
         return query
 
     @tool("reply_user")
@@ -967,7 +967,10 @@ async def test_timed_out_search_cannot_finish_without_replying_to_user():
         model,
         [search_web, reply_user, finish],
         "system",
-        limits=AgentRunLimits(tool_timeout_seconds=0.001),
+        # Keep a wide gap between the executor timeout and the deliberately
+        # slow search. A 1 ms timeout also made the lightweight reply tool
+        # race the event loop under Python 3.13 + coverage.
+        limits=AgentRunLimits(tool_timeout_seconds=0.05),
     )
 
     result = await graph.ainvoke(_state(AIMessage(content="placeholder")))

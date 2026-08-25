@@ -177,6 +177,10 @@ def test_agent_builds_group_model_with_resolved_credentials(monkeypatch):
 
 def test_group_config_permission_accepts_admin_role(monkeypatch):
     from types import SimpleNamespace
+    from typing import cast
+
+    from nonebot.adapters import Event
+    from nonebot_plugin_uninfo import Uninfo
 
     from nonebot_plugin_ai_groupmate import group_api_commands
 
@@ -185,9 +189,11 @@ def test_group_config_permission_accepts_admin_role(monkeypatch):
         user=SimpleNamespace(id="user-1"),
         member=SimpleNamespace(role=SimpleNamespace(name="admin")),
     )
-    assert group_api_commands.can_manage_group_config(session, SimpleNamespace())
+    typed_session = cast(Uninfo, session)
+    event = cast(Event, SimpleNamespace())
+    assert group_api_commands.can_manage_group_config(typed_session, event)
     session.member.role.name = "member"
-    assert not group_api_commands.can_manage_group_config(session, SimpleNamespace())
+    assert not group_api_commands.can_manage_group_config(typed_session, event)
 
 
 @pytest.mark.asyncio
