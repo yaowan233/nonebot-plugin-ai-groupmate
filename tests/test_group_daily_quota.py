@@ -94,6 +94,51 @@ async def test_zero_daily_quota_limit_is_unlimited_and_not_persisted():
 
 
 @pytest.mark.asyncio
+async def test_exhausted_quota_does_not_read_expired_row_after_commit():
+    from nonebot_plugin_orm import get_session
+
+    from nonebot_plugin_ai_groupmate.model import GlobalModelGroupUsage
+    from nonebot_plugin_ai_groupmate.group_daily_quota import (
+        consume_group_daily_quota,
+    )
+
+    group_id = "daily-quota-expired-row-test"
+    now = datetime.datetime(
+        2026,
+        8,
+        25,
+        20,
+        tzinfo=datetime.timezone(datetime.timedelta(hours=8)),
+    )
+    async with get_session() as session:
+        session.sync_session.expire_on_commit = True
+        await session.execute(
+            delete(GlobalModelGroupUsage).where(
+                GlobalModelGroupUsage.group_id == group_id
+            )
+        )
+        await session.commit()
+
+        allowed = await consume_group_daily_quota(
+            session, group_id, 1, now=now
+        )
+        exhausted = await consume_group_daily_quota(
+            session, group_id, 1, now=now
+        )
+
+        assert allowed.allowed is True
+        assert exhausted.allowed is False
+        assert exhausted.used == 1
+
+        await session.execute(
+            delete(GlobalModelGroupUsage).where(
+                GlobalModelGroupUsage.group_id == group_id
+            )
+        )
+        await session.commit()
+
+
+@pytest.mark.asyncio
 async def test_concurrent_daily_quota_reservations_do_not_exceed_limit():
     from nonebot_plugin_orm import get_session
 

@@ -4,7 +4,7 @@ import weakref
 import datetime
 from dataclasses import dataclass
 
-from sqlalchemy import Select, update
+from sqlalchemy import Select, select, update
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -114,12 +114,15 @@ async def _consume_group_daily_quota_once(
             .execution_options(synchronize_session=False)
         )
         if getattr(result, "rowcount", 0) > 0:
+            used = await db_session.scalar(
+                select(GlobalModelGroupUsage.used_count).where(
+                    GlobalModelGroupUsage.group_id == group_id
+                )
+            )
             await db_session.commit()
-            row = await db_session.get(GlobalModelGroupUsage, group_id)
-            used = row.used_count if row is not None else 1
             return GroupDailyQuotaStatus(
                 allowed=True,
-                used=used,
+                used=used if used is not None else 1,
                 limit=limit,
                 resets_at=_reset_time(local_now),
             )
@@ -159,10 +162,11 @@ async def _consume_group_daily_quota_once(
         )
         if row is not None:
             if row.usage_date == usage_date and row.used_count >= limit:
+                used = row.used_count
                 await db_session.commit()
                 return GroupDailyQuotaStatus(
                     allowed=False,
-                    used=row.used_count,
+                    used=used,
                     limit=limit,
                     resets_at=_reset_time(local_now),
                 )
