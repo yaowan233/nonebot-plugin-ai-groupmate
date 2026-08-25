@@ -1,9 +1,10 @@
 import asyncio
 import secrets
+import datetime
 from html import escape
 from typing import Any
 from urllib.parse import urlencode
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 
 from nonebot import logger, get_driver
 from pydantic import ValidationError
@@ -28,6 +29,20 @@ from .runtime_config import (
     save_runtime_config_updates,
     reset_runtime_config_overrides,
 )
+from .group_model_config import (
+    GroupModelPayload,
+    LocalSecretCipher,
+    GroupModelConfigError,
+    LocalEncryptionKeyError,
+    save_group_model_config,
+    list_group_model_configs,
+    delete_group_model_config,
+    build_candidate_chat_config,
+    get_group_model_config_detail,
+    get_decrypted_group_model_config,
+    validate_group_provider_resolution,
+)
+from .group_api_settings_ui import render_group_api_settings_page
 
 SETTINGS_COOKIE_NAME = "ai_groupmate_settings"
 SETTINGS_COOKIE_MAX_AGE = 7 * 24 * 60 * 60
@@ -133,14 +148,59 @@ async def _test_model_connection(role: str, config: ScopedConfig) -> None:
     )
 
 
-def _safe_connection_error(error: Exception, config: ScopedConfig) -> str:
+def _safe_connection_error(
+    error: Exception,
+    config: ScopedConfig,
+    *,
+    extra_secrets: Iterable[str] = (),
+) -> str:
     message = str(error)
-    for field_name in SECRET_FIELDS:
-        secret_value = str(getattr(config, field_name, "") or "")
+    configured_secrets = (
+        str(getattr(config, field_name, "") or "")
+        for field_name in SECRET_FIELDS
+    )
+    for secret_value in (*configured_secrets, *extra_secrets):
         if secret_value:
             message = message.replace(secret_value, "***")
     message = " ".join(message.split())
     return message[:240] or type(error).__name__
+
+
+async def _test_group_model_connection(
+    payload: GroupModelPayload,
+    config: ScopedConfig,
+) -> None:
+    candidate = build_candidate_chat_config(payload, config)
+    await validate_group_provider_resolution(
+        payload.base_url,
+        config.group_api_allowed_provider_hosts,
+    )
+    model = create_chat_llm(candidate)
+    await asyncio.wait_for(
+        model.ainvoke([HumanMessage(content="请只回复 OK")]),
+        timeout=min(config.agent_llm_timeout_seconds, 20.0),
+    )
+
+
+def _clear_group_chat_model_cache(group_id: str) -> None:
+    from .agent import clear_group_chat_model_cache
+
+    clear_group_chat_model_cache(group_id)
+
+
+def _validate_group_id(value: Any) -> str:
+    if not isinstance(value, str):
+        raise ValueError("群 ID 必须是字符串")
+    group_id = value.strip()
+    if not group_id:
+        raise ValueError("请填写群 ID")
+    if len(group_id) > 160:
+        raise ValueError("群 ID 不能超过 160 个字符")
+    if any(ord(character) < 32 for character in group_id) or any(
+        character in "/\\" for character in group_id
+    ):
+        raise ValueError("群 ID 包含不支持的字符")
+    return group_id
 
 
 def _auth_query(config: ScopedConfig, token: str | None) -> str:
@@ -522,6 +582,8 @@ def register_usage_webui(
     api_path = f"{path}/api"
     settings_path = f"{path}/settings"
     settings_api_path = f"{settings_path}/api"
+    group_models_path = f"{settings_path}/groups"
+    group_models_api_path = f"{group_models_path}/api"
 
     async def _load_data(days: int, session_id: str, user_id: str) -> dict:
         async with get_session() as db_session:
@@ -574,7 +636,170 @@ def register_usage_webui(
                 pending_restart_fields=get_pending_restart_fields(),
                 dashboard_path=path,
                 settings_path=settings_path,
+                group_models_path=group_models_path,
             )
+        )
+
+    @app.get(
+        group_models_path,
+        response_class=HTMLResponse,
+        include_in_schema=False,
+    )
+    async def group_models_page(request: Request):
+        if not _settings_token_ok(config, request):
+            return HTMLResponse(
+                render_settings_login(
+                    settings_path,
+                    auth_configured=bool(config.usage_webui_token),
+                ),
+                headers={"Cache-Control": "no-store"},
+            )
+        return HTMLResponse(
+            render_group_api_settings_page(
+                dashboard_path=path,
+                settings_path=settings_path,
+                group_models_path=group_models_path,
+            ),
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.get(
+        group_models_api_path,
+        response_class=JSONResponse,
+        include_in_schema=False,
+    )
+    async def list_group_models(request: Request):
+        if not _settings_token_ok(config, request):
+            raise HTTPException(status_code=401, detail="invalid token")
+        async with get_session() as db_session:
+            groups = await list_group_model_configs(db_session)
+        return JSONResponse(
+            {"groups": [group.model_dump(mode="json") for group in groups]},
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.post(
+        group_models_api_path,
+        response_class=JSONResponse,
+        include_in_schema=False,
+    )
+    async def save_group_model(request: Request):
+        if not _settings_token_ok(config, request):
+            raise HTTPException(status_code=401, detail="invalid token")
+        raw_payload = await request.json()
+        if not isinstance(raw_payload, dict):
+            raise HTTPException(status_code=400, detail="invalid group model payload")
+        try:
+            group_id = _validate_group_id(raw_payload.get("group_id"))
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+
+        runtime_config = get_runtime_config()
+        if not runtime_config.group_api_local_encryption_key:
+            raise HTTPException(
+                status_code=503,
+                detail="群 API 本地加密密钥尚未初始化，请检查插件数据目录后重启 Bot",
+            )
+        try:
+            cipher = LocalSecretCipher(
+                runtime_config.group_api_local_encryption_key
+            )
+        except LocalEncryptionKeyError as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
+
+        submitted_api_key = str(raw_payload.get("api_key", "")).strip()
+        try:
+            async with get_session() as db_session:
+                if not submitted_api_key:
+                    existing = await get_decrypted_group_model_config(
+                        db_session,
+                        group_id,
+                        cipher,
+                    )
+                    if existing is None:
+                        raise ValueError("新建群配置时必须填写 API Key")
+                    submitted_api_key = existing.api_key
+
+                candidate = GroupModelPayload(
+                    ticket_id="webui-admin",
+                    api_format=raw_payload.get("api_format", "openai"),
+                    base_url=raw_payload.get("base_url", ""),
+                    api_key=submitted_api_key,
+                    chat_model=raw_payload.get("chat_model", ""),
+                    chat_multimodal=raw_payload.get("chat_multimodal", True),
+                    allow_global_fallback=False,
+                    created_at=datetime.datetime.now(datetime.timezone.utc),
+                )
+                await _test_group_model_connection(candidate, runtime_config)
+                active = await save_group_model_config(
+                    db_session,
+                    group_id=group_id,
+                    operator_id="webui-admin",
+                    payload=candidate,
+                    cipher=cipher,
+                )
+                detail = await get_group_model_config_detail(
+                    db_session,
+                    active.group_id,
+                )
+        except ValidationError as error:
+            raise HTTPException(
+                status_code=422,
+                detail=_validation_detail(error),
+            ) from error
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        except LocalEncryptionKeyError as error:
+            raise HTTPException(
+                status_code=503,
+                detail="无法解密已有群配置，请检查本地加密密钥",
+            ) from error
+        except GroupModelConfigError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        except asyncio.TimeoutError as error:
+            raise HTTPException(status_code=504, detail="模型连接测试超时") from error
+        except Exception as error:
+            safe_error = _safe_connection_error(
+                error,
+                runtime_config,
+                extra_secrets=(submitted_api_key,),
+            )
+            logger.warning(
+                f"群模型连接测试失败 group={group_id}: {safe_error}"
+            )
+            raise HTTPException(
+                status_code=502,
+                detail=f"模型连接失败：{safe_error}",
+            ) from error
+        _clear_group_chat_model_cache(group_id)
+        if detail is None:
+            raise HTTPException(status_code=500, detail="群配置保存后无法读取")
+        return JSONResponse(
+            {"ok": True, "group": detail.model_dump(mode="json")},
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.delete(
+        f"{group_models_api_path}/{{group_id}}",
+        response_class=JSONResponse,
+        include_in_schema=False,
+    )
+    async def remove_group_model(group_id: str, request: Request):
+        if not _settings_token_ok(config, request):
+            raise HTTPException(status_code=401, detail="invalid token")
+        try:
+            normalized_group_id = _validate_group_id(group_id)
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        async with get_session() as db_session:
+            deleted = await delete_group_model_config(
+                db_session,
+                normalized_group_id,
+            )
+        _clear_group_chat_model_cache(normalized_group_id)
+        return JSONResponse(
+            {"ok": True, "deleted": deleted},
+            headers={"Cache-Control": "no-store"},
         )
 
     @app.post(

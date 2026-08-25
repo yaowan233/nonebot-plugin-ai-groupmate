@@ -71,7 +71,15 @@ from .runtime_config import (
     mark_restart_fields_applied,
     load_runtime_config_overrides,
 )
+from .group_api_relay import delete_expired_pending_group_configs
 from .agent.reply_tools import create_reply_tool
+from .group_model_config import (
+    LOCAL_ENCRYPTION_KEY_FILENAME,
+    LocalSecretCipher,
+    LocalEncryptionKeyError,
+    load_group_model_configs,
+    load_or_create_local_encryption_key,
+)
 from .relation_maintenance import count_negative_relations, reset_negative_relations
 
 
@@ -107,6 +115,7 @@ _rag_backfill_task: asyncio.Task[None] | None = None
 with open(Path(__file__).parent / "stop_words.txt", encoding="utf-8") as f:
     stop_words = f.read().splitlines() + ["id", "回复"]
 
+
 @lru_cache
 def get_tagging_model():
     return create_tagging_llm(plugin_config)
@@ -126,16 +135,47 @@ register_usage_webui(
     on_config_change=_refresh_runtime_resources,
 )
 
+# Register the group-owned model configuration commands.  The relay feature is
+# disabled by default and the handlers report missing bootstrap configuration.
+from . import group_api_commands as group_api_commands
+
 
 @get_driver().on_startup
 async def _load_webui_runtime_config() -> None:
     try:
         async with get_session() as db_session:
             changed_fields = await load_runtime_config_overrides(db_session)
+            group_api_management_enabled = bool(
+                plugin_config.group_api_relay_url
+                or plugin_config.usage_webui_token
+            )
+            if group_api_management_enabled and not plugin_config.group_api_local_encryption_key:
+                try:
+                    plugin_config.group_api_local_encryption_key = load_or_create_local_encryption_key(plugin_data_dir / LOCAL_ENCRYPTION_KEY_FILENAME)
+                    logger.info("已生成或加载群 API 本地加密密钥")
+                except LocalEncryptionKeyError:
+                    logger.exception("无法初始化群 API 本地加密密钥；群 API 自助配置和管理页已禁用")
+            try:
+                expired_tickets = await delete_expired_pending_group_configs(db_session)
+                if expired_tickets:
+                    logger.info(f"已清理 {expired_tickets} 个过期的群 API 配置单")
+            except Exception:
+                # Ticket cleanup is maintenance only and must never prevent the
+                # plugin's existing runtime configuration from loading.
+                logger.warning("清理过期群 API 配置单失败，将在下次启动时重试")
+            if plugin_config.group_api_local_encryption_key:
+                try:
+                    loaded_group_configs = await load_group_model_configs(
+                        db_session,
+                        LocalSecretCipher(plugin_config.group_api_local_encryption_key),
+                        plugin_config,
+                    )
+                    if loaded_group_configs:
+                        logger.info(f"已加载 {loaded_group_configs} 个群的独立主模型配置")
+                except Exception:
+                    logger.exception("加载群级主模型配置失败；相关群暂时使用全局配置")
         _refresh_runtime_resources(changed_fields)
-        has_restart_required_changes = bool(
-            changed_fields & RESTART_REQUIRED_FIELDS
-        )
+        has_restart_required_changes = bool(changed_fields & RESTART_REQUIRED_FIELDS)
         if has_restart_required_changes:
             await DB.reconfigure()
             # reconfigure 已经让连接资源使用当前运行配置。集合兼容性是独立
@@ -146,27 +186,16 @@ async def _load_webui_runtime_config() -> None:
             try:
                 await DB.check_collections()
             except CollectionEmbeddingConfigMismatchError:
-                logger.error(
-                    "启动时 Qdrant 集合校验失败，相关向量操作已拒绝；"
-                    "请根据上方日志中的当前配置和 collection 配置人工重建向量"
-                )
+                logger.error("启动时 Qdrant 集合校验失败，相关向量操作已拒绝；请根据上方日志中的当前配置和 collection 配置人工重建向量")
             except EmbeddingProviderUnavailableError:
-                logger.warning(
-                    "启动时 Embedding API 暂时不可用，文本向量操作将在首次使用时重试"
-                )
+                logger.warning("启动时 Embedding API 暂时不可用，文本向量操作将在首次使用时重试")
             except Exception:
-                logger.exception(
-                    "启动时 Qdrant 集合校验暂时失败，将在首次向量操作时重试"
-                )
+                logger.exception("启动时 Qdrant 集合校验暂时失败，将在首次向量操作时重试")
             _start_rag_backfill_task()
         if changed_fields:
-            logger.info(
-                f"已加载 WebUI 配置覆盖项，变更字段数={len(changed_fields)}"
-            )
+            logger.info(f"已加载 WebUI 配置覆盖项，变更字段数={len(changed_fields)}")
     except Exception:
-        logger.exception(
-            "加载 WebUI 配置失败，继续使用环境变量；请确认已执行 nb orm upgrade"
-        )
+        logger.exception("加载 WebUI 配置失败，继续使用环境变量；请确认已执行 nb orm upgrade")
 
 
 @get_driver().on_shutdown
@@ -246,9 +275,7 @@ def _refresh_continuous_conversation(session_id: str, user_id: str) -> None:
     ttl = _continuous_conversation_ttl()
     if ttl <= datetime.timedelta(0):
         return
-    _continuous_conversation_until[(session_id, user_id)] = (
-        datetime.datetime.now() + ttl
-    )
+    _continuous_conversation_until[(session_id, user_id)] = datetime.datetime.now() + ttl
 
 
 def _sample_proactive_reply_modes(
@@ -377,13 +404,7 @@ def _sample_repeat_reply(
     is_group: bool,
 ) -> bool:
     """对已识别的群聊复读队形独立采样。"""
-    if (
-        repeat_text is None
-        or addressed
-        or continuous
-        or command_like
-        or not is_group
-    ):
+    if repeat_text is None or addressed or continuous or command_like or not is_group:
         return False
     return random.random() < plugin_config.repeat_probability
 
@@ -396,9 +417,7 @@ async def _load_repeat_chain_text(
     context_minutes = plugin_config.continuous_conversation_minutes
     if context_minutes <= 0:
         return None
-    context_since = datetime.datetime.now() - datetime.timedelta(
-        minutes=context_minutes
-    )
+    context_since = datetime.datetime.now() - datetime.timedelta(minutes=context_minutes)
     rows = (
         (
             await db_session.execute(
@@ -470,19 +489,7 @@ async def _load_agent_history(db_session, session_id: str) -> list[ChatHistorySc
 
     async def query_since(hours: int) -> list[ChatHistory]:
         cutoff_time = now - datetime.timedelta(hours=hours)
-        rows = (
-            (
-                await db_session.execute(
-                    Select(ChatHistory)
-                    .where(ChatHistory.session_id == session_id)
-                    .where(ChatHistory.created_at >= cutoff_time)
-                    .order_by(ChatHistory.msg_id.desc())
-                    .limit(AGENT_HISTORY_LIMIT)
-                )
-            )
-            .scalars()
-            .all()
-        )
+        rows = (await db_session.execute(Select(ChatHistory).where(ChatHistory.session_id == session_id).where(ChatHistory.created_at >= cutoff_time).order_by(ChatHistory.msg_id.desc()).limit(AGENT_HISTORY_LIMIT))).scalars().all()
         return list(rows)
 
     rows = await query_since(AGENT_RECENT_HISTORY_HOURS)
@@ -537,16 +544,12 @@ async def _queue_group_reply_request(
     """明确 @ 串行排队；非定向消息不能打断或挤占定向请求。"""
     async with _group_reply_state_lock:
         reply_state = _group_reply_states.setdefault(group_id, GroupReplyState())
-        active_is_addressed = bool(
-            reply_state.active is not None and reply_state.active.is_tome
-        )
+        active_is_addressed = bool(reply_state.active is not None and reply_state.active.is_tome)
 
         if request.is_tome:
             addressed_count = len(reply_state.addressed) + int(active_is_addressed)
             if addressed_count >= MAX_GROUP_ADDRESSED_REQUESTS:
-                logger.warning(
-                    f"群 {group_id} 待处理的 @Bot 请求已达上限，忽略额外请求"
-                )
+                logger.warning(f"群 {group_id} 待处理的 @Bot 请求已达上限，忽略额外请求")
                 return False
             reply_state.addressed.append(request)
             # 明确 @ 到来时丢弃尚未开始的随机/表情/复读请求。
@@ -662,9 +665,7 @@ async def handle_message(
     )
     addressed_bot_id = _select_addressed_bot_id(event, connected_bot_ids)
     if addressed_bot_id is not None and addressed_bot_id != str(bot.self_id):
-        logger.debug(
-            f"消息明确发给其他 Bot {addressed_bot_id}，当前 Bot {bot.self_id} 跳过处理"
-        )
+        logger.debug(f"消息明确发给其他 Bot {addressed_bot_id}，当前 Bot {bot.self_id} 跳过处理")
         return
 
     bot_name = plugin_config.bot_name
@@ -673,9 +674,7 @@ async def handle_message(
     incoming_message_id = str(get_message_id())
     content_prefix = f"id: {incoming_message_id}\n"
     content = content_prefix
-    to_me = addressed_bot_id == str(bot.self_id) or (
-        addressed_bot_id is None and event.is_tome()
-    )
+    to_me = addressed_bot_id == str(bot.self_id) or (addressed_bot_id is None and event.is_tome())
     is_text = False
     reply_id: str | None = None  # 记录回复 ID，稍后单独成行插入
     body = ""  # 正文部分单独拼接
@@ -750,9 +749,7 @@ async def handle_message(
                 ChatHistory.created_at >= time_window,
             )
             if not sender_is_connected_bot:
-                existing_query = existing_query.where(
-                    ChatHistory.user_id == session.user.id
-                )
+                existing_query = existing_query.where(ChatHistory.user_id == session.user.id)
             existing = await db_session.execute(existing_query)
             if any(
                 _matches_inbound_message(
@@ -798,28 +795,12 @@ async def handle_message(
     if stripped_plain_text.lower().startswith(plugin_config.bot_name):
         to_me = True
     explicit_to_me = to_me
-    continuous_to_me = (
-        not explicit_to_me
-        and not command_like
-        and not has_at_mention
-        and not reply_id
-        and bool(stripped_plain_text)
-        and session.scene.type == SceneType.GROUP
-        and _is_continuous_conversation(session.scene.id, session.user.id)
-    )
+    continuous_to_me = not explicit_to_me and not command_like and not has_at_mention and not reply_id and bool(stripped_plain_text) and session.scene.type == SceneType.GROUP and _is_continuous_conversation(session.scene.id, session.user.id)
     if continuous_to_me:
-        logger.debug(
-            f"群 {session.scene.id} 用户 {session.user.id} 命中连续对话窗口"
-        )
+        logger.debug(f"群 {session.scene.id} 用户 {session.user.id} 命中连续对话窗口")
     is_group = session.scene.type == SceneType.GROUP
     repeat_text = None
-    if (
-        is_group
-        and not to_me
-        and not continuous_to_me
-        and not command_like
-        and bool(stripped_plain_text)
-    ):
+    if is_group and not to_me and not continuous_to_me and not command_like and bool(stripped_plain_text):
         repeat_text = await _load_repeat_chain_text(db_session, session.scene.id)
     repeat_reply_sample = _sample_repeat_reply(
         repeat_text=repeat_text,
@@ -846,21 +827,9 @@ async def handle_message(
             is_group=is_group,
             reaction_supported=is_onebot_context(bot, event),
         )
-    meme_required = (
-        (to_me or continuous_to_me)
-        and _is_explicit_meme_request(stripped_plain_text)
-    )
-    meme_send_count = (
-        _get_explicit_meme_send_count(stripped_plain_text)
-        if meme_required
-        else 1
-    )
-    reaction_required = (
-        not meme_required
-        and (to_me or continuous_to_me)
-        and is_onebot_context(bot, event)
-        and _is_explicit_reaction_request(stripped_plain_text)
-    )
+    meme_required = (to_me or continuous_to_me) and _is_explicit_meme_request(stripped_plain_text)
+    meme_send_count = _get_explicit_meme_send_count(stripped_plain_text) if meme_required else 1
+    reaction_required = not meme_required and (to_me or continuous_to_me) and is_onebot_context(bot, event) and _is_explicit_reaction_request(stripped_plain_text)
     if meme_required:
         random_reply_sample = False
         proactive_reaction_only = False
@@ -869,14 +838,7 @@ async def handle_message(
         random_reply_sample = False
         proactive_reaction_only = True
         proactive_meme_only = False
-    should_reply = (
-        to_me
-        or continuous_to_me
-        or random_reply_sample
-        or proactive_reaction_only
-        or proactive_meme_only
-        or repeat_reply_sample
-    )
+    should_reply = to_me or continuous_to_me or random_reply_sample or proactive_reaction_only or proactive_meme_only or repeat_reply_sample
     if explicit_to_me or continuous_to_me:
         _refresh_continuous_conversation(session.scene.id, session.user.id)
     if not plain_text and not imgs:
@@ -892,7 +854,14 @@ async def handle_message(
         if should_reply:
             for img in imgs:
                 await process_image_message(
-                    db_session, img, event, bot, state, session, user_name, content_prefix
+                    db_session,
+                    img,
+                    event,
+                    bot,
+                    state,
+                    session,
+                    user_name,
+                    content_prefix,
                 )
         else:
             for img in imgs:
@@ -957,16 +926,12 @@ async def process_image_message(
 
         # 1. 获取和压缩图片
         try:
-            pic = await asyncio.wait_for(
-                image_fetch(event, bot, state, img), timeout=15.0
-            )
+            pic = await asyncio.wait_for(image_fetch(event, bot, state, img), timeout=15.0)
         except asyncio.TimeoutError:
             logger.warning("下载图片超时，跳过")
             return
 
-        pic = await asyncio.to_thread(
-            check_and_compress_image_bytes, pic, image_format=image_format.upper()
-        )
+        pic = await asyncio.to_thread(check_and_compress_image_bytes, pic, image_format=image_format.upper())
         file_hash = generate_file_hash(pic)
         file_name = f"{file_hash}.{image_format}"
         file_path = pic_dir / file_name
@@ -1052,17 +1017,13 @@ async def process_image_message(
         await db_session.rollback()
 
 
-async def _process_image_task(
-    img, event, bot, state, session, user_name, content_prefix
-):
+async def _process_image_task(img, event, bot, state, session, user_name, content_prefix):
     """后台图片处理任务，使用独立的数据库会话，不阻塞主消息流程"""
     # Queueing happens before a session is opened, so an image burst cannot
     # reserve every pooled connection while waiting for CPU/network work.
     async with background_image_gate.slot():
         async with get_session() as db_session:
-            await process_image_message(
-                db_session, img, event, bot, state, session, user_name, content_prefix
-            )
+            await process_image_message(db_session, img, event, bot, state, session, user_name, content_prefix)
 
 
 def _consume_background_image_task(task: asyncio.Task[None]) -> None:
@@ -1083,16 +1044,11 @@ def _start_background_image_task(
     content_prefix: str,
 ) -> bool:
     if len(_background_image_tasks) >= plugin_config.background_image_max_pending:
-        logger.warning(
-            "后台图片任务已达上限 "
-            f"{plugin_config.background_image_max_pending}，跳过本张图片"
-        )
+        logger.warning(f"后台图片任务已达上限 {plugin_config.background_image_max_pending}，跳过本张图片")
         return False
 
     task = asyncio.create_task(
-        _process_image_task(
-            img, event, bot, state, session, user_name, content_prefix
-        ),
+        _process_image_task(img, event, bot, state, session, user_name, content_prefix),
         name=f"ai-groupmate-image:{session.scene.id}",
     )
     _background_image_tasks.add(task)
@@ -1131,16 +1087,10 @@ async def handle_reply_logic(
                     repeat_session,
                     session.scene.id,
                 )
-                current_normalized = (
-                    " ".join(current_repeat_text.split()).casefold()
-                    if current_repeat_text is not None
-                    else None
-                )
+                current_normalized = " ".join(current_repeat_text.split()).casefold() if current_repeat_text is not None else None
                 requested_normalized = " ".join(repeat_text.split()).casefold()
                 if current_normalized != requested_normalized:
-                    logger.info(
-                        f"复读队形已变化或 bot 已参与，跳过二次复读: {repeat_text}"
-                    )
+                    logger.info(f"复读队形已变化或 bot 已参与，跳过二次复读: {repeat_text}")
                     await repeat_session.commit()
                     return
                 # 跟随执行时最新一条的原始格式，检测比较仍使用标准化文本。
@@ -1161,9 +1111,7 @@ async def handle_reply_logic(
                     group_members=[],
                     repeat_text=repeat_text,
                 )
-                raw_result = await reply_tool.ainvoke(
-                    {"content": repeat_text, "next_step": "end"}
-                )
+                raw_result = await reply_tool.ainvoke({"content": repeat_text, "next_step": "end"})
                 result = json.loads(raw_result)
                 if result.get("status") != "sent":
                     logger.info(f"复读消息未发送: {result.get('message', raw_result)}")
@@ -1188,9 +1136,7 @@ async def handle_reply_logic(
                 .scalars()
                 .all()
             )
-            recent_msgs = [
-                ChatHistorySchema.model_validate(row) for row in recent_msgs[::-1]
-            ]
+            recent_msgs = [ChatHistorySchema.model_validate(row) for row in recent_msgs[::-1]]
             await history_session.commit()
 
         if not recent_msgs:
@@ -1204,36 +1150,14 @@ async def handle_reply_logic(
             else:
                 history_summary += f"{m.user_name}: {m.content}\n"
 
-        current_msg_text = (
-            recent_msgs[-1].content
-            if recent_msgs[-1].content_type == "text"
-            else "[图片/表情包。除非用户明确在问这张图、@bot、回复bot或正在延续图片话题，否则通常不需要回应]"
-        )
+        current_msg_text = recent_msgs[-1].content if recent_msgs[-1].content_type == "text" else "[图片/表情包。除非用户明确在问这张图、@bot、回复bot或正在延续图片话题，否则通常不需要回应]"
         gatekeeper_msg_text = current_msg_text
         if is_continuous:
-            gatekeeper_msg_text = (
-                "这是用户在刚才主动呼叫 bot 后的连续对话消息。"
-                "如果像追问、补充、回应 bot 或继续话题，应倾向回复；"
-                "如果只是“嗯”“哈哈”“行”等无需回应的短反馈，可以不回复。\n"
-                f"{current_msg_text}"
-            )
+            gatekeeper_msg_text = f"这是用户在刚才主动呼叫 bot 后的连续对话消息。如果像追问、补充、回应 bot 或继续话题，应倾向回复；如果只是“嗯”“哈哈”“行”等无需回应的短反馈，可以不回复。\n{current_msg_text}"
         elif proactive_reaction_only:
-            gatekeeper_msg_text = (
-                "这条群消息命中了低概率主动 reaction 采样。"
-                "仅当用一个消息表情回应就能自然表达赞同、好笑、惊讶、安慰、感谢或轻量态度时才回复；"
-                "提问、求助、敏感/沉重话题、真实冲突、他人之间的定向对话，"
-                "以及没有明显反应价值的普通消息都应保持沉默。\n"
-                f"{current_msg_text}"
-            )
+            gatekeeper_msg_text = f"这条群消息命中了低概率主动 reaction 采样。仅当用一个消息表情回应就能自然表达赞同、好笑、惊讶、安慰、感谢或轻量态度时才回复；提问、求助、敏感/沉重话题、真实冲突、他人之间的定向对话，以及没有明显反应价值的普通消息都应保持沉默。\n{current_msg_text}"
         elif proactive_meme_only:
-            gatekeeper_msg_text = (
-                "这条群消息命中了低概率主动表情包采样。"
-                "只要一张表情包能大致作为群友式接梗、吐槽或情绪反应就可以回复，"
-                "允许轻微偏题，不要求完全精确；"
-                "认真求助、事实问题、敏感/沉重话题、真实冲突、他人之间的定向对话，"
-                "以及普通到没有反应价值的消息都应保持沉默。\n"
-                f"{current_msg_text}"
-            )
+            gatekeeper_msg_text = f"这条群消息命中了低概率主动表情包采样。只要一张表情包能大致作为群友式接梗、吐槽或情绪反应就可以回复，允许轻微偏题，不要求完全精确；认真求助、事实问题、敏感/沉重话题、真实冲突、他人之间的定向对话，以及普通到没有反应价值的消息都应保持沉默。\n{current_msg_text}"
 
         # === Gatekeeper 判断 ===
         if not is_tome and repeat_text is None:
@@ -1261,9 +1185,7 @@ async def handle_reply_logic(
         group_members: list[Any] | None = None
         if not is_private:
             try:
-                group_members = list(
-                    await interface.get_members(SceneType.GROUP, session.scene.id)
-                )
+                group_members = list(await interface.get_members(SceneType.GROUP, session.scene.id))
                 for member in group_members:
                     role_name = getattr(getattr(member, "role", None), "name", None)
                     if role_name in {"owner", "admin"}:
@@ -1332,9 +1254,7 @@ def _build_wordcloud_image(words: str) -> BytesIO:
     return image_bytes
 
 
-async def _collect_words_from_db(
-    db_session, session_id: str, days: int = 1, user_id: str | None = None
-) -> str:
+async def _collect_words_from_db(db_session, session_id: str, days: int = 1, user_id: str | None = None) -> str:
     """Query chat history and return a cleaned space-joined word string for wordcloud."""
     if not 1 <= days <= MAX_WORDCLOUD_DAYS:
         raise ValueError(f"days must be between 1 and {MAX_WORDCLOUD_DAYS}")
@@ -1391,11 +1311,7 @@ async def _(db_session: async_scoped_session, arg: Message = CommandArg()):
         await _safe_rollback(db_session)
         if affected_count == 0:
             await reset_negative_relation.finish("没有需要重置的负好感度关系。")
-        await reset_negative_relation.finish(
-            f"检测到 {affected_count} 条负好感度关系。\n"
-            "本操作会先备份，再将这些用户的好感度归零并清空旧标签。\n"
-            "确认执行请发送：/重置负面关系 确认"
-        )
+        await reset_negative_relation.finish(f"检测到 {affected_count} 条负好感度关系。\n本操作会先备份，再将这些用户的好感度归零并清空旧标签。\n确认执行请发送：/重置负面关系 确认")
 
     try:
         result = await reset_negative_relations(db_session, relation_backup_dir)
@@ -1406,19 +1322,14 @@ async def _(db_session: async_scoped_session, arg: Message = CommandArg()):
 
     if result.affected_count == 0:
         await reset_negative_relation.finish("没有需要重置的负好感度关系。")
-    await reset_negative_relation.finish(
-        f"已重置 {result.affected_count} 条负好感度关系。\n"
-        f"备份文件：{result.backup_path}"
-    )
+    await reset_negative_relation.finish(f"已重置 {result.affected_count} 条负好感度关系。\n备份文件：{result.backup_path}")
 
 
 frequency = on_command("词频")
 
 
 @frequency.handle()
-async def _(
-    db_session: async_scoped_session, session: Uninfo, arg: Message = CommandArg()
-):
+async def _(db_session: async_scoped_session, session: Uninfo, arg: Message = CommandArg()):
     session_id = session.scene.id
     arg_text = arg.extract_plain_text().strip()
     try:
@@ -1426,9 +1337,7 @@ async def _(
     except ValueError as e:
         await frequency.finish(str(e))
 
-    words = await _collect_words_from_db(
-        db_session, session_id, days=days, user_id=session.user.id
-    )
+    words = await _collect_words_from_db(db_session, session_id, days=days, user_id=session.user.id)
     await db_session.commit()
     if not words:
         await frequency.finish("在指定时间内，没有说过话呢")
@@ -1441,9 +1350,7 @@ group_frequency = on_command("群词频")
 
 
 @group_frequency.handle()
-async def _(
-    db_session: async_scoped_session, session: Uninfo, arg: Message = CommandArg()
-):
+async def _(db_session: async_scoped_session, session: Uninfo, arg: Message = CommandArg()):
     session_id = session.scene.id
     arg_text = arg.extract_plain_text().strip()
     try:
@@ -1451,9 +1358,7 @@ async def _(
     except ValueError as e:
         await group_frequency.finish(str(e))
 
-    words = await _collect_words_from_db(
-        db_session, session_id, days=days, user_id=None
-    )
+    words = await _collect_words_from_db(db_session, session_id, days=days, user_id=None)
     await db_session.commit()
     # Even if no words, return an empty wordcloud (original group_frequency didn't check emptiness)
     if not words:
@@ -1494,15 +1399,9 @@ async def _run_idle_rag_vectorization(session_id: str) -> None:
                         session_id,
                     )
                 if result:
-                    logger.info(
-                        f"自主向量化会话 {session_id} 完成，"
-                        f"处理 {result['processed_groups']}/{result['total_groups']} 组"
-                    )
+                    logger.info(f"自主向量化会话 {session_id} 完成，处理 {result['processed_groups']}/{result['total_groups']} 组")
                     if result["failed_groups"]:
-                        logger.warning(
-                            f"自主向量化会话 {session_id} 尚有 "
-                            f"{result['failed_groups']} 组失败，稍后重试"
-                        )
+                        logger.warning(f"自主向量化会话 {session_id} 尚有 {result['failed_groups']} 组失败，稍后重试")
                         await asyncio.sleep(RAG_MAINTENANCE_RETRY_SECONDS)
                         continue
             except Exception:
@@ -1550,9 +1449,7 @@ def _consume_rag_backfill_task(task: asyncio.Task[None]) -> None:
 
 def _start_rag_backfill_task() -> None:
     global _rag_backfill_task
-    if not DB.enabled or (
-        _rag_backfill_task is not None and not _rag_backfill_task.done()
-    ):
+    if not DB.enabled or (_rag_backfill_task is not None and not _rag_backfill_task.done()):
         return
     _rag_backfill_task = asyncio.create_task(
         _run_delayed_rag_backfill(),
@@ -1567,9 +1464,7 @@ async def _run_delayed_rag_backfill() -> None:
     await _run_rag_backfill()
 
 
-@scheduler.scheduled_job(
-    "interval", hours=6, max_instances=1, coalesce=True, id="vectorize_chat"
-)
+@scheduler.scheduled_job("interval", hours=6, max_instances=1, coalesce=True, id="vectorize_chat")
 async def vectorize_message_history():
     await _run_rag_backfill()
 
@@ -1586,9 +1481,7 @@ async def _run_rag_backfill() -> None:
         started_at = time.perf_counter()
         try:
             async with get_session() as discovery_session:
-                result = await discovery_session.execute(
-                    Select(ChatHistory.session_id.distinct())
-                )
+                result = await discovery_session.execute(Select(ChatHistory.session_id.distinct()))
                 session_ids = list(result.scalars().all())
                 await discovery_session.commit()
 
@@ -1599,13 +1492,9 @@ async def _run_rag_backfill() -> None:
                     # sessions, and no session exists while this job waits for
                     # its maintenance slot.
                     async with get_session() as vector_session:
-                        res = await process_and_vectorize_session_chats(
-                            vector_session, session_id
-                        )
+                        res = await process_and_vectorize_session_chats(vector_session, session_id)
                     if res:
-                        logger.info(
-                            f"向量化会话 {res['session_id']} 成功，共处理 {res['processed_groups']}/{res['total_groups']} 组"
-                        )
+                        logger.info(f"向量化会话 {res['session_id']} 成功，共处理 {res['processed_groups']}/{res['total_groups']} 组")
                     else:
                         logger.info(f"{session_id} 无需向量化")
                 except Exception as e:
@@ -1684,19 +1573,13 @@ async def _process_media_vectorization(media_id: int) -> str:
             return "skipped"
         media_file_path = media.file_path
         existing_description = media.description
-        needs_reindex = (
-            media.vectorized
-            and media.embedding_version != active_embedding_version
-            and existing_description != "[图片]"
-        )
+        needs_reindex = media.vectorized and media.embedding_version != active_embedding_version and existing_description != "[图片]"
         await db_session.commit()
 
     try:
         file_path = pic_dir / media_file_path
         try:
-            img_data_uri = await asyncio.to_thread(
-                _read_image_data_uri, file_path, media_file_path
-            )
+            img_data_uri = await asyncio.to_thread(_read_image_data_uri, file_path, media_file_path)
         except Exception as e:
             logger.error(f"读取图片失败 {media_id}: {e}")
             return "failed"
@@ -1845,10 +1728,7 @@ async def _vectorize_media_impl():
         await db_session.commit()
 
     media_ids = list(dict.fromkeys(pending_ids + outdated_ids))
-    logger.info(
-        f"本轮待处理新图片: {len(pending_ids)}，"
-        f"待重建旧表情包: {len(outdated_ids)}，并发数: {concurrency}"
-    )
+    logger.info(f"本轮待处理新图片: {len(pending_ids)}，待重建旧表情包: {len(outdated_ids)}，并发数: {concurrency}")
     if not media_ids:
         return
 
@@ -1861,20 +1741,11 @@ async def _vectorize_media_impl():
     results = await asyncio.gather(*(process_one(media_id) for media_id in media_ids))
     missing_count = results.count("missing")
     if missing_count:
-        logger.warning(
-            f"本轮跳过 {missing_count} 个文件缺失的历史表情包，"
-            "已停止后续重建重试"
-        )
-    logger.info(
-        f"本轮图片处理完成：成功 {results.count('indexed')}，"
-        f"跳过 {results.count('skipped') + missing_count}，"
-        f"失败待重试 {results.count('failed')}"
-    )
+        logger.warning(f"本轮跳过 {missing_count} 个文件缺失的历史表情包，已停止后续重建重试")
+    logger.info(f"本轮图片处理完成：成功 {results.count('indexed')}，跳过 {results.count('skipped') + missing_count}，失败待重试 {results.count('failed')}")
 
 
-@scheduler.scheduled_job(
-    "interval", minutes=10, max_instances=1, coalesce=True, id="vectorize_media"
-)
+@scheduler.scheduled_job("interval", minutes=10, max_instances=1, coalesce=True, id="vectorize_media")
 async def vectorize_media():
     if not DB.enabled:
         logger.debug("Qdrant 未启用，跳过媒体向量化调度")
@@ -1932,9 +1803,7 @@ def _delete_orphaned_files(
     return orphaned_count, deleted_count
 
 
-@scheduler.scheduled_job(
-    "interval", minutes=35, max_instances=1, coalesce=True, id="clear_cache"
-)
+@scheduler.scheduled_job("interval", minutes=35, max_instances=1, coalesce=True, id="clear_cache")
 async def clear_cache_pic():
     async with maintenance_gate.slot(wait=False) as admitted:
         if not admitted:
@@ -1951,8 +1820,7 @@ async def clear_cache_pic():
                 result = await cleanup_session.execute(
                     Select(MediaStorage).where(
                         MediaStorage.references < 3,
-                        MediaStorage.created_at
-                        < datetime.datetime.now() - datetime.timedelta(days=30),
+                        MediaStorage.created_at < datetime.datetime.now() - datetime.timedelta(days=30),
                     )
                 )
                 medias = list(result.scalars().all())
@@ -1962,20 +1830,13 @@ async def clear_cache_pic():
                 await cleanup_session.commit()
 
             if media_files:
-                deleted_files = await asyncio.to_thread(
-                    _batch_delete_files, media_files, "过期媒体"
-                )
-                logger.info(
-                    f"成功清理 {len(media_files)} 个过期媒体记录"
-                    f"（{deleted_files} 个文件）"
-                )
+                deleted_files = await asyncio.to_thread(_batch_delete_files, media_files, "过期媒体")
+                logger.info(f"成功清理 {len(media_files)} 个过期媒体记录（{deleted_files} 个文件）")
 
             # Materialize the known filenames and close the database session
             # before scanning/stat'ing the directory.
             async with get_session() as discovery_session:
-                known_result = await discovery_session.execute(
-                    Select(MediaStorage.file_path)
-                )
+                known_result = await discovery_session.execute(Select(MediaStorage.file_path))
                 known_files = {str(row[0]) for row in known_result.all()}
                 await discovery_session.commit()
 
@@ -1986,10 +1847,10 @@ async def clear_cache_pic():
                 datetime.timedelta(minutes=10),
             )
             if orphaned_count:
-                logger.info(
-                    f"成功清理 {deleted_count}/{orphaned_count} 个孤立文件"
-                )
+                logger.info(f"成功清理 {deleted_count}/{orphaned_count} 个孤立文件")
         finally:
             elapsed = time.perf_counter() - started_at
             logger.info(f"媒体清理任务结束，耗时 {elapsed:.2f}s")
+
+
 # 群档案由 agent 工具按需维护，不再注册定时任务。

@@ -341,7 +341,9 @@ def render_settings_page(
     pending_restart_fields: set[str],
     dashboard_path: str,
     settings_path: str,
+    group_models_path: str | None = None,
 ) -> str:
+    group_models_path = group_models_path or f"{settings_path}/groups"
     configured_fields = {
         field_name
         for _, _, fields in SETTING_GROUPS
@@ -436,7 +438,10 @@ def render_settings_page(
   </style>
 </head>
 <body>
-  <header><div class="header-inner"><div><h1>配置中心</h1><div class="subtitle">环境变量作为默认值，网页保存值作为覆盖项。</div></div><nav><a href="{escape(dashboard_path)}">运行概览</a><button id="logout" type="button">退出</button></nav></div></header>
+  <header><div class="header-inner">
+    <div><h1>配置中心</h1><div class="subtitle">环境变量作为默认值，网页保存值作为覆盖项。</div></div>
+    <nav><a href="{escape(group_models_path)}">群聊 API</a><a href="{escape(dashboard_path)}">运行概览</a><button id="logout" type="button">退出</button></nav>
+  </div></header>
   <main>
     <div class="notice">密钥字段不会回显；留空表示保持原值。WebUI 地址、开关和管理密码仍由环境变量控制。</div>
     {restart_banner}

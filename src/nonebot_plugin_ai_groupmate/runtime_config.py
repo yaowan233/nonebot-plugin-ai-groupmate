@@ -11,28 +11,36 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from .model import RuntimeConfigOverride
 from .config import Config, ScopedConfig
 
-BOOTSTRAP_FIELDS = frozenset({
-    "usage_webui_enabled",
-    "usage_webui_path",
-    "usage_webui_token",
-})
-RESTART_REQUIRED_FIELDS = frozenset({
-    "qdrant_uri",
-    "qdrant_api_key",
-    "embedding_api_key",
-    "embedding_base_url",
-    "embedding_model",
-    "embedding_dimension",
-    "meme_embedding_mode",
-    "rerank_api_url",
-    "rerank_api_key",
-    "qwen_token",
-})
-SECRET_FIELDS = frozenset(
-    name
-    for name in ScopedConfig.model_fields
-    if name.endswith(("_api_key", "_token"))
+BOOTSTRAP_FIELDS = frozenset(
+    {
+        "usage_webui_enabled",
+        "usage_webui_path",
+        "usage_webui_token",
+        "group_api_relay_url",
+        "group_api_relay_registration_token",
+        "group_api_local_encryption_key",
+        "group_api_relay_timeout_seconds",
+        "group_api_ticket_ttl_seconds",
+        "group_api_allowed_provider_hosts",
+    }
 )
+RESTART_REQUIRED_FIELDS = frozenset(
+    {
+        "qdrant_uri",
+        "qdrant_api_key",
+        "embedding_api_key",
+        "embedding_base_url",
+        "embedding_model",
+        "embedding_dimension",
+        "meme_embedding_mode",
+        "rerank_api_url",
+        "rerank_api_key",
+        "qwen_token",
+    }
+)
+SECRET_FIELDS = frozenset(
+    name for name in ScopedConfig.model_fields if name.endswith(("_api_key", "_token"))
+) | {"group_api_local_encryption_key"}
 CONFIGURABLE_FIELDS = frozenset(ScopedConfig.model_fields) - BOOTSTRAP_FIELDS
 
 _environment_config = get_plugin_config(Config).ai_groupmate
@@ -64,11 +72,13 @@ def get_pending_restart_fields() -> set[str]:
 
 def _refresh_pending_restart_fields() -> set[str]:
     _pending_restart_fields.clear()
-    _pending_restart_fields.update({
-        field_name
-        for field_name, applied_value in _restart_baseline.items()
-        if getattr(_runtime_config, field_name) != applied_value
-    })
+    _pending_restart_fields.update(
+        {
+            field_name
+            for field_name, applied_value in _restart_baseline.items()
+            if getattr(_runtime_config, field_name) != applied_value
+        }
+    )
     return set(_pending_restart_fields)
 
 
@@ -80,11 +90,9 @@ def mark_restart_fields_applied() -> None:
 
 def _validated_config(overrides: dict[str, Any]) -> ScopedConfig:
     values = _environment_config.model_dump()
-    values.update({
-        key: value
-        for key, value in overrides.items()
-        if key in CONFIGURABLE_FIELDS
-    })
+    values.update(
+        {key: value for key, value in overrides.items() if key in CONFIGURABLE_FIELDS}
+    )
     return ScopedConfig.model_validate(values)
 
 
@@ -149,11 +157,7 @@ async def load_runtime_config_overrides(db_session: AsyncSession) -> set[str]:
     )
     row = result.scalar_one_or_none()
     stored = row.overrides if row and isinstance(row.overrides, dict) else {}
-    stored = {
-        key: value
-        for key, value in stored.items()
-        if key in CONFIGURABLE_FIELDS
-    }
+    stored = {key: value for key, value in stored.items() if key in CONFIGURABLE_FIELDS}
     try:
         config = _validated_config(stored)
     except ValidationError:

@@ -15,6 +15,13 @@ class ScopedConfig(BaseModel):
     usage_webui_enabled: bool = True
     usage_webui_path: str = "/ai-groupmate/usage"
     usage_webui_token: str = ""
+    # === 分群模型 API 中转（启动配置） ===
+    group_api_relay_url: str = ""
+    group_api_relay_registration_token: str = ""
+    group_api_local_encryption_key: str = ""
+    group_api_relay_timeout_seconds: float = Field(default=15.0, gt=0)
+    group_api_ticket_ttl_seconds: int = Field(default=900, ge=60, le=3600)
+    group_api_allowed_provider_hosts: list[str] = Field(default_factory=list)
     chat_input_cost_per_million: float = 2.0
     chat_output_cost_per_million: float = 8.0
     chat_cached_input_cost_per_million: float = 0.4

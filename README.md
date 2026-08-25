@@ -136,6 +136,12 @@ curl http://127.0.0.1:6333/collections/media_collection_v3
 | ai_groupmate__chat_api_format | 否 | `openai` | 主聊天接口格式，可选 `openai` / `anthropic` / `vertex` |
 | ai_groupmate__chat_multimodal | 否 | `true` | 主聊天模型是否支持图片输入；若使用纯文本模型请设为 `false`，将跳过图片上传只发文本 |
 | ai_groupmate__chat_explicit_prompt_cache | 否 | `true` | 为支持的接口添加显式 Prompt 缓存断点；支持 DashScope、Anthropic，以及 OpenRouter 上的 Gemini/Claude，并自动使用匿名群级粘性路由 |
+| ai_groupmate__group_api_relay_url | 否 | 无 | 群 API 公网中转服务根地址；留空时禁用群管理员自助配置 |
+| ai_groupmate__group_api_relay_registration_token | 私有注册模式首次必填 | 无 | 中转服务签发的部署者注册码；服务器开放注册时留空，实例注册成功后也可移除 |
+| ai_groupmate__group_api_local_encryption_key | 否 | 自动生成 | 可选的 32 字节 Base64URL 本地主密钥；留空时在插件数据目录自动生成并持久化 |
+| ai_groupmate__group_api_relay_timeout_seconds | 否 | `15` | 调用中转服务的 HTTP 超时（秒） |
+| ai_groupmate__group_api_ticket_ttl_seconds | 否 | `900` | 配置链接和一次性配置码的有效期（秒，范围 60～3600） |
+| ai_groupmate__group_api_allowed_provider_hosts | 否 | `[]` | 群 API 模型服务主机白名单，支持精确主机及 `*.example.com`；留空时仅允许 DNS 全部解析到公网 IP 的 HTTPS 地址，配置私有模型端点时必须显式填写 |
 | ai_groupmate__vertex_project | 标准 Vertex 时推荐 | 无 | Google Cloud 项目 ID；ADC / 服务账号模式使用，Express Mode API Key 不需要 |
 | ai_groupmate__vertex_location | 否 | `global` | ADC / 服务账号模式的 Vertex AI 区域；Express Mode API Key 下忽略 |
 | ai_groupmate__vertex_api_key | Express Mode 必填 | 无 | Vertex AI Express Mode API Key，可直接写入 NoneBot 的 `.env`；服务账号路径已配置时忽略 |
@@ -203,6 +209,28 @@ SQLALCHEMY_ENGINE_OPTIONS={"pool_size":5,"max_overflow":10,"pool_timeout":5,"poo
 用量 WebUI 默认地址为 `/ai-groupmate/usage`。升级数据库后，页面会额外展示每轮 agent 的 LLM/工具调用次数、平均耗时、工具超时、结果截断与副作用去重情况；旧记录会以 0 显示这些新增指标。
 
 页面右上角的“配置中心”可维护插件运行配置。使用前必须在环境变量中设置非空的 `AI_GROUPMATE__USAGE_WEBUI_TOKEN`，配置中心会使用独立的 HttpOnly Cookie 登录，不会在页面中回显 API Key。网页保存的值存入插件数据库，加载顺序为“代码默认值 → 环境变量 → 网页覆盖值”；可随时一键恢复环境变量配置。
+
+配置中心顶部的“群聊 API”页面可由 Bot 管理员按群 ID 新增、修改和删除独立主聊天模型。新增或修改时会先测试模型连接，成功后立即生效；编辑已有记录时 API Key 留空会保留原 Key。列表与接口只返回脱敏信息，删除后该群立即恢复使用全局主聊天 API。启用配置中心后，插件也会自动生成本地群 API 加密密钥，因此即使不启用公网中转也可以使用这个管理页。
+
+针对内网部署 Bot 的群级自带模型 API（BYOK）能力已经完成端到端实现：群管理员可通过公网配置页取得一次性配置码，再私聊交给 Bot；插件会解密、测试并按群保存主模型配置。协议与部署说明见 [分群模型 API 中转配置设计](./docs/group-model-api-relay.md)。配套 FastAPI 中转服务位于 `../backend`，Mayumi 配置页位于 `../mayumi-front`；生产启用前仍需配置域名、HTTPS 与 Secret。
+
+启用插件端功能时，在 Bot 启动环境中配置：
+
+```dotenv
+AI_GROUPMATE__GROUP_API_RELAY_URL=https://relay.example.com
+# 仅中转服务器未开放公开注册时需要
+AI_GROUPMATE__GROUP_API_RELAY_REGISTRATION_TOKEN=replace-with-issued-token
+# 可选；建议生产环境显式限制群管理员可选的模型服务域名
+AI_GROUPMATE__GROUP_API_ALLOWED_PROVIDER_HOSTS=["api.openai.com","openrouter.ai","*.example-provider.com"]
+```
+
+插件默认在数据目录生成 `group_api_local_encryption.key`。请把该文件与数据库一起持久化并备份；丢失后已经保存的群 API Key、实例令牌和私钥均无法恢复。使用 Secret 管理平台时，也可以继续显式设置本地主密钥：
+
+```bash
+python -c "import base64,secrets; print(base64.urlsafe_b64encode(secrets.token_bytes(32)).decode().rstrip('='))"
+```
+
+`GROUP_API_RELAY_REGISTRATION_TOKEN` 只在 Bot 第一次向中转服务注册时使用，注册成功并确认数据库已持久化后可以从环境中移除。上述启动配置不会进入插件配置中心，也不会在 WebUI 回显。
 
 回复概率、Agent 限制、模型与费用配置会在保存后热更新；Qdrant、Embedding、表情包向量化模式、兼容 Qwen Token 和 Rerank 连接配置会标记为“等待重启”。WebUI 开关、访问路径和管理密码属于启动配置，仍需通过环境变量修改。升级后请先执行：
 
@@ -297,5 +325,9 @@ AI_GROUPMATE__CHAT_MODEL=qwen3.7-plus
 | /群词频 <统计天数> | 生成群词频词云  |
 | /重置负面关系 | 仅超级用户；预览需要重置的历史负面关系数量 |
 | /重置负面关系 确认 | 仅超级用户；备份后将负好感度归零并清空这些用户的旧标签 |
+| /配置群API | 群主、群管理员或超级用户创建配置链接；链接通过私聊发送 |
+| /提交群API <配置码> | 发起人私聊提交一次性配置码，测试并应用群主模型配置 |
+| /查看群API | 群内查看当前群级主模型配置的脱敏摘要 |
+| /删除群API 确认 | 群主、群管理员或超级用户删除群配置并恢复全局主模型 |
 
 关系备份保存在 NoneBot 插件数据目录下的 `relation_backups` 文件夹中。重复执行是安全的；没有负好感度记录时不会创建备份或修改数据库。

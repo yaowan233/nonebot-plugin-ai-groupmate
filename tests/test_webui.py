@@ -443,3 +443,172 @@ def test_settings_routes_require_login_and_apply_updates(monkeypatch):
         assert saved.status_code == 200
         assert saved.json()["restart_required"] is False
         assert changed_callbacks == [{"reply_probability", "llm_api_key"}]
+
+
+def test_group_model_admin_routes_are_authenticated_and_never_return_api_key(
+    monkeypatch,
+):
+    from contextlib import asynccontextmanager
+
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    import nonebot_plugin_ai_groupmate.webui as webui_module
+    from nonebot_plugin_ai_groupmate.config import ScopedConfig
+    from nonebot_plugin_ai_groupmate.group_model_config import (
+        LocalSecretCipher,
+        ActiveGroupModelConfig,
+        GroupModelConfigDetail,
+    )
+
+    app = FastAPI()
+    config = ScopedConfig(
+        usage_webui_token="admin-password",
+        group_api_local_encryption_key=LocalSecretCipher.generate_key(),
+    )
+    now = datetime.now()
+    detail = GroupModelConfigDetail(
+        group_id="10001",
+        enabled=True,
+        api_format="openai",
+        provider_host="provider.example",
+        base_url="https://provider.example/v1",
+        api_key_configured=True,
+        chat_model="group-model",
+        chat_multimodal=False,
+        allow_global_fallback=False,
+        updated_by="webui-admin",
+        updated_at=now,
+        last_test_status="success",
+        version=2,
+    )
+    existing = ActiveGroupModelConfig(
+        group_id="10001",
+        api_format="openai",
+        base_url="https://provider.example/v1",
+        api_key="sk-existing-secret",
+        chat_model="group-model",
+        chat_multimodal=False,
+        version=2,
+    )
+    tested_keys: list[str] = []
+    cleared_groups: list[str] = []
+
+    @asynccontextmanager
+    async def fake_session():
+        yield object()
+
+    async def fake_list(_session):
+        return [detail]
+
+    async def fake_get_decrypted(_session, group_id, _cipher):
+        assert group_id == "10001"
+        return existing
+
+    async def fake_test(payload, _config):
+        tested_keys.append(payload.api_key)
+
+    async def fake_save(
+        _session,
+        *,
+        group_id,
+        operator_id,
+        payload,
+        cipher,
+    ):
+        assert group_id == "10001"
+        assert operator_id == "webui-admin"
+        assert isinstance(cipher, LocalSecretCipher)
+        return ActiveGroupModelConfig(
+            group_id=group_id,
+            api_format=payload.api_format,
+            base_url=payload.base_url,
+            api_key=payload.api_key,
+            chat_model=payload.chat_model,
+            chat_multimodal=payload.chat_multimodal,
+            version=3,
+        )
+
+    async def fake_detail(_session, group_id):
+        assert group_id == "10001"
+        return detail.model_copy(update={"version": 3})
+
+    async def fake_delete(_session, group_id):
+        assert group_id == "10001"
+        return True
+
+    monkeypatch.setattr(
+        webui_module,
+        "get_driver",
+        lambda: SimpleNamespace(server_app=app),
+    )
+    monkeypatch.setattr(webui_module, "get_session", fake_session)
+    monkeypatch.setattr(webui_module, "get_runtime_config", lambda: config)
+    monkeypatch.setattr(webui_module, "list_group_model_configs", fake_list)
+    monkeypatch.setattr(
+        webui_module,
+        "get_decrypted_group_model_config",
+        fake_get_decrypted,
+    )
+    monkeypatch.setattr(webui_module, "_test_group_model_connection", fake_test)
+    monkeypatch.setattr(webui_module, "save_group_model_config", fake_save)
+    monkeypatch.setattr(webui_module, "get_group_model_config_detail", fake_detail)
+    monkeypatch.setattr(webui_module, "delete_group_model_config", fake_delete)
+    monkeypatch.setattr(
+        webui_module,
+        "_clear_group_chat_model_cache",
+        cleared_groups.append,
+    )
+    webui_module.register_usage_webui(config)
+
+    api_path = "/ai-groupmate/usage/settings/groups/api"
+    with TestClient(app) as client:
+        assert client.get(api_path).status_code == 401
+        client.post(
+            "/ai-groupmate/usage/settings/login",
+            json={"token": "admin-password"},
+        )
+
+        page = client.get("/ai-groupmate/usage/settings/groups")
+        assert page.status_code == 200
+        assert "群聊 API" in page.text
+        assert "测试并保存" in page.text
+        assert "sk-existing-secret" not in page.text
+
+        listing = client.get(api_path)
+        assert listing.status_code == 200
+        assert listing.json()["groups"][0]["group_id"] == "10001"
+        assert '"api_key":' not in listing.text
+
+        created = client.post(
+            api_path,
+            json={
+                "group_id": "10001",
+                "api_format": "openai",
+                "base_url": "https://provider.example/v1",
+                "api_key": "sk-new-secret",
+                "chat_model": "group-model",
+                "chat_multimodal": False,
+            },
+        )
+        assert created.status_code == 200
+        assert "sk-new-secret" not in created.text
+
+        updated = client.post(
+            api_path,
+            json={
+                "group_id": "10001",
+                "api_format": "openai",
+                "base_url": "https://provider.example/v1",
+                "api_key": "",
+                "chat_model": "group-model-v2",
+                "chat_multimodal": True,
+            },
+        )
+        assert updated.status_code == 200
+        assert tested_keys == ["sk-new-secret", "sk-existing-secret"]
+
+        removed = client.delete(f"{api_path}/10001")
+        assert removed.status_code == 200
+        assert removed.json()["deleted"] is True
+        assert cleared_groups == ["10001", "10001", "10001"]

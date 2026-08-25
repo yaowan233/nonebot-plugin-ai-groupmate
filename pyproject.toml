@@ -8,7 +8,9 @@ authors = [
     {name = "yaowan233", email = "572473053@qq.com"},
 ]
 dependencies = [
+    "cryptography>=45.0.0",
     "datasets>=3.4.1",
+    "httpx>=0.28.0",
     "jieba>=0.42.1",
     "langchain>=1.1.0",
     "langchain-anthropic>=1.4.4",

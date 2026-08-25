@@ -2294,10 +2294,12 @@ wheels = [
 
 [[package]]
 name = "nonebot-plugin-ai-groupmate"
-version = "2.3.3"
+version = "2.3.5"
 source = { editable = "." }
 dependencies = [
+    { name = "cryptography" },
     { name = "datasets" },
+    { name = "httpx" },
     { name = "jieba" },
     { name = "langchain" },
     { name = "langchain-anthropic" },
@@ -2340,7 +2342,9 @@ test = [
 
 [package.metadata]
 requires-dist = [
+    { name = "cryptography", specifier = ">=45.0.0" },
     { name = "datasets", specifier = ">=3.4.1" },
+    { name = "httpx", specifier = ">=0.28.0" },
     { name = "jieba", specifier = ">=0.42.1" },
     { name = "langchain", specifier = ">=1.1.0" },
     { name = "langchain-anthropic", specifier = ">=1.4.4" },

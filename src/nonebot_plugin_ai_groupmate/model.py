@@ -1,7 +1,7 @@
 from datetime import datetime
 
 from pydantic import BaseModel
-from sqlalchemy import JSON, Float, Index, String, Boolean, Integer
+from sqlalchemy import JSON, Text, Float, Index, String, Boolean, Integer
 from sqlalchemy.orm import Mapped, mapped_column
 from nonebot_plugin_orm import Model
 
@@ -135,6 +135,50 @@ class RuntimeConfigOverride(Model):
         default=datetime.now,
         onupdate=datetime.now,
     )
+
+
+class RelayInstanceIdentity(Model):
+    """Locally persisted identity used to authenticate with the relay."""
+
+    id: Mapped[int] = mapped_column(primary_key=True, default=1)
+    relay_url: Mapped[str]
+    instance_id: Mapped[str] = mapped_column(unique=True)
+    instance_token_ciphertext: Mapped[str] = mapped_column(Text)
+    public_key_jwk: Mapped[dict[str, object]] = mapped_column(JSON)
+    private_key_ciphertext: Mapped[str] = mapped_column(Text)
+    key_id: Mapped[str]
+    registered_at: Mapped[datetime] = mapped_column(default=datetime.now)
+
+
+class PendingGroupConfig(Model):
+    """A short-lived relay ticket bound to its requesting group administrator."""
+
+    ticket_id: Mapped[str] = mapped_column(primary_key=True)
+    group_id: Mapped[str] = mapped_column(index=True)
+    operator_id: Mapped[str] = mapped_column(index=True)
+    expires_at: Mapped[datetime] = mapped_column(index=True)
+    created_at: Mapped[datetime] = mapped_column(default=datetime.now)
+
+
+class GroupModelConfig(Model):
+    """Encrypted main-chat model configuration owned by one group."""
+
+    group_id: Mapped[str] = mapped_column(primary_key=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    api_format: Mapped[str] = mapped_column(String(16), default="openai")
+    base_url: Mapped[str] = mapped_column(Text)
+    api_key_ciphertext: Mapped[str] = mapped_column(Text)
+    chat_model: Mapped[str]
+    chat_multimodal: Mapped[bool] = mapped_column(Boolean, default=True)
+    allow_global_fallback: Mapped[bool] = mapped_column(Boolean, default=False)
+    updated_by: Mapped[str]
+    updated_at: Mapped[datetime] = mapped_column(
+        default=datetime.now,
+        onupdate=datetime.now,
+    )
+    last_tested_at: Mapped[datetime | None]
+    last_test_status: Mapped[str] = mapped_column(String(32), default="untested")
+    version: Mapped[int] = mapped_column(default=1)
 
 
 class ChatHistorySchema(BaseModel):
