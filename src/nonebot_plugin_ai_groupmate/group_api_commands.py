@@ -30,6 +30,7 @@ from .group_api_relay import (
 )
 from .group_model_config import (
     LocalEncryptionKeyError,
+    ActivePrivateModelConfig,
     save_group_model_config,
     delete_group_model_config,
     save_private_model_config,
@@ -345,7 +346,7 @@ async def _do_submit(
         logger.warning(
             f"群 API 配置已应用但中转确认失败: ticket={redeemed.ticket_id[-6:]}"
         )
-    if redeemed.target.scope == "private":
+    if isinstance(active, ActivePrivateModelConfig):
         await matcher.finish(
             f"模型连接测试通过。你的私聊主模型已更新为 {active.chat_model}，之后不再占用每日公共模型额度。"
         )
