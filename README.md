@@ -124,6 +124,8 @@ curl http://127.0.0.1:6333/collections/media_collection_v3
 | ai_groupmate__reply_probability | 否 | `0.01` | 群内主动发言概率 |
 | ai_groupmate__global_model_daily_group_limit_enabled | 否 | `true` | 是否启用每群每日公共主模型额度；关闭后不查询、不记录额度 |
 | ai_groupmate__global_model_daily_group_limit | 否 | `50` | 每个群每天可使用公共主模型的回复次数，按 Bot 本地时间零点重置；`0` 表示不限额，配置了群聊独立 API 的群不计入 |
+| ai_groupmate__global_model_daily_private_user_limit_enabled | 否 | `true` | 是否启用每位用户每日私聊公共主模型额度；关闭后不查询、不记录额度 |
+| ai_groupmate__global_model_daily_private_user_limit | 否 | `10` | 每位用户每天私聊可使用公共主模型的回复次数，按 Bot 本地时间零点重置；`0` 表示不限额 |
 | ai_groupmate__repeat_probability | 否 | `0.15` | Bot 已在当前连续对话窗口参与，且至少两名不同群友连续发送同一句短文本后，Bot 对每条新跟读加入队形的概率 |
 | ai_groupmate__proactive_reaction_probability | 否 | `0.05` | 兼容旧配置；非定向群消息的主动 reaction 采样已停用，避免额外模型调用 |
 | ai_groupmate__proactive_meme_probability | 否 | `0.02` | 兼容旧配置；非定向群消息的主动表情包采样已停用，避免额外模型调用 |

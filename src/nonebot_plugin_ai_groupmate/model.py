@@ -151,9 +151,12 @@ class RelayInstanceIdentity(Model):
 
 
 class PendingGroupConfig(Model):
-    """A short-lived relay ticket bound to its requesting group administrator."""
+    """A short-lived relay ticket bound to one group or private user."""
 
     ticket_id: Mapped[str] = mapped_column(primary_key=True)
+    scope: Mapped[str] = mapped_column(String(16), default="group", index=True)
+    # Kept as ``group_id`` for database compatibility. For private tickets it
+    # stores the user ID; callers should use GroupModelRelay's target seam.
     group_id: Mapped[str] = mapped_column(index=True)
     operator_id: Mapped[str] = mapped_column(index=True)
     expires_at: Mapped[datetime] = mapped_column(index=True)
@@ -182,10 +185,42 @@ class GroupModelConfig(Model):
     version: Mapped[int] = mapped_column(default=1)
 
 
+class PrivateModelConfig(Model):
+    """Encrypted main-chat model configuration owned by one private user."""
+
+    user_id: Mapped[str] = mapped_column(primary_key=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    api_format: Mapped[str] = mapped_column(String(16), default="openai")
+    base_url: Mapped[str] = mapped_column(Text)
+    api_key_ciphertext: Mapped[str] = mapped_column(Text)
+    chat_model: Mapped[str]
+    chat_multimodal: Mapped[bool] = mapped_column(Boolean, default=True)
+    allow_global_fallback: Mapped[bool] = mapped_column(Boolean, default=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        default=datetime.now,
+        onupdate=datetime.now,
+    )
+    last_tested_at: Mapped[datetime | None]
+    last_test_status: Mapped[str] = mapped_column(String(32), default="untested")
+    version: Mapped[int] = mapped_column(default=1)
+
+
 class GlobalModelGroupUsage(Model):
     """Current local-day public model reply usage for one group."""
 
     group_id: Mapped[str] = mapped_column(primary_key=True)
+    usage_date: Mapped[date] = mapped_column(index=True)
+    used_count: Mapped[int] = mapped_column(Integer, default=0)
+    updated_at: Mapped[datetime] = mapped_column(
+        default=datetime.now,
+        onupdate=datetime.now,
+    )
+
+
+class GlobalModelPrivateUserUsage(Model):
+    """Current local-day public model private reply usage for one user."""
+
+    user_id: Mapped[str] = mapped_column(primary_key=True)
     usage_date: Mapped[date] = mapped_column(index=True)
     used_count: Mapped[int] = mapped_column(Integer, default=0)
     updated_at: Mapped[datetime] = mapped_column(

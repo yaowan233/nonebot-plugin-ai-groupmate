@@ -78,13 +78,18 @@ from .group_daily_quota import (
     consume_group_daily_quota,
     get_group_daily_quota_status,
     build_quota_exhausted_message,
+    consume_private_user_daily_quota,
+    get_private_user_daily_quota_status,
+    build_private_quota_exhausted_message,
 )
 from .group_model_config import (
     LOCAL_ENCRYPTION_KEY_FILENAME,
     LocalSecretCipher,
     LocalEncryptionKeyError,
     has_group_model_config,
+    has_private_model_config,
     load_group_model_configs,
+    load_private_model_configs,
     resolve_group_reply_probability,
     load_or_create_local_encryption_key,
 )
@@ -180,6 +185,13 @@ async def _load_webui_runtime_config() -> None:
                     )
                     if loaded_group_configs:
                         logger.info(f"已加载 {loaded_group_configs} 个群的独立主模型配置")
+                    loaded_private_configs = await load_private_model_configs(
+                        db_session,
+                        LocalSecretCipher(plugin_config.group_api_local_encryption_key),
+                        plugin_config,
+                    )
+                    if loaded_private_configs:
+                        logger.info(f"已加载 {loaded_private_configs} 个用户的私聊独立主模型配置")
                 except Exception:
                     logger.exception("加载群级主模型配置失败；相关群暂时使用全局配置")
         _refresh_runtime_resources(changed_fields)
@@ -1068,7 +1080,7 @@ def _start_background_image_task(
     return True
 
 
-async def _send_group_quota_notice(
+async def _send_quota_notice(
     db_session,
     *,
     status: GroupDailyQuotaStatus,
@@ -1076,18 +1088,31 @@ async def _send_group_quota_notice(
     session: Uninfo,
     interface: QryItrface,
     bot_name: str,
+    is_private: bool = False,
+    user_id: str | None = None,
 ) -> None:
-    message = build_quota_exhausted_message(status)
+    if is_private:
+        message = build_private_quota_exhausted_message(status)
+        send_target = Target(
+            id=user_id or session.scene.id,
+            private=True,
+            self_id=session.self_id,
+        )
+        log_label = "私聊公共模型额度提示未发送"
+    else:
+        message = build_quota_exhausted_message(status)
+        send_target = Target(
+            id=session.scene.id,
+            private=False,
+            self_id=session.self_id,
+        )
+        log_label = "公共模型额度提示未发送"
     reply_tool = create_reply_tool(
         db_session,
         session.scene.id,
         request_id,
         interface=interface,
-        send_target=Target(
-            id=session.scene.id,
-            private=False,
-            self_id=session.self_id,
-        ),
+        send_target=send_target,
         bot_name=bot_name,
         parse_msg_meta=_parse_msg_meta,
         group_members=[],
@@ -1097,7 +1122,7 @@ async def _send_group_quota_notice(
     )
     result = json.loads(raw_result)
     if not result.get("ok"):
-        logger.info(f"公共模型额度提示未发送: {result.get('message', raw_result)}")
+        logger.info(f"{log_label}: {result.get('message', raw_result)}")
     await db_session.commit()
 
 
@@ -1122,12 +1147,19 @@ async def handle_reply_logic(
 ):
     """处理回复逻辑"""
     is_private = session.scene.type == SceneType.PRIVATE
-    quota_limit = plugin_config.global_model_daily_group_limit
+    group_quota_limit = plugin_config.global_model_daily_group_limit
+    private_quota_limit = plugin_config.global_model_daily_private_user_limit
     uses_global_model_quota = (
         not is_private
         and plugin_config.global_model_daily_group_limit_enabled
-        and quota_limit > 0
+        and group_quota_limit > 0
         and not has_group_model_config(session.scene.id)
+    )
+    uses_private_model_quota = (
+        is_private
+        and plugin_config.global_model_daily_private_user_limit_enabled
+        and private_quota_limit > 0
+        and not has_private_model_config(user_id)
     )
     try:
         if repeat_text is not None and not is_private:
@@ -1177,10 +1209,18 @@ async def handle_reply_logic(
                 await get_group_daily_quota_status(
                     history_session,
                     session.scene.id,
-                    quota_limit,
+                    group_quota_limit,
                 )
                 if uses_global_model_quota
-                else None
+                else (
+                    await get_private_user_daily_quota_status(
+                        history_session,
+                        user_id,
+                        private_quota_limit,
+                    )
+                    if uses_private_model_quota
+                    else None
+                )
             )
             recent_msgs = (
                 (
@@ -1201,9 +1241,21 @@ async def handle_reply_logic(
             await history_session.commit()
 
         if quota_status is not None and not quota_status.allowed:
-            if is_tome:
+            if uses_private_model_quota:
                 async with get_session() as notice_session:
-                    await _send_group_quota_notice(
+                    await _send_quota_notice(
+                        notice_session,
+                        status=quota_status,
+                        request_id=request_id,
+                        session=session,
+                        interface=interface,
+                        bot_name=bot_name,
+                        is_private=True,
+                        user_id=user_id,
+                    )
+            elif is_tome:
+                async with get_session() as notice_session:
+                    await _send_quota_notice(
                         notice_session,
                         status=quota_status,
                         request_id=request_id,
@@ -1265,11 +1317,11 @@ async def handle_reply_logic(
                 quota_status = await consume_group_daily_quota(
                     quota_session,
                     session.scene.id,
-                    quota_limit,
+                    group_quota_limit,
                 )
                 if not quota_status.allowed:
                     if is_tome:
-                        await _send_group_quota_notice(
+                        await _send_quota_notice(
                             quota_session,
                             status=quota_status,
                             request_id=request_id,
@@ -1277,6 +1329,29 @@ async def handle_reply_logic(
                             interface=interface,
                             bot_name=bot_name,
                         )
+                    return
+
+        # A private-level API bypasses the public quota. Re-check the active
+        # configuration here in case the user changed it while this request
+        # was waiting in the queue.
+        if uses_private_model_quota and not has_private_model_config(user_id):
+            async with get_session() as quota_session:
+                quota_status = await consume_private_user_daily_quota(
+                    quota_session,
+                    user_id,
+                    private_quota_limit,
+                )
+                if not quota_status.allowed:
+                    await _send_quota_notice(
+                        quota_session,
+                        status=quota_status,
+                        request_id=request_id,
+                        session=session,
+                        interface=interface,
+                        bot_name=bot_name,
+                        is_private=True,
+                        user_id=user_id,
+                    )
                     return
 
         role_map: dict[str, str] = {}

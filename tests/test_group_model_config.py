@@ -350,3 +350,65 @@ async def test_loading_with_wrong_local_key_does_not_activate_group():
         assert has_group_model_config(group_id) is False
         await session.execute(delete(GroupModelConfig).where(GroupModelConfig.group_id == group_id))
         await session.commit()
+
+
+@pytest.mark.asyncio
+async def test_private_model_config_is_encrypted_resolved_and_deleted():
+    from nonebot_plugin_orm import get_session
+
+    from nonebot_plugin_ai_groupmate.model import PrivateModelConfig
+    from nonebot_plugin_ai_groupmate.config import ScopedConfig
+    from nonebot_plugin_ai_groupmate.group_model_config import (
+        LocalSecretCipher,
+        has_private_model_config,
+        save_private_model_config,
+        delete_private_model_config,
+        resolve_session_chat_config,
+        get_private_model_config_summary,
+        clear_active_private_model_configs,
+    )
+
+    user_id = "private-config-test"
+    cipher = LocalSecretCipher(LocalSecretCipher.generate_key())
+    global_config = ScopedConfig(chat_model="global-model", chat_api_key="global-key")
+    clear_active_private_model_configs()
+    async with get_session() as session:
+        await session.execute(
+            delete(PrivateModelConfig).where(PrivateModelConfig.user_id == user_id)
+        )
+        await session.commit()
+        active = await save_private_model_config(
+            session,
+            user_id=user_id,
+            payload=_payload(),
+            cipher=cipher,
+        )
+        row = await session.get(PrivateModelConfig, user_id)
+        assert row is not None
+        assert "sk-group-secret" not in row.api_key_ciphertext
+        assert active.chat_model == "group-chat-model"
+        assert has_private_model_config(user_id)
+
+        resolved = resolve_session_chat_config(
+            session_id=user_id,
+            user_id=user_id,
+            is_private=True,
+            global_config=global_config,
+        )
+        assert resolved.chat_model == "group-chat-model"
+        assert resolved.chat_api_key == "sk-group-secret"
+        summary = await get_private_model_config_summary(session, user_id)
+        assert summary is not None
+        assert summary.provider_host == "group-provider.example"
+
+        assert await delete_private_model_config(session, user_id)
+        assert not has_private_model_config(user_id)
+        assert (
+            resolve_session_chat_config(
+                session_id=user_id,
+                user_id=user_id,
+                is_private=True,
+                global_config=global_config,
+            )
+            is global_config
+        )

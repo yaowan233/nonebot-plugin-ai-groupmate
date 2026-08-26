@@ -2,7 +2,7 @@ import re
 import uuid
 import asyncio
 import datetime
-from typing import Any, Literal, Protocol
+from typing import Any, Literal, Protocol, cast
 from importlib import metadata
 from dataclasses import field, dataclass
 from urllib.parse import urlsplit
@@ -169,11 +169,17 @@ class ConfigTicket:
 
 
 @dataclass(frozen=True)
-class RedeemedGroupConfig:
+class ConfigTarget:
+    scope: Literal["group", "private"]
+    subject_id: str
+    operator_id: str
+
+
+@dataclass(frozen=True)
+class RedeemedModelConfig:
     delivery_id: str
     ticket_id: str
-    group_id: str
-    operator_id: str
+    target: ConfigTarget
     payload: GroupModelPayload = field(repr=False)
 
 
@@ -403,9 +409,18 @@ class GroupModelRelay:
         self,
         db_session: AsyncSession,
         *,
-        group_id: str,
-        operator_id: str,
+        target: ConfigTarget | None = None,
+        group_id: str | None = None,
+        operator_id: str | None = None,
     ) -> ConfigTicket:
+        if target is None:
+            if group_id is None or operator_id is None:
+                raise TypeError("target or group_id/operator_id is required")
+            target = ConfigTarget(
+                scope="group",
+                subject_id=str(group_id),
+                operator_id=str(operator_id),
+            )
         transport = self._require_transport()
         identity = await self.ensure_registered(db_session)
         response = await transport.post(
@@ -430,15 +445,17 @@ class GroupModelRelay:
 
         await db_session.execute(
             delete(PendingGroupConfig).where(
-                PendingGroupConfig.group_id == str(group_id),
-                PendingGroupConfig.operator_id == str(operator_id),
+                PendingGroupConfig.scope == target.scope,
+                PendingGroupConfig.group_id == target.subject_id,
+                PendingGroupConfig.operator_id == target.operator_id,
             )
         )
         db_session.add(
             PendingGroupConfig(
                 ticket_id=ticket.ticket_id,
-                group_id=str(group_id),
-                operator_id=str(operator_id),
+                scope=target.scope,
+                group_id=target.subject_id,
+                operator_id=target.operator_id,
                 expires_at=expires_at,
                 created_at=_utc_now_naive(),
             )
@@ -456,7 +473,7 @@ class GroupModelRelay:
         *,
         code: str,
         operator_id: str,
-    ) -> RedeemedGroupConfig:
+    ) -> RedeemedModelConfig:
         transport = self._require_transport()
         normalized_code = normalize_config_code(code)
         identity = await self.ensure_registered(db_session)
@@ -474,6 +491,8 @@ class GroupModelRelay:
         if pending is None:
             raise RelayTicketError("本地找不到对应的待处理配置单")
         if pending.operator_id != str(operator_id):
+            if pending.scope == "private":
+                raise RelayTicketError("请由发起配置的用户本人提交配置码")
             raise RelayTicketError("请由发起配置的管理员本人提交配置码")
         if pending.expires_at <= _utc_now_naive():
             raise RelayTicketError("配置单已过期，请重新生成")
@@ -489,18 +508,21 @@ class GroupModelRelay:
         payload_created_at = _utc_naive(payload.created_at)
         if not (pending.created_at - datetime.timedelta(minutes=5) <= payload_created_at <= pending.expires_at):
             raise RelayPayloadError("配置内容的创建时间不在配置单有效期内")
-        return RedeemedGroupConfig(
+        return RedeemedModelConfig(
             delivery_id=redeemed.delivery_id,
             ticket_id=redeemed.ticket_id,
-            group_id=pending.group_id,
-            operator_id=pending.operator_id,
+            target=ConfigTarget(
+                scope=cast(Literal["group", "private"], pending.scope),
+                subject_id=pending.group_id,
+                operator_id=pending.operator_id,
+            ),
             payload=payload,
         )
 
     async def acknowledge(
         self,
         db_session: AsyncSession,
-        redeemed: RedeemedGroupConfig,
+        redeemed: RedeemedModelConfig,
         *,
         outcome: str,
     ) -> None:

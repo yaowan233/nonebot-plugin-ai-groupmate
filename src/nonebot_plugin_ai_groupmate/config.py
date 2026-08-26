@@ -13,6 +13,12 @@ class ScopedConfig(BaseModel):
         ge=0,
         description="每个群每天可使用公共主模型的回复次数，0 表示不限制",
     )
+    global_model_daily_private_user_limit_enabled: bool = True
+    global_model_daily_private_user_limit: int = Field(
+        default=10,
+        ge=0,
+        description="每位用户每天私聊可使用公共主模型的回复次数，0 表示不限制",
+    )
     repeat_probability: float = Field(default=0.15, ge=0.0, le=1.0)
     proactive_reaction_probability: float = Field(default=0.05, ge=0.0, le=1.0)
     proactive_meme_probability: float = Field(default=0.02, ge=0.0, le=1.0)

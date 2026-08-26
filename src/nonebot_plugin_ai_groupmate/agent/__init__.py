@@ -93,7 +93,11 @@ from .schedule_tools import (
 from ..runtime_config import get_runtime_config
 from .moderation_tools import create_mute_tool
 from .group_memory_tools import create_group_memory_tool
-from ..group_model_config import resolve_chat_config, has_group_model_config
+from ..group_model_config import (
+    resolve_chat_config,
+    resolve_session_chat_config,
+    resolve_session_model_owner,
+)
 
 
 async def _finish_db_operation(coro):
@@ -211,6 +215,7 @@ def refresh_runtime_resources() -> None:
     get_flash_model.cache_clear()
     get_chat_model.cache_clear()
     clear_group_chat_model_cache()
+    clear_private_chat_model_cache()
     get_vision_model.cache_clear()
     search_web = create_search_web_tool(plugin_config.tavily_api_key)
 
@@ -295,6 +300,7 @@ def get_chat_model() -> Any:
 
 
 _group_chat_model_cache: dict[str, Any] = {}
+_private_chat_model_cache: dict[str, Any] = {}
 
 
 def get_group_chat_model(group_id: str) -> Any:
@@ -311,6 +317,29 @@ def clear_group_chat_model_cache(group_id: str | None = None) -> None:
         _group_chat_model_cache.clear()
     else:
         _group_chat_model_cache.pop(str(group_id), None)
+
+
+def get_private_chat_model(user_id: str) -> Any:
+    user_id = str(user_id)
+    model = _private_chat_model_cache.get(user_id)
+    if model is None:
+        model = create_chat_llm(
+            resolve_session_chat_config(
+                session_id=user_id,
+                user_id=user_id,
+                is_private=True,
+                global_config=plugin_config,
+            )
+        )
+        _private_chat_model_cache[user_id] = model
+    return model
+
+
+def clear_private_chat_model_cache(user_id: str | None = None) -> None:
+    if user_id is None:
+        _private_chat_model_cache.clear()
+    else:
+        _private_chat_model_cache.pop(str(user_id), None)
 
 
 @lru_cache
@@ -392,7 +421,11 @@ async def _run_scheduled_agent_task(
     bot_id: str | None,
 ) -> None:
     try:
-        chat_config = resolve_chat_config(None if is_private else session_id)
+        chat_config = resolve_session_chat_config(
+            session_id=session_id,
+            user_id=session_id,
+            is_private=is_private,
+        )
         scoped_format_history = partial(format_chat_history, config=chat_config)
         async with agent_run_gate.slot():
             # Only keep the discovery session for the history query.  Scheduled
@@ -871,8 +904,12 @@ async def create_chat_graph(
     repeat_text: str | None = None,
 ) -> tuple[Any, list[Any], str]:
     """创建 LangGraph 聊天图"""
-    chat_group_id = None if is_private else session_id
-    chat_config = resolve_chat_config(chat_group_id, plugin_config)
+    chat_config = resolve_session_chat_config(
+        session_id=session_id,
+        user_id=str(user_id),
+        is_private=is_private,
+        global_config=plugin_config,
+    )
     meme_send_count = max(1, min(int(meme_send_count), MAX_MEME_SEND_COUNT))
     relation_context = await get_user_relation_context(db_session, user_id, user_name)
     group_context = ""
@@ -970,11 +1007,17 @@ async def create_chat_graph(
 - 不能撤回用户或其他成员的消息；遇到他人违规消息时只能提醒、吐槽或请求管理员处理。
 - target_msg_id 必须来自聊天历史里 bot 自己消息的 `id: xxx`，不要编造消息 ID。
 """
-    model = (
-        get_group_chat_model(chat_group_id)
-        if chat_group_id is not None and has_group_model_config(chat_group_id)
-        else get_chat_model()
+    model_owner = resolve_session_model_owner(
+        session_id=session_id,
+        user_id=str(user_id),
+        is_private=is_private,
     )
+    if model_owner is None:
+        model = get_chat_model()
+    elif model_owner[0] == "private":
+        model = get_private_chat_model(model_owner[1])
+    else:
+        model = get_group_chat_model(model_owner[1])
     report_tool = create_report_tool(
         db_session,
         session_id,
@@ -1318,7 +1361,11 @@ async def choice_response_strategy(
     """
     meme_send_count = max(1, min(int(meme_send_count), MAX_MEME_SEND_COUNT))
     try:
-        chat_config = resolve_chat_config(None if is_private else session_id)
+        chat_config = resolve_session_chat_config(
+            session_id=session_id,
+            user_id=str(user_id),
+            is_private=is_private,
+        )
         scoped_format_history = partial(format_chat_history, config=chat_config)
         member_snapshot = group_members
         if not is_private and interface is not None and member_snapshot is None:

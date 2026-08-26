@@ -4,7 +4,7 @@ import socket
 import asyncio
 import datetime
 import ipaddress
-from typing import Literal, cast
+from typing import Any, Literal, cast
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -14,11 +14,12 @@ from nonebot.log import logger
 from sqlalchemy.ext.asyncio import AsyncSession
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from .model import GroupModelConfig
+from .model import GroupModelConfig, PrivateModelConfig
 from .config import ScopedConfig
 
 LOCAL_CIPHERTEXT_VERSION = "v1"
 GROUP_API_KEY_PURPOSE_PREFIX = "ai-groupmate:group-api-key:"
+PRIVATE_API_KEY_PURPOSE_PREFIX = "ai-groupmate:private-api-key:"
 LOCAL_ENCRYPTION_KEY_FILENAME = "group_api_local_encryption.key"
 MAX_GROUP_REPLY_PROBABILITY = 0.1
 
@@ -85,6 +86,34 @@ class ActiveGroupModelConfig(BaseModel):
     reply_probability: float | None = None
     allow_global_fallback: bool = False
     version: int = 1
+
+
+class ActivePrivateModelConfig(BaseModel):
+    """In-memory decrypted model configuration owned by one private user."""
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    user_id: str
+    api_format: Literal["openai", "anthropic", "vertex"]
+    base_url: str
+    api_key: str = Field(repr=False)
+    chat_model: str
+    chat_multimodal: bool
+    allow_global_fallback: bool = False
+    version: int = 1
+
+
+class PrivateModelConfigSummary(BaseModel):
+    user_id: str
+    enabled: bool
+    api_format: str
+    provider_host: str
+    chat_model: str
+    chat_multimodal: bool
+    allow_global_fallback: bool
+    updated_at: datetime.datetime
+    last_test_status: str
+    version: int
 
 
 class GroupModelConfigSummary(BaseModel):
@@ -229,10 +258,15 @@ def load_or_create_local_encryption_key(path: Path) -> str:
 
 
 _active_configs: dict[str, ActiveGroupModelConfig] = {}
+_active_private_configs: dict[str, ActivePrivateModelConfig] = {}
 
 
 def _api_key_purpose(group_id: str) -> str:
     return GROUP_API_KEY_PURPOSE_PREFIX + str(group_id)
+
+
+def _private_api_key_purpose(user_id: str) -> str:
+    return PRIVATE_API_KEY_PURPOSE_PREFIX + str(user_id)
 
 
 def _host_matches_allowlist(hostname: str, allowed_hosts: list[str]) -> bool:
@@ -327,6 +361,25 @@ def _active_from_row(
     )
 
 
+def _active_private_from_row(
+    row: PrivateModelConfig,
+    cipher: LocalSecretCipher,
+) -> ActivePrivateModelConfig:
+    return ActivePrivateModelConfig(
+        user_id=row.user_id,
+        api_format=cast(Literal["openai", "anthropic", "vertex"], row.api_format),
+        base_url=row.base_url,
+        api_key=cipher.decrypt(
+            row.api_key_ciphertext,
+            purpose=_private_api_key_purpose(row.user_id),
+        ),
+        chat_model=row.chat_model,
+        chat_multimodal=row.chat_multimodal,
+        allow_global_fallback=row.allow_global_fallback,
+        version=row.version,
+    )
+
+
 def _detail_from_row(row: GroupModelConfig) -> GroupModelConfigDetail:
     return GroupModelConfigDetail(
         group_id=row.group_id,
@@ -368,17 +421,53 @@ async def load_group_model_configs(
     return len(loaded)
 
 
+async def load_private_model_configs(
+    db_session: AsyncSession,
+    cipher: LocalSecretCipher,
+    global_config: ScopedConfig | None = None,
+) -> int:
+    result = await db_session.execute(
+        Select(PrivateModelConfig).where(PrivateModelConfig.enabled.is_(True))
+    )
+    loaded: dict[str, ActivePrivateModelConfig] = {}
+    for row in result.scalars().all():
+        try:
+            if global_config is not None:
+                await validate_group_provider_resolution(
+                    row.base_url,
+                    global_config.group_api_allowed_provider_hosts,
+                )
+            loaded[row.user_id] = _active_private_from_row(row, cipher)
+        except (GroupModelConfigError, LocalEncryptionKeyError, ValueError):
+            logger.warning(f"用户 {row.user_id} 的私聊模型配置无法加载，将使用全局配置")
+    _active_private_configs.clear()
+    _active_private_configs.update(loaded)
+    return len(loaded)
+
+
 def set_active_group_model_config(config: ActiveGroupModelConfig) -> None:
     """Install one validated config in memory; useful for startup and tests."""
     _active_configs[config.group_id] = config
+
+
+def set_active_private_model_config(config: ActivePrivateModelConfig) -> None:
+    _active_private_configs[config.user_id] = config
 
 
 def clear_active_group_model_configs() -> None:
     _active_configs.clear()
 
 
+def clear_active_private_model_configs() -> None:
+    _active_private_configs.clear()
+
+
 def has_group_model_config(group_id: str) -> bool:
     return str(group_id) in _active_configs
+
+
+def has_private_model_config(user_id: str) -> bool:
+    return str(user_id) in _active_private_configs
 
 
 def resolve_group_reply_probability(
@@ -420,20 +509,63 @@ def resolve_chat_config(
     return _resolve_active_chat_config(group_config, global_config)
 
 
+def resolve_session_chat_config(
+    *,
+    session_id: str,
+    user_id: str,
+    is_private: bool,
+    global_config: ScopedConfig | None = None,
+) -> ScopedConfig:
+    """Resolve the model at the conversation seam without leaking scope rules."""
+
+    if global_config is None:
+        from .runtime_config import get_runtime_config
+
+        global_config = get_runtime_config()
+    if not is_private:
+        return resolve_chat_config(session_id, global_config)
+    private_config = _active_private_configs.get(str(user_id))
+    if private_config is None:
+        return global_config
+    return _resolve_active_chat_config(private_config, global_config)
+
+
+def resolve_session_model_owner(
+    *,
+    session_id: str,
+    user_id: str,
+    is_private: bool,
+) -> tuple[Literal["group", "private"], str] | None:
+    """Return the active scoped config owner for one session, if any.
+
+    The priority rule lives only here: a private session prefers the user's
+    own config, a group session prefers the group config, and ``None``
+    means the caller should fall back to the Bot owner's global model.
+    """
+
+    if is_private:
+        if has_private_model_config(user_id):
+            return ("private", str(user_id))
+        return None
+    if has_group_model_config(session_id):
+        return ("group", str(session_id))
+    return None
+
+
 def _resolve_active_chat_config(
-    group_config: ActiveGroupModelConfig,
+    scoped_config: ActiveGroupModelConfig | ActivePrivateModelConfig,
     global_config: ScopedConfig,
 ) -> ScopedConfig:
 
     resolved = global_config.model_copy(deep=True)
-    resolved.chat_api_format = group_config.api_format
-    resolved.chat_api_key = group_config.api_key
-    resolved.chat_base_url = group_config.base_url
-    resolved.chat_model = group_config.chat_model
-    resolved.chat_multimodal = group_config.chat_multimodal
-    if group_config.api_format == "vertex":
-        # Group Vertex credentials support Express Mode only in phase one.
-        resolved.vertex_api_key = group_config.api_key
+    resolved.chat_api_format = scoped_config.api_format
+    resolved.chat_api_key = scoped_config.api_key
+    resolved.chat_base_url = scoped_config.base_url
+    resolved.chat_model = scoped_config.chat_model
+    resolved.chat_multimodal = scoped_config.chat_multimodal
+    if scoped_config.api_format == "vertex":
+        # Scoped Vertex credentials support Express Mode only in phase one.
+        resolved.vertex_api_key = scoped_config.api_key
         resolved.vertex_credentials_path = ""
         resolved.vertex_project = ""
     return resolved
@@ -478,6 +610,43 @@ def validate_group_model_test_response(response: object) -> None:
     raise GroupModelConfigError("模型连接成功但返回了空响应")
 
 
+async def _upsert_model_config_row(
+    db_session: AsyncSession,
+    *,
+    row_model: type[Any],
+    subject_id: str,
+    payload: GroupModelPayload,
+    ciphertext: str,
+    extra_fields: dict[str, Any],
+) -> int:
+    """Insert or update one scoped model config row; return its new version."""
+
+    now = datetime.datetime.now()
+    row = await db_session.get(row_model, subject_id)
+    next_version = (row.version + 1) if row else 1
+    values: dict[str, Any] = {
+        "enabled": True,
+        "api_format": payload.api_format,
+        "base_url": payload.base_url,
+        "api_key_ciphertext": ciphertext,
+        "chat_model": payload.chat_model,
+        "chat_multimodal": payload.chat_multimodal,
+        "allow_global_fallback": payload.allow_global_fallback,
+        "updated_at": now,
+        "last_tested_at": now,
+        "last_test_status": "success",
+        "version": next_version,
+        **extra_fields,
+    }
+    if row is None:
+        db_session.add(row_model(**values))
+    else:
+        for key, value in values.items():
+            setattr(row, key, value)
+    await db_session.commit()
+    return next_version
+
+
 async def save_group_model_config(
     db_session: AsyncSession,
     *,
@@ -487,47 +656,21 @@ async def save_group_model_config(
     cipher: LocalSecretCipher,
 ) -> ActiveGroupModelConfig:
     group_id = str(group_id)
-    now = datetime.datetime.now()
-    row = await db_session.get(GroupModelConfig, group_id)
-    next_version = (row.version + 1) if row else 1
-    ciphertext = cipher.encrypt(
-        payload.api_key,
-        purpose=_api_key_purpose(group_id),
+    next_version = await _upsert_model_config_row(
+        db_session,
+        row_model=GroupModelConfig,
+        subject_id=group_id,
+        payload=payload,
+        ciphertext=cipher.encrypt(
+            payload.api_key,
+            purpose=_api_key_purpose(group_id),
+        ),
+        extra_fields={
+            "group_id": group_id,
+            "reply_probability": payload.reply_probability,
+            "updated_by": str(operator_id),
+        },
     )
-    if row is None:
-        row = GroupModelConfig(
-            group_id=group_id,
-            enabled=True,
-            api_format=payload.api_format,
-            base_url=payload.base_url,
-            api_key_ciphertext=ciphertext,
-            chat_model=payload.chat_model,
-            chat_multimodal=payload.chat_multimodal,
-            reply_probability=payload.reply_probability,
-            allow_global_fallback=payload.allow_global_fallback,
-            updated_by=str(operator_id),
-            updated_at=now,
-            last_tested_at=now,
-            last_test_status="success",
-            version=next_version,
-        )
-        db_session.add(row)
-    else:
-        row.enabled = True
-        row.api_format = payload.api_format
-        row.base_url = payload.base_url
-        row.api_key_ciphertext = ciphertext
-        row.chat_model = payload.chat_model
-        row.chat_multimodal = payload.chat_multimodal
-        row.reply_probability = payload.reply_probability
-        row.allow_global_fallback = payload.allow_global_fallback
-        row.updated_by = str(operator_id)
-        row.updated_at = now
-        row.last_tested_at = now
-        row.last_test_status = "success"
-        row.version = next_version
-    await db_session.commit()
-
     active = ActiveGroupModelConfig(
         group_id=group_id,
         api_format=payload.api_format,
@@ -543,6 +686,39 @@ async def save_group_model_config(
     return active
 
 
+async def save_private_model_config(
+    db_session: AsyncSession,
+    *,
+    user_id: str,
+    payload: GroupModelPayload,
+    cipher: LocalSecretCipher,
+) -> ActivePrivateModelConfig:
+    user_id = str(user_id)
+    next_version = await _upsert_model_config_row(
+        db_session,
+        row_model=PrivateModelConfig,
+        subject_id=user_id,
+        payload=payload,
+        ciphertext=cipher.encrypt(
+            payload.api_key,
+            purpose=_private_api_key_purpose(user_id),
+        ),
+        extra_fields={"user_id": user_id},
+    )
+    active = ActivePrivateModelConfig(
+        user_id=user_id,
+        api_format=payload.api_format,
+        base_url=payload.base_url,
+        api_key=payload.api_key,
+        chat_model=payload.chat_model,
+        chat_multimodal=payload.chat_multimodal,
+        allow_global_fallback=payload.allow_global_fallback,
+        version=next_version,
+    )
+    _active_private_configs[user_id] = active
+    return active
+
+
 async def delete_group_model_config(
     db_session: AsyncSession,
     group_id: str,
@@ -555,6 +731,21 @@ async def delete_group_model_config(
     await db_session.delete(row)
     await db_session.commit()
     _active_configs.pop(group_id, None)
+    return True
+
+
+async def delete_private_model_config(
+    db_session: AsyncSession,
+    user_id: str,
+) -> bool:
+    user_id = str(user_id)
+    row = await db_session.get(PrivateModelConfig, user_id)
+    if row is None:
+        _active_private_configs.pop(user_id, None)
+        return False
+    await db_session.delete(row)
+    await db_session.commit()
+    _active_private_configs.pop(user_id, None)
     return True
 
 
@@ -598,4 +789,25 @@ async def get_group_model_config_summary(
         return None
     return GroupModelConfigSummary.model_validate(
         _detail_from_row(row).model_dump()
+    )
+
+
+async def get_private_model_config_summary(
+    db_session: AsyncSession,
+    user_id: str,
+) -> PrivateModelConfigSummary | None:
+    row = await db_session.get(PrivateModelConfig, str(user_id))
+    if row is None:
+        return None
+    return PrivateModelConfigSummary(
+        user_id=row.user_id,
+        enabled=row.enabled,
+        api_format=row.api_format,
+        provider_host=urlsplit(row.base_url).hostname or "未知",
+        chat_model=row.chat_model,
+        chat_multimodal=row.chat_multimodal,
+        allow_global_fallback=row.allow_global_fallback,
+        updated_at=row.updated_at,
+        last_test_status=row.last_test_status,
+        version=row.version,
     )

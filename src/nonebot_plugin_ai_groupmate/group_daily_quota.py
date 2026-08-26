@@ -2,24 +2,26 @@ import math
 import asyncio
 import weakref
 import datetime
+from typing import Any
 from dataclasses import dataclass
 
 from sqlalchemy import Select, select, update
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .model import GlobalModelGroupUsage
+from .model import GlobalModelGroupUsage, GlobalModelPrivateUserUsage
 
-_group_quota_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
+_quota_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
     weakref.WeakValueDictionary()
 )
 
 
-def _get_group_quota_lock(group_id: str) -> asyncio.Lock:
-    lock = _group_quota_locks.get(group_id)
+def _get_quota_lock(scope: str, subject_id: str) -> asyncio.Lock:
+    lock_key = f"{scope}:{subject_id}"
+    lock = _quota_locks.get(lock_key)
     if lock is None:
         lock = asyncio.Lock()
-        _group_quota_locks[group_id] = lock
+        _quota_locks[lock_key] = lock
     return lock
 
 
@@ -63,19 +65,19 @@ def _status(
     )
 
 
-async def get_group_daily_quota_status(
+async def _get_daily_quota_status(
     db_session: AsyncSession,
-    group_id: str,
+    subject_id: str,
     limit: int,
     *,
+    usage_model: type[Any],
     now: datetime.datetime | None = None,
 ) -> GroupDailyQuotaStatus:
-    """Read a group's current public-model quota without consuming it."""
     local_now = _local_now(now)
     if limit <= 0:
         return _status(used=0, limit=limit, now=local_now)
 
-    row = await db_session.get(GlobalModelGroupUsage, group_id)
+    row = await db_session.get(usage_model, subject_id)
     used = (
         row.used_count
         if row is not None and row.usage_date == local_now.date()
@@ -84,11 +86,47 @@ async def get_group_daily_quota_status(
     return _status(used=used, limit=limit, now=local_now)
 
 
-async def _consume_group_daily_quota_once(
+async def get_group_daily_quota_status(
     db_session: AsyncSession,
     group_id: str,
     limit: int,
     *,
+    now: datetime.datetime | None = None,
+) -> GroupDailyQuotaStatus:
+    """Read a group's current public-model quota without consuming it."""
+    return await _get_daily_quota_status(
+        db_session,
+        group_id,
+        limit,
+        usage_model=GlobalModelGroupUsage,
+        now=now,
+    )
+
+
+async def get_private_user_daily_quota_status(
+    db_session: AsyncSession,
+    user_id: str,
+    limit: int,
+    *,
+    now: datetime.datetime | None = None,
+) -> GroupDailyQuotaStatus:
+    """Read a user's current private public-model quota without consuming it."""
+    return await _get_daily_quota_status(
+        db_session,
+        user_id,
+        limit,
+        usage_model=GlobalModelPrivateUserUsage,
+        now=now,
+    )
+
+
+async def _consume_daily_quota_once(
+    db_session: AsyncSession,
+    subject_id: str,
+    limit: int,
+    *,
+    usage_model: type[Any],
+    id_field: Any,
     now: datetime.datetime | None = None,
 ) -> GroupDailyQuotaStatus:
     """Atomically reserve one public-model reply and finish the transaction."""
@@ -101,23 +139,21 @@ async def _consume_group_daily_quota_once(
     # increment while the stored value is below the current runtime limit.
     for _ in range(3):
         result = await db_session.execute(
-            update(GlobalModelGroupUsage)
+            update(usage_model)
             .where(
-                GlobalModelGroupUsage.group_id == group_id,
-                GlobalModelGroupUsage.usage_date == usage_date,
-                GlobalModelGroupUsage.used_count < limit,
+                id_field == subject_id,
+                usage_model.usage_date == usage_date,
+                usage_model.used_count < limit,
             )
             .values(
-                used_count=GlobalModelGroupUsage.used_count + 1,
+                used_count=usage_model.used_count + 1,
                 updated_at=local_now.replace(tzinfo=None),
             )
             .execution_options(synchronize_session=False)
         )
         if getattr(result, "rowcount", 0) > 0:
             used = await db_session.scalar(
-                select(GlobalModelGroupUsage.used_count).where(
-                    GlobalModelGroupUsage.group_id == group_id
-                )
+                select(usage_model.used_count).where(id_field == subject_id)
             )
             await db_session.commit()
             return GroupDailyQuotaStatus(
@@ -128,10 +164,10 @@ async def _consume_group_daily_quota_once(
             )
 
         result = await db_session.execute(
-            update(GlobalModelGroupUsage)
+            update(usage_model)
             .where(
-                GlobalModelGroupUsage.group_id == group_id,
-                GlobalModelGroupUsage.usage_date != usage_date,
+                id_field == subject_id,
+                usage_model.usage_date != usage_date,
             )
             .values(
                 usage_date=usage_date,
@@ -152,9 +188,7 @@ async def _consume_group_daily_quota_once(
         row = (
             (
                 await db_session.execute(
-                    Select(GlobalModelGroupUsage).where(
-                        GlobalModelGroupUsage.group_id == group_id
-                    )
+                    Select(usage_model).where(id_field == subject_id)
                 )
             )
             .scalars()
@@ -174,8 +208,8 @@ async def _consume_group_daily_quota_once(
             continue
 
         db_session.add(
-            GlobalModelGroupUsage(
-                group_id=group_id,
+            usage_model(
+                **{id_field.key: subject_id},
                 usage_date=usage_date,
                 used_count=1,
                 updated_at=local_now.replace(tzinfo=None),
@@ -184,7 +218,7 @@ async def _consume_group_daily_quota_once(
         try:
             await db_session.commit()
         except IntegrityError:
-            # Another process inserted this group between SELECT and INSERT.
+            # Another process inserted this subject between SELECT and INSERT.
             await db_session.rollback()
             continue
         return GroupDailyQuotaStatus(
@@ -196,10 +230,11 @@ async def _consume_group_daily_quota_once(
 
     # A highly contended INSERT raced repeatedly. Re-read once so the caller
     # receives a safe denial instead of allowing the limit to be bypassed.
-    status = await get_group_daily_quota_status(
+    status = await _get_daily_quota_status(
         db_session,
-        group_id,
+        subject_id,
         limit,
+        usage_model=usage_model,
         now=local_now,
     )
     await db_session.commit()
@@ -211,21 +246,25 @@ async def _consume_group_daily_quota_once(
     )
 
 
-async def consume_group_daily_quota(
+async def _consume_daily_quota(
     db_session: AsyncSession,
-    group_id: str,
+    subject_id: str,
     limit: int,
     *,
+    scope: str,
+    usage_model: type[Any],
+    id_field: Any,
     now: datetime.datetime | None = None,
 ) -> GroupDailyQuotaStatus:
-    """Atomically reserve one reply, retrying transient SQLite write locks."""
-    async with _get_group_quota_lock(group_id):
+    async with _get_quota_lock(scope, subject_id):
         for attempt in range(8):
             try:
-                return await _consume_group_daily_quota_once(
+                return await _consume_daily_quota_once(
                     db_session,
-                    group_id,
+                    subject_id,
                     limit,
+                    usage_model=usage_model,
+                    id_field=id_field,
                     now=now,
                 )
             except OperationalError as error:
@@ -237,9 +276,46 @@ async def consume_group_daily_quota(
     raise RuntimeError("公共模型额度预留重试次数耗尽")
 
 
-def build_quota_exhausted_message(
-    status: GroupDailyQuotaStatus,
+async def consume_group_daily_quota(
+    db_session: AsyncSession,
+    group_id: str,
+    limit: int,
     *,
+    now: datetime.datetime | None = None,
+) -> GroupDailyQuotaStatus:
+    """Atomically reserve one group reply."""
+    return await _consume_daily_quota(
+        db_session,
+        group_id,
+        limit,
+        scope="group",
+        usage_model=GlobalModelGroupUsage,
+        id_field=GlobalModelGroupUsage.group_id,
+        now=now,
+    )
+
+
+async def consume_private_user_daily_quota(
+    db_session: AsyncSession,
+    user_id: str,
+    limit: int,
+    *,
+    now: datetime.datetime | None = None,
+) -> GroupDailyQuotaStatus:
+    """Atomically reserve one private reply for a user."""
+    return await _consume_daily_quota(
+        db_session,
+        user_id,
+        limit,
+        scope="private-user",
+        usage_model=GlobalModelPrivateUserUsage,
+        id_field=GlobalModelPrivateUserUsage.user_id,
+        now=now,
+    )
+
+
+def _quota_wait_text(
+    status: GroupDailyQuotaStatus,
     now: datetime.datetime | None = None,
 ) -> str:
     local_now = _local_now(now)
@@ -247,13 +323,33 @@ def build_quota_exhausted_message(
     total_minutes = max(1, math.ceil(seconds / 60))
     hours, minutes = divmod(total_minutes, 60)
     if hours and minutes:
-        wait_text = f"约 {hours} 小时 {minutes} 分钟"
-    elif hours:
-        wait_text = f"约 {hours} 小时"
-    else:
-        wait_text = f"约 {minutes} 分钟"
+        return f"约 {hours} 小时 {minutes} 分钟"
+    if hours:
+        return f"约 {hours} 小时"
+    return f"约 {minutes} 分钟"
+
+
+def build_quota_exhausted_message(
+    status: GroupDailyQuotaStatus,
+    *,
+    now: datetime.datetime | None = None,
+) -> str:
+    wait_text = _quota_wait_text(status, now)
     return (
         f"本群今天的公共模型额度（{status.limit} 次）已用完。"
         "群主或管理员可发送 /配置群API 使用本群自己的 API；"
+        f"公共额度将在 {wait_text}后恢复。"
+    )
+
+
+def build_private_quota_exhausted_message(
+    status: GroupDailyQuotaStatus,
+    *,
+    now: datetime.datetime | None = None,
+) -> str:
+    wait_text = _quota_wait_text(status, now)
+    return (
+        f"你今天的私聊公共模型额度（{status.limit} 次）已用完。"
+        "可发送 /配置个人API 使用自己的 API；"
         f"公共额度将在 {wait_text}后恢复。"
     )

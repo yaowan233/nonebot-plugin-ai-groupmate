@@ -356,6 +356,11 @@ async def test_reply_logic_closes_history_sessions_before_agent_wait(monkeypatch
         return ResponseMessage(need_reply=False, text=None)
 
     monkeypatch.setattr(plugin, "get_session", fake_get_session)
+    monkeypatch.setattr(
+        plugin.plugin_config,
+        "global_model_daily_private_user_limit_enabled",
+        False,
+    )
     monkeypatch.setattr(plugin, "_load_agent_history", fake_load_agent_history)
     monkeypatch.setattr(
         plugin, "choice_response_strategy", fake_choice_response_strategy

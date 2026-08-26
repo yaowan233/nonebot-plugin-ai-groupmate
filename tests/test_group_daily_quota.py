@@ -70,6 +70,61 @@ async def test_group_daily_quota_stops_at_limit_and_resets_next_day():
 
 
 @pytest.mark.asyncio
+async def test_private_user_daily_quota_stops_at_ten_and_is_per_user():
+    from nonebot_plugin_orm import get_session
+
+    from nonebot_plugin_ai_groupmate.model import GlobalModelPrivateUserUsage
+    from nonebot_plugin_ai_groupmate.group_daily_quota import (
+        consume_private_user_daily_quota,
+    )
+
+    user_ids = ("private-quota-user-a", "private-quota-user-b")
+    now = datetime.datetime(
+        2026,
+        8,
+        26,
+        12,
+        tzinfo=datetime.timezone(datetime.timedelta(hours=8)),
+    )
+    async with get_session() as session:
+        await session.execute(
+            delete(GlobalModelPrivateUserUsage).where(
+                GlobalModelPrivateUserUsage.user_id.in_(user_ids)
+            )
+        )
+        await session.commit()
+
+        user_a_results = [
+            await consume_private_user_daily_quota(
+                session,
+                user_ids[0],
+                10,
+                now=now,
+            )
+            for _ in range(11)
+        ]
+        user_b_first = await consume_private_user_daily_quota(
+            session,
+            user_ids[1],
+            10,
+            now=now,
+        )
+
+        assert sum(status.allowed for status in user_a_results) == 10
+        assert user_a_results[-1].allowed is False
+        assert user_a_results[-1].used == 10
+        assert user_b_first.allowed is True
+        assert user_b_first.used == 1
+
+        await session.execute(
+            delete(GlobalModelPrivateUserUsage).where(
+                GlobalModelPrivateUserUsage.user_id.in_(user_ids)
+            )
+        )
+        await session.commit()
+
+
+@pytest.mark.asyncio
 async def test_zero_daily_quota_limit_is_unlimited_and_not_persisted():
     from nonebot_plugin_orm import get_session
 
@@ -212,8 +267,133 @@ def test_daily_quota_config_rejects_negative_values():
 
     assert ScopedConfig().global_model_daily_group_limit_enabled is True
     assert ScopedConfig().global_model_daily_group_limit == 50
+    assert ScopedConfig().global_model_daily_private_user_limit_enabled is True
+    assert ScopedConfig().global_model_daily_private_user_limit == 10
     with pytest.raises(ValidationError):
         ScopedConfig(global_model_daily_group_limit=-1)
+    with pytest.raises(ValidationError):
+        ScopedConfig(global_model_daily_private_user_limit=-1)
+
+
+def test_private_quota_message_contains_limit_and_wait_time():
+    from nonebot_plugin_ai_groupmate.group_daily_quota import (
+        GroupDailyQuotaStatus,
+        build_private_quota_exhausted_message,
+    )
+
+    timezone = datetime.timezone(datetime.timedelta(hours=8))
+    now = datetime.datetime(2026, 8, 26, 20, 30, tzinfo=timezone)
+    status = GroupDailyQuotaStatus(
+        allowed=False,
+        used=10,
+        limit=10,
+        resets_at=datetime.datetime(2026, 8, 27, tzinfo=timezone),
+    )
+
+    message = build_private_quota_exhausted_message(status, now=now)
+
+    assert "私聊公共模型额度（10 次）已用完" in message
+    assert "/配置个人API" in message
+    assert "约 3 小时 30 分钟后恢复" in message
+
+
+@pytest.mark.asyncio
+async def test_exhausted_private_user_quota_notifies_and_skips_agent(monkeypatch):
+    from nonebot.adapters import Bot, Event
+    from nonebot_plugin_uninfo import Uninfo, SceneType, QryItrface
+
+    import nonebot_plugin_ai_groupmate as plugin
+    from nonebot_plugin_ai_groupmate.group_daily_quota import (
+        GroupDailyQuotaStatus,
+    )
+
+    class _Result:
+        def scalars(self):
+            return self
+
+        def all(self):
+            return [
+                SimpleNamespace(
+                    msg_id=1,
+                    session_id="private-user-1",
+                    user_id="private-user-1",
+                    content_type="text",
+                    content="你好",
+                    created_at=datetime.datetime.now(),
+                    user_name="tester",
+                    media_id=None,
+                    vectorized=False,
+                    vectorized_version=0,
+                )
+            ]
+
+    class _Session:
+        async def execute(self, _statement):
+            return _Result()
+
+        async def commit(self):
+            return None
+
+    opened_sessions = 0
+
+    @asynccontextmanager
+    async def fake_get_session():
+        nonlocal opened_sessions
+        opened_sessions += 1
+        yield _Session()
+
+    async def fake_status(*_args, **_kwargs):
+        return GroupDailyQuotaStatus(
+            allowed=False,
+            used=10,
+            limit=10,
+            resets_at=datetime.datetime.now().astimezone()
+            + datetime.timedelta(hours=2),
+        )
+
+    notices: list[GroupDailyQuotaStatus] = []
+
+    async def fake_notice(_db_session, *, status, **_kwargs):
+        notices.append(status)
+
+    async def unexpected_agent(*_args, **_kwargs):
+        raise AssertionError("私聊额度耗尽时不应调用主 Agent")
+
+    monkeypatch.setattr(
+        plugin.plugin_config,
+        "global_model_daily_private_user_limit",
+        10,
+    )
+    monkeypatch.setattr(plugin, "get_session", fake_get_session)
+    monkeypatch.setattr(
+        plugin,
+        "get_private_user_daily_quota_status",
+        fake_status,
+    )
+    monkeypatch.setattr(plugin, "_send_quota_notice", fake_notice)
+    monkeypatch.setattr(plugin, "choice_response_strategy", unexpected_agent)
+
+    fake_session = SimpleNamespace(
+        scene=SimpleNamespace(id="private-user-1", type=SceneType.PRIVATE),
+        self_id="bot-1",
+    )
+    await plugin.handle_reply_logic(
+        "private-quota-request",
+        cast(Uninfo, fake_session),
+        cast(QryItrface, SimpleNamespace()),
+        cast(Bot, SimpleNamespace()),
+        cast(Event, SimpleNamespace()),
+        "bot",
+        "private-user-1",
+        "tester",
+        True,
+        False,
+        None,
+    )
+
+    assert len(notices) == 1
+    assert notices[0].limit == 10
+    assert opened_sessions == 2
 
 
 @pytest.mark.asyncio
@@ -290,7 +470,7 @@ async def test_exhausted_group_only_notifies_explicit_requests(
     monkeypatch.setattr(plugin, "has_group_model_config", lambda _group_id: False)
     monkeypatch.setattr(plugin, "get_session", fake_get_session)
     monkeypatch.setattr(plugin, "get_group_daily_quota_status", fake_status)
-    monkeypatch.setattr(plugin, "_send_group_quota_notice", fake_notice)
+    monkeypatch.setattr(plugin, "_send_quota_notice", fake_notice)
     monkeypatch.setattr(plugin, "choice_response_strategy", unexpected_agent)
 
     fake_session = SimpleNamespace(

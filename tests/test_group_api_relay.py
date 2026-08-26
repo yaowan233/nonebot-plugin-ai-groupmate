@@ -176,7 +176,7 @@ async def test_relay_register_ticket_redeem_and_ack_round_trip():
             code=code,
             operator_id="admin-relay-test",
         )
-        assert redeemed.group_id == "group-relay-test"
+        assert redeemed.target.subject_id == "group-relay-test"
         assert redeemed.payload.api_key == "sk-relay-secret"
         assert redeemed.payload.chat_model == "relay-model"
         assert redeemed.payload.reply_probability == 0.08
@@ -189,6 +189,52 @@ async def test_relay_register_ticket_redeem_and_ack_round_trip():
         assert "instance-secret-token" not in identity_row.instance_token_ciphertext
         assert "PRIVATE KEY" not in identity_row.private_key_ciphertext
 
+        await session.execute(delete(RelayInstanceIdentity))
+        await session.commit()
+
+
+@pytest.mark.asyncio
+async def test_private_ticket_scope_round_trip():
+    from nonebot_plugin_orm import get_session
+
+    from nonebot_plugin_ai_groupmate.model import (
+        PendingGroupConfig,
+        RelayInstanceIdentity,
+    )
+    from nonebot_plugin_ai_groupmate.group_api_relay import (
+        ConfigTarget,
+        GroupModelRelay,
+    )
+
+    transport = FakeRelayTransport()
+    relay = GroupModelRelay(_relay_config(), transport=transport)
+    async with get_session() as session:
+        await session.execute(delete(PendingGroupConfig))
+        await session.execute(delete(RelayInstanceIdentity))
+        await session.commit()
+        await relay.create_ticket(
+            session,
+            target=ConfigTarget(
+                scope="private",
+                subject_id="private-user",
+                operator_id="private-user",
+            ),
+        )
+        create_call = next(call for call in transport.calls if call[0] == "/v1/config-tickets")
+        # The protocol body carries no scope; it only lives in local state.
+        assert "scope" not in create_call[1]
+        pending = await session.get(PendingGroupConfig, transport.ticket_id)
+        assert pending is not None
+        assert pending.scope == "private"
+
+        redeemed = await relay.redeem(
+            session,
+            code="AGC-2345-67AB-ABCD-EFGH",
+            operator_id="private-user",
+        )
+        assert redeemed.target.scope == "private"
+        assert redeemed.target.subject_id == "private-user"
+        await relay.acknowledge(session, redeemed, outcome="applied")
         await session.execute(delete(RelayInstanceIdentity))
         await session.commit()
 
