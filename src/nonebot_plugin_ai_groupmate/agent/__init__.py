@@ -189,6 +189,7 @@ def _agent_run_limits() -> AgentRunLimits:
         max_total_tokens=plugin_config.agent_max_total_tokens,
         llm_timeout_seconds=plugin_config.agent_llm_timeout_seconds,
         tool_timeout_seconds=plugin_config.agent_tool_timeout_seconds,
+        max_parallel_tools=plugin_config.agent_max_parallel_tools,
         tool_result_max_chars=plugin_config.agent_tool_result_max_chars,
     )
 

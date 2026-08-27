@@ -140,6 +140,234 @@ async def test_agent_binds_provider_tools_without_registering_them_locally():
     assert model.bound_tool_names == [("local_lookup", "web_search")]
 
 
+@pytest.mark.asyncio
+async def test_parallel_safe_tools_run_concurrently_and_keep_result_order():
+    from langchain_core.messages import ToolMessage
+
+    from nonebot_plugin_ai_groupmate.agent.graph import (
+        AgentRunLimits,
+        build_chat_graph,
+    )
+    from nonebot_plugin_ai_groupmate.agent.common_tools import finish
+
+    started: set[str] = set()
+    both_started = asyncio.Event()
+
+    async def wait_for_peer(name: str) -> str:
+        started.add(name)
+        if len(started) == 2:
+            both_started.set()
+        await asyncio.wait_for(both_started.wait(), timeout=0.5)
+        return f"{name}-result"
+
+    @tool("search_web")
+    async def search_web(query: str) -> str:
+        """Search the web for testing."""
+        return await wait_for_peer("search")
+
+    @tool("calculate_expression")
+    async def calculate_expression(expression: str) -> str:
+        """Calculate an expression for testing."""
+        return await wait_for_peer("calculate")
+
+    model = _ToolSpyModel([
+        AIMessage(
+            content="",
+            tool_calls=[
+                {"name": "search_web", "args": {"query": "q"}, "id": "search-1"},
+                {
+                    "name": "calculate_expression",
+                    "args": {"expression": "1+1"},
+                    "id": "calculate-1",
+                },
+            ],
+        ),
+        AIMessage(
+            content="",
+            tool_calls=[{"name": "finish", "args": {}, "id": "finish-1"}],
+        ),
+    ])
+    graph = build_chat_graph(
+        model,
+        [search_web, calculate_expression, finish],
+        "system",
+        limits=AgentRunLimits(tool_timeout_seconds=1.0),
+    )
+
+    await graph.ainvoke(_state(AIMessage(content="question")))
+
+    tool_messages = [
+        message
+        for message in model.invoke_messages[1]
+        if isinstance(message, ToolMessage)
+    ]
+    assert started == {"search", "calculate"}
+    assert [message.tool_call_id for message in tool_messages] == [
+        "search-1",
+        "calculate-1",
+    ]
+    assert [message.content for message in tool_messages] == [
+        "search-result",
+        "calculate-result",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_parallel_safe_tools_respect_configured_limit():
+    from nonebot_plugin_ai_groupmate.agent.graph import (
+        AgentRunLimits,
+        build_chat_graph,
+    )
+    from nonebot_plugin_ai_groupmate.agent.common_tools import finish
+
+    active = 0
+    max_active = 0
+    completed: list[str] = []
+
+    @tool("search_web")
+    async def search_web(query: str) -> str:
+        """Search the web while tracking test concurrency."""
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        try:
+            await asyncio.sleep(0.02)
+            completed.append(query)
+            return query
+        finally:
+            active -= 1
+
+    model = _ToolSpyModel([
+        AIMessage(
+            content="",
+            tool_calls=[
+                {"name": "search_web", "args": {"query": "1"}, "id": "search-1"},
+                {"name": "search_web", "args": {"query": "2"}, "id": "search-2"},
+                {"name": "search_web", "args": {"query": "3"}, "id": "search-3"},
+            ],
+        ),
+        AIMessage(
+            content="",
+            tool_calls=[{"name": "finish", "args": {}, "id": "finish-1"}],
+        ),
+    ])
+    graph = build_chat_graph(
+        model,
+        [search_web, finish],
+        "system",
+        limits=AgentRunLimits(max_parallel_tools=2),
+    )
+
+    await graph.ainvoke(_state(AIMessage(content="question")))
+
+    assert max_active == 2
+    assert completed == ["1", "2", "3"]
+
+
+@pytest.mark.asyncio
+async def test_parallel_tool_failure_does_not_cancel_its_peer():
+    from langchain_core.messages import ToolMessage
+
+    from nonebot_plugin_ai_groupmate.agent.graph import build_chat_graph
+    from nonebot_plugin_ai_groupmate.agent.common_tools import finish
+
+    completed: list[str] = []
+
+    @tool("search_web")
+    async def search_web(query: str) -> str:
+        """Fail a web search for testing."""
+        await asyncio.sleep(0)
+        raise RuntimeError(query)
+
+    @tool("calculate_expression")
+    async def calculate_expression(expression: str) -> str:
+        """Complete a calculation despite a peer failure."""
+        await asyncio.sleep(0)
+        completed.append(expression)
+        return "2"
+
+    model = _ToolSpyModel([
+        AIMessage(
+            content="",
+            tool_calls=[
+                {"name": "search_web", "args": {"query": "boom"}, "id": "search-1"},
+                {
+                    "name": "calculate_expression",
+                    "args": {"expression": "1+1"},
+                    "id": "calculate-1",
+                },
+            ],
+        ),
+        AIMessage(
+            content="",
+            tool_calls=[{"name": "finish", "args": {}, "id": "finish-1"}],
+        ),
+    ])
+    graph = build_chat_graph(
+        model,
+        [search_web, calculate_expression, finish],
+        "system",
+    )
+
+    await graph.ainvoke(_state(AIMessage(content="question")))
+
+    tool_messages = [
+        message
+        for message in model.invoke_messages[1]
+        if isinstance(message, ToolMessage)
+    ]
+    assert completed == ["1+1"]
+    assert [message.tool_call_id for message in tool_messages] == [
+        "search-1",
+        "calculate-1",
+    ]
+    assert "tool_execution_failed" in str(tool_messages[0].content)
+    assert tool_messages[1].content == "2"
+
+
+@pytest.mark.asyncio
+async def test_unknown_tools_remain_serial_by_default():
+    from nonebot_plugin_ai_groupmate.agent.graph import build_chat_graph
+    from nonebot_plugin_ai_groupmate.agent.common_tools import finish
+
+    order: list[str] = []
+
+    @tool("custom_first")
+    async def custom_first(value: str) -> str:
+        """Run the first stateful custom operation."""
+        order.extend(["first:start", "first:end"])
+        return value
+
+    @tool("custom_second")
+    async def custom_second(value: str) -> str:
+        """Run the second stateful custom operation."""
+        order.extend(["second:start", "second:end"])
+        return value
+
+    model = _ToolSpyModel([
+        AIMessage(
+            content="",
+            tool_calls=[
+                {"name": "custom_first", "args": {"value": "1"}, "id": "first-1"},
+                {"name": "custom_second", "args": {"value": "2"}, "id": "second-1"},
+            ],
+        ),
+        AIMessage(
+            content="",
+            tool_calls=[{"name": "finish", "args": {}, "id": "finish-1"}],
+        ),
+    ])
+    graph = build_chat_graph(
+        model,
+        [custom_first, custom_second, finish],
+        "system",
+    )
+
+    await graph.ainvoke(_state(AIMessage(content="question")))
+
+    assert order == ["first:start", "first:end", "second:start", "second:end"]
+
+
 class _InvalidImageThenResponseModel:
     def __init__(self, response: AIMessage):
         self.response = response

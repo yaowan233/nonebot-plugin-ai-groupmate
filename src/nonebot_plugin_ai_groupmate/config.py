@@ -46,6 +46,7 @@ class ScopedConfig(BaseModel):
     agent_llm_timeout_seconds: float = Field(default=60.0, gt=0)
     agent_tool_timeout_seconds: float = Field(default=30.0, gt=0)
     agent_max_concurrency: int = Field(default=4, ge=1)
+    agent_max_parallel_tools: int = Field(default=4, ge=1, le=16)
     background_image_max_concurrency: int = Field(default=2, ge=1)
     background_image_max_pending: int = Field(default=100, ge=1)
     maintenance_max_concurrency: int = Field(default=1, ge=1)

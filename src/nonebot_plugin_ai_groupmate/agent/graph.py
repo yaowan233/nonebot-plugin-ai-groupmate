@@ -29,6 +29,11 @@ MAX_REPLY_COUNT = 5
 MAX_TOOL_COUNT = 20
 MAX_REPLY_PER_ROUND = 1  # 每轮只发1条，强制模型逐条思考，上下文连续
 MAX_REACTION_PER_ROUND = 3
+PARALLEL_SAFE_TOOL_NAMES = frozenset({
+    "calculate_expression",
+    "qwen_code_interpreter",
+    "search_web",
+})
 EMPTY_RESPONSE_RETRY_PROMPT = (
     "你刚才返回了空响应，这是无效输出。请重新选择下一步：需要回应时调用对应工具；"
     "确实不需要回应时必须调用 finish。不要再次返回空内容。"
@@ -55,7 +60,66 @@ class AgentRunLimits:
     max_total_tokens: int = 64_000
     llm_timeout_seconds: float = 60.0
     tool_timeout_seconds: float = 30.0
+    max_parallel_tools: int = 4
     tool_result_max_chars: int = 6_000
+
+
+@dataclass(frozen=True)
+class _PreparedToolInvocation:
+    call_index: int
+    tool: BaseTool
+    tool_input: dict[str, Any]
+    runtime: Any
+
+
+@dataclass(frozen=True)
+class _ToolInvocationOutcome:
+    call_index: int
+    elapsed_ms: float
+    result: Any = None
+    error: Exception | None = None
+    timed_out: bool = False
+
+
+async def _invoke_tools_concurrently(
+    invocations: Sequence[_PreparedToolInvocation],
+    *,
+    timeout_seconds: float,
+) -> dict[int, _ToolInvocationOutcome]:
+    """Execute an already validated read-only batch and preserve call ordering."""
+
+    async def invoke_one(
+        invocation: _PreparedToolInvocation,
+    ) -> _ToolInvocationOutcome:
+        started_at = time.perf_counter()
+        try:
+            result = await asyncio.wait_for(
+                invocation.tool.ainvoke(
+                    invocation.tool_input,
+                    runtime=invocation.runtime,
+                ),
+                timeout=timeout_seconds,
+            )
+            return _ToolInvocationOutcome(
+                call_index=invocation.call_index,
+                elapsed_ms=(time.perf_counter() - started_at) * 1000,
+                result=result,
+            )
+        except asyncio.TimeoutError:
+            return _ToolInvocationOutcome(
+                call_index=invocation.call_index,
+                elapsed_ms=(time.perf_counter() - started_at) * 1000,
+                timed_out=True,
+            )
+        except Exception as error:
+            return _ToolInvocationOutcome(
+                call_index=invocation.call_index,
+                elapsed_ms=(time.perf_counter() - started_at) * 1000,
+                error=error,
+            )
+
+    outcomes = await asyncio.gather(*(invoke_one(item) for item in invocations))
+    return {outcome.call_index: outcome for outcome in outcomes}
 
 
 class AgentState(TypedDict):
@@ -700,7 +764,9 @@ def _make_tool_node(
                 "required_side_effect_target_count": required_side_effect_target_count,
             }
 
-        for tc in tool_calls:
+        parallel_outcomes: dict[int, _ToolInvocationOutcome] = {}
+
+        for tc_index, tc in enumerate(tool_calls):
             name: str = tc["name"]
             tool_call_id = tc.get("id") or ""
             args: dict[str, Any] = tc.get("args", {})
@@ -868,15 +934,85 @@ def _make_tool_node(
                     )
                     continue
 
+            if (
+                name in PARALLEL_SAFE_TOOL_NAMES
+                and tc_index not in parallel_outcomes
+            ):
+                # Only batch a contiguous run that is already visible. This keeps
+                # ordering around stateful/side-effect tools intact and avoids
+                # sharing the SQLAlchemy session across tasks.
+                max_batch_end = min(
+                    len(tool_calls),
+                    tc_index
+                    + min(
+                        limits.max_parallel_tools,
+                        1 + max(0, MAX_TOOL_COUNT - tool_count),
+                    ),
+                )
+                prepared_invocations: list[_PreparedToolInvocation] = []
+                for candidate_index in range(tc_index, max_batch_end):
+                    candidate_call = tool_calls[candidate_index]
+                    candidate_name = str(candidate_call.get("name", ""))
+                    if candidate_name not in PARALLEL_SAFE_TOOL_NAMES:
+                        break
+                    if candidate_name not in visible_tool_names:
+                        continue
+                    candidate_tool = tools_by_name.get(candidate_name)
+                    if candidate_tool is None:
+                        continue
+                    candidate_args = candidate_call.get("args", {})
+                    if not isinstance(candidate_args, dict):
+                        continue
+                    candidate_call_id = candidate_call.get("id") or ""
+                    candidate_runtime = _build_tool_runtime(
+                        agent_ctx,
+                        candidate_call_id,
+                        candidate_args,
+                    )
+                    candidate_input = (
+                        {**candidate_args, "runtime": candidate_runtime}
+                        if _tool_accepts_runtime(candidate_tool)
+                        else candidate_args
+                    )
+                    prepared_invocations.append(_PreparedToolInvocation(
+                        call_index=candidate_index,
+                        tool=candidate_tool,
+                        tool_input=candidate_input,
+                        runtime=candidate_runtime,
+                    ))
+                if len(prepared_invocations) >= 2:
+                    parallel_outcomes.update(
+                        await _invoke_tools_concurrently(
+                            prepared_invocations,
+                            timeout_seconds=limits.tool_timeout_seconds,
+                        )
+                    )
+                    logger.info(
+                        f"[AgentTrace] 工具并发 session={session_id} "
+                        f"count={len(prepared_invocations)}"
+                    )
+
             try:
-                runtime = _build_tool_runtime(agent_ctx, tool_call_id, args)
-                tool_input = {**args, "runtime": runtime} if _tool_accepts_runtime(tool) else args
                 started_at = time.perf_counter()
                 try:
-                    result = await asyncio.wait_for(
-                        tool.ainvoke(tool_input, runtime=runtime),
-                        timeout=limits.tool_timeout_seconds,
-                    )
+                    parallel_outcome = parallel_outcomes.get(tc_index)
+                    if parallel_outcome is not None:
+                        if parallel_outcome.timed_out:
+                            raise asyncio.TimeoutError
+                        if parallel_outcome.error is not None:
+                            raise parallel_outcome.error
+                        result = parallel_outcome.result
+                    else:
+                        runtime = _build_tool_runtime(agent_ctx, tool_call_id, args)
+                        tool_input = (
+                            {**args, "runtime": runtime}
+                            if _tool_accepts_runtime(tool)
+                            else args
+                        )
+                        result = await asyncio.wait_for(
+                            tool.ainvoke(tool_input, runtime=runtime),
+                            timeout=limits.tool_timeout_seconds,
+                        )
                     # A tool may have started a transaction.  The following
                     # model call can take minutes, so do not keep that
                     # transaction (and its pooled connection) checked out.
@@ -918,7 +1054,11 @@ def _make_tool_node(
                     if delivery_unknown:
                         break
                     continue
-                elapsed_ms = (time.perf_counter() - started_at) * 1000
+                elapsed_ms = (
+                    parallel_outcome.elapsed_ms
+                    if parallel_outcome is not None
+                    else (time.perf_counter() - started_at) * 1000
+                )
                 tool_content, extra_content = _normalize_tool_result(result)
                 tool_status = _tool_result_status(tool_content)
                 parsed_tool_result = parse_tool_result(tool_content)
