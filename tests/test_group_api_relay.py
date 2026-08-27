@@ -221,8 +221,7 @@ async def test_private_ticket_scope_round_trip():
             ),
         )
         create_call = next(call for call in transport.calls if call[0] == "/v1/config-tickets")
-        # The protocol body carries no scope; it only lives in local state.
-        assert "scope" not in create_call[1]
+        assert create_call[1]["scope"] == "private"
         pending = await session.get(PendingGroupConfig, transport.ticket_id)
         assert pending is not None
         assert pending.scope == "private"

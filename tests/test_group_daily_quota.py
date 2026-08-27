@@ -594,3 +594,98 @@ async def test_custom_api_or_disabled_switch_bypasses_public_quota(
     )
 
     assert agent_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_private_custom_api_bypasses_public_quota(monkeypatch):
+    from nonebot.adapters import Bot, Event
+    from nonebot_plugin_uninfo import Uninfo, SceneType, QryItrface
+
+    import nonebot_plugin_ai_groupmate as plugin
+
+    history_row = SimpleNamespace(
+        msg_id=1,
+        session_id="private-custom-api-user",
+        user_id="private-custom-api-user",
+        content_type="text",
+        content="你好",
+        created_at=datetime.datetime.now(),
+        user_name="tester",
+        media_id=None,
+        vectorized=False,
+        vectorized_version=0,
+    )
+
+    class _Result:
+        def scalars(self):
+            return self
+
+        def all(self):
+            return [history_row]
+
+    class _Session:
+        async def execute(self, _statement):
+            return _Result()
+
+        async def commit(self):
+            return None
+
+    @asynccontextmanager
+    async def fake_get_session():
+        yield _Session()
+
+    async def quota_must_not_run(*_args, **_kwargs):
+        raise AssertionError("已配置个人 API 时不应读取或消耗公共额度")
+
+    async def fake_load_history(_db_session, _session_id):
+        return [history_row]
+
+    agent_calls = 0
+
+    async def fake_agent(*_args, **_kwargs):
+        nonlocal agent_calls
+        agent_calls += 1
+        return "done"
+
+    monkeypatch.setattr(
+        plugin.plugin_config,
+        "global_model_daily_private_user_limit",
+        10,
+    )
+    monkeypatch.setattr(plugin, "has_private_model_config", lambda _user_id: True)
+    monkeypatch.setattr(plugin, "get_session", fake_get_session)
+    monkeypatch.setattr(
+        plugin,
+        "get_private_user_daily_quota_status",
+        quota_must_not_run,
+    )
+    monkeypatch.setattr(
+        plugin,
+        "consume_private_user_daily_quota",
+        quota_must_not_run,
+    )
+    monkeypatch.setattr(plugin, "_load_agent_history", fake_load_history)
+    monkeypatch.setattr(plugin, "choice_response_strategy", fake_agent)
+
+    fake_session = SimpleNamespace(
+        scene=SimpleNamespace(
+            id="private-custom-api-user",
+            type=SceneType.PRIVATE,
+        ),
+        self_id="bot-1",
+    )
+    await plugin.handle_reply_logic(
+        "private-custom-api-request",
+        cast(Uninfo, fake_session),
+        cast(QryItrface, SimpleNamespace()),
+        cast(Bot, SimpleNamespace()),
+        cast(Event, SimpleNamespace()),
+        "bot",
+        "private-custom-api-user",
+        "tester",
+        True,
+        False,
+        None,
+    )
+
+    assert agent_calls == 1

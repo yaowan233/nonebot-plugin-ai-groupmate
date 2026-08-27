@@ -212,7 +212,8 @@ Content-Type: application/json
 
 {
   "protocol_version": 1,
-  "expires_in": 900
+  "expires_in": 900,
+  "scope": "group"
 }
 ```
 
@@ -255,9 +256,12 @@ GET /v1/config-tickets/tkt_01J6EXAMPLE/public
   "instance_id": "ins_01J6EXAMPLE",
   "key_id": "key_01J6EXAMPLE",
   "public_key_jwk": {},
+  "scope": "group",
   "expires_at": "2026-08-24T12:15:00Z"
 }
 ```
+
+`scope` 只表示配置应用于 `group` 还是 `private`，不包含群号或用户 ID。私聊配置页据此隐藏只对群聊有效的主动发言概率控件。
 
 此接口只返回公钥和非敏感元数据，不返回实例令牌或业务身份。
 
@@ -470,7 +474,7 @@ version
 
 ### PrivateModelConfig
 
-每位用户最多一条，`user_id` 为主键。字段与 `GroupModelConfig` 相同，但不含 `reply_probability` 和 `updated_by`。私聊载荷复用同一份 `GroupModelPayload` schema，页面无需区分场景；`reply_probability` 对私聊无意义，用户留空即为 `null`，保存时不落库。
+每位用户最多一条，`user_id` 为主键。字段与 `GroupModelConfig` 相同，但不含 `reply_probability` 和 `updated_by`。私聊载荷复用同一份 `GroupModelPayload` schema；页面根据票据 `scope` 隐藏主动发言概率，并提交 `null`，插件保存时不落库。
 
 群 API Key、实例令牌和 RSA 私钥必须使用本地长期主密钥加密。建议新增环境变量：
 

@@ -423,12 +423,17 @@ class GroupModelRelay:
             )
         transport = self._require_transport()
         identity = await self.ensure_registered(db_session)
+        ticket_request: dict[str, Any] = {
+            "protocol_version": PROTOCOL_VERSION,
+            "expires_in": self._config.group_api_ticket_ttl_seconds,
+        }
+        # Preserve compatibility with protocol-v1 relays that predate personal
+        # configuration: group tickets keep the original request shape.
+        if target.scope != "group":
+            ticket_request["scope"] = target.scope
         response = await transport.post(
             "/v1/config-tickets",
-            {
-                "protocol_version": PROTOCOL_VERSION,
-                "expires_in": self._config.group_api_ticket_ttl_seconds,
-            },
+            ticket_request,
             authorization=f"Bearer {identity.instance_token}",
             idempotency_key=str(uuid.uuid4()),
         )
