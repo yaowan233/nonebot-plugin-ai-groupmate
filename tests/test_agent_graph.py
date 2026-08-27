@@ -86,10 +86,16 @@ class _ToolSpyModel:
         self.invoke_messages = []
 
     def bind_tools(self, tools):
-        self.bound_tool_names.append(tuple(
-            tool.get("type") if isinstance(tool, dict) else tool.name
-            for tool in tools
-        ))
+        bound_tool_names: list[str] = []
+        for bound_tool in tools:
+            tool_name = (
+                bound_tool.get("type")
+                if isinstance(bound_tool, dict)
+                else bound_tool.name
+            )
+            assert isinstance(tool_name, str)
+            bound_tool_names.append(tool_name)
+        self.bound_tool_names.append(tuple(bound_tool_names))
         return self
 
     def bind(self, *, tools):

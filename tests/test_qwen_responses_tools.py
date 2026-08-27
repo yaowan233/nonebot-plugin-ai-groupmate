@@ -8,12 +8,12 @@ from langchain_core.messages import AIMessage
 def test_builtin_tool_config_accepts_webui_and_env_formats():
     from nonebot_plugin_ai_groupmate.config import ScopedConfig
 
-    csv_config = ScopedConfig(
-        chat_responses_builtin_tools="web_search， web_extractor,web_search"
-    )
-    json_config = ScopedConfig(
-        chat_responses_builtin_tools='["code_interpreter", "image_search"]'
-    )
+    csv_config = ScopedConfig.model_validate({
+        "chat_responses_builtin_tools": "web_search， web_extractor,web_search"
+    })
+    json_config = ScopedConfig.model_validate({
+        "chat_responses_builtin_tools": '["code_interpreter", "image_search"]'
+    })
 
     assert csv_config.chat_responses_builtin_tools == [
         "web_search",
@@ -25,7 +25,7 @@ def test_builtin_tool_config_accepts_webui_and_env_formats():
     ]
 
     with pytest.raises(ValidationError):
-        ScopedConfig(chat_responses_builtin_tools="t2i_search")
+        ScopedConfig.model_validate({"chat_responses_builtin_tools": "t2i_search"})
 
 
 def test_builtin_tools_require_official_dashscope_endpoint_and_add_dependency():
