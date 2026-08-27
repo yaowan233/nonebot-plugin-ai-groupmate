@@ -56,7 +56,7 @@ class ScopedConfig(BaseModel):
     media_vectorize_concurrency: int = Field(default=8, ge=1, le=32)
     group_memory_update_timeout_seconds: float = Field(default=120.0, gt=0)
     agent_max_llm_calls: int = Field(default=8, ge=1)
-    agent_max_total_tokens: int = Field(default=64000, ge=1)
+    agent_max_total_tokens: int = Field(default=128000, ge=1)
     agent_tool_result_max_chars: int = Field(default=6000, ge=256)
     chat_long_context_threshold_tokens: int = 256000
     chat_long_input_cost_per_million: float = 6.0

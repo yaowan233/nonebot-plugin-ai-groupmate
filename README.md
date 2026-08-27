@@ -173,7 +173,7 @@ curl http://127.0.0.1:6333/collections/media_collection_v3
 | ai_groupmate__media_vectorize_concurrency | 否 | `8` | 表情包标注与向量化的并发数（过高可能触发接口限流） |
 | ai_groupmate__group_memory_update_timeout_seconds | 否 | `120` | 群档案后台更新超时（秒） |
 | ai_groupmate__agent_max_llm_calls | 否 | `8` | 单次 agent 最多调用主模型次数 |
-| ai_groupmate__agent_max_total_tokens | 否 | `64000` | 单次 agent 最多累计模型 token 数 |
+| ai_groupmate__agent_max_total_tokens | 否 | `128000` | 单次 agent 常规工作阶段最多累计模型 token 数；达到上限且尚未回复时会额外执行一次受控收尾 |
 | ai_groupmate__agent_tool_result_max_chars | 否 | `6000` | 写回后续上下文的单次工具结果最大字符数 |
 | ai_groupmate__flash_model | 否 | `qwen-flash` | 快速判断是否需要回复的模型 |
 | ai_groupmate__flash_api_key | 否 | 无 | 快速判断模型专用 API Key |

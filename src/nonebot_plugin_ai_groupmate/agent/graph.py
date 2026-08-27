@@ -38,6 +38,16 @@ EMPTY_RESPONSE_RETRY_PROMPT = (
     "你刚才返回了空响应，这是无效输出。请重新选择下一步：需要回应时调用对应工具；"
     "确实不需要回应时必须调用 finish。不要再次返回空内容。"
 )
+BUDGET_FINALIZATION_PROMPT = (
+    "本轮 Agent 的累计 Token 已达到预算上限。现在停止搜索、计算和其他工具操作，"
+    "仅根据当前对话及已经取得的工具结果，整理一条尽可能完整、准确的最终回复。"
+    "只输出要发送给用户的正文，不要调用任何工具；若资料仍不完整，请明确说明限制，"
+    "不要编造。"
+)
+BUDGET_FINALIZATION_FALLBACK = (
+    "我已经取得了一些资料，但本轮处理达到了 Token 上限，暂时没能完成整理。"
+    "你可以让我继续，我会接着完成。"
+)
 SIDE_EFFECT_TOOL_NAMES = frozenset({
     "add_message_reaction",
     "mute_user",
@@ -57,7 +67,7 @@ ContentBlock = str | dict[str, Any]
 @dataclass(frozen=True)
 class AgentRunLimits:
     max_llm_calls: int = 8
-    max_total_tokens: int = 64_000
+    max_total_tokens: int = 128_000
     llm_timeout_seconds: float = 60.0
     tool_timeout_seconds: float = 30.0
     max_parallel_tools: int = 4
@@ -138,6 +148,7 @@ class AgentState(TypedDict):
     llm_cache_creation_tokens: int
     llm_call_count: int
     llm_total_tokens: int
+    budget_finalization_attempted: bool
     tool_timeout_count: int
     tool_timeout_names: list[str]
     tool_result_truncation_count: int
@@ -648,6 +659,101 @@ def _make_agent_node(
         }
 
     return agent_node
+
+
+def _budget_final_reply_text(response: AIMessage) -> str:
+    text = _message_text_content(response)
+    if text:
+        return text
+    for tool_call in response.tool_calls or []:
+        if tool_call.get("name") != "reply_user":
+            continue
+        args = tool_call.get("args")
+        if isinstance(args, dict):
+            content = args.get("content")
+            if isinstance(content, str) and content.strip():
+                return content.strip()
+    return BUDGET_FINALIZATION_FALLBACK
+
+
+def _make_budget_finalizer_node(
+    model: Any,
+    system_prompt: str | Sequence[BaseMessage],
+    limits: AgentRunLimits,
+    request_kwargs_factory: Callable[[str], dict[str, Any]] | None = None,
+) -> Any:
+    """Use one tool-free model turn to turn completed work into a visible reply."""
+    system_messages = normalize_system_messages(system_prompt)
+
+    async def finalizer_node(state: AgentState) -> dict:
+        full: list[BaseMessage] = system_messages + list(state["messages"])
+        image_input_disabled = state.get("image_input_disabled", False)
+        if image_input_disabled:
+            full, _ = _remove_image_blocks(full)
+        call_messages = [
+            *full,
+            HumanMessage(content=BUDGET_FINALIZATION_PROMPT),
+        ]
+        call_number = state.get("llm_call_count", 0) + 1
+        input_tokens = state.get("llm_input_tokens", 0)
+        output_tokens = state.get("llm_output_tokens", 0)
+        total_tokens = state.get("llm_total_tokens", 0)
+        cached_tokens = state.get("llm_cached_tokens", 0)
+        cache_creation_tokens = state.get("llm_cache_creation_tokens", 0)
+        started_at = time.perf_counter()
+
+        try:
+            request_kwargs = (
+                request_kwargs_factory(str(state["session_id"]))
+                if request_kwargs_factory is not None
+                else {}
+            )
+            response: AIMessage = await asyncio.wait_for(
+                model.ainvoke(call_messages, **request_kwargs),
+                timeout=limits.llm_timeout_seconds,
+            )
+            elapsed_ms = (time.perf_counter() - started_at) * 1000
+            usage = _log_llm_cache_usage(response)
+            budget_tokens = usage["total_tokens"] or _estimate_message_tokens(
+                [*call_messages, response]
+            )
+            total_tokens += budget_tokens
+            input_tokens += usage["input_tokens"]
+            output_tokens += usage["output_tokens"]
+            cached_tokens += usage["cached_tokens"]
+            cache_creation_tokens += usage["cache_creation_tokens"]
+            logger.info(
+                f"[AgentTrace] LLM session={state['session_id']} call={call_number} "
+                f"mode=budget_finalization duration_ms={elapsed_ms:.0f} "
+                "visible_tools=0 builtin_tools=0 "
+                f"tokens={budget_tokens}{' (估算)' if not usage['total_tokens'] else ''}"
+            )
+            final_text = _budget_final_reply_text(response)
+        except Exception as e:
+            elapsed_ms = (time.perf_counter() - started_at) * 1000
+            logger.warning(
+                f"[AgentTrace] 预算收尾模型失败 session={state['session_id']} "
+                f"call={call_number} duration_ms={elapsed_ms:.0f} "
+                f"error={type(e).__name__}，改用固定兜底回复"
+            )
+            final_text = BUDGET_FINALIZATION_FALLBACK
+
+        return {
+            "messages": [AIMessage(content=final_text)],
+            "reply_this_round": 0,
+            "reply_requires_continuation": False,
+            "called_finish": 0,
+            "llm_input_tokens": input_tokens,
+            "llm_output_tokens": output_tokens,
+            "llm_cached_tokens": cached_tokens,
+            "llm_cache_creation_tokens": cache_creation_tokens,
+            "llm_call_count": call_number,
+            "llm_total_tokens": total_tokens,
+            "budget_finalization_attempted": True,
+            "image_input_disabled": image_input_disabled,
+        }
+
+    return finalizer_node
 
 
 def _make_tool_node(
@@ -1244,16 +1350,25 @@ def _should_continue(state: AgentState, limits: AgentRunLimits) -> str:
     if state.get("tool_count", 0) >= MAX_TOOL_COUNT:
         logger.info("[Agent] 已达最大工具调用次数，结束本轮对话")
         return "end"
+    if state.get("llm_total_tokens", 0) >= limits.max_total_tokens:
+        if (
+            state.get("reply_count", 0) == 0
+            and not state.get("budget_finalization_attempted", False)
+        ):
+            logger.info(
+                f"[AgentTrace] 触发预算收尾 session={state['session_id']} "
+                f"reason=max_total_tokens limit={limits.max_total_tokens}"
+            )
+            return "finalize"
+        logger.info(
+            f"[AgentTrace] 结束 session={state['session_id']} reason=max_total_tokens "
+            f"limit={limits.max_total_tokens}"
+        )
+        return "end"
     if state.get("llm_call_count", 0) >= limits.max_llm_calls:
         logger.info(
             f"[AgentTrace] 结束 session={state['session_id']} reason=max_llm_calls "
             f"limit={limits.max_llm_calls}"
-        )
-        return "end"
-    if state.get("llm_total_tokens", 0) >= limits.max_total_tokens:
-        logger.info(
-            f"[AgentTrace] 结束 session={state['session_id']} reason=max_total_tokens "
-            f"limit={limits.max_total_tokens}"
         )
         return "end"
     if state.get("reply_this_round", 0) > 0:
@@ -1312,12 +1427,22 @@ def build_chat_graph(
             required_side_effect_count=required_side_effect_count,
         ),
     )
+    builder.add_node(
+        "finalize",
+        _make_budget_finalizer_node(
+            model,
+            system_prompt,
+            limits,
+            request_kwargs_factory,
+        ),
+    )
     builder.add_edge(START, "agent")
     builder.add_conditional_edges("agent", _should_call_tools, {"tools": "tools", "end": END})
+    builder.add_edge("finalize", "tools")
     builder.add_conditional_edges(
         "tools",
         lambda state: _should_continue(state, limits),
-        {"agent": "agent", "end": END},
+        {"agent": "agent", "finalize": "finalize", "end": END},
     )
 
     return builder.compile()

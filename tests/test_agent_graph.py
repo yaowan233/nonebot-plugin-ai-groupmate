@@ -27,6 +27,7 @@ def _state(message: AIMessage, *, tool_count: int = 0) -> "AgentState":
         "llm_cache_creation_tokens": 0,
         "llm_call_count": 0,
         "llm_total_tokens": 0,
+        "budget_finalization_attempted": False,
         "tool_timeout_count": 0,
         "tool_timeout_names": [],
         "tool_result_truncation_count": 0,
@@ -1345,13 +1346,127 @@ async def test_llm_call_budget_stops_before_another_model_turn():
     assert result["llm_call_count"] == 1
 
 
-def test_token_budget_ends_the_loop():
+def test_token_budget_routes_to_finalization_before_ending():
     from nonebot_plugin_ai_groupmate.agent.graph import AgentRunLimits, _should_continue
 
     state = _state(AIMessage(content="placeholder"))
     state["llm_total_tokens"] = 10
 
-    assert _should_continue(state, AgentRunLimits(max_total_tokens=10)) == "end"
+    assert _should_continue(state, AgentRunLimits(max_total_tokens=10)) == "finalize"
+
+
+@pytest.mark.asyncio
+async def test_token_budget_finalizes_with_user_visible_reply():
+    from nonebot_plugin_ai_groupmate.agent.graph import AgentRunLimits, build_chat_graph
+
+    replies: list[str] = []
+    generated_reply = "这是根据已经查到的资料整理出的剧情概要。"
+
+    @tool("search_web")
+    async def search_web(query: str) -> str:
+        """Return a search result for testing."""
+        return f"result for {query}"
+
+    @tool("reply_user")
+    async def reply_user(content: str, next_step: str = "end") -> str:
+        """Record the user-visible reply for testing."""
+        replies.append(content)
+        return next_step
+
+    model = _ToolSpyModel([
+        AIMessage(
+            content="",
+            tool_calls=[{
+                "name": "search_web",
+                "args": {"query": "arcaea story"},
+                "id": "search-1",
+            }],
+            usage_metadata={
+                "input_tokens": 8,
+                "output_tokens": 2,
+                "total_tokens": 10,
+            },
+        ),
+        AIMessage(content=generated_reply),
+    ])
+    graph = build_chat_graph(
+        model,
+        [search_web, reply_user],
+        "system",
+        limits=AgentRunLimits(max_total_tokens=10),
+    )
+
+    result = await graph.ainvoke(_state(AIMessage(content="question")))
+
+    assert model.invoke_count == 2
+    assert result["reply_count"] == 1
+    assert replies == [generated_reply]
+
+
+@pytest.mark.asyncio
+async def test_token_budget_finalizer_failure_still_sends_fallback_reply():
+    from nonebot_plugin_ai_groupmate.agent.graph import (
+        BUDGET_FINALIZATION_FALLBACK,
+        AgentRunLimits,
+        build_chat_graph,
+    )
+
+    replies: list[str] = []
+
+    @tool("search_web")
+    async def search_web(query: str) -> str:
+        """Return a search result for testing."""
+        return query
+
+    @tool("reply_user")
+    async def reply_user(content: str, next_step: str = "end") -> str:
+        """Record the user-visible reply for testing."""
+        replies.append(content)
+        return next_step
+
+    class _FinalizerFailureModel(_ToolSpyModel):
+        async def ainvoke(self, messages):
+            if self.invoke_count == 1:
+                self.invoke_count += 1
+                self.invoke_messages.append(messages)
+                raise RuntimeError("finalizer unavailable")
+            return await super().ainvoke(messages)
+
+    model = _FinalizerFailureModel([
+        AIMessage(
+            content="",
+            tool_calls=[{
+                "name": "search_web",
+                "args": {"query": "x"},
+                "id": "search-1",
+            }],
+            usage_metadata={
+                "input_tokens": 8,
+                "output_tokens": 2,
+                "total_tokens": 10,
+            },
+        ),
+    ])
+    graph = build_chat_graph(
+        model,
+        [search_web, reply_user],
+        "system",
+        limits=AgentRunLimits(max_total_tokens=10),
+    )
+
+    result = await graph.ainvoke(_state(AIMessage(content="question")))
+
+    assert model.invoke_count == 2
+    assert result["reply_count"] == 1
+    assert replies == [BUDGET_FINALIZATION_FALLBACK]
+
+
+def test_default_agent_token_budget_is_128k():
+    from nonebot_plugin_ai_groupmate.config import ScopedConfig
+    from nonebot_plugin_ai_groupmate.agent.graph import AgentRunLimits
+
+    assert ScopedConfig().agent_max_total_tokens == 128_000
+    assert AgentRunLimits().max_total_tokens == 128_000
 
 
 @pytest.mark.asyncio

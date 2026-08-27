@@ -130,6 +130,7 @@ async def test_agent_node_forwards_provider_request_kwargs():
         "llm_cache_creation_tokens": 0,
         "llm_call_count": 0,
         "llm_total_tokens": 0,
+        "budget_finalization_attempted": False,
         "tool_timeout_count": 0,
         "tool_timeout_names": [],
         "tool_result_truncation_count": 0,
