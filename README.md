@@ -163,6 +163,7 @@ curl http://127.0.0.1:6333/collections/media_collection_v3
 | ai_groupmate__agent_llm_timeout_seconds | 否 | `60` | 每次主模型调用超时（秒） |
 | ai_groupmate__agent_tool_timeout_seconds | 否 | `30` | 每次工具调用超时（秒） |
 | ai_groupmate__agent_max_concurrency | 否 | `4` | 全局同时运行的 Agent 上限，超出的请求在不占用数据库连接的状态下等待 |
+| ai_groupmate__agent_max_concurrency_per_group | 否 | `2` | 同一个群可同时处理的 @Bot 或连续追问数；后台插话仍保持单任务 |
 | ai_groupmate__agent_max_parallel_tools | 否 | `4` | 单轮可同时执行的安全只读工具上限；未知或有副作用的工具仍串行执行 |
 | ai_groupmate__background_image_max_concurrency | 否 | `2` | 后台图片下载、压缩和入库的并发上限 |
 | ai_groupmate__background_image_max_pending | 否 | `100` | 后台图片任务的最大待处理数，防止高峰期无界堆积 |

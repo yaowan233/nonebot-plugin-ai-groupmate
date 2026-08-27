@@ -162,15 +162,8 @@ async def test_addressed_requests_queue_without_background_preemption(monkeypatc
     import nonebot_plugin_ai_groupmate as plugin
 
     invalidated_requests: list[str] = []
-
-    class FakeTask:
-        cancelled = False
-
-        def done(self) -> bool:
-            return False
-
-        def cancel(self) -> None:
-            self.cancelled = True
+    started = asyncio.Event()
+    release = asyncio.Event()
 
     def request(
         request_id: str,
@@ -184,26 +177,38 @@ async def test_addressed_requests_queue_without_background_preemption(monkeypatc
             Any,
             SimpleNamespace(
                 request_id=request_id,
+                session=None,
+                interface=None,
+                bot=None,
+                event=None,
+                bot_name="bot",
                 user_id=user_id,
+                user_name=user_id,
                 is_tome=is_tome,
                 is_continuous=is_continuous,
+                reply_to_id=None,
                 proactive_meme_only=proactive_meme_only,
                 repeat_text=None,
             ),
         )
 
+    async def fake_handle_reply_logic(*args, **kwargs) -> None:
+        started.set()
+        await release.wait()
+
     async def fake_set_latest_request_id(group_id: str, request_id: str) -> None:
         invalidated_requests.append(request_id)
 
+    monkeypatch.setattr(plugin, "handle_reply_logic", fake_handle_reply_logic)
     monkeypatch.setattr(plugin, "set_latest_request_id", fake_set_latest_request_id)
     plugin._group_reply_states.clear()
     direct_request = request("direct-1", "user-1", is_tome=True)
-    fake_task = FakeTask()
-    plugin._group_reply_states["group-1"] = plugin.GroupReplyState(
-        running=True,
-        active=direct_request,
-        task=cast(Any, fake_task),
+    accepted = await plugin._queue_group_reply_request(
+        "group-1",
+        direct_request,
     )
+    assert accepted is True
+    await asyncio.wait_for(started.wait(), timeout=0.2)
 
     try:
         accepted = await plugin._queue_group_reply_request(
@@ -213,17 +218,19 @@ async def test_addressed_requests_queue_without_background_preemption(monkeypatc
 
         assert accepted is False
         assert invalidated_requests == []
-        assert fake_task.cancelled is False
-        assert plugin._group_reply_states["group-1"].active is direct_request
+        assert "direct-1" in plugin._group_reply_states["group-1"].addressed_tasks
 
         accepted = await plugin._queue_group_reply_request(
             "group-1",
             request("continuous-1", "user-1", is_continuous=True),
         )
 
-        assert accepted is False
+        assert accepted is True
         assert invalidated_requests == []
-        assert fake_task.cancelled is False
+        assert set(plugin._group_reply_states["group-1"].addressed_tasks) == {
+            "direct-1",
+            "continuous-1",
+        }
 
         accepted = await plugin._queue_group_reply_request(
             "group-1",
@@ -232,21 +239,35 @@ async def test_addressed_requests_queue_without_background_preemption(monkeypatc
 
         assert accepted is True
         assert invalidated_requests == []
-        assert fake_task.cancelled is False
+        assert set(plugin._group_reply_states["group-1"].addressed_tasks) == {
+            "direct-1",
+            "continuous-1",
+        }
         addressed = plugin._group_reply_states["group-1"].addressed
         assert [item.request_id for item in addressed] == ["direct-2"]
     finally:
+        release.set()
+        while True:
+            state = plugin._group_reply_states["group-1"]
+            tasks = list(state.addressed_tasks.values())
+            if not tasks and not state.addressed:
+                break
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.sleep(0)
         plugin._group_reply_states.clear()
 
 
 @pytest.mark.asyncio
-async def test_group_worker_processes_multiple_addressed_requests_in_order(
+async def test_group_runs_two_addressed_requests_concurrently_and_queues_third(
     monkeypatch,
 ):
     import nonebot_plugin_ai_groupmate as plugin
 
-    handled: list[str] = []
-    activated: list[str] = []
+    started: list[str] = []
+    release = asyncio.Event()
+    two_started = asyncio.Event()
+    all_finished = asyncio.Event()
+    finished = 0
 
     def request(request_id: str):
         return cast(
@@ -269,24 +290,46 @@ async def test_group_worker_processes_multiple_addressed_requests_in_order(
         )
 
     async def fake_handle_reply_logic(request_id: str, *args, **kwargs) -> None:
-        handled.append(request_id)
-
-    async def fake_set_latest_request_id(group_id: str, request_id: str) -> None:
-        activated.append(request_id)
+        nonlocal finished
+        started.append(request_id)
+        if len(started) == 2:
+            two_started.set()
+        await release.wait()
+        finished += 1
+        if finished == 3:
+            all_finished.set()
 
     monkeypatch.setattr(plugin, "handle_reply_logic", fake_handle_reply_logic)
-    monkeypatch.setattr(plugin, "set_latest_request_id", fake_set_latest_request_id)
+    monkeypatch.setattr(plugin.plugin_config, "agent_max_concurrency_per_group", 2)
     plugin._group_reply_states.clear()
-    state = plugin.GroupReplyState(running=True)
-    state.addressed.extend([request("direct-1"), request("direct-2")])
-    plugin._group_reply_states["group-1"] = state
 
     try:
-        await plugin._run_group_reply_worker("group-1")
+        for index in range(1, 4):
+            accepted = await plugin._queue_group_reply_request(
+                "group-1",
+                request(f"direct-{index}"),
+            )
+            assert accepted is True
 
-        assert handled == ["direct-1", "direct-2"]
-        assert activated == ["direct-1", "direct-2"]
+        await asyncio.wait_for(two_started.wait(), timeout=0.2)
+        await asyncio.sleep(0)
+        assert started == ["direct-1", "direct-2"]
+
+        release.set()
+        await asyncio.wait_for(all_finished.wait(), timeout=0.2)
+        assert started == ["direct-1", "direct-2", "direct-3"]
     finally:
+        release.set()
+        state = plugin._group_reply_states.get("group-1")
+        tasks = (
+            []
+            if state is None
+            else [state.task, *state.addressed_tasks.values()]
+        )
+        await asyncio.gather(
+            *(task for task in tasks if task is not None),
+            return_exceptions=True,
+        )
         plugin._group_reply_states.clear()
 
 

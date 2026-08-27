@@ -63,7 +63,11 @@ from .memory import (
     CollectionEmbeddingConfigMismatchError,
 )
 from .concurrency import agent_run_gate, maintenance_gate, background_image_gate
-from .reply_guard import set_latest_request_id
+from .reply_guard import (
+    activate_request_id,
+    deactivate_request_id,
+    set_latest_request_id,
+)
 from .agent.reaction import is_onebot_context
 from .runtime_config import (
     RESTART_REQUIRED_FIELDS,
@@ -256,11 +260,12 @@ class GroupReplyState:
     running: bool = False
     latest: ReplyRequest | None = None
     addressed: deque[ReplyRequest] = field(default_factory=deque)
+    addressed_tasks: dict[str, asyncio.Task[None]] = field(default_factory=dict)
     active: ReplyRequest | None = None
     task: asyncio.Task | None = None
 
 
-# 每个群串行处理少量明确 @；非定向回复只保留最新一条，避免高峰期刷屏。
+# 每个群有限并发处理明确 @；非定向回复只保留最新一条，避免高峰期刷屏。
 _group_reply_states: dict[str, GroupReplyState] = {}
 _group_reply_state_lock = asyncio.Lock()
 _continuous_conversation_until: dict[tuple[str, str], datetime.datetime] = {}
@@ -553,42 +558,114 @@ def _extract_reply_message_id_from_event(event: Event) -> str | None:
 
 
 def _start_group_reply_worker_locked(group_id: str, state: GroupReplyState):
-    """在已持有状态锁时启动群回复 worker。"""
+    """在已持有状态锁时启动 latest-only 后台回复 worker。"""
     state.running = True
     state.task = asyncio.create_task(_run_group_reply_worker(group_id))
+
+
+def _is_addressed_reply_request(request: ReplyRequest) -> bool:
+    return request.is_tome or request.is_continuous
+
+
+async def _execute_reply_request(request: ReplyRequest) -> None:
+    # Wait for a global Agent slot before opening a database session. This
+    # bounds cross-group concurrency without consuming pool capacity while queued.
+    async with agent_run_gate.slot():
+        await handle_reply_logic(
+            request.request_id,
+            request.session,
+            request.interface,
+            request.bot,
+            request.event,
+            request.bot_name,
+            request.user_id,
+            request.user_name,
+            request.is_tome,
+            request.is_continuous,
+            request.reply_to_id,
+            getattr(request, "proactive_meme_only", False),
+            getattr(request, "meme_required", False),
+            getattr(request, "meme_send_count", 1),
+            getattr(request, "proactive_reaction_only", False),
+            getattr(request, "reaction_required", False),
+            getattr(request, "repeat_text", None),
+        )
+
+
+def _start_addressed_workers_locked(
+    group_id: str,
+    state: GroupReplyState,
+) -> None:
+    limit = max(int(plugin_config.agent_max_concurrency_per_group), 1)
+    while state.addressed and len(state.addressed_tasks) < limit:
+        request = state.addressed.popleft()
+        task = asyncio.create_task(
+            _run_addressed_reply_request(group_id, request),
+            name=f"ai-groupmate-addressed:{group_id}:{request.request_id}",
+        )
+        state.addressed_tasks[request.request_id] = task
+
+
+async def _run_addressed_reply_request(
+    group_id: str,
+    request: ReplyRequest,
+) -> None:
+    """Run one independently deliverable addressed request."""
+    try:
+        await activate_request_id(group_id, request.request_id)
+        await _execute_reply_request(request)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception(
+            f"群 {group_id} 明确提问处理失败 request={request.request_id}"
+        )
+    finally:
+        await deactivate_request_id(group_id, request.request_id)
+        async with _group_reply_state_lock:
+            state = _group_reply_states.get(group_id)
+            if state is None:
+                return
+            state.addressed_tasks.pop(request.request_id, None)
+            _start_addressed_workers_locked(group_id, state)
+            if (
+                not state.addressed
+                and not state.addressed_tasks
+                and state.latest is not None
+                and (not state.running or state.task is None or state.task.done())
+            ):
+                _start_group_reply_worker_locked(group_id, state)
 
 
 async def _queue_group_reply_request(
     group_id: str,
     request: ReplyRequest,
 ) -> bool:
-    """明确 @ 串行排队；非定向消息不能打断或挤占定向请求。"""
+    """明确 @ 有限并发；非定向消息不能打断或挤占定向请求。"""
     async with _group_reply_state_lock:
         reply_state = _group_reply_states.setdefault(group_id, GroupReplyState())
-        active_is_addressed = bool(reply_state.active is not None and reply_state.active.is_tome)
+        active_is_addressed = bool(reply_state.addressed_tasks)
 
-        if request.is_tome:
-            addressed_count = len(reply_state.addressed) + int(active_is_addressed)
+        if _is_addressed_reply_request(request):
+            addressed_count = len(reply_state.addressed) + len(
+                reply_state.addressed_tasks
+            )
             if addressed_count >= MAX_GROUP_ADDRESSED_REQUESTS:
-                logger.warning(f"群 {group_id} 待处理的 @Bot 请求已达上限，忽略额外请求")
+                logger.warning(f"群 {group_id} 待处理的定向请求已达上限，忽略额外请求")
                 return False
             reply_state.addressed.append(request)
             # 明确 @ 到来时丢弃尚未开始的随机/表情/复读请求。
             reply_state.latest = None
-            if not reply_state.running:
-                _start_group_reply_worker_locked(group_id, reply_state)
-            elif not reply_state.task or reply_state.task.done():
-                logger.warning(f"群 {group_id} 回复 worker 不可用，已重新启动")
-                _start_group_reply_worker_locked(group_id, reply_state)
-            elif reply_state.active is not None and not active_is_addressed:
+            if reply_state.active is not None and reply_state.task is not None:
                 # 抢占正在运行的低优先级 Agent，并提前使其发送工具失效。
                 await set_latest_request_id(group_id, request.request_id)
                 reply_state.task.cancel()
                 logger.info(f"群 {group_id} 收到明确 @，已取消后台回复")
+            _start_addressed_workers_locked(group_id, reply_state)
             return True
 
         if active_is_addressed or reply_state.addressed:
-            logger.debug(f"群 {group_id} 存在待处理的 @Bot 请求，忽略后台回复采样")
+            logger.debug(f"群 {group_id} 存在待处理的定向请求，忽略后台回复采样")
             return False
 
         # 非定向请求仍只保留最新一个，避免随机插话、主动表情或复读积压刷屏。
@@ -606,50 +683,24 @@ async def _queue_group_reply_request(
 
 
 async def _run_group_reply_worker(group_id: str):
-    """按群串行处理明确 @ 队列，并在队列为空时消费最新后台请求。"""
+    """消费同群 latest-only 后台请求；明确提问由独立 worker 处理。"""
     try:
         while True:
             async with _group_reply_state_lock:
                 state = _group_reply_states.get(group_id)
                 if not state:
                     return
-                if state.addressed:
-                    request = state.addressed.popleft()
-                else:
-                    request = state.latest
-                    state.latest = None
+                if state.addressed or state.addressed_tasks:
+                    return
+                request = state.latest
+                state.latest = None
                 state.active = request
 
             if request is None:
                 break
 
-            # 排队中的 @ 请求不能提前覆盖当前请求的发送许可；轮到它执行时
-            # 再切换 request_id，保证前一个 Agent 能正常完成发送。
             await set_latest_request_id(group_id, request.request_id)
-
-            # Wait for an Agent slot before opening a database session.  This
-            # bounds cross-group concurrency without consuming pool capacity
-            # while queued.
-            async with agent_run_gate.slot():
-                await handle_reply_logic(
-                    request.request_id,
-                    request.session,
-                    request.interface,
-                    request.bot,
-                    request.event,
-                    request.bot_name,
-                    request.user_id,
-                    request.user_name,
-                    request.is_tome,
-                    request.is_continuous,
-                    request.reply_to_id,
-                    getattr(request, "proactive_meme_only", False),
-                    getattr(request, "meme_required", False),
-                    getattr(request, "meme_send_count", 1),
-                    getattr(request, "proactive_reaction_only", False),
-                    getattr(request, "reaction_required", False),
-                    getattr(request, "repeat_text", None),
-                )
+            await _execute_reply_request(request)
     finally:
         async with _group_reply_state_lock:
             state = _group_reply_states.get(group_id)
@@ -657,7 +708,12 @@ async def _run_group_reply_worker(group_id: str):
                 state.running = False
                 state.active = None
                 state.task = None
-                if state.addressed or state.latest is not None:
+                _start_addressed_workers_locked(group_id, state)
+                if (
+                    not state.addressed
+                    and not state.addressed_tasks
+                    and state.latest is not None
+                ):
                     _start_group_reply_worker_locked(group_id, state)
 
 
