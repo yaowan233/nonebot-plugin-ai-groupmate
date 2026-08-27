@@ -86,13 +86,52 @@ class _ToolSpyModel:
         self.invoke_messages = []
 
     def bind_tools(self, tools):
-        self.bound_tool_names.append(tuple(tool.name for tool in tools))
+        self.bound_tool_names.append(tuple(
+            tool.get("type") if isinstance(tool, dict) else tool.name
+            for tool in tools
+        ))
+        return self
+
+    def bind(self, *, tools):
+        self.bound_tool_names.append(tuple(
+            tool.get("type")
+            if tool.get("type") != "function"
+            else tool["function"]["name"]
+            for tool in tools
+        ))
         return self
 
     async def ainvoke(self, messages):
         self.invoke_count += 1
         self.invoke_messages.append(messages)
         return next(self.responses)
+
+
+@pytest.mark.asyncio
+async def test_agent_binds_provider_tools_without_registering_them_locally():
+    from nonebot_plugin_ai_groupmate.agent.graph import (
+        AgentRunLimits,
+        _make_agent_node,
+    )
+
+    @tool("local_lookup")
+    async def local_lookup(query: str) -> str:
+        """Look up local test data."""
+        return query
+
+    model = _ToolSpyModel([AIMessage(content="done")])
+    agent_node = _make_agent_node(
+        model,
+        [local_lookup],
+        "system",
+        {},
+        AgentRunLimits(),
+        builtin_tools=[{"type": "web_search"}],
+    )
+
+    await agent_node(_state(AIMessage(content="question")))
+
+    assert model.bound_tool_names == [("local_lookup", "web_search")]
 
 
 class _InvalidImageThenResponseModel:

@@ -1,4 +1,6 @@
+import json
 from typing import Any, Literal
+from urllib.parse import urlparse
 
 from pydantic import Field, BaseModel, SecretStr, field_validator
 from langchain_openai import ChatOpenAI
@@ -74,6 +76,22 @@ class ScopedConfig(BaseModel):
     chat_temperature: float = 0.7
     chat_api_format: Literal["openai", "anthropic", "vertex"] = "openai"
     chat_multimodal: bool = True  # 主聊天模型是否支持图片输入
+    chat_responses_builtin_tools: list[
+        Literal[
+            "code_interpreter",
+            "web_search",
+            "web_extractor",
+            "web_search_image",
+            "image_search",
+        ]
+    ] = Field(
+        default_factory=list,
+        description="千问 Responses API 官方工具；留空表示不启用",
+    )
+    chat_responses_enable_thinking: bool = Field(
+        default=False,
+        description="调用千问 Responses API 时启用 medium 强度思考",
+    )
 
     # === Google Vertex AI（chat/tagging/vision 共用） ===
     # 凭据优先级：vertex_credentials_path > vertex_api_key > ADC。
@@ -140,6 +158,28 @@ class ScopedConfig(BaseModel):
             return None
         return value
 
+    @field_validator("chat_responses_builtin_tools", mode="before")
+    @classmethod
+    def _parse_chat_responses_builtin_tools(cls, value: Any) -> Any:
+        """Accept JSON arrays from env vars and comma-separated WebUI input."""
+        if not isinstance(value, str):
+            return value
+        normalized = value.strip()
+        if not normalized:
+            return []
+        if normalized.startswith("["):
+            return json.loads(normalized)
+        return [
+            item.strip()
+            for item in normalized.replace("，", ",").split(",")
+            if item.strip()
+        ]
+
+    @field_validator("chat_responses_builtin_tools")
+    @classmethod
+    def _deduplicate_chat_responses_builtin_tools(cls, value: list[str]) -> list[str]:
+        return list(dict.fromkeys(value))
+
     rerank_api_url: str = ""
     rerank_api_key: str = ""
 
@@ -154,6 +194,33 @@ class ScopedConfig(BaseModel):
 
 class Config(BaseModel):
     ai_groupmate: ScopedConfig = Field(default_factory=ScopedConfig)
+
+
+_DASHSCOPE_RESPONSES_HOSTS = frozenset(
+    {
+        "dashscope.aliyuncs.com",
+        "dashscope-intl.aliyuncs.com",
+        "dashscope-us.aliyuncs.com",
+    }
+)
+
+
+def resolve_chat_responses_builtin_tools(cfg: ScopedConfig) -> list[dict[str, str]]:
+    """Return server-side tools only for the official DashScope OpenAI endpoint."""
+    if cfg.chat_api_format != "openai" or not cfg.chat_responses_builtin_tools:
+        return []
+    base_url = cfg.chat_base_url or cfg.llm_base_url
+    hostname = (urlparse(base_url).hostname or "").lower()
+    if (
+        hostname not in _DASHSCOPE_RESPONSES_HOSTS
+        and not hostname.endswith(".maas.aliyuncs.com")
+    ):
+        return []
+    tool_types = list(cfg.chat_responses_builtin_tools)
+    if "web_extractor" in tool_types and "web_search" not in tool_types:
+        # DashScope requires web_extractor to be offered together with web_search.
+        tool_types.insert(0, "web_search")
+    return [{"type": tool_type} for tool_type in tool_types]
 
 
 def create_chat_openai(
@@ -179,6 +246,16 @@ def create_chat_openai(
     }
     if max_tokens is not None:
         kwargs["max_completion_tokens"] = max_tokens
+    if role == "chat" and resolve_chat_responses_builtin_tools(cfg):
+        kwargs["use_responses_api"] = True
+        kwargs["output_version"] = "responses/v1"
+        if (
+            cfg.chat_responses_enable_thinking
+            or "code_interpreter" in cfg.chat_responses_builtin_tools
+        ):
+            # DashScope recommends the Responses reasoning parameter for new code;
+            # the older extra_body.enable_thinking form is being phased out.
+            kwargs["reasoning"] = {"effort": "medium"}
     return ChatOpenAI(**kwargs)
 
 

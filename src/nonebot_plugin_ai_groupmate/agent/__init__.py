@@ -25,7 +25,12 @@ from ..usage import (
     extract_cached_tokens,
     extract_cache_creation_tokens,
 )
-from ..config import create_chat_llm, create_vision_llm, create_chat_openai
+from ..config import (
+    create_chat_llm,
+    create_vision_llm,
+    create_chat_openai,
+    resolve_chat_responses_builtin_tools,
+)
 from ..memory import DB
 from .context import (
     get_group_context,
@@ -98,6 +103,7 @@ from ..group_model_config import (
     resolve_session_chat_config,
     resolve_session_model_owner,
 )
+from .qwen_responses_tools import create_qwen_code_interpreter_tool
 
 
 async def _finish_db_operation(coro):
@@ -151,6 +157,10 @@ configure_concurrency(
 
 def _use_explicit_prompt_cache(config=None) -> bool:
     config = config or plugin_config
+    if resolve_chat_responses_builtin_tools(config):
+        # cache_control blocks belong to Chat Completions/Anthropic-compatible
+        # payloads and must not be mixed into DashScope Responses requests.
+        return False
     base_url = config.chat_base_url or config.llm_base_url
     model = config.chat_model or config.base_model
     return should_use_explicit_prompt_cache(
@@ -1018,6 +1028,32 @@ async def create_chat_graph(
         model = get_private_chat_model(model_owner[1])
     else:
         model = get_group_chat_model(model_owner[1])
+    responses_builtin_tools = resolve_chat_responses_builtin_tools(chat_config)
+    code_interpreter_enabled = any(
+        item.get("type") == "code_interpreter"
+        for item in responses_builtin_tools
+    )
+    # DashScope does not allow code_interpreter and Function Calling in one
+    # request. Keep it available through an isolated local wrapper request.
+    direct_responses_builtin_tools = [
+        item
+        for item in responses_builtin_tools
+        if item.get("type") != "code_interpreter"
+    ]
+    code_interpreter_tool = (
+        create_qwen_code_interpreter_tool(model)
+        if code_interpreter_enabled
+        and not proactive_meme_only
+        and not proactive_reaction_only
+        and repeat_text is None
+        else None
+    )
+    if code_interpreter_tool is not None:
+        system_prompt += """
+【千问代码解释器】
+- 需要精确计算、运行 Python 或分析数据时，调用 `qwen_code_interpreter`。
+- 它返回分析材料；得到结果后仍需调用 `reply_user` 向用户作答。
+"""
     report_tool = create_report_tool(
         db_session,
         session_id,
@@ -1247,6 +1283,7 @@ async def create_chat_graph(
             else []
         ),
         *custom_agent_tools,
+        *([code_interpreter_tool] if code_interpreter_tool is not None else []),
         finish,
     ]
     if repeat_text is not None:
@@ -1329,6 +1366,7 @@ async def create_chat_graph(
                 else {}
             )
         ),
+        builtin_tools=direct_responses_builtin_tools,
     )
     return graph, agent_tools, dynamic_context
 

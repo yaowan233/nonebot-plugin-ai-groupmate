@@ -53,7 +53,7 @@ SETTING_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     ),
     (
         "主聊天模型",
-        "负责 Agent 推理、工具调用和最终回复。",
+        "负责 Agent 推理、工具调用和最终回复。千问官方工具只支持百炼 OpenAI 兼容地址，并会自动切换到 Responses API。",
         (
             "chat_model",
             "chat_api_key",
@@ -61,6 +61,8 @@ SETTING_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
             "chat_temperature",
             "chat_api_format",
             "chat_multimodal",
+            "chat_responses_builtin_tools",
+            "chat_responses_enable_thinking",
         ),
     ),
     (
@@ -191,6 +193,8 @@ _DIRECT_LABELS = {
     "agent_tool_result_max_chars": "工具结果最大字符数",
     "chat_explicit_prompt_cache": "启用显式 Prompt 缓存",
     "chat_multimodal": "主模型支持图片",
+    "chat_responses_builtin_tools": "千问官方工具",
+    "chat_responses_enable_thinking": "Responses API 启用思考",
     "vertex_project": "Google Cloud 项目 ID",
     "vertex_location": "Vertex 区域",
     "vertex_api_key": "Vertex API Key",
@@ -207,6 +211,16 @@ _DIRECT_LABELS = {
     "rerank_api_key": "Rerank API Key",
     "base_model": "旧版默认模型",
     "qwen_token": "旧版 Qwen Token",
+}
+_FIELD_HINTS = {
+    "chat_responses_builtin_tools": (
+        "可按需勾选，全部不选表示关闭。web_extractor 会自动同时启用收费的 web_search；"
+        "工具在百炼服务器执行，可能产生额外工具费和 Token 费。"
+    ),
+    "chat_responses_enable_thinking": (
+        "开启后使用官方推荐的 medium 推理强度；仅在至少启用一个千问官方工具时生效。"
+        "code_interpreter 按官方要求会自动开启。"
+    ),
 }
 _ROLE_LABELS = {
     "llm": "通用模型",
@@ -261,6 +275,8 @@ def _display_environment_value(field_name: str, value: Any) -> str:
         return "未配置"
     if value == "":
         return "空"
+    if isinstance(value, list):
+        return "、".join(str(item) for item in value) if value else "未启用"
     return str(value)
 
 
@@ -314,6 +330,25 @@ def _render_field(
             f'<textarea data-setting="{key}" rows="5">'
             f'{escape(str(value))}</textarea>'
         )
+    elif field_name == "chat_responses_builtin_tools":
+        tool_options = (
+            ("code_interpreter", "代码解释器（限时免工具费）"),
+            ("web_search", "联网搜索（北京 ¥4/千次）"),
+            ("web_extractor", "网页抓取（限免，依赖联网搜索）"),
+            ("web_search_image", "文搜图（北京 ¥24/千次）"),
+            ("image_search", "图搜图（北京 ¥48/千次）"),
+        )
+        control = (
+            f'<div class="tool-options" data-tool-list="{key}">'
+            + "".join(
+                f'<label><input type="checkbox" value="{escape(tool_type)}" '
+                f'{"checked" if tool_type in value else ""} /> '
+                f'{escape(option_label)}</label>'
+                for tool_type, option_label in tool_options
+            )
+            + f'<input type="hidden" data-setting="{key}" '
+            f'value="{escape(",".join(value))}" /></div>'
+        )
     elif isinstance(value, (int, float)) and not isinstance(value, bool):
         step = "1" if isinstance(value, int) else "any"
         control = (
@@ -332,12 +367,15 @@ def _render_field(
             f'value="{escape(str(value))}" />'
         )
 
+    field_hint = _FIELD_HINTS.get(field_name)
+    hint_html = f"<small>{escape(field_hint)}</small>" if field_hint else ""
     return f"""
       <div class="setting-field">
         <div class="setting-title"><span>{label}</span>{badge_html}</div>
         <code>{key}</code>
         {control}
         <small>环境变量：{environment_hint}</small>
+        {hint_html}
       </div>"""
 
 
@@ -425,6 +463,8 @@ def render_settings_page(
     textarea {{ resize:vertical; }}
     small {{ display:block; margin-top:7px; color:var(--muted); font-size:11px; overflow-wrap:anywhere; }}
     .switch,.clear-secret {{ display:flex; align-items:center; gap:7px; color:var(--muted); font-size:12px; }}
+    .tool-options {{ display:grid; gap:7px; }}
+    .tool-options label {{ display:flex; align-items:flex-start; gap:7px; color:var(--text); font-size:12px; line-height:1.35; }}
     .clear-secret {{ margin-top:8px; }}
     .badge {{ padding:3px 6px; border-radius:999px; font-size:10px; font-weight:750; }}
     .badge.override {{ background:#ecfdf5; color:#047857; }} .badge.restart {{ background:#f1f5f9; color:#475569; }} .badge.pending {{ background:#fff7ed; color:#b45309; }}
@@ -466,6 +506,10 @@ def render_settings_page(
       const setStatus = (text, error=false) => {{ status.textContent=text; status.style.color=error?"#b91c1c":"#64748b"; }};
       document.getElementById("save").addEventListener("click", async () => {{
         const updates = {{}};
+        document.querySelectorAll("[data-tool-list]").forEach((container) => {{
+          const selected = [...container.querySelectorAll('input[type="checkbox"]:checked')].map((input) => input.value);
+          container.querySelector('input[type="hidden"]').value = selected.join(",");
+        }});
         document.querySelectorAll("[data-setting]").forEach((input) => {{
           if (input.dataset.secret === "true" && !input.value) return;
           updates[input.dataset.setting] = input.type === "checkbox" ? input.checked : input.value;

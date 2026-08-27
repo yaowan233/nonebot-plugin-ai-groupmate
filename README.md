@@ -133,12 +133,14 @@ curl http://127.0.0.1:6333/collections/media_collection_v3
 | ai_groupmate__tavily_api_key | 否 | 无 | Tavily 搜索 API 密钥（联网搜索功能） |
 | ai_groupmate__llm_api_key | 推荐 | 无 | 通用 LLM API Key，未单独配置各角色 key 时使用 |
 | ai_groupmate__llm_base_url | 否 | `https://dashscope.aliyuncs.com/compatible-mode/v1` | 通用 OpenAI 兼容接口地址 |
-| ai_groupmate__chat_model | 否 | `qwen3.5-plus` | 主聊天/工具调用模型，推荐 `qwen3.5-plus` 或 `qwen3.7-plus` |
+| ai_groupmate__chat_model | 否 | `qwen3.7-plus` | 主聊天/工具调用模型；使用百炼官方工具时推荐 `qwen3.8-max` |
 | ai_groupmate__chat_api_key | 否 | 无 | 主聊天模型专用 API Key，留空则使用 `llm_api_key` / `qwen_token` |
 | ai_groupmate__chat_base_url | 否 | 无 | 主聊天模型专用 Base URL，留空则使用 `llm_base_url` |
 | ai_groupmate__chat_temperature | 否 | `0.7` | 主聊天模型温度 |
 | ai_groupmate__chat_api_format | 否 | `openai` | 主聊天接口格式，可选 `openai` / `anthropic` / `vertex` |
 | ai_groupmate__chat_multimodal | 否 | `true` | 主聊天模型是否支持图片输入；若使用纯文本模型请设为 `false`，将跳过图片上传只发文本 |
+| ai_groupmate__chat_responses_builtin_tools | 否 | `[]` | 千问 Responses API 官方工具白名单，可选 `code_interpreter`、`web_search`、`web_extractor`、`web_search_image`、`image_search`；仅官方百炼 OpenAI 兼容地址生效，留空完全关闭 |
+| ai_groupmate__chat_responses_enable_thinking | 否 | `false` | 官方工具调用启用 medium 思考强度；启用 `code_interpreter` 时会按官方要求自动开启 |
 | ai_groupmate__chat_explicit_prompt_cache | 否 | `true` | 为支持的接口添加显式 Prompt 缓存断点；支持 DashScope、Anthropic，以及 OpenRouter 上的 Gemini/Claude，并自动使用匿名群级粘性路由 |
 | ai_groupmate__group_api_relay_url | 否 | `https://mayumi.xyz` | 群 API 公网中转服务根地址；默认使用 Mayumi，也可覆盖为自建中转服务 |
 | ai_groupmate__group_api_relay_registration_token | 私有注册模式首次必填 | 无 | 中转服务签发的部署者注册码；服务器开放注册时留空，实例注册成功后也可移除 |
@@ -299,6 +301,18 @@ AI_GROUPMATE__PERSONALITY_SETTING="【固定知识】当用户询问加群、群
 ```dotenv
 AI_GROUPMATE__CHAT_MODEL=qwen3.7-plus
 ```
+
+如果要让 `qwen3.8-max` 使用百炼服务器提供的代码解释器、联网搜索和网页抓取：
+
+```dotenv
+AI_GROUPMATE__CHAT_MODEL=qwen3.8-max
+AI_GROUPMATE__CHAT_RESPONSES_BUILTIN_TOOLS='["code_interpreter","web_search","web_extractor"]'
+AI_GROUPMATE__CHAT_RESPONSES_ENABLE_THINKING=true
+```
+
+这些工具只在官方百炼 OpenAI 兼容地址上生效，配置后会自动使用 Responses API。所有工具默认关闭；工具列表只是授权模型按需调用，并不代表每轮都会执行。`web_extractor` 依赖 `web_search`，只填写前者时插件也会自动启用后者。代码解释器因为不能与 Bot 的 Function Calling 同请求，会由插件隔离调用，再把结果交回主 Agent。
+
+华北 2（北京）当前参考工具价为：`code_interpreter`、`web_extractor` 限时免工具费，`web_search` 4 元/千次，`web_search_image`（文搜图）24 元/千次，`image_search`（图搜图）48 元/千次；所有工具产生的额外模型 Token 仍收费，实际价格以百炼控制台为准。Token Plan Harness 的 `t2i_search` / `i2i_search` 个人版 Key 不可用于机器人后端，因此这里使用普通按量 API 的正式工具名。接口、地域和计费依据见 [千问 Responses API 官方工具调研](./docs/qwen-responses-built-in-tools.md)。
 
 插件会尽量复用稳定 system prompt、固定工具 schema，并在连续对话中复用 append-only history，以提高输入缓存命中率。日志中可通过 `[LLM缓存]` 查看缓存命中 token；如果服务商未返回缓存字段，会显示 `缓存命中=未返回`。
 

@@ -14,6 +14,7 @@ from langchain_core.tools import BaseTool
 from langchain_core.messages import AIMessage, BaseMessage, ToolMessage, HumanMessage
 from langgraph.graph.message import add_messages
 from langchain_core.runnables import RunnableConfig
+from langchain_core.utils.function_calling import convert_to_openai_tool
 
 from ..reply_guard import is_request_active
 from .prompt_cache import normalize_system_messages
@@ -436,6 +437,21 @@ def _active_tools(
     return tools
 
 
+def _bind_model_tools(
+    model: Any,
+    visible_tools: list[BaseTool],
+    builtin_tools: Sequence[dict[str, Any]],
+) -> Any:
+    if not builtin_tools:
+        return model.bind_tools(visible_tools)
+
+    # langchain-openai only recognizes OpenAI's built-in tool names. DashScope
+    # adds web_extractor/web_search_image/image_search, so bypass bind_tools'
+    # allowlist after converting the bot's local functions ourselves.
+    formatted_local_tools = [convert_to_openai_tool(tool) for tool in visible_tools]
+    return model.bind(tools=[*formatted_local_tools, *builtin_tools])
+
+
 def _make_agent_node(
     model: Any,
     base_tools: list[BaseTool],
@@ -443,6 +459,7 @@ def _make_agent_node(
     tools_by_skill: dict[str, list[BaseTool]],
     limits: AgentRunLimits,
     request_kwargs_factory: Callable[[str], dict[str, Any]] | None = None,
+    builtin_tools: Sequence[dict[str, Any]] = (),
 ) -> Any:
     system_messages = normalize_system_messages(system_prompt)
     bound_models: dict[tuple[str, ...], Any] = {}
@@ -456,7 +473,10 @@ def _make_agent_node(
         tool_names = tuple(tool.name for tool in visible_tools)
         bound_model = bound_models.get(tool_names)
         if bound_model is None:
-            bound_model = model.bind_tools(visible_tools)
+            # Provider-side Responses tools execute inside the model request and
+            # therefore must be bound to the model, but not registered in the
+            # local tool node.
+            bound_model = _bind_model_tools(model, visible_tools, builtin_tools)
             bound_models[tool_names] = bound_model
         full: list[BaseMessage] = system_messages + list(state["messages"])
         call_messages = full
@@ -525,6 +545,7 @@ def _make_agent_node(
             logger.info(
                 f"[AgentTrace] LLM session={state['session_id']} call={call_number} "
                 f"duration_ms={elapsed_ms:.0f} visible_tools={len(visible_tools)} "
+                f"builtin_tools={len(builtin_tools)} "
                 f"tokens={budget_tokens}{' (估算)' if not usage['total_tokens'] else ''}"
             )
 
@@ -1117,6 +1138,7 @@ def build_chat_graph(
     required_side_effect_tool: str | None = None,
     required_side_effect_count: int = 1,
     request_kwargs_factory: Callable[[str], dict[str, Any]] | None = None,
+    builtin_tools: Sequence[dict[str, Any]] = (),
 ) -> Any:
     tools_by_name: dict[str, BaseTool] = {t.name: t for t in tools}
     base_tools = list(base_tools) if base_tools is not None else list(tools)
@@ -1133,6 +1155,7 @@ def build_chat_graph(
             tools_by_skill,
             limits,
             request_kwargs_factory,
+            builtin_tools,
         ),
     )
     builder.add_node(
