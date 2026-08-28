@@ -40,7 +40,7 @@ from nonebot_plugin_alconna import (
     get_message_id,
 )
 from nonebot_plugin_apscheduler import scheduler
-from nonebot_plugin_alconna.uniseg import UniMsg
+from nonebot_plugin_alconna.uniseg import Audio, Video, UniMsg, Reference
 
 from .agent import (
     _parse_msg_meta,
@@ -68,6 +68,7 @@ from .reply_guard import (
     deactivate_request_id,
     set_latest_request_id,
 )
+from .media_message import format_media_markers
 from .agent.reaction import is_onebot_context
 from .runtime_config import (
     RESTART_REQUIRED_FIELDS,
@@ -75,6 +76,7 @@ from .runtime_config import (
     mark_restart_fields_applied,
     load_runtime_config_overrides,
 )
+from .forward_message import format_forward_reference_markers
 from .group_api_relay import delete_expired_pending_group_configs
 from .agent.reply_tools import create_reply_tool
 from .group_daily_quota import (
@@ -747,6 +749,9 @@ async def handle_message(
 
     bot_name = plugin_config.bot_name
     imgs = msg.include(Image)
+    audios = list(msg.include(Audio))
+    videos = list(msg.include(Video))
+    forward_references = list(msg.include(Reference))
     # 第1行固定是本条消息的平台 ID 元数据，格式 "id: {id}"
     incoming_message_id = str(get_message_id())
     content_prefix = f"id: {incoming_message_id}\n"
@@ -783,6 +788,24 @@ async def handle_message(
         if i.type == "mface":
             body += "[表情]"
 
+    if forward_references:
+        forward_text = format_forward_reference_markers(forward_references)
+        if body and not body.endswith("\n"):
+            body += "\n"
+        body += forward_text
+        is_text = True
+
+    if audios or videos:
+        media_text = format_media_markers(
+            incoming_message_id,
+            audio_count=len(audios),
+            video_count=len(videos),
+        )
+        if body and not body.endswith("\n"):
+            body += "\n"
+        body += media_text
+        is_text = True
+
     if to_me and not has_at_mention:
         reply_to_bot = False
         if reply := getattr(event, "reply", None):
@@ -793,7 +816,8 @@ async def handle_message(
             except Exception:
                 pass
         if not reply_to_bot:
-            body = f"{plugin_config.bot_name} {body}"
+            separator = "\n" if forward_references or audios or videos else " "
+            body = f"{plugin_config.bot_name}{separator}{body}"
 
     if not reply_id:
         reply_id = _extract_reply_message_id_from_event(event)
@@ -921,11 +945,17 @@ async def handle_message(
     should_reply = to_me or continuous_to_me or random_reply_sample or proactive_reaction_only or proactive_meme_only or repeat_reply_sample
     if explicit_to_me or continuous_to_me:
         _refresh_continuous_conversation(session.scene.id, session.user.id)
-    if not plain_text and not imgs:
+    if not plain_text and not imgs and not forward_references and not audios and not videos:
         should_reply = False
     if command_like:
         should_reply = False
-    if not plain_text and not (to_me or continuous_to_me):
+    if (
+        not plain_text
+        and not forward_references
+        and not audios
+        and not videos
+        and not (to_me or continuous_to_me)
+    ):
         should_reply = False
 
     # ========== 步骤3: 处理图片消息 ==========

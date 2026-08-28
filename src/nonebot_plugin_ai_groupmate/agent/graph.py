@@ -32,6 +32,9 @@ MAX_REACTION_PER_ROUND = 3
 PARALLEL_SAFE_TOOL_NAMES = frozenset({
     "calculate_expression",
     "qwen_code_interpreter",
+    "read_audio_message",
+    "read_forward_message",
+    "read_video_message",
     "search_web",
 })
 EMPTY_RESPONSE_RETRY_PROMPT = (
