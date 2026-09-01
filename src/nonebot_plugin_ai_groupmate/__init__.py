@@ -1212,6 +1212,40 @@ async def _send_quota_notice(
     await db_session.commit()
 
 
+async def _send_agent_error_notice(
+    db_session,
+    *,
+    content: str,
+    request_id: str,
+    session: Uninfo,
+    interface: QryItrface,
+    bot_name: str,
+    is_private: bool,
+    group_members: list[Any] | None,
+) -> None:
+    reply_tool = create_reply_tool(
+        db_session,
+        session.scene.id,
+        request_id,
+        interface=interface,
+        send_target=Target(
+            id=session.scene.id,
+            private=is_private,
+            self_id=session.self_id,
+        ),
+        bot_name=bot_name,
+        parse_msg_meta=_parse_msg_meta,
+        group_members=group_members or [],
+    )
+    raw_result = await reply_tool.ainvoke(
+        {"content": content, "next_step": "end"}
+    )
+    result = json.loads(raw_result)
+    if not result.get("ok"):
+        logger.info(f"模型 API 错误提示未发送: {result.get('message', raw_result)}")
+    await db_session.commit()
+
+
 async def handle_reply_logic(
     request_id: str,
     session: Uninfo,
@@ -1488,6 +1522,23 @@ async def handle_reply_logic(
         except asyncio.CancelledError:
             logger.debug(f"群 {session.scene.id} 回复任务被取消（切换到更新请求）")
             raise
+
+        if (
+            strategy.need_reply
+            and strategy.text
+            and (is_private or is_tome)
+        ):
+            async with get_session() as notice_session:
+                await _send_agent_error_notice(
+                    notice_session,
+                    content=strategy.text,
+                    request_id=request_id,
+                    session=session,
+                    interface=interface,
+                    bot_name=bot_name,
+                    is_private=is_private,
+                    group_members=group_members,
+                )
 
         logger.info(f"Agent决策结果: {strategy}")
 

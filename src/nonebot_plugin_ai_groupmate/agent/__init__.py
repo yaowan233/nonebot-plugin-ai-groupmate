@@ -17,7 +17,11 @@ from nonebot_plugin_alconna import Target
 from sqlalchemy.ext.asyncio import AsyncSession
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 
-from .graph import AgentRunLimits, build_chat_graph
+from .graph import (
+    AgentRunLimits,
+    build_chat_graph,
+    is_multimodal_unsupported_error,
+)
 from ..model import ChatHistory, ChatHistorySchema
 from ..usage import (
     estimate_cost,
@@ -253,6 +257,55 @@ class ResponseMessage(BaseModel):
             return None  # 返回 None，Pydantic 将其视为缺失或 null 值
 
         return value
+
+
+def _scoped_model_error_notice(
+    error: Exception,
+    owner: tuple[str, str] | None,
+) -> str | None:
+    """Build a safe user-facing notice for failures from a scoped model API."""
+    if owner is None:
+        return None
+
+    scope, _ = owner
+    scope_name = "当前群" if scope == "group" else "你的个人"
+    config_command = "/配置群API" if scope == "group" else "/配置个人API"
+    error_text = str(error).lower()
+
+    if isinstance(error, asyncio.TimeoutError):
+        return (
+            f"{scope_name}模型 API 响应超时，请稍后重试；"
+            f"若持续出现，请通过 {config_command} 检查服务地址和模型配置。"
+        )
+    if is_multimodal_unsupported_error(error):
+        return (
+            f"{scope_name}模型 API 不支持图片输入。请通过 {config_command} "
+            "关闭“模型支持图片输入”，或更换支持多模态的 Key/模型。"
+        )
+
+    status_code = getattr(error, "status_code", None)
+    if status_code in {401, 403} or any(
+        marker in error_text
+        for marker in (
+            "error code: 401",
+            "error code: 403",
+            "authenticationerror",
+            "permissiondenied",
+        )
+    ):
+        return (
+            f"{scope_name}模型 API 拒绝了请求，请管理员通过 {config_command} "
+            "检查 API Key、模型权限和服务地址。"
+        )
+    if status_code == 429 or "error code: 429" in error_text:
+        return f"{scope_name}模型 API 当前限流或额度不足，请稍后重试或通过 {config_command} 检查额度。"
+    if (
+        isinstance(status_code, int)
+        and status_code >= 500
+        or any(f"error code: {code}" in error_text for code in range(500, 600))
+    ):
+        return f"{scope_name}模型服务暂时不可用，请稍后重试；若持续出现，请通过 {config_command} 更换服务。"
+    return None
 
 
 @dataclass
@@ -1895,7 +1948,15 @@ async def choice_response_strategy(
         # it as an unhandled Agent exception to error monitoring.
         logger.warning(f"Agent LLM 调用超时，已跳过本轮回复 - session: {session_id}")
         await _safe_rollback(db_session)
-        return ResponseMessage(need_reply=False, text=None)
+        notice = _scoped_model_error_notice(
+            asyncio.TimeoutError(),
+            resolve_session_model_owner(
+                session_id=session_id,
+                user_id=str(user_id),
+                is_private=is_private,
+            ),
+        )
+        return ResponseMessage(need_reply=notice is not None, text=notice)
     except Exception as e:
         err_str = str(e)
         if "data_inspection_failed" in err_str or (
@@ -1906,7 +1967,15 @@ async def choice_response_strategy(
             return ResponseMessage(need_reply=False, text=None)
         logger.exception("Agent 决策过程发生异常")
         await _safe_rollback(db_session)
-        return ResponseMessage(need_reply=False, text=None)
+        notice = _scoped_model_error_notice(
+            e,
+            resolve_session_model_owner(
+                session_id=session_id,
+                user_id=str(user_id),
+                is_private=is_private,
+            ),
+        )
+        return ResponseMessage(need_reply=notice is not None, text=notice)
 
 
 if __name__ == "__main__":

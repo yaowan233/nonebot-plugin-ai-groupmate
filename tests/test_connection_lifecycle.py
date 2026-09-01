@@ -188,6 +188,54 @@ async def test_reply_releases_database_connection_before_adapter_send(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_agent_error_notice_uses_guarded_reply_tool(monkeypatch):
+    from nonebot_plugin_uninfo import Uninfo, SceneType, QryItrface
+
+    import nonebot_plugin_ai_groupmate as plugin
+
+    calls: list[object] = []
+
+    class _ReplyTool:
+        async def ainvoke(self, args):
+            calls.append(args)
+            return json.dumps({"ok": True})
+
+    class _Session:
+        async def commit(self):
+            calls.append("commit")
+
+    def fake_create_reply_tool(*args, **kwargs):
+        calls.append(kwargs["send_target"])
+        return _ReplyTool()
+
+    monkeypatch.setattr(plugin, "create_reply_tool", fake_create_reply_tool)
+    fake_session = SimpleNamespace(
+        scene=SimpleNamespace(id="group-1", type=SceneType.GROUP),
+        self_id="bot-1",
+    )
+
+    await plugin._send_agent_error_notice(
+        _Session(),
+        content="当前群模型 API 配置有误。",
+        request_id="request-1",
+        session=cast(Uninfo, fake_session),
+        interface=cast(QryItrface, SimpleNamespace()),
+        bot_name="bot",
+        is_private=False,
+        group_members=[],
+    )
+
+    target = calls[0]
+    assert getattr(target, "id") == "group-1"
+    assert getattr(target, "private") is False
+    assert calls[1] == {
+        "content": "当前群模型 API 配置有误。",
+        "next_step": "end",
+    }
+    assert calls[2] == "commit"
+
+
+@pytest.mark.asyncio
 async def test_chat_vectorization_releases_connection_before_qdrant(monkeypatch):
     from nonebot_plugin_ai_groupmate import utils
 

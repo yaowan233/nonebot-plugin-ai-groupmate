@@ -74,6 +74,11 @@ def _relay() -> GroupModelRelay:
 
 
 ConfigScope = Literal["group", "private"]
+_CONNECTION_TEST_IMAGE_DATA_URI = (
+    "data:image/png;base64,"
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8A"
+    "AQUBAScY42YAAAAASUVORK5CYII="
+)
 
 
 def _feature_name(scope: ConfigScope) -> str:
@@ -144,8 +149,17 @@ async def _test_candidate_connection(payload) -> None:
         config.group_api_allowed_provider_hosts,
     )
     model = create_chat_llm(config)
+    test_content = "请只回复 OK"
+    if payload.chat_multimodal:
+        test_content = [
+            {"type": "text", "text": "请只回复 OK"},
+            {
+                "type": "image_url",
+                "image_url": {"url": _CONNECTION_TEST_IMAGE_DATA_URI},
+            },
+        ]
     response = await asyncio.wait_for(
-        model.ainvoke([HumanMessage(content="请只回复 OK")]),
+        model.ainvoke([HumanMessage(content=test_content)]),
         timeout=min(config.agent_llm_timeout_seconds, 20.0),
     )
     validate_group_model_test_response(response)

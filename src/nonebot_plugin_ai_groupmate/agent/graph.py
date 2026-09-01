@@ -446,7 +446,38 @@ def _message_text_content(message: AIMessage) -> str:
     return ""
 
 
-def _is_invalid_image_error(error: Exception) -> bool:
+def is_multimodal_unsupported_error(error: Exception) -> bool:
+    error_text = str(error).lower()
+    is_supported_status = (
+        getattr(error, "status_code", None) in {400, 403, 422}
+        or any(
+            marker in error_text
+            for marker in (
+                "error code: 400",
+                "error code: 403",
+                "error code: 422",
+                "status code: 400",
+                "status code: 403",
+                "status code: 422",
+            )
+        )
+    )
+    unsupported_markers = (
+        "do not support multimodal",
+        "does not support multimodal",
+        "multimodal functionality",
+        "image input is not supported",
+        "image analysis is not supported",
+        "不支持多模态",
+        "不支持图片输入",
+        "不支持图像输入",
+    )
+    return is_supported_status and any(
+        marker in error_text for marker in unsupported_markers
+    )
+
+
+def _is_image_input_error(error: Exception) -> bool:
     error_text = str(error).lower()
     is_bad_request = (
         getattr(error, "status_code", None) == 400
@@ -459,8 +490,9 @@ def _is_invalid_image_error(error: Exception) -> bool:
         "invalid image",
         "failed to process image",
     )
-    return is_bad_request and any(
-        marker in error_text for marker in invalid_image_markers
+    return is_multimodal_unsupported_error(error) or (
+        is_bad_request
+        and any(marker in error_text for marker in invalid_image_markers)
     )
 
 
@@ -593,7 +625,7 @@ def _make_agent_node(
                 can_retry_without_images = (
                     not image_input_disabled
                     and call_number < limits.max_llm_calls
-                    and _is_invalid_image_error(e)
+                    and _is_image_input_error(e)
                 )
                 if can_retry_without_images:
                     sanitized_messages, removed_count = _remove_image_blocks(

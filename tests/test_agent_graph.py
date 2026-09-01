@@ -370,8 +370,9 @@ async def test_unknown_tools_remain_serial_by_default():
 
 
 class _InvalidImageThenResponseModel:
-    def __init__(self, response: AIMessage):
+    def __init__(self, response: AIMessage, error_message: str):
         self.response = response
+        self.error_message = error_message
         self.invoke_messages = []
 
     def bind_tools(self, tools):
@@ -380,20 +381,28 @@ class _InvalidImageThenResponseModel:
     async def ainvoke(self, messages):
         self.invoke_messages.append(messages)
         if len(self.invoke_messages) == 1:
-            raise RuntimeError(
-                "Error code: 400 - The image format is illegal and cannot be opened"
-            )
+            raise RuntimeError(self.error_message)
         return self.response
 
 
 @pytest.mark.asyncio
-async def test_invalid_image_error_retries_with_text_only_messages():
+@pytest.mark.parametrize("error_message", [
+    "Error code: 400 - The image format is illegal and cannot be opened",
+    (
+        "Error code: 403 - Free accounts do not support multimodal "
+        "functionality (image analysis)"
+    ),
+])
+async def test_image_provider_error_retries_with_text_only_messages(error_message):
     from nonebot_plugin_ai_groupmate.agent.graph import (
         AgentRunLimits,
         _make_agent_node,
     )
 
-    model = _InvalidImageThenResponseModel(AIMessage(content="recovered"))
+    model = _InvalidImageThenResponseModel(
+        AIMessage(content="recovered"),
+        error_message,
+    )
     agent_node = _make_agent_node(
         model,
         [],
@@ -423,6 +432,30 @@ async def test_invalid_image_error_retries_with_text_only_messages():
     )
     assert result["image_input_disabled"] is True
     assert result["llm_call_count"] == 2
+
+
+def test_scoped_multimodal_error_notice_is_actionable_and_redacted():
+    from nonebot_plugin_ai_groupmate.agent import _scoped_model_error_notice
+
+    provider_error = RuntimeError(
+        "Error code: 403 - Free accounts do not support multimodal "
+        "functionality (image analysis); api_key=<REDACTED>"
+    )
+
+    notice = _scoped_model_error_notice(provider_error, ("group", "group-1"))
+
+    assert notice is not None
+    assert "不支持图片输入" in notice
+    assert "/配置群API" in notice
+    assert "<REDACTED>" not in notice
+
+
+def test_global_model_error_does_not_generate_scoped_config_notice():
+    from nonebot_plugin_ai_groupmate.agent import _scoped_model_error_notice
+
+    notice = _scoped_model_error_notice(RuntimeError("Error code: 403"), None)
+
+    assert notice is None
 
 
 @pytest.mark.asyncio

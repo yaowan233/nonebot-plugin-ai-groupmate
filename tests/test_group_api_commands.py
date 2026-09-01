@@ -1,4 +1,7 @@
 import re
+from types import SimpleNamespace
+
+import pytest
 
 
 def _matcher_pattern(matcher) -> re.Pattern:
@@ -61,3 +64,60 @@ def test_submit_commands_capture_the_config_code_argument():
     assert matched is not None
     assert matched.group("arg").strip() == "AGC-2345-67AB-ABCD-EFGH"
     assert pattern.fullmatch("/提交api")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("chat_multimodal", [False, True])
+async def test_candidate_connection_checks_declared_image_capability(
+    monkeypatch,
+    chat_multimodal,
+):
+    from nonebot_plugin_ai_groupmate import group_api_commands
+
+    invoked_messages = []
+
+    class _Model:
+        async def ainvoke(self, messages):
+            invoked_messages.extend(messages)
+            return object()
+
+    async def fake_validate_provider(*args, **kwargs):
+        return None
+
+    config = SimpleNamespace(
+        agent_llm_timeout_seconds=30.0,
+        group_api_allowed_provider_hosts=[],
+    )
+    payload = SimpleNamespace(
+        base_url="https://example.com",
+        chat_multimodal=chat_multimodal,
+    )
+    monkeypatch.setattr(
+        group_api_commands,
+        "build_candidate_chat_config",
+        lambda payload, runtime_config: config,
+    )
+    monkeypatch.setattr(
+        group_api_commands,
+        "validate_group_provider_resolution",
+        fake_validate_provider,
+    )
+    monkeypatch.setattr(
+        group_api_commands,
+        "create_chat_llm",
+        lambda candidate_config: _Model(),
+    )
+    monkeypatch.setattr(
+        group_api_commands,
+        "validate_group_model_test_response",
+        lambda response: None,
+    )
+
+    await group_api_commands._test_candidate_connection(payload)
+
+    content = invoked_messages[0].content
+    if chat_multimodal:
+        assert isinstance(content, list)
+        assert any(block.get("type") == "image_url" for block in content)
+    else:
+        assert content == "请只回复 OK"
