@@ -152,6 +152,13 @@ curl http://127.0.0.1:6333/collections/media_collection_v3
 | ai_groupmate__vertex_location | 否 | `global` | ADC / 服务账号模式的 Vertex AI 区域；Express Mode API Key 下忽略 |
 | ai_groupmate__vertex_api_key | Express Mode 必填 | 无 | Vertex AI Express Mode API Key，可直接写入 NoneBot 的 `.env`；服务账号路径已配置时忽略 |
 | ai_groupmate__vertex_credentials_path | 否 | 无 | 容器内服务账号 JSON 路径；留空时使用 Application Default Credentials (ADC) |
+| ai_groupmate__google_web_detection_enabled | 否 | `false` | 启用 Google Cloud Vision Web Detection 反向搜图；仅在用户明确要求以图搜图、找原图、图源或出处时向 Agent 暴露 |
+| ai_groupmate__google_web_detection_credentials_path | 否 | 无 | 反向搜图服务账号 JSON 路径；留空时复用 `vertex_credentials_path`，再回退 ADC |
+| ai_groupmate__google_web_detection_project_id | 否 | 无 | 反向搜图计费项目 ID；留空时复用 `vertex_project`，再使用凭据自带项目 |
+| ai_groupmate__google_web_detection_monthly_limit | 否 | `900` | 整个 Bot 每个自然月的本地硬限额，范围 1～1000；缓存命中不计数，失败请求保守计数 |
+| ai_groupmate__google_web_detection_cache_days | 否 | `30` | 相同图片 SHA-256 的反向搜图结果缓存天数 |
+| ai_groupmate__google_web_detection_timeout_seconds | 否 | `20` | Google Web Detection 请求超时（秒） |
+| ai_groupmate__google_web_detection_max_results | 否 | `5` | 每类匹配网页、完整匹配图、局部匹配图和相似图的最大返回数，范围 1～10 |
 | ai_groupmate__vision_model | 否 | 无 | 图片回读辅助模型（如 `qwen-vl-max`）；主模型不支持图片时用它总结工具返回的图片内容，留空则跳过图片回读 |
 | ai_groupmate__vision_api_key | 否 | 无 | 图片回读辅助模型专用 API Key，留空则使用 `llm_api_key` / `qwen_token` |
 | ai_groupmate__vision_base_url | 否 | 无 | 图片回读辅助模型专用 Base URL，留空则使用 `llm_base_url` |
@@ -160,7 +167,7 @@ curl http://127.0.0.1:6333/collections/media_collection_v3
 | ai_groupmate__vision_input_cost_per_million | 否 | `0` | 图片回读辅助模型每百万输入 Token 费用，用于 WebUI 成本统计 |
 | ai_groupmate__vision_output_cost_per_million | 否 | `0` | 图片回读辅助模型每百万输出 Token 费用，用于 WebUI 成本统计 |
 | ai_groupmate__agent_timeout_seconds | 否 | `180` | 单次 agent 总运行超时（秒） |
-| ai_groupmate__agent_llm_timeout_seconds | 否 | `60` | 每次主模型调用超时（秒） |
+| ai_groupmate__agent_llm_timeout_seconds | 否 | `60` | 主模型首个流式片段及后续片段的等待超时（秒）；收到片段后重新计时，整轮仍受 agent_timeout_seconds 限制 |
 | ai_groupmate__agent_tool_timeout_seconds | 否 | `30` | 每次工具调用超时（秒） |
 | ai_groupmate__agent_max_concurrency | 否 | `4` | 全局同时运行的 Agent 上限，超出的请求在不占用数据库连接的状态下等待 |
 | ai_groupmate__agent_max_concurrency_per_group | 否 | `2` | 同一个群可同时处理的 @Bot 或连续追问数；后台插话仍保持单任务 |
@@ -289,6 +296,28 @@ ID、Location、服务账号。插件检测到该 Key 后会使用 Express Mode�
 `VERTEX_PROJECT` 和 `VERTEX_LOCATION`；认证优先级为服务账号 JSON → Vertex API
 Key → ADC。`AI_GROUPMATE__CHAT_API_KEY` 是其他接口使用的聊天模型 Key，在 Vertex
 模式下不会读取。
+
+Google Cloud Vision 反向搜图示例：
+
+```dotenv
+AI_GROUPMATE__GOOGLE_WEB_DETECTION_ENABLED=true
+AI_GROUPMATE__GOOGLE_WEB_DETECTION_PROJECT_ID=your-google-cloud-project
+AI_GROUPMATE__GOOGLE_WEB_DETECTION_CREDENTIALS_PATH=/app/secrets/google-vision-service-account.json
+# 默认 900，给 Google 每月前 1000 个免费单位留出余量
+AI_GROUPMATE__GOOGLE_WEB_DETECTION_MONTHLY_LIMIT=900
+```
+
+先在对应 Google Cloud 项目中启用 Cloud Vision API 和结算，再把服务账号 JSON
+只读挂载到容器。若已经配置 Vertex 服务账号和项目，可省略反向搜图专用的路径与
+项目 ID；也可全部留空使用 ADC。升级后必须执行 `nb orm upgrade` 创建缓存、月用量和最近搜图记录表。
+启用后，正常对话可使用反向搜图工具；仅在用户要求新搜索时调用，不再依赖关键词决定工具是否可见。
+有引用时只搜索被回复的图片，引用找不到会报错；没有引用时才搜索当前用户最近发送的图片。相同图片在默认 30 天缓存期内
+不会再次请求 Google。这里的 900 次限制只统计本 Bot 发出的请求；若同一 Google 项目
+还被其他程序使用，应把限制设得更低，并同时在 Google Cloud 设置预算告警或配额。
+
+最近一次搜图结果按会话和用户持久化保存，包含目标图片、时间、匹配链接和失败状态。
+追问“搜到了什么”时使用 `get_last_image_search_result` 读取证据，不重新联网；新搜图之后最多补查两次网页，再根据证据回答。
+明确叫 Bot 处理任务时保留文字回复工具；只发表情或 reaction 的模式仅用于 Bot 自主插话。
 
 固定知识示例（将群号和入群方式替换为自己的信息）：
 

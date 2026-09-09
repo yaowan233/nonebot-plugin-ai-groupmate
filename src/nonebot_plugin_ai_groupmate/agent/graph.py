@@ -1,4 +1,5 @@
 """LangGraph-based agent replacement for create_agent + middleware."""
+import re
 import json
 import time
 import asyncio
@@ -11,7 +12,7 @@ from nonebot.log import logger
 from langchain.tools import ToolRuntime
 from langgraph.graph import END, START, StateGraph
 from langchain_core.tools import BaseTool
-from langchain_core.messages import AIMessage, BaseMessage, ToolMessage, HumanMessage
+from langchain_core.messages import AIMessage, BaseMessage, ToolMessage, HumanMessage, message_chunk_to_message
 from langgraph.graph.message import add_messages
 from langchain_core.runnables import RunnableConfig
 from langchain_core.utils.function_calling import convert_to_openai_tool
@@ -42,7 +43,7 @@ EMPTY_RESPONSE_RETRY_PROMPT = (
     "确实不需要回应时必须调用 finish。不要再次返回空内容。"
 )
 BUDGET_FINALIZATION_PROMPT = (
-    "本轮 Agent 的累计 Token 已达到预算上限。现在停止搜索、计算和其他工具操作，"
+    "本轮 Agent 已达到处理预算上限。现在停止搜索、计算和其他工具操作，"
     "仅根据当前对话及已经取得的工具结果，整理一条尽可能完整、准确的最终回复。"
     "只输出要发送给用户的正文，不要调用任何工具；若资料仍不完整，请明确说明限制，"
     "不要编造。"
@@ -92,6 +93,98 @@ class _ToolInvocationOutcome:
     result: Any = None
     error: Exception | None = None
     timed_out: bool = False
+
+
+COMPLETION_RULE = (
+    "任务必须在本轮实际处理并交付结果；若无法完成，明确说明已知结论、卡点或缺少的条件。"
+    "不要只回复‘还在推/正在查/等下再回你’，也不要声称结束后仍会在后台工作。"
+    "只有定时任务工具已明确返回成功，才能承诺稍后自动回复。"
+    "next_step=end 表示整个任务本轮已结束，不是这一句话写完；"
+    "需要继续处理时先处理再回复，不要用进度闲聊替代结果。"
+)
+INCOMPLETE_REPLY_FALLBACK = "这次没能给出可靠结果，目前无法完成这项任务。刚才没有完成的部分不会在后台继续运行。"
+
+
+def _is_progress_only_reply(text: str) -> bool:
+    """Catch short, explicit work promises; leave substantive answers untouched."""
+    if len(text.strip()) > 240 or re.search(r"[？?]$|已确认|已查到|结论是|答案是|缺少.{0,12}条件|卡在", text):
+        return False
+    # Quoting someone else's promise is not making that promise.
+    text = re.sub(r'“[^”]*”|「[^」]*」|"[^"\n]*"|`[^`]*`', "", text)
+    return bool(re.search(
+        r"(?:等下|等会[儿]?|稍后|待会[儿]?|一会[儿]?).{0,25}(?:我.{0,10}(?:推|查|算|搜|整理)|再(?:回|发|告诉|给)你)"
+        r"|(?:我.{0,12})?(?:还在|正在|继续在).{0,12}(?:推(?:题|导|一下)?|查(?:找|询|资料)?|搜(?:索)?|计算|整理)(?:[^。！？\n]{0,45})$"
+        r"|(?:我先|让我|我再|等我).{0,12}(?:推|查|算|搜|整理).{0,15}(?:再回|再发|等我|稍等|等下)"
+        r"|(?:I'll|I will|I'm|I am) (?:keep working|still working|working on it|get back to you)",
+        text, re.IGNORECASE,
+    ))
+
+
+def _has_unfinished_reply(response: AIMessage, messages: Sequence[BaseMessage]) -> bool:
+    scheduled_calls = set()
+    for message in messages:
+        if isinstance(message, AIMessage):
+            scheduled_calls.update(call["id"] for call in message.tool_calls if call["name"] in {"schedule_agent_task", "schedule_message"})
+        elif isinstance(message, ToolMessage) and message.tool_call_id in scheduled_calls:
+            if tool_result_status(message.content) == "succeeded":
+                return False
+    texts = [_message_text_content(response)]
+    texts.extend(call.get("args", {}).get("content", "") for call in response.tool_calls if call["name"] == "reply_user")
+    return any(isinstance(text, str) and _is_progress_only_reply(text) for text in texts)
+
+
+async def _invoke_model_with_idle_timeout(
+    model: Any,
+    messages: Sequence[BaseMessage],
+    *,
+    timeout_seconds: float,
+    session_id: str,
+    request_kwargs: dict[str, Any],
+) -> AIMessage:
+    """Wait for each stream event separately; never execute partial tool calls."""
+    if not callable(getattr(model, "astream", None)):
+        # Custom non-streaming adapters can only time out waiting for a full reply.
+        return await asyncio.wait_for(
+            model.ainvoke(messages, **request_kwargs), timeout=timeout_seconds
+        )
+    stream = model.astream(messages, **request_kwargs)
+    combined = None
+    chunks = 0
+    started_at = time.perf_counter()
+    try:
+        while True:
+            try:
+                chunk = await asyncio.wait_for(anext(stream), timeout=timeout_seconds)
+            except StopAsyncIteration:
+                break
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"[AgentTrace] LLM stream_timeout session={session_id} "
+                    f"phase={'first_chunk' if chunks == 0 else 'idle'} "
+                    f"chunks={chunks} idle_timeout={timeout_seconds:.1f}s "
+                    f"elapsed_ms={(time.perf_counter() - started_at) * 1000:.0f}"
+                )
+                raise
+            chunks += 1
+            if chunks == 1:
+                logger.info(
+                    f"[AgentTrace] LLM stream_started session={session_id} "
+                    f"first_chunk_ms={(time.perf_counter() - started_at) * 1000:.0f}"
+                )
+            combined = chunk if combined is None else combined + chunk
+    finally:
+        if callable(getattr(stream, "aclose", None)):
+            await stream.aclose()
+    logger.info(
+        f"[AgentTrace] LLM stream_completed session={session_id} chunks={chunks} "
+        f"duration_ms={(time.perf_counter() - started_at) * 1000:.0f}"
+    )
+    if combined is None:
+        return AIMessage(content="")
+    response = message_chunk_to_message(combined)
+    if not isinstance(response, AIMessage):
+        raise TypeError("Expected an AI message from the model stream")
+    return response
 
 
 async def _invoke_tools_concurrently(
@@ -562,6 +655,30 @@ def _bind_model_tools(
     return model.bind(tools=[*formatted_local_tools, *builtin_tools])
 
 
+def _image_search_allowed_tools(messages: Sequence[BaseMessage]) -> set[str] | None:
+    """Once image evidence is available, bound verification and keep answering."""
+    calls: dict[str, str] = {}
+    outcomes: list[tuple[str, Any]] = []
+    for message in messages:
+        if isinstance(message, AIMessage):
+            calls.update({call["id"]: call["name"] for call in message.tool_calls})
+        elif isinstance(message, ToolMessage) and message.tool_call_id in calls:
+            outcomes.append((calls[message.tool_call_id], parse_tool_result(message.content) if isinstance(message.content, str) else None))
+    image_names = {"reverse_image_search", "get_last_image_search_result"}
+    image_outcomes = [(index, name, result) for index, (name, result) in enumerate(outcomes) if name in image_names]
+    if not image_outcomes:
+        return None
+    index, name, result = image_outcomes[-1]
+    allowed = {"reply_user", "finish"}
+    if result and result.get("status") == "succeeded":
+        # Reading a previous result is an answer to a follow-up, not a new task.
+        if name == "reverse_image_search" and sum(tool == "search_web" for tool, _ in outcomes[index + 1:]) < 2:
+            allowed.add("search_web")
+    elif name == "reverse_image_search" and result and result.get("retryable") and len(image_outcomes) < 2:
+        allowed.add("reverse_image_search")
+    return allowed
+
+
 def _make_agent_node(
     model: Any,
     base_tools: list[BaseTool],
@@ -580,15 +697,20 @@ def _make_agent_node(
             tools_by_skill,
             state.get("active_skills", []),
         )
+        image_search_tools = _image_search_allowed_tools(state["messages"])
+        if image_search_tools is not None:
+            visible_tools = [tool for tool in visible_tools if tool.name in image_search_tools]
         tool_names = tuple(tool.name for tool in visible_tools)
         bound_model = bound_models.get(tool_names)
         if bound_model is None:
             # Provider-side Responses tools execute inside the model request and
             # therefore must be bound to the model, but not registered in the
             # local tool node.
-            bound_model = _bind_model_tools(model, visible_tools, builtin_tools)
+            bound_model = _bind_model_tools(model, visible_tools, builtin_tools if image_search_tools is None else ())
             bound_models[tool_names] = bound_model
-        full: list[BaseMessage] = system_messages + list(state["messages"])
+        full: list[BaseMessage] = system_messages + [HumanMessage(content=COMPLETION_RULE)] + list(state["messages"])
+        if image_search_tools is not None:
+            full.append(HumanMessage(content="请根据刚才返回的原始搜图证据回答。匹配链接和已确认的信息优先；不要根据画风猜作者。当前已收紧工具范围，不能继续搜索时请直接说明证据与不确定之处，并以 reply_user(next_step='end') 完成本轮。"))
         call_messages = full
         call_number = state.get("llm_call_count", 0)
         input_tokens = state.get("llm_input_tokens", 0)
@@ -597,6 +719,7 @@ def _make_agent_node(
         cached_tokens = state.get("llm_cached_tokens", 0)
         cache_creation_tokens = state.get("llm_cache_creation_tokens", 0)
         retried_empty_response = False
+        rejected_progress_replies = 0
         image_input_disabled = state.get("image_input_disabled", False)
         if image_input_disabled:
             full, _ = _remove_image_blocks(full)
@@ -611,9 +734,11 @@ def _make_agent_node(
                     if request_kwargs_factory is not None
                     else {}
                 )
-                response: AIMessage = await asyncio.wait_for(
-                    bound_model.ainvoke(call_messages, **request_kwargs),
-                    timeout=limits.llm_timeout_seconds,
+                response = await _invoke_model_with_idle_timeout(
+                    bound_model, call_messages,
+                    timeout_seconds=limits.llm_timeout_seconds,
+                    session_id=str(state["session_id"]),
+                    request_kwargs=request_kwargs,
                 )
             except asyncio.TimeoutError:
                 logger.warning(
@@ -656,8 +781,27 @@ def _make_agent_node(
                 f"[AgentTrace] LLM session={state['session_id']} call={call_number} "
                 f"duration_ms={elapsed_ms:.0f} visible_tools={len(visible_tools)} "
                 f"builtin_tools={len(builtin_tools)} "
-                f"tokens={budget_tokens}{' (估算)' if not usage['total_tokens'] else ''}"
+                f"tokens={budget_tokens}{' (估算)' if not usage['total_tokens'] else ''} "
+                f"finish_reason={response.response_metadata.get('finish_reason', response.response_metadata.get('stop_reason', 'unknown'))}"
             )
+
+            if _has_unfinished_reply(response, full):
+                rejected_progress_replies += 1
+                logger.warning(
+                    f"[AgentTrace] unfinished_reply_blocked session={state['session_id']} "
+                    f"call={call_number} corrections={rejected_progress_replies}"
+                )
+                if rejected_progress_replies >= 2 or call_number >= limits.max_llm_calls or total_tokens >= limits.max_total_tokens:
+                    response = AIMessage(content=INCOMPLETE_REPLY_FALLBACK)
+                    break
+                # Nothing in this batch has run yet. Resolve every tool-call ID
+                # before retrying, including a simultaneous premature finish.
+                rejected_tools = [ToolMessage(
+                    content=tool_failure("unfinished_reply", "本批调用均未执行，进度承诺未发送。" + COMPLETION_RULE),
+                    tool_call_id=call["id"],
+                ) for call in response.tool_calls]
+                call_messages = [*full, response, *rejected_tools, HumanMessage(content=COMPLETION_RULE)]
+                continue
 
             has_output = bool(response.tool_calls or _message_text_content(response))
             can_retry = (
@@ -721,7 +865,7 @@ def _make_budget_finalizer_node(
     system_messages = normalize_system_messages(system_prompt)
 
     async def finalizer_node(state: AgentState) -> dict:
-        full: list[BaseMessage] = system_messages + list(state["messages"])
+        full: list[BaseMessage] = system_messages + [HumanMessage(content=COMPLETION_RULE)] + list(state["messages"])
         image_input_disabled = state.get("image_input_disabled", False)
         if image_input_disabled:
             full, _ = _remove_image_blocks(full)
@@ -743,9 +887,11 @@ def _make_budget_finalizer_node(
                 if request_kwargs_factory is not None
                 else {}
             )
-            response: AIMessage = await asyncio.wait_for(
-                model.ainvoke(call_messages, **request_kwargs),
-                timeout=limits.llm_timeout_seconds,
+            response = await _invoke_model_with_idle_timeout(
+                model, call_messages,
+                timeout_seconds=limits.llm_timeout_seconds,
+                session_id=str(state["session_id"]),
+                request_kwargs=request_kwargs,
             )
             elapsed_ms = (time.perf_counter() - started_at) * 1000
             usage = _log_llm_cache_usage(response)
@@ -761,9 +907,12 @@ def _make_budget_finalizer_node(
                 f"[AgentTrace] LLM session={state['session_id']} call={call_number} "
                 f"mode=budget_finalization duration_ms={elapsed_ms:.0f} "
                 "visible_tools=0 builtin_tools=0 "
-                f"tokens={budget_tokens}{' (估算)' if not usage['total_tokens'] else ''}"
+                f"tokens={budget_tokens}{' (估算)' if not usage['total_tokens'] else ''} "
+                f"finish_reason={response.response_metadata.get('finish_reason', response.response_metadata.get('stop_reason', 'unknown'))}"
             )
             final_text = _budget_final_reply_text(response)
+            if _has_unfinished_reply(response, full):
+                final_text = INCOMPLETE_REPLY_FALLBACK
         except Exception as e:
             elapsed_ms = (time.perf_counter() - started_at) * 1000
             logger.warning(
@@ -925,6 +1074,14 @@ def _make_tool_node(
                 continue
             tool_count += 1
 
+            image_search_tools = _image_search_allowed_tools([*state["messages"], *results])
+            if image_search_tools is not None and name not in image_search_tools:
+                results.append(ToolMessage(content=tool_skipped("image_search_budget_reached", "搜图已完成或达到补查上限，请根据已有证据用 reply_user 回答。"), tool_call_id=tool_call_id))
+                continue
+            if image_search_tools is not None and name == "finish" and reply_count == 0:
+                results.append(ToolMessage(content=tool_skipped("image_search_answer_required", "搜图结果尚未告知用户，请先用 reply_user 回答。"), tool_call_id=tool_call_id))
+                continue
+
             if name == "finish":
                 if has_pending_tool_work:
                     results.append(ToolMessage(
@@ -1077,6 +1234,7 @@ def _make_tool_node(
 
             if (
                 name in PARALLEL_SAFE_TOOL_NAMES
+                and image_search_tools is None
                 and tc_index not in parallel_outcomes
             ):
                 # Only batch a contiguous run that is already visible. This keeps
@@ -1382,6 +1540,13 @@ def _should_continue(state: AgentState, limits: AgentRunLimits) -> str:
     if state.get("reply_count", 0) >= MAX_REPLY_COUNT:
         logger.info("[Agent] 已达最大回复次数，结束本轮对话")
         return "end"
+    if (
+        _image_search_allowed_tools(state["messages"]) is not None
+        and state.get("reply_count", 0) == 0
+        and not state.get("budget_finalization_attempted", False)
+        and (state.get("tool_count", 0) >= MAX_TOOL_COUNT or state.get("llm_call_count", 0) >= limits.max_llm_calls)
+    ):
+        return "finalize"
     if state.get("tool_count", 0) >= MAX_TOOL_COUNT:
         logger.info("[Agent] 已达最大工具调用次数，结束本轮对话")
         return "end"

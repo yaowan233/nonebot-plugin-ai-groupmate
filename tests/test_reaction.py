@@ -46,6 +46,21 @@ def test_explicit_reaction_request_detection():
     assert plugin._is_explicit_meme_request("发五张卡通猫娘图")
 
 
+@pytest.mark.parametrize("text", [
+    "你搜图搜到了什么",
+    "搜图结果是什么",
+    "你找图找到了什么",
+    "这个表情包是什么意思",
+    "为什么给我发表情包",
+    "不要发表情包，告诉我搜索结果",
+    "帮我搜图 初音未来",
+])
+def test_image_search_and_questions_do_not_force_meme_only_mode(text):
+    import nonebot_plugin_ai_groupmate as plugin
+
+    assert not plugin._is_explicit_meme_request(text)
+
+
 def test_explicit_meme_send_count_is_parsed_and_capped():
     import nonebot_plugin_ai_groupmate as plugin
 

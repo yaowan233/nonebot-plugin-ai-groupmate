@@ -78,6 +78,19 @@ SETTING_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         ),
     ),
     (
+        "Google 反向搜图",
+        "仅在用户明确要求找原图、图源或图片出处时使用；缓存命中不消耗月额度。",
+        (
+            "google_web_detection_enabled",
+            "google_web_detection_credentials_path",
+            "google_web_detection_project_id",
+            "google_web_detection_monthly_limit",
+            "google_web_detection_cache_days",
+            "google_web_detection_timeout_seconds",
+            "google_web_detection_max_results",
+        ),
+    ),
+    (
         "快速决策模型",
         "用于 Gatekeeper 判断消息是否值得回复。",
         (
@@ -180,7 +193,7 @@ _DIRECT_LABELS = {
     "continuous_conversation_minutes": "连续对话窗口（分钟）",
     "personality_setting": "人格设定",
     "agent_timeout_seconds": "Agent 总超时（秒）",
-    "agent_llm_timeout_seconds": "单次模型超时（秒）",
+    "agent_llm_timeout_seconds": "模型首包/流式空闲超时（秒）",
     "agent_tool_timeout_seconds": "单次工具超时（秒）",
     "agent_max_concurrency": "Agent 全局并发上限",
     "agent_max_concurrency_per_group": "单群定向提问并发上限",
@@ -203,6 +216,13 @@ _DIRECT_LABELS = {
     "vertex_location": "Vertex 区域",
     "vertex_api_key": "Vertex API Key",
     "vertex_credentials_path": "服务账号 JSON 路径",
+    "google_web_detection_enabled": "启用 Google 反向搜图",
+    "google_web_detection_credentials_path": "反向搜图服务账号 JSON 路径",
+    "google_web_detection_project_id": "反向搜图计费项目 ID",
+    "google_web_detection_monthly_limit": "每月本地硬限额",
+    "google_web_detection_cache_days": "结果缓存天数",
+    "google_web_detection_timeout_seconds": "反向搜图超时（秒）",
+    "google_web_detection_max_results": "每类最大结果数",
     "tavily_api_key": "Tavily API Key",
     "qdrant_uri": "Qdrant 地址",
     "qdrant_api_key": "Qdrant API Key",
@@ -217,6 +237,18 @@ _DIRECT_LABELS = {
     "qwen_token": "旧版 Qwen Token",
 }
 _FIELD_HINTS = {
+    "google_web_detection_enabled": (
+        "开启后也只会在用户明确说“以图搜图、找原图、找图源、查图片出处”等请求中向 Agent 暴露工具。"
+    ),
+    "google_web_detection_credentials_path": (
+        "留空时先复用 Vertex 服务账号路径，再使用 Application Default Credentials。"
+    ),
+    "google_web_detection_project_id": (
+        "留空时先复用 Vertex 项目 ID，再使用凭据自带的项目；用于 x-goog-user-project 计费。"
+    ),
+    "google_web_detection_monthly_limit": (
+        "按 Bot 本地时间自然月统计，范围 1～1000；默认 900，为 Google 每月免费额度保留余量。"
+    ),
     "chat_responses_builtin_tools": (
         "可按需勾选，全部不选表示关闭。web_extractor 会自动同时启用收费的 web_search；"
         "工具在百炼服务器执行，可能产生额外工具费和 Token 费。"

@@ -10,6 +10,69 @@ if TYPE_CHECKING:
     from nonebot_plugin_ai_groupmate.agent.graph import AgentState
 
 
+def test_image_search_policy_keeps_reply_and_limits_followup_searches():
+    from langchain_core.messages import ToolMessage
+
+    from nonebot_plugin_ai_groupmate.agent.graph import _image_search_allowed_tools
+    from nonebot_plugin_ai_groupmate.agent.tool_results import tool_success
+
+    messages = [AIMessage(content="", tool_calls=[{"name": "reverse_image_search", "args": {}, "id": "image"}]), ToolMessage(content=tool_success("matches", "found"), tool_call_id="image")]
+    allowed = _image_search_allowed_tools(messages)
+    assert allowed == {"reply_user", "finish", "search_web"}
+    for i in range(2):
+        messages.extend([AIMessage(content="", tool_calls=[{"name": "search_web", "args": {}, "id": str(i)}]), ToolMessage(content="found", tool_call_id=str(i))])
+    assert _image_search_allowed_tools(messages) == {"reply_user", "finish"}
+    assert _image_search_allowed_tools([]) is None
+
+
+def test_image_search_followup_answers_from_record_and_budget_finalizes():
+    from langchain_core.messages import ToolMessage
+
+    from nonebot_plugin_ai_groupmate.agent import graph as module
+    from nonebot_plugin_ai_groupmate.agent.tool_results import tool_success
+
+    state = _state(AIMessage(content="", tool_calls=[{"name": "get_last_image_search_result", "args": {}, "id": "record"}]))
+    state["messages"].append(ToolMessage(content=tool_success("last_image_search_loaded", "record"), tool_call_id="record"))
+    assert module._image_search_allowed_tools(state["messages"]) == {"reply_user", "finish"}
+    state["llm_call_count"] = 8
+    assert module._should_continue(state, module.AgentRunLimits()) == "finalize"
+
+
+def test_image_search_failure_allows_only_one_retry():
+    from langchain_core.messages import ToolMessage
+
+    from nonebot_plugin_ai_groupmate.agent.graph import _image_search_allowed_tools
+    from nonebot_plugin_ai_groupmate.agent.tool_results import tool_failure
+
+    messages = []
+    for i in range(2):
+        messages.extend([AIMessage(content="", tool_calls=[{"name": "reverse_image_search", "args": {}, "id": str(i)}]), ToolMessage(content=tool_failure("provider_unavailable", "failed", retryable=True), tool_call_id=str(i))])
+        expected = {"reply_user", "finish", "reverse_image_search"} if i == 0 else {"reply_user", "finish"}
+        assert _image_search_allowed_tools(messages) == expected
+
+
+@pytest.mark.asyncio
+async def test_image_search_policy_blocks_excess_searches_in_same_batch():
+    from langchain_core.messages import ToolMessage
+
+    from nonebot_plugin_ai_groupmate.agent import graph as module
+    from nonebot_plugin_ai_groupmate.agent.tool_results import tool_success
+    calls = []
+
+    @tool("search_web")
+    async def search_web(query: str) -> str:
+        """Search the web."""
+        calls.append(query)
+        return tool_success("found", "result")
+
+    state = _state(AIMessage(content="", tool_calls=[{"name": "search_web", "args": {"query": str(i)}, "id": str(i)} for i in range(3)]))
+    state["messages"] = [AIMessage(content="", tool_calls=[{"name": "reverse_image_search", "args": {}, "id": "image"}]), ToolMessage(content=tool_success("matches", "found"), tool_call_id="image"), *state["messages"]]
+    node = module._make_tool_node({"search_web": search_web}, [search_web], {}, module.AgentRunLimits())
+    result = await node(state)
+    assert calls == ["0", "1"]
+    assert json.loads(result["messages"][-1].content)["reason_code"] == "image_search_budget_reached"
+
+
 def _state(message: AIMessage, *, tool_count: int = 0) -> "AgentState":
     return {
         "messages": [message],
@@ -1560,3 +1623,223 @@ async def test_successful_tool_commits_before_returning_to_model():
     )
 
     assert session.commit_count == 1
+
+
+@pytest.mark.asyncio
+async def test_stream_progress_survives_single_call_timeout():
+    from langchain_core.messages import AIMessageChunk
+
+    from nonebot_plugin_ai_groupmate.agent.graph import AgentRunLimits, _make_agent_node
+
+    class StreamingModel(_ToolSpyModel):
+        async def astream(self, messages, **kwargs):
+            for _ in range(8):
+                await asyncio.sleep(0.02)
+                yield AIMessageChunk(content="", additional_kwargs={"reasoning_content": "thinking "})
+            yield AIMessageChunk(content="done", usage_metadata={"input_tokens": 3, "output_tokens": 8, "total_tokens": 11})
+
+        async def ainvoke(self, messages, **kwargs):
+            result = None
+            async for chunk in self.astream(messages, **kwargs):
+                result = chunk if result is None else result + chunk
+            return result
+
+    node = _make_agent_node(StreamingModel([]), [], "system", {}, AgentRunLimits(llm_timeout_seconds=0.1))
+    result = await node(_state(AIMessage(content="question")))
+    message = result["messages"][0]
+    assert type(message) is AIMessage
+    assert message.content == "done"
+    assert message.additional_kwargs["reasoning_content"] == "thinking " * 8
+    assert message.usage_metadata["total_tokens"] == 11
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first_chunk", [False, True])
+async def test_stream_idle_timeout_closes_without_returning_partial_tools(first_chunk):
+    from langchain_core.messages import AIMessageChunk
+
+    from nonebot_plugin_ai_groupmate.agent.graph import _invoke_model_with_idle_timeout
+
+    closed = asyncio.Event()
+
+    class Model:
+        async def astream(self, messages, **kwargs):
+            try:
+                if first_chunk:
+                    yield AIMessageChunk(content="", tool_call_chunks=[{"name": "reply_user", "args": '{"text":', "id": "call", "index": 0}])
+                await asyncio.Event().wait()
+            finally:
+                closed.set()
+
+    with pytest.raises(asyncio.TimeoutError):
+        await _invoke_model_with_idle_timeout(Model(), [], timeout_seconds=0.05, session_id="test", request_kwargs={})
+    assert closed.is_set()
+
+
+@pytest.mark.asyncio
+async def test_stream_cancellation_closes_upstream():
+    from langchain_core.messages import AIMessageChunk
+
+    from nonebot_plugin_ai_groupmate.agent.graph import _invoke_model_with_idle_timeout
+
+    started = asyncio.Event()
+    closed = asyncio.Event()
+
+    class Model:
+        async def astream(self, messages, **kwargs):
+            try:
+                yield AIMessageChunk(content="partial")
+                started.set()
+                await asyncio.Event().wait()
+            finally:
+                closed.set()
+
+    task = asyncio.create_task(_invoke_model_with_idle_timeout(Model(), [], timeout_seconds=10, session_id="test", request_kwargs={}))
+    await asyncio.wait_for(started.wait(), timeout=1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert closed.is_set()
+
+
+@pytest.mark.asyncio
+async def test_openai_sse_reasoning_resets_idle_timeout_and_assembles_tools():
+    import httpx
+    from langchain_openai import ChatOpenAI
+
+    from nonebot_plugin_ai_groupmate.agent.graph import _invoke_model_with_idle_timeout
+
+    class SSEBody(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            deltas = [{"reasoning_content": "thinking"}] * 8 + [
+                {"tool_calls": [{"index": 0, "id": "call", "type": "function", "function": {"name": "reply_user", "arguments": '{"text":'}}]},
+                {"tool_calls": [{"index": 0, "function": {"arguments": '"done"}'}}]},
+            ]
+            for delta in deltas:
+                await asyncio.sleep(0.2)
+                event = {"id": "reply", "object": "chat.completion.chunk", "created": 0, "model": "test", "choices": [{"index": 0, "delta": delta, "finish_reason": None}]}
+                yield ("data: " + json.dumps(event) + "\n\n").encode()
+            yield b"data: [DONE]\n\n"
+
+    def handler(request):
+        assert json.loads(request.content)["stream"] is True
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=SSEBody())
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        model = ChatOpenAI(model="test", api_key="test", base_url="https://test.invalid/v1", http_async_client=client, max_retries=0)
+        response = await _invoke_model_with_idle_timeout(model, [AIMessage(content="question")], timeout_seconds=1.0, session_id="test", request_kwargs={})
+    assert type(response) is AIMessage
+    assert response.tool_calls == [{"name": "reply_user", "args": {"text": "done"}, "id": "call", "type": "tool_call"}]
+
+
+@pytest.mark.asyncio
+async def test_budget_finalizer_uses_stream_progress():
+    from langchain_core.messages import AIMessageChunk
+
+    from nonebot_plugin_ai_groupmate.agent.graph import AgentRunLimits, _make_budget_finalizer_node
+
+    class Model:
+        async def astream(self, messages, **kwargs):
+            for _ in range(8):
+                await asyncio.sleep(0.02)
+                yield AIMessageChunk(content="answer ")
+
+    node = _make_budget_finalizer_node(Model(), "system", AgentRunLimits(llm_timeout_seconds=0.1))
+    result = await node(_state(AIMessage(content="question")))
+    assert result["messages"][0].content.strip() == ("answer " * 8).strip()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("direct", [False, True])
+async def test_progress_promise_is_not_sent_as_completed_reply(direct):
+    from nonebot_plugin_ai_groupmate.agent.graph import build_chat_graph
+
+    replies = []
+
+    @tool("reply_user")
+    async def reply_user(content: str, next_step: str) -> str:
+        """Record a reply."""
+        replies.append(content)
+        return "sent"
+
+    promise = "神社那条函数题等下我推一下再回你 别催"
+    response = AIMessage(content=promise) if direct else AIMessage(content="", tool_calls=[
+        {"name": "reply_user", "args": {"content": promise, "next_step": "end"}, "id": "promise"},
+        {"name": "finish", "args": {}, "id": "finish"},
+    ])
+    answer = "目前无法完成证明，卡在递推关系的收敛性，不能确定答案。"
+    model = _ToolSpyModel([response, AIMessage(content=answer)])
+    graph = build_chat_graph(model, [reply_user], "system")
+    await graph.ainvoke(_state(AIMessage(content="你推出来了吗")))
+    assert replies == [answer]
+    assert model.invoke_count == 2
+
+
+@pytest.mark.parametrize("text", [
+    "还在推 这递归套娃套得我头疼",
+    "？你才杂鱼 我这不还在这给你推题呢",
+    "等我查一下再回你",
+    "我稍后再回你",
+])
+def test_progress_reply_detection(text):
+    from nonebot_plugin_ai_groupmate.agent.graph import _is_progress_only_reply
+    assert _is_progress_only_reply(text)
+
+
+@pytest.mark.parametrize("text", [
+    "目前无法完成证明，缺少初始条件。",
+    "答案是 42，代入递推公式可验证。",
+    "他说“等下我推一下再回你”，实际上没有继续。",
+    "你还在推吗？",
+    "我还在查，但已确认错误来自参数缺失。",
+])
+def test_progress_guard_allows_results_limitations_and_quotes(text):
+    from nonebot_plugin_ai_groupmate.agent.graph import _is_progress_only_reply
+    assert not _is_progress_only_reply(text)
+
+
+@pytest.mark.asyncio
+async def test_repeated_progress_promises_stop_with_honest_fallback():
+    from nonebot_plugin_ai_groupmate.agent.graph import INCOMPLETE_REPLY_FALLBACK, build_chat_graph
+    replies = []
+
+    @tool("reply_user")
+    async def reply_user(content: str, next_step: str) -> str:
+        """Record a reply."""
+        replies.append(content)
+        return "sent"
+
+    model = _ToolSpyModel([AIMessage(content="还在推 这递归套娃套得我头疼")] * 2)
+    await build_chat_graph(model, [reply_user], "system").ainvoke(_state(AIMessage(content="question")))
+    assert replies == [INCOMPLETE_REPLY_FALLBACK]
+    assert model.invoke_count == 2
+
+
+def test_confirmed_schedule_can_promise_later_reply():
+    from langchain_core.messages import ToolMessage
+
+    from nonebot_plugin_ai_groupmate.agent.graph import _has_unfinished_reply
+    from nonebot_plugin_ai_groupmate.agent.tool_results import tool_failure, tool_success
+
+    call = AIMessage(content="", tool_calls=[{"name": "schedule_agent_task", "args": {}, "id": "schedule"}])
+    response = AIMessage(content="我稍后再回你")
+    assert not _has_unfinished_reply(response, [call, ToolMessage(content=tool_success("scheduled", "ok"), tool_call_id="schedule")])
+    assert _has_unfinished_reply(response, [call, ToolMessage(content=tool_failure("failed", "error"), tool_call_id="schedule")])
+
+
+@pytest.mark.asyncio
+async def test_finalizer_cannot_send_another_progress_promise():
+    from nonebot_plugin_ai_groupmate.agent.graph import INCOMPLETE_REPLY_FALLBACK, AgentRunLimits, _make_budget_finalizer_node
+    node = _make_budget_finalizer_node(_ToolSpyModel([AIMessage(content="等我查一下再回你")]), "system", AgentRunLimits())
+    result = await node(_state(AIMessage(content="question")))
+    assert result["messages"][0].content == INCOMPLETE_REPLY_FALLBACK
+
+
+@pytest.mark.asyncio
+async def test_progress_correction_respects_model_call_budget():
+    from nonebot_plugin_ai_groupmate.agent.graph import INCOMPLETE_REPLY_FALLBACK, AgentRunLimits, _make_agent_node
+    model = _ToolSpyModel([AIMessage(content="还在推 这递归套娃套得我头疼")])
+    node = _make_agent_node(model, [], "system", {}, AgentRunLimits(max_llm_calls=1))
+    result = await node(_state(AIMessage(content="question")))
+    assert result["messages"][0].content == INCOMPLETE_REPLY_FALLBACK
+    assert model.invoke_count == 1

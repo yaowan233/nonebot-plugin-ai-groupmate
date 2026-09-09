@@ -10,6 +10,7 @@ authors = [
 dependencies = [
     "cryptography>=45.0.0",
     "datasets>=3.4.1",
+    "google-auth[requests]>=2.0.0",
     "httpx>=0.28.0",
     "jieba>=0.42.1",
     "langchain>=1.1.0",

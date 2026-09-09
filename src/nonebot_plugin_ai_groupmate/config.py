@@ -104,6 +104,17 @@ class ScopedConfig(BaseModel):
     vertex_api_key: str = ""
     vertex_credentials_path: str = ""
 
+    # === Google Cloud Vision Web Detection（反向搜图） ===
+    # 凭据留空时回退复用 Vertex 凭据，再回退 ADC。默认关闭，且把本地
+    # 月用量硬限制在免费额度以内，避免 Agent 误调用产生意外费用。
+    google_web_detection_enabled: bool = False
+    google_web_detection_credentials_path: str = ""
+    google_web_detection_project_id: str = ""
+    google_web_detection_monthly_limit: int = Field(default=900, ge=1, le=1000)
+    google_web_detection_cache_days: int = Field(default=30, ge=1, le=365)
+    google_web_detection_timeout_seconds: float = Field(default=20.0, gt=0, le=60)
+    google_web_detection_max_results: int = Field(default=5, ge=1, le=10)
+
     # === 快速决策模型（Gatekeeper） ===
     flash_model: str = "qwen-flash"
     flash_api_key: str = ""

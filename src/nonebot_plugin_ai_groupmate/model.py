@@ -229,6 +229,38 @@ class GlobalModelPrivateUserUsage(Model):
     )
 
 
+class LastImageSearch(Model):
+    """Last search outcome for one user in one conversation."""
+
+    session_id: Mapped[str] = mapped_column(String(255), primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(255), primary_key=True)
+    result: Mapped[dict[str, object]] = mapped_column(JSON)
+    updated_at: Mapped[datetime] = mapped_column(default=datetime.now)
+
+
+class GoogleWebDetectionCache(Model):
+    """Normalized Web Detection result cached by the image SHA-256."""
+
+    image_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    result: Mapped[dict[str, object]] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(default=datetime.now, index=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        default=datetime.now,
+        onupdate=datetime.now,
+    )
+
+
+class GoogleWebDetectionUsage(Model):
+    """Global per-Bot monthly request counter for the Google free-tier guard."""
+
+    usage_month: Mapped[str] = mapped_column(String(7), primary_key=True)
+    used_count: Mapped[int] = mapped_column(Integer, default=0)
+    updated_at: Mapped[datetime] = mapped_column(
+        default=datetime.now,
+        onupdate=datetime.now,
+    )
+
+
 class ChatHistorySchema(BaseModel):
     msg_id: int
     session_id: str

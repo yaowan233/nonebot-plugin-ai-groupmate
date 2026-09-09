@@ -100,6 +100,7 @@ from .group_model_config import (
     load_or_create_local_encryption_key,
 )
 from .relation_maintenance import count_negative_relations, reset_negative_relations
+from .agent.web_image_search import is_explicit_web_image_search_request
 
 
 async def _safe_rollback(db_session) -> None:
@@ -347,21 +348,25 @@ def _is_explicit_meme_request(text: str) -> bool:
     normalized = " ".join((text or "").strip().lower().split())
     if not normalized:
         return False
-    if "表情包" in normalized:
-        return True
+    if is_explicit_web_image_search_request(normalized):
+        return False
+    # Only explicit image-delivery requests may remove the normal reply tools.
+    # Search requests and questions about images need the full conversation flow.
+    if re.search(r"什么|为何|怎么|结果|来源|出处|不要|别|不用", normalized):
+        return False
     return bool(
         re.search(
-            r"(?:发|来|整|找|搜|给)"
+            r"(?:发|来|整|给)"
             r"(?:(?:\d{1,3}|[一二两三四五六七八九十]{1,3})(?:张|个)?"
             r"|一个|个|点|些|一下|几张|张)?(?:图片|图|表情)"
-            r"|(?:图片|图|表情)(?:发|来|整|找|搜)"
+            r"|(?:图片|图|表情)(?:发|来|整)"
             r"(?:(?:\d{1,3}|[一二两三四五六七八九十]{1,3})(?:张|个)?"
             r"|一个|个|点|些|一下)?"
             r"|(?:图片|图|表情包)(?:呢|在哪)[？?]?($|\s)",
             normalized,
         )
         or re.search(
-            r"(?:发|来|整|找|搜|给)"
+            r"(?:发|来|整|给)"
             r"(?:(?:\d{1,3}|[一二两三四五六七八九十]{1,3})(?:张|个)?"
             r"|一个|个|点|些|一下|几张|张)"
             r"[^，。！？?\n]{1,20}?(?:图片|图|表情)",
@@ -938,10 +943,10 @@ async def handle_message(
     if meme_required:
         random_reply_sample = False
         proactive_reaction_only = False
-        proactive_meme_only = True
+        proactive_meme_only = False
     elif reaction_required:
         random_reply_sample = False
-        proactive_reaction_only = True
+        proactive_reaction_only = False
         proactive_meme_only = False
     should_reply = to_me or continuous_to_me or random_reply_sample or proactive_reaction_only or proactive_meme_only or repeat_reply_sample
     if explicit_to_me or continuous_to_me:
@@ -1104,10 +1109,18 @@ async def process_image_message(
                     Select(ChatHistory).where(
                         ChatHistory.session_id == session.scene.id,
                         ChatHistory.media_id == media_obj.media_id,
+                        ChatHistory.user_id == session.user.id,
                         ChatHistory.created_at >= time_window,
                     )
                 )
-                if existing_img.scalar_one_or_none():
+                existing_image = existing_img.scalar_one_or_none()
+                if existing_image:
+                    # Different bot accounts assign different IDs to the same
+                    # message. Retain aliases while keeping the filename last.
+                    message_marker = content_prefix.splitlines()[0]
+                    if message_marker.startswith("id: ") and f"{message_marker}\n" not in existing_image.content:
+                        header, separator, filename = existing_image.content.rpartition("\n")
+                        existing_image.content = f"{header}{separator}alias_{message_marker}\n{filename}"
                     logger.debug("图片记录已存在，跳过重复")
                 else:
                     chat_history = ChatHistory(

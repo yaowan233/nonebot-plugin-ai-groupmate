@@ -77,6 +77,8 @@ def create_reply_tool(
             content: 你想发送的内容。
             next_step: 发送后是否还需要继续思考并发送下一条。单条回复填 end；
                 只有下一条会提供新信息时填 continue，最后一条必须填 end。
+                end 表示本轮任务结束。不要发送“还在推/等下再回你”等空承诺；
+                应先完成处理，给出结果，或明确说明无法完成及具体卡点。
         """
         if request_id is not None and not await is_request_active(
             session_id, request_id
