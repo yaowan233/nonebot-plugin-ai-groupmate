@@ -1,9 +1,11 @@
 import json
 import datetime
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import AsyncMock
 
 import pytest
+from nonebot.adapters import Bot, Event
 
 
 @pytest.mark.asyncio
@@ -48,7 +50,7 @@ async def test_private_recall_permissions(monkeypatch, sender, age_minutes, foun
     monkeypatch.setattr(recall_tools, "message_recall", recall)
     reader = recall_tools.create_recall_message_tool(
         session, "private-1", None,
-        bot_name="bot", has_admin_permission=False, bot=bot, event=event,
+        bot_name="bot", has_admin_permission=False, bot=cast(Bot, bot), event=cast(Event, event),
     )
     result = json.loads(await reader.ainvoke({"target_msg_id": "123"}))
 

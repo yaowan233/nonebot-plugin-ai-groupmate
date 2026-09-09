@@ -1,7 +1,8 @@
 import json
-from typing import Any
+from typing import Any, cast
 
 import pytest
+from nonebot.adapters import Bot
 
 
 class _FakeBot:
@@ -26,13 +27,14 @@ async def test_forward_tool_returns_image_and_text_to_model():
         {"type": "image", "data": {"url": url}},
         {"type": "text", "data": {"text": "图片后面的文字"}},
     ]}]}})
-    reader = create_read_forward_message_tool(bot, {"mixed"})
+    reader = create_read_forward_message_tool(cast(Bot, bot), {"mixed"})
     result = await reader.ainvoke({"forward_id": "mixed"})
     text, blocks = _normalize_tool_result(result)
 
     assert "图片后面的文字" in text
     assert blocks is not None
     message = await _build_extra_content_message(blocks, supports_images=True, image_summarizer=None)
+    assert isinstance(message.content, list)
     assert {"type": "image_url", "image_url": {"url": url}} in message.content
 
     async def summarize(content):
@@ -59,14 +61,14 @@ async def test_forward_images_nested_limit_and_unavailable():
             {"type": "text", "data": {"text": "内层文字"}},
         ]}]},
     })
-    result = await create_read_forward_message_tool(bot, {"outer"}).ainvoke({"forward_id": "outer"})
+    result = await create_read_forward_message_tool(cast(Bot, bot), {"outer"}).ainvoke({"forward_id": "outer"})
     text, blocks = _normalize_tool_result(result)
     assert "外层文字" in text
     assert "内层文字" in text
     assert "转发图片 1，无法读取" in text
     assert "超过本次读取数量上限" in text
     assert blocks is not None
-    assert len([block for block in blocks if block["type"] == "image_url"]) == 2
+    assert len([block for block in blocks if isinstance(block, dict) and block.get("type") == "image_url"]) == 2
 
 
 @pytest.mark.asyncio
@@ -84,15 +86,16 @@ async def test_forward_image_resolves_file_id_and_base64():
             assert data == {"file": "image-id"}
             return {"data": {"url": "https://example.com/resolved.png"}}
 
-    assert await _forward_image_source(ImageBot(), {"file": "image-id"}) == "https://example.com/resolved.png"
+    bot = cast(Bot, ImageBot())
+    assert await _forward_image_source(bot, {"file": "image-id"}) == "https://example.com/resolved.png"
     buffer = io.BytesIO()
     Image.new("RGB", (2, 2), "red").save(buffer, format="PNG")
     encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
     for prefix in ("base64://", "data:image/png;base64,"):
-        result = await _forward_image_source(ImageBot(), {"file": prefix + encoded})
+        result = await _forward_image_source(bot, {"file": prefix + encoded})
         assert result is not None
         assert result.startswith("data:image/")
-    assert await _forward_image_source(ImageBot(), {"file": "base64://invalid"}) is None
+    assert await _forward_image_source(bot, {"file": "base64://invalid"}) is None
 
 
 @pytest.mark.asyncio
@@ -111,7 +114,7 @@ async def test_agent_reads_text_in_cq_forward_with_large_image(image_first):
             {"sender": {"nickname": "Bob"}, "message": "下一条文字"},
         ]},
     })
-    reader = create_read_forward_message_tool(bot, {"mixed"})
+    reader = create_read_forward_message_tool(cast(Bot, bot), {"mixed"})
 
     result = json.loads(await reader.ainvoke({"forward_id": "mixed"}))
     body = result["data"]["content"]
@@ -140,7 +143,7 @@ async def test_cq_forward_preserves_escaped_text_nested_ids_and_media():
     })
 
     result = await expand_forward_message(
-        bot, register_media=registry.register_forwarded, forward_id="outer",
+        cast(Bot, bot), register_media=registry.register_forwarded, forward_id="outer",
     )
 
     assert "[CQ:image,file=literal] & [图片]图片后文字" in result
