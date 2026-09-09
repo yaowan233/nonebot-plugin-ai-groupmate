@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import json
 import datetime
 from typing import Any
@@ -51,12 +52,42 @@ def _segment_data(segment: Any) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+def _parse_cq_segments(content: str) -> Iterable[dict[str, Any]]:
+    """Normalize CQ strings before media payloads consume the text budget."""
+    def unescape(value: str) -> str:
+        return (
+            value.replace("&#91;", "[")
+            .replace("&#93;", "]")
+            .replace("&#44;", ",")
+            .replace("&amp;", "&")
+        )
+
+    offset = 0
+    for match in re.finditer(
+        r"\[CQ:(?P<type>[a-zA-Z0-9_.-]+)"
+        r"(?P<params>(?:,[a-zA-Z0-9_.-]+=[^,\]]*)*),?\]",
+        content,
+    ):
+        if match.start() > offset:
+            yield {"type": "text", "data": {"text": unescape(content[offset:match.start()])}}
+        data = {}
+        for param in match.group("params").split(","):
+            if param:
+                key, value = param.split("=", 1)
+                data[key] = unescape(value)
+        yield {"type": match.group("type"), "data": data}
+        offset = match.end()
+    if offset < len(content):
+        yield {"type": "text", "data": {"text": unescape(content[offset:])}}
+
+
 def _format_segments(
     segments: Any,
     register_media: Callable[[MediaKind, dict[str, Any]], str] | None = None,
+    register_image: Callable[[dict[str, Any]], str] | None = None,
 ) -> tuple[str, list[str]]:
     if isinstance(segments, str):
-        return segments, []
+        segments = _parse_cq_segments(segments)
     if not isinstance(segments, Iterable) or isinstance(segments, (dict, bytes)):
         return str(segments or ""), []
 
@@ -103,6 +134,8 @@ def _format_segments(
                     f"[{label}，内容未读取，media_ref: {media_ref}；"
                     f"需要时调用 read_{kind}_message]"
                 )
+        elif segment_type == "image" and register_image is not None:
+            parts.append(register_image(data))
         elif segment_type in placeholders:
             parts.append(placeholders[segment_type])
         elif segment_type:
@@ -167,6 +200,7 @@ async def _expand_forward_id(
     depth: int,
     budget: _ForwardBudget,
     register_media: Callable[[MediaKind, dict[str, Any]], str] | None = None,
+    register_image: Callable[[dict[str, Any]], str] | None = None,
 ) -> list[str]:
     if depth > MAX_FORWARD_DEPTH:
         budget.truncated = True
@@ -185,12 +219,12 @@ async def _expand_forward_id(
 
     lines: list[str] = []
     for node in nodes:
-        if budget.nodes >= MAX_FORWARD_NODES:
+        if budget.nodes >= MAX_FORWARD_NODES or budget.chars >= MAX_FORWARD_CHARS:
             budget.truncated = True
             break
         budget.nodes += 1
         name, uid, content, timestamp = _node_fields(node)
-        body, nested_ids = _format_segments(content, register_media)
+        body, nested_ids = _format_segments(content, register_media, register_image)
         identity = f"{name}({uid})" if uid else name
         time_text = _format_time(timestamp)
         prefix = f"[{time_text}] " if time_text else ""
@@ -204,6 +238,7 @@ async def _expand_forward_id(
                 depth=depth + 1,
                 budget=budget,
                 register_media=register_media,
+                register_image=register_image,
             )
             lines.extend(f"  {item}" for item in nested_lines)
     return lines
@@ -251,6 +286,7 @@ async def expand_forward_message(
     forward_id: str,
     *,
     register_media: Callable[[MediaKind, dict[str, Any]], str] | None = None,
+    register_image: Callable[[dict[str, Any]], str] | None = None,
 ) -> str:
     """Resolve one merged-forward ID into bounded, model-readable text."""
     budget = _ForwardBudget()
@@ -260,6 +296,7 @@ async def expand_forward_message(
         depth=1,
         budget=budget,
         register_media=register_media,
+        register_image=register_image,
     )
     sections = ["【合并转发聊天记录】\n" + "\n".join(lines)]
     if budget.truncated:

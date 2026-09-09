@@ -806,7 +806,8 @@ async def handle_message(
         body += media_text
         is_text = True
 
-    if to_me and not has_at_mention:
+    # 私聊默认 to_me，不代表用户在正文中提及了机器人。
+    if to_me and not has_at_mention and session.scene.type != SceneType.PRIVATE:
         reply_to_bot = False
         if reply := getattr(event, "reply", None):
             try:

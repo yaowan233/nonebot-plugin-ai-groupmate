@@ -17,6 +17,141 @@ class _FakeBot:
 
 
 @pytest.mark.asyncio
+async def test_forward_tool_returns_image_and_text_to_model():
+    from nonebot_plugin_ai_groupmate.agent.graph import _normalize_tool_result, _build_extra_content_message
+    from nonebot_plugin_ai_groupmate.agent.forward_tools import create_read_forward_message_tool
+
+    url = "https://example.com/forward.png"
+    bot = _FakeBot({"mixed": {"messages": [{"message": [
+        {"type": "image", "data": {"url": url}},
+        {"type": "text", "data": {"text": "图片后面的文字"}},
+    ]}]}})
+    reader = create_read_forward_message_tool(bot, {"mixed"})
+    result = await reader.ainvoke({"forward_id": "mixed"})
+    text, blocks = _normalize_tool_result(result)
+
+    assert "图片后面的文字" in text
+    assert blocks is not None
+    message = await _build_extra_content_message(blocks, supports_images=True, image_summarizer=None)
+    assert {"type": "image_url", "image_url": {"url": url}} in message.content
+
+    async def summarize(content):
+        assert {"type": "image_url", "image_url": {"url": url}} in content
+        return "图片中的文字"
+
+    fallback = await _build_extra_content_message(blocks, supports_images=False, image_summarizer=summarize)
+    assert "图片中的文字" in fallback.content
+
+
+@pytest.mark.asyncio
+async def test_forward_images_nested_limit_and_unavailable():
+    from nonebot_plugin_ai_groupmate.agent.graph import _normalize_tool_result
+    from nonebot_plugin_ai_groupmate.agent.forward_tools import create_read_forward_message_tool
+
+    bot = _FakeBot({
+        "outer": {"messages": [{"message": [
+            {"type": "text", "data": {"text": "外层文字"}},
+            {"type": "forward", "data": {"id": "inner"}},
+        ]}]},
+        "inner": {"messages": [{"message": [
+            {"type": "image", "data": {}},
+            *[{"type": "image", "data": {"url": f"https://example.com/{i}.png"}} for i in range(4)],
+            {"type": "text", "data": {"text": "内层文字"}},
+        ]}]},
+    })
+    result = await create_read_forward_message_tool(bot, {"outer"}).ainvoke({"forward_id": "outer"})
+    text, blocks = _normalize_tool_result(result)
+    assert "外层文字" in text
+    assert "内层文字" in text
+    assert "转发图片 1，无法读取" in text
+    assert "超过本次读取数量上限" in text
+    assert blocks is not None
+    assert len([block for block in blocks if block["type"] == "image_url"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_forward_image_resolves_file_id_and_base64():
+    import io
+    import base64
+
+    from PIL import Image
+
+    from nonebot_plugin_ai_groupmate.agent.forward_tools import _forward_image_source
+
+    class ImageBot:
+        async def call_api(self, api, **data):
+            assert api == "get_image"
+            assert data == {"file": "image-id"}
+            return {"data": {"url": "https://example.com/resolved.png"}}
+
+    assert await _forward_image_source(ImageBot(), {"file": "image-id"}) == "https://example.com/resolved.png"
+    buffer = io.BytesIO()
+    Image.new("RGB", (2, 2), "red").save(buffer, format="PNG")
+    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+    for prefix in ("base64://", "data:image/png;base64,"):
+        result = await _forward_image_source(ImageBot(), {"file": prefix + encoded})
+        assert result is not None
+        assert result.startswith("data:image/")
+    assert await _forward_image_source(ImageBot(), {"file": "base64://invalid"}) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("image_first", [True, False])
+async def test_agent_reads_text_in_cq_forward_with_large_image(image_first):
+    from nonebot_plugin_ai_groupmate.agent.forward_tools import (
+        create_read_forward_message_tool,
+    )
+
+    image = "[CQ:image,file=base64://" + "A" * 13_000 + "]"
+    text = "图旁边的重要文字"
+    content = image + text if image_first else text + image
+    bot = _FakeBot({
+        "mixed": {"messages": [
+            {"sender": {"nickname": "Alice"}, "message": content},
+            {"sender": {"nickname": "Bob"}, "message": "下一条文字"},
+        ]},
+    })
+    reader = create_read_forward_message_tool(bot, {"mixed"})
+
+    result = json.loads(await reader.ainvoke({"forward_id": "mixed"}))
+    body = result["data"]["content"]
+
+    assert text in body
+    assert "Bob: 下一条文字" in body
+    marker = "[转发图片 1，无法读取]"
+    assert (marker + text if image_first else text + marker) in body
+    assert "base64://" not in body
+
+
+@pytest.mark.asyncio
+async def test_cq_forward_preserves_escaped_text_nested_ids_and_media():
+    from nonebot_plugin_ai_groupmate.media_message import LazyMediaRegistry
+    from nonebot_plugin_ai_groupmate.forward_message import expand_forward_message
+
+    registry = LazyMediaRegistry({})
+    bot = _FakeBot({
+        "outer": {"messages": [{"message": (
+            "&#91;CQ:image,file=literal&#93; &amp; "
+            "[CQ:image,file=a.jpg]图片后文字"
+            "[CQ:record,url=https://example.com/a?x=1&#44;2&amp;y=3]"
+            "[CQ:forward,id=inner]"
+        )}]},
+        "inner": {"messages": [{"message": "内层文字"}]},
+    })
+
+    result = await expand_forward_message(
+        bot, register_media=registry.register_forwarded, forward_id="outer",
+    )
+
+    assert "[CQ:image,file=literal] & [图片]图片后文字" in result
+    assert "内层文字" in result
+    assert bot.calls == ["outer", "inner"]
+    assert registry.forwarded_source("forward-media-1", "audio") == {
+        "url": "https://example.com/a?x=1,2&y=3",
+    }
+
+
+@pytest.mark.asyncio
 async def test_expand_forward_reference_preserves_nodes_and_nested_content():
     from nonebot_plugin_ai_groupmate.media_message import LazyMediaRegistry
     from nonebot_plugin_ai_groupmate.forward_message import (
