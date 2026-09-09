@@ -54,9 +54,9 @@ def create_recall_message_tool(
     @tool("recall_message")
     async def recall_message(target_msg_id: str, reason: str | None = None) -> str:
         """
-        撤回当前群历史中的一条消息。
+        撤回当前会话历史中的一条消息。
 
-        管理员/群主权限下可以撤回他人消息；普通权限下只能撤回 bot 自己发送且 5 分钟内的消息。
+        群聊管理员/群主权限下可以撤回他人消息；私聊或群聊普通权限下只能撤回 bot 自己发送且 5 分钟内的消息。
 
         Args:
             target_msg_id: 聊天历史里 `id: xxx` 的平台消息 ID。
@@ -90,7 +90,7 @@ def create_recall_message_tool(
         if history is None:
             return tool_failure(
                 "message_not_found",
-                "撤回失败：没有在当前群历史中找到这条消息。",
+                "撤回失败：没有在当前会话历史中找到这条消息。",
                 retryable=True,
                 delivery_state="not_attempted",
             )
@@ -102,13 +102,13 @@ def create_recall_message_tool(
             if not is_bot_message:
                 return tool_failure(
                     "permission_denied",
-                    "bot 不是管理员，只能撤回自己发送的消息。",
+                    "当前会话权限只允许撤回 bot 自己发送的消息。",
                     delivery_state="not_attempted",
                 )
             if datetime.datetime.now() - history.created_at > SELF_RECALL_WINDOW:
                 return tool_failure(
                     "recall_window_expired",
-                    "bot 不是管理员，只能撤回自己 5 分钟内发送的消息。",
+                    "当前会话权限只允许撤回 bot 自己 5 分钟内发送的消息。",
                     delivery_state="not_attempted",
                 )
 

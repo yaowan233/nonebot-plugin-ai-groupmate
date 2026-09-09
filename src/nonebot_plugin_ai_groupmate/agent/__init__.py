@@ -1031,7 +1031,7 @@ async def create_chat_graph(
         and not is_private
         and interface is not None
     )
-    recall_message_enabled = not is_private and bot is not None and event is not None
+    recall_message_enabled = bot is not None and event is not None
     prompt_result = build_chat_system_prompt(
         bot_name=plugin_config.bot_name,
         is_private=is_private,
@@ -1059,7 +1059,15 @@ async def create_chat_graph(
 - 能在群内自然说清的内容优先用 `reply_user`。
 """
     if recall_message_enabled:
-        if has_admin_permission:
+        if is_private:
+            system_prompt += """
+【消息撤回】
+- 可使用 `recall_message` 撤回当前私聊中 bot 自己发送且 5 分钟内的消息。
+- 用户明确要求撤回，或 bot 自己误发、重复发、格式错乱、内容不合适时可以使用。
+- 不能撤回用户发送的消息。
+- target_msg_id 必须来自当前私聊历史里 bot 自己消息的 `id: xxx`，不要编造消息 ID。
+"""
+        elif has_admin_permission:
             system_prompt += """
 【消息撤回】
 - 你当前拥有管理员/群主权限，可使用 `recall_message` 撤回当前群历史中的消息，包括他人消息。
