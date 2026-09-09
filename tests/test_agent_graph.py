@@ -1642,6 +1642,7 @@ async def test_stream_progress_survives_single_call_timeout():
             result = None
             async for chunk in self.astream(messages, **kwargs):
                 result = chunk if result is None else result + chunk
+            assert result is not None
             return result
 
     node = _make_agent_node(StreamingModel([]), [], "system", {}, AgentRunLimits(llm_timeout_seconds=0.1))
@@ -1650,6 +1651,7 @@ async def test_stream_progress_survives_single_call_timeout():
     assert type(message) is AIMessage
     assert message.content == "done"
     assert message.additional_kwargs["reasoning_content"] == "thinking " * 8
+    assert message.usage_metadata is not None
     assert message.usage_metadata["total_tokens"] == 11
 
 
@@ -1705,6 +1707,7 @@ async def test_stream_cancellation_closes_upstream():
 @pytest.mark.asyncio
 async def test_openai_sse_reasoning_resets_idle_timeout_and_assembles_tools():
     import httpx
+    from pydantic import SecretStr
     from langchain_openai import ChatOpenAI
 
     from nonebot_plugin_ai_groupmate.agent.graph import _invoke_model_with_idle_timeout
@@ -1726,7 +1729,7 @@ async def test_openai_sse_reasoning_resets_idle_timeout_and_assembles_tools():
         return httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=SSEBody())
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        model = ChatOpenAI(model="test", api_key="test", base_url="https://test.invalid/v1", http_async_client=client, max_retries=0)
+        model = ChatOpenAI(model="test", api_key=SecretStr("test"), base_url="https://test.invalid/v1", http_async_client=client, max_retries=0)
         response = await _invoke_model_with_idle_timeout(model, [AIMessage(content="question")], timeout_seconds=1.0, session_id="test", request_kwargs={})
     assert type(response) is AIMessage
     assert response.tool_calls == [{"name": "reply_user", "args": {"text": "done"}, "id": "call", "type": "tool_call"}]

@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import uuid
 import datetime
+from typing import cast
+from unittest.mock import MagicMock
 
 import pytest
+from nonebot.adapters import Bot, Event
 
 
 def test_web_detection_defaults_stay_inside_free_tier():
@@ -135,6 +138,7 @@ async def test_web_detection_cache_does_not_consume_a_second_unit():
     )
     now = datetime.datetime(2098, 1, 3, 12, 0, 0)
     async with get_session() as db_session:
+        db_session.sync_session.expire_on_commit = True
         first = await perform_web_detection(
             db_session,
             image_hash,
@@ -292,6 +296,8 @@ async def test_duplicate_image_preserves_both_bot_message_ids(monkeypatch, tmp_p
 
     from sqlalchemy import Select
     from nonebot_plugin_orm import get_session
+    from nonebot_plugin_uninfo import Uninfo
+    from nonebot_plugin_alconna.uniseg import Image
 
     import nonebot_plugin_ai_groupmate as plugin
     from nonebot_plugin_ai_groupmate.model import ChatHistory
@@ -308,7 +314,7 @@ async def test_duplicate_image_preserves_both_bot_message_ids(monkeypatch, tmp_p
     session = SimpleNamespace(scene=SimpleNamespace(id=group), user=SimpleNamespace(id="alice"))
     async with get_session() as db:
         for message_id in ("bot-one-id", "bot-two-id", "bot-two-id"):
-            await plugin.process_image_message(db, SimpleNamespace(id="image.jpg"), None, None, {}, session, "Alice", f"id: {message_id}\n")
+            await plugin.process_image_message(db, Image(id="image.jpg"), MagicMock(spec=Event), MagicMock(spec=Bot), {}, cast(Uninfo, session), "Alice", f"id: {message_id}\n")
         rows = (await db.execute(Select(ChatHistory).where(ChatHistory.session_id == group))).scalars().all()
         assert len(rows) == 1
         assert rows[0].content.count("id: bot-two-id\n") == 1
@@ -423,7 +429,7 @@ async def test_agent_exposes_search_and_evidence_tools_without_keyword_gate(
         "user-1",
         "Alice",
         history=[],
-        event=FakeEvent(),
+        event=cast(Event, FakeEvent()),
         is_private=False,
         reply_to_id="quoted-image-id",
         meme_required=explicit_meme,

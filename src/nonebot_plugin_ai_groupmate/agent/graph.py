@@ -126,7 +126,7 @@ def _has_unfinished_reply(response: AIMessage, messages: Sequence[BaseMessage]) 
         if isinstance(message, AIMessage):
             scheduled_calls.update(call["id"] for call in message.tool_calls if call["name"] in {"schedule_agent_task", "schedule_message"})
         elif isinstance(message, ToolMessage) and message.tool_call_id in scheduled_calls:
-            if tool_result_status(message.content) == "succeeded":
+            if isinstance(message.content, str) and tool_result_status(message.content) == "succeeded":
                 return False
     texts = [_message_text_content(response)]
     texts.extend(call.get("args", {}).get("content", "") for call in response.tool_calls if call["name"] == "reply_user")
@@ -661,7 +661,7 @@ def _image_search_allowed_tools(messages: Sequence[BaseMessage]) -> set[str] | N
     outcomes: list[tuple[str, Any]] = []
     for message in messages:
         if isinstance(message, AIMessage):
-            calls.update({call["id"]: call["name"] for call in message.tool_calls})
+            calls.update({call["id"]: call["name"] for call in message.tool_calls if call["id"] is not None})
         elif isinstance(message, ToolMessage) and message.tool_call_id in calls:
             outcomes.append((calls[message.tool_call_id], parse_tool_result(message.content) if isinstance(message.content, str) else None))
     image_names = {"reverse_image_search", "get_last_image_search_result"}

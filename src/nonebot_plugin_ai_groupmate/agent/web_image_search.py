@@ -449,9 +449,10 @@ async def perform_web_detection(
         cached = await db_session.get(GoogleWebDetectionCache, image_hash)
         if cached is not None and cached.created_at >= cache_cutoff:
             used_count = await _get_month_usage(db_session, usage_month)
+            cached_result = dict(cached.result)
             await db_session.commit()
             return WebDetectionSearchResult(
-                result=dict(cached.result),
+                result=cached_result,
                 cached=True,
                 used_count=used_count,
                 monthly_limit=monthly_limit,
