@@ -130,7 +130,7 @@ curl http://127.0.0.1:6333/collections/media_collection_v3
 | ai_groupmate__proactive_reaction_probability | 否 | `0.05` | 兼容旧配置；非定向群消息的主动 reaction 采样已停用，避免额外模型调用 |
 | ai_groupmate__proactive_meme_probability | 否 | `0.02` | 兼容旧配置；非定向群消息的主动表情包采样已停用，避免额外模型调用 |
 | ai_groupmate__personality_setting | 否 | 无 | 自定义人设和固定业务知识 prompt |
-| ai_groupmate__tavily_api_key | 否 | 无 | Tavily 搜索 API 密钥（联网搜索功能） |
+| ai_groupmate__tavily_api_key | 否 | 无 | Tavily 搜索 API 密钥（联网搜索及关键词搜图发送功能，支持群聊和私聊） |
 | ai_groupmate__llm_api_key | 推荐 | 无 | 通用 LLM API Key，未单独配置各角色 key 时使用 |
 | ai_groupmate__llm_base_url | 否 | `https://dashscope.aliyuncs.com/compatible-mode/v1` | 通用 OpenAI 兼容接口地址 |
 | ai_groupmate__chat_model | 否 | `qwen3.7-plus` | 主聊天/工具调用模型；使用百炼官方工具时推荐 `qwen3.8-max` |
@@ -296,6 +296,8 @@ ID、Location、服务账号。插件检测到该 Key 后会使用 Express Mode�
 `VERTEX_PROJECT` 和 `VERTEX_LOCATION`；认证优先级为服务账号 JSON → Vertex API
 Key → ADC。`AI_GROUPMATE__CHAT_API_KEY` 是其他接口使用的聊天模型 Key，在 Vertex
 模式下不会读取。
+
+联网搜图发送：配置 `ai_groupmate__tavily_api_key` 后，可在群聊或私聊中说“网上搜一张猫咪图片发给我”或“搜索风景图片，发两张”。Agent 用 `search_web_images` 获取最多 5 个候选，按描述筛选 1～2 张后调用 `preview_web_images` 看图，再用 `send_web_image` 发送；默认发送 1 张，每轮最多 3 张。支持视觉的主模型直接查看图片，否则使用已配置的 `vision_model` 逐张总结。未配置视觉模型、下载失败或识别失败时会标记为仅按描述选择；只有显式允许降级发送并向用户说明未经视觉确认后才发送。预览成功的图片会缓存到本轮内存并用于发送，避免重复下载。预览下载限制为每张 10 MB。此功能复用 Tavily 搜索额度，无需配置 Google 反向搜图。
 
 Google Cloud Vision 反向搜图示例：
 

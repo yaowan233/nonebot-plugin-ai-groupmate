@@ -73,6 +73,38 @@ async def test_image_search_policy_blocks_excess_searches_in_same_batch():
     assert json.loads(result["messages"][-1].content)["reason_code"] == "image_search_budget_reached"
 
 
+@pytest.mark.asyncio
+async def test_web_image_send_waits_for_model_to_read_preview():
+    from nonebot_plugin_ai_groupmate.agent import graph as module
+
+    sent = []
+
+    @tool("preview_web_images")
+    async def preview_web_images() -> str:
+        """Preview images."""
+        return "Actual image preview"
+
+    @tool("send_web_image")
+    async def send_web_image() -> str:
+        """Send an image."""
+        sent.append(True)
+        return "sent"
+
+    tools = [preview_web_images, send_web_image]
+    node = module._make_tool_node({item.name: item for item in tools}, tools, {}, module.AgentRunLimits())
+    state = _state(AIMessage(content="", tool_calls=[
+        {"name": "preview_web_images", "args": {}, "id": "preview"},
+        {"name": "send_web_image", "args": {}, "id": "send"},
+    ]))
+    result = await node(state)
+    assert not sent
+    assert json.loads(result["messages"][-1].content)["reason_code"] == "preview_review_required"
+    state["messages"].extend(result["messages"])
+    state["messages"].append(AIMessage(content="", tool_calls=[{"name": "send_web_image", "args": {}, "id": "send-next"}]))
+    await node(state)
+    assert sent == [True]
+
+
 def _state(message: AIMessage, *, tool_count: int = 0) -> "AgentState":
     return {
         "messages": [message],

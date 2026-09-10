@@ -350,6 +350,10 @@ def _is_explicit_meme_request(text: str) -> bool:
         return False
     if is_explicit_web_image_search_request(normalized):
         return False
+    # Online image requests must retain web search/send tools instead of
+    # forcing the local meme retrieval workflow.
+    if re.search(r"网上|联网|网络|搜图|搜[^，。！？?\n]*(?:图|照片|壁纸)", normalized):
+        return False
     # Only explicit image-delivery requests may remove the normal reply tools.
     # Search requests and questions about images need the full conversation flow.
     if re.search(r"什么|为何|怎么|结果|来源|出处|不要|别|不用", normalized):

@@ -60,6 +60,7 @@ SIDE_EFFECT_TOOL_NAMES = frozenset({
     "schedule_agent_task",
     "schedule_message",
     "send_meme_image",
+    "send_web_image",
     "send_private_message",
     "update_group_memory",
     "update_user_impression",
@@ -1073,6 +1074,13 @@ def _make_tool_node(
                 ))
                 continue
             tool_count += 1
+
+            if name == "send_web_image" and any(call["name"] == "preview_web_images" for call in tool_calls):
+                results.append(ToolMessage(
+                    content=tool_skipped("preview_review_required", "请先阅读本次图片预览结果，再在下一轮决定发送哪张图片。", delivery_state="not_attempted"),
+                    tool_call_id=tool_call_id,
+                ))
+                continue
 
             image_search_tools = _image_search_allowed_tools([*state["messages"], *results])
             if image_search_tools is not None and name not in image_search_tools:
