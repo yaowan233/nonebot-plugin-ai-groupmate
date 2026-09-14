@@ -35,6 +35,14 @@ class FakeAsyncClient:
         return self.response
 
 
+class FakeBatchEmbeddingClient:
+    def __init__(self, embeddings: Any):
+        self.embeddings = embeddings
+
+    def with_options(self, **_: Any) -> Self:
+        return self
+
+
 def make_bad_request_error(message: str):
     """构造 openai.BadRequestError（响应类型需为 httpx.Response）。"""
     import httpx
@@ -1337,7 +1345,7 @@ async def test_get_batch_text_embeddings_uses_configured_dimension(
                 ]
             )
 
-    operator.emb_client = SimpleNamespace(embeddings=FakeEmbeddings())
+    operator.emb_client = FakeBatchEmbeddingClient(embeddings=FakeEmbeddings())
 
     embeddings = await operator._get_batch_text_embeddings(["one", "two"])
 
@@ -1370,7 +1378,7 @@ async def test_get_batch_text_embeddings_omits_dimensions_when_not_configured(
                 ]
             )
 
-    operator.emb_client = SimpleNamespace(embeddings=FakeEmbeddings())
+    operator.emb_client = FakeBatchEmbeddingClient(embeddings=FakeEmbeddings())
 
     embeddings = await operator._get_batch_text_embeddings(["one", "two"])
 
@@ -1404,7 +1412,7 @@ async def test_batch_text_embeddings_throttles_and_splits_large_backfill(
     async def fake_sleep(delay: float) -> None:
         sleep_delays.append(delay)
 
-    operator.emb_client = SimpleNamespace(embeddings=FakeEmbeddings())
+    operator.emb_client = FakeBatchEmbeddingClient(embeddings=FakeEmbeddings())
     monkeypatch.setattr(memory_module.asyncio, "sleep", fake_sleep)
 
     texts = [f"text-{index}" for index in range(45)]
@@ -1447,7 +1455,7 @@ async def test_batch_text_embeddings_retries_only_rate_limited_sub_batch(
     async def fake_sleep(delay: float) -> None:
         sleep_delays.append(delay)
 
-    operator.emb_client = SimpleNamespace(embeddings=FakeEmbeddings())
+    operator.emb_client = FakeBatchEmbeddingClient(embeddings=FakeEmbeddings())
     monkeypatch.setattr(memory_module.asyncio, "sleep", fake_sleep)
 
     texts = [f"text-{index}" for index in range(21)]
@@ -1606,7 +1614,7 @@ async def test_batch_text_embedding_uses_configured_dimension(memory_module: Any
                 ]
             )
 
-    operator.emb_client = SimpleNamespace(embeddings=FakeEmbeddings())
+    operator.emb_client = FakeBatchEmbeddingClient(embeddings=FakeEmbeddings())
 
     embeddings = await operator._get_batch_text_embeddings(["one", "two"])
 

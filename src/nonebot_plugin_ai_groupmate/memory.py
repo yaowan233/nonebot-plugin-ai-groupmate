@@ -15,9 +15,10 @@ from collections import Counter
 from collections.abc import Mapping, Sequence, Collection
 
 import httpx
-from openai import AsyncOpenAI, RateLimitError, BadRequestError
+from openai import AsyncOpenAI, APIStatusError, RateLimitError, BadRequestError, APIConnectionError
 from nonebot.log import logger
 from qdrant_client import AsyncQdrantClient, models
+from qdrant_client.http.exceptions import UnexpectedResponse, ResponseHandlingException
 
 from .runtime_config import get_runtime_config
 
@@ -86,6 +87,17 @@ TEXT_EMBEDDING_BATCH_MIN_INTERVAL_SECONDS = 1.5
 TEXT_EMBEDDING_RATE_LIMIT_MAX_RETRIES = 4
 TEXT_EMBEDDING_RATE_LIMIT_BASE_DELAY_SECONDS = 15.0
 TEXT_EMBEDDING_RATE_LIMIT_MAX_DELAY_SECONDS = 60.0
+TEXT_EMBEDDING_TRANSIENT_MAX_RETRIES = 2
+TEXT_EMBEDDING_TRANSIENT_BASE_DELAY_SECONDS = 5.0
+TEXT_EMBEDDING_BATCH_TIMEOUT_SECONDS = 60.0
+
+# Keep chat backfills small and sequential so waiting for one large update does
+# not monopolize a resource-constrained Qdrant instance.
+CHAT_UPSERT_BATCH_SIZE = 32
+CHAT_UPSERT_TIMEOUT_SECONDS = 60
+CHAT_UPSERT_MAX_ATTEMPTS = 3
+CHAT_UPSERT_RETRY_BASE_DELAY_SECONDS = 2.0
+CHAT_UPSERT_RETRY_MAX_DELAY_SECONDS = 30.0
 
 
 class CollectionEmbeddingConfigMismatchError(RuntimeError):
@@ -94,6 +106,39 @@ class CollectionEmbeddingConfigMismatchError(RuntimeError):
 
 class EmbeddingProviderUnavailableError(RuntimeError):
     """Raised when the embedding endpoint cannot be checked or reached."""
+
+
+class QdrantWriteError(RuntimeError):
+    """Chat writes failed after local handling; do not re-embed the whole batch."""
+
+
+def _qdrant_write_error_source(error: Exception) -> Exception:
+    for _ in range(8):
+        if not isinstance(error, ResponseHandlingException):
+            break
+        error = error.source
+    return error
+
+
+def _is_retryable_qdrant_write_error(error: Exception) -> bool:
+    error = _qdrant_write_error_source(error)
+    if isinstance(error, UnexpectedResponse):
+        return error.status_code in {408, 429, 500, 502, 503, 504}
+    return isinstance(error, (TimeoutError, ConnectionError, httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError))
+
+
+def _qdrant_write_retry_delay(error: Exception, attempt: int) -> float:
+    delay = CHAT_UPSERT_RETRY_BASE_DELAY_SECONDS * (2 ** attempt)
+    source = _qdrant_write_error_source(error)
+    headers = getattr(source, "headers", None)
+    if headers is not None:
+        try:
+            requested_delay = float(headers.get("retry-after", "0"))
+        except (TypeError, ValueError):
+            requested_delay = 0.0
+        if math.isfinite(requested_delay):
+            delay = max(delay, requested_delay)
+    return min(delay, CHAT_UPSERT_RETRY_MAX_DELAY_SECONDS)
 
 
 class CollectionMetadataBackfillError(RuntimeError):
@@ -1465,7 +1510,7 @@ class VectorDBOperator:
         """
         批量调用 API 获取文本向量。
 
-        对大规模回填进行串行限速；触发 429 时只重试当前子批次，
+        对大规模回填进行串行限速；限流、连接超时或服务暂时异常时只重试当前子批次，
         不会丢弃已经成功的向量并从头重做整个批次。
         """
         if not texts:
@@ -1478,6 +1523,12 @@ class VectorDBOperator:
             self._embedding_batch_lock = batch_lock
 
         all_embeddings: list[list[float]] = []
+        # Own the retry budget here instead of multiplying it by SDK retries.
+        # A scalar timeout works with both the httpx and httpx2 SDK transports.
+        batch_client = self.emb_client.with_options(
+            max_retries=0,
+            timeout=TEXT_EMBEDDING_BATCH_TIMEOUT_SECONDS,
+        )
         async with batch_lock:
             for offset in range(0, len(texts), TEXT_EMBEDDING_BATCH_SIZE):
                 chunk = texts[offset: offset + TEXT_EMBEDDING_BATCH_SIZE]
@@ -1497,7 +1548,7 @@ class VectorDBOperator:
 
                     self._embedding_last_batch_request_at = time.monotonic()
                     try:
-                        resp = await self.emb_client.embeddings.create(
+                        resp = await batch_client.embeddings.create(
                             **self._embedding_request_kwargs(chunk),
                         )
                         break
@@ -1524,6 +1575,29 @@ class VectorDBOperator:
                         await asyncio.sleep(retry_after)
                     except CollectionEmbeddingConfigMismatchError:
                         raise
+                    except (APIConnectionError, APIStatusError) as exc:
+                        # APITimeoutError inherits APIConnectionError, including
+                        # timeouts wrapped from the SDK's httpx2 transport.
+                        status_code = getattr(exc, "status_code", None)
+                        retryable = isinstance(exc, APIConnectionError) or status_code in {
+                            408, 500, 502, 503, 504,
+                        }
+                        if not retryable or attempt >= TEXT_EMBEDDING_TRANSIENT_MAX_RETRIES:
+                            message = (
+                                f"Embedding API 子批次失败: offset={offset}, size={len(chunk)}, "
+                                f"attempts={attempt + 1}, status={status_code}, error_type={type(exc).__name__}; "
+                                "保留消息等待后续处理"
+                            )
+                            logger.error(message)
+                            raise EmbeddingProviderUnavailableError(message) from exc
+                        delay = TEXT_EMBEDDING_TRANSIENT_BASE_DELAY_SECONDS * (2 ** attempt)
+                        logger.warning(
+                            f"Embedding API 暂时不可用: offset={offset}, size={len(chunk)}, "
+                            f"status={status_code}, error_type={type(exc).__name__}; "
+                            f"{delay:.1f} 秒后仅重试当前子批次 "
+                            f"({attempt + 1}/{TEXT_EMBEDDING_TRANSIENT_MAX_RETRIES})"
+                        )
+                        await asyncio.sleep(delay)
                     except Exception as exc:
                         logger.error(f"Batch Embedding API Error: {exc}")
                         raise EmbeddingProviderUnavailableError(str(exc)) from exc
@@ -1649,18 +1723,45 @@ class VectorDBOperator:
                 }
             ))
 
-        # 3. 批量写入 Qdrant
-        # Qdrant 的 upsert 本身就支持批量，效率很高
-        try:
-            await self.client.upsert(
-                collection_name=self.chat_col,
-                points=points,
-                wait=True  # 批量插入建议等待确认，保证数据一致性
-            )
-            logger.info(f"成功批量插入 {len(points)} 条记录到 Qdrant")
-        except Exception as e:
-            logger.error(f"Qdrant 批量写入失败: {e}")
-            raise e  # 抛出异常让 utils.py 的重试机制捕获
+        # Reuse the prepared vectors and stable IDs across write retries; a
+        # timeout can mean the server already accepted some or all of the points.
+        await self._upsert_chat_points(points)
+        logger.info(f"成功批量插入 {len(points)} 条记录到 Qdrant")
+
+    async def _upsert_chat_points(self, points: list[models.PointStruct]) -> None:
+        for offset in range(0, len(points), CHAT_UPSERT_BATCH_SIZE):
+            chunk = points[offset:offset + CHAT_UPSERT_BATCH_SIZE]
+            for attempt in range(CHAT_UPSERT_MAX_ATTEMPTS):
+                try:
+                    result = await self.client.upsert(
+                        collection_name=self.chat_col,
+                        points=chunk,
+                        wait=True,
+                        timeout=CHAT_UPSERT_TIMEOUT_SECONDS,
+                    )
+                    status = getattr(result, "status", None)
+                    if status in {"acknowledged", "wait_timeout"}:
+                        raise TimeoutError("Qdrant 尚未确认写入完成")
+                    if status != "completed":
+                        raise ValueError("Qdrant 返回未知写入状态，未确认写入完成")
+                    break
+                except Exception as error:
+                    status_code = getattr(_qdrant_write_error_source(error), "status_code", None)
+                    if not _is_retryable_qdrant_write_error(error) or attempt + 1 == CHAT_UPSERT_MAX_ATTEMPTS:
+                        message = (
+                            f"Qdrant 聊天向量写入未完成: offset={offset}, size={len(chunk)}, "
+                            f"attempts={attempt + 1}, status={status_code}, error_type={type(error).__name__}; "
+                            "消息保留待处理状态，等待后续调度"
+                        )
+                        logger.error(message)
+                        raise QdrantWriteError(message) from error
+                    delay = _qdrant_write_retry_delay(error, attempt)
+                    logger.warning(
+                        f"Qdrant 聊天向量写入暂时失败: offset={offset}, size={len(chunk)}, "
+                        f"status={status_code}, error_type={type(error).__name__}; "
+                        f"{delay:.1f} 秒后重试当前子批次 ({attempt + 1}/{CHAT_UPSERT_MAX_ATTEMPTS})"
+                    )
+                    await asyncio.sleep(delay)
 
     @staticmethod
     def _weighted_sample_meme_ids(

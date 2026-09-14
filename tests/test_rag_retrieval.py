@@ -288,6 +288,38 @@ async def test_batch_insert_keeps_messages_pending_when_embeddings_are_missing()
 
 
 @pytest.mark.asyncio
+async def test_batch_insert_recovers_from_qdrant_408_without_reembedding(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    import httpx
+    from qdrant_client.http.exceptions import UnexpectedResponse
+
+    from nonebot_plugin_ai_groupmate import memory
+    from nonebot_plugin_ai_groupmate.memory import CHAT_COLLECTION, VectorDBOperator
+
+    sleep = AsyncMock()
+    monkeypatch.setattr(memory.asyncio, "sleep", sleep)
+
+    operator: Any = object.__new__(VectorDBOperator)
+    operator.enabled = True
+    operator.chat_col = CHAT_COLLECTION
+    operator._ensure_collections = AsyncMock()
+    operator._get_batch_text_embeddings = AsyncMock(return_value=[[0.1, 0.2]])
+    operator.client = SimpleNamespace(upsert=AsyncMock(side_effect=[
+        UnexpectedResponse(408, "Request Timeout", b"operation timed out", httpx.Headers()),
+        SimpleNamespace(status="completed"),
+    ]))
+    await operator.batch_insert(["保留这条消息"], "group-1", payloads=[{"msg_ids": [123]}])
+    assert operator.client.upsert.await_count == 2
+    operator._get_batch_text_embeddings.assert_awaited_once()
+    attempts = operator.client.upsert.call_args_list
+    assert attempts[0].kwargs["points"] == attempts[1].kwargs["points"]
+    assert all(call.kwargs["wait"] is True for call in attempts)
+    assert all(call.kwargs["timeout"] == memory.CHAT_UPSERT_TIMEOUT_SECONDS for call in attempts)
+    sleep.assert_awaited_once_with(memory.CHAT_UPSERT_RETRY_BASE_DELAY_SECONDS)
+
+
+@pytest.mark.asyncio
 async def test_chat_chunking_keeps_overlap_but_not_across_time_gaps():
     from nonebot_plugin_ai_groupmate import utils
 

@@ -17,6 +17,7 @@ from .model import ChatHistory, ChatHistorySchema
 from .memory import (
     DB,
     CHAT_INDEX_VERSION,
+    QdrantWriteError,
     EmbeddingProviderUnavailableError,
     CollectionEmbeddingConfigMismatchError,
 )
@@ -394,7 +395,7 @@ async def process_and_vectorize_session_chats(
         if not batch_contexts:
             continue
 
-        # 3. 批量插入向量到 Milvus（带重试）
+        # 3. 批量插入向量到 Qdrant（带重试）
         try:
             await insert_vectors_with_retry(
                 batch_contexts,
@@ -479,9 +480,14 @@ async def insert_vectors_with_retry(
         except CollectionEmbeddingConfigMismatchError:
             raise
         except EmbeddingProviderUnavailableError:
-            # memory.py 内部已对 429 按分钟窗口做了退避。
+            # memory.py 内部已对限流、超时和临时服务错误做了子批次退避。
             # 这里若再用 1/2 秒整批重试，只会重复消耗已成功的
             # 子批次并再次撞限；交给后台调度器稍后重试。
+            raise
+        except QdrantWriteError:
+            # memory.py already retried only the failed write sub-batch using
+            # the prepared vectors. Re-entering batch_insert here would spend
+            # embedding tokens again and repeat confirmed writes.
             raise
         except Exception as e:
             if attempt == max_retries - 1:
