@@ -15,6 +15,7 @@ MISFIRE_GRACE_SECONDS = 300
 LEASE_SECONDS = 180
 HEARTBEAT_SECONDS = 30
 MAX_RUNNING_TASKS = 20
+MAINTENANCE_BATCH_SIZE = 100
 
 # Execution handles only: no pending task content, timing or state is cached here.
 _running_tasks: dict[str, asyncio.Task[None]] = {}
@@ -141,21 +142,24 @@ async def poll_scheduled_tasks() -> None:
     if _stopping:
         return
     now = utcnow()
+    missed_filter = (
+        ScheduledTask.status == "scheduled",
+        ScheduledTask.run_at < now - timedelta(seconds=MISFIRE_GRACE_SECONDS),
+    )
+    interrupted_filter = (
+        ScheduledTask.status == "running", ScheduledTask.lease_until < now,
+    )
+    # Even an UPDATE matching zero rows takes SQLite's writer lock. Discover
+    # maintenance candidates with reads, and release that transaction first.
     async with get_session() as session:
-        await session.execute(
-            update(ScheduledTask).where(
-                ScheduledTask.status == "scheduled",
-                ScheduledTask.run_at < now - timedelta(seconds=MISFIRE_GRACE_SECONDS),
-            ).values(status="missed", finished_at=now, updated_at=now, error="超过 5 分钟执行宽限期，未执行。")
-        )
-        await session.execute(
-            update(ScheduledTask).where(
-                ScheduledTask.status == "running", ScheduledTask.lease_until < now,
-            ).values(
-                status="interrupted", finished_at=now, updated_at=now, lease_until=None,
-                error="执行进程中断或失去数据库连接，结果未知；为避免重复发送，不自动重试。",
-            )
-        )
+        missed_ids = list((await session.scalars(
+            select(ScheduledTask.job_id).where(*missed_filter)
+            .order_by(ScheduledTask.run_at, ScheduledTask.job_id).limit(MAINTENANCE_BATCH_SIZE)
+        )).all())
+        interrupted_ids = list((await session.scalars(
+            select(ScheduledTask.job_id).where(*interrupted_filter)
+            .order_by(ScheduledTask.lease_until, ScheduledTask.job_id).limit(MAINTENANCE_BATCH_SIZE)
+        )).all())
         capacity = MAX_RUNNING_TASKS - len(_running_tasks)
         bot_ids = list(get_bots())
         job_ids = []
@@ -164,11 +168,31 @@ async def poll_scheduled_tasks() -> None:
                 select(ScheduledTask.job_id).where(
                     ScheduledTask.status == "scheduled",
                     ScheduledTask.run_at <= now,
+                    ScheduledTask.run_at >= now - timedelta(seconds=MISFIRE_GRACE_SECONDS),
                     or_(ScheduledTask.bot_id.in_(bot_ids), ScheduledTask.bot_id.is_(None)),
                     ScheduledTask.job_id.not_in(list(_running_tasks)),
                 ).order_by(ScheduledTask.run_at, ScheduledTask.job_id).limit(capacity)
             )).all())
-        await session.commit()
+    if missed_ids or interrupted_ids:
+        async with get_session() as session:
+            # Recheck state/time: a task may have been edited or renewed since
+            # discovery. Bound each maintenance write instead of locking all rows.
+            if missed_ids:
+                await session.execute(
+                    update(ScheduledTask).where(
+                        ScheduledTask.job_id.in_(missed_ids), *missed_filter,
+                    ).values(status="missed", finished_at=now, updated_at=now, error="超过 5 分钟执行宽限期，未执行。")
+                )
+            if interrupted_ids:
+                await session.execute(
+                    update(ScheduledTask).where(
+                        ScheduledTask.job_id.in_(interrupted_ids), *interrupted_filter,
+                    ).values(
+                        status="interrupted", finished_at=now, updated_at=now, lease_until=None,
+                        error="执行进程中断或失去数据库连接，结果未知；为避免重复发送，不自动重试。",
+                    )
+                )
+            await session.commit()
     # Shutdown may have begun while the database query was in flight.
     if _stopping:
         return

@@ -272,6 +272,55 @@ async def test_database_errors_return_failure_protocol(task_database, monkeypatc
     assert result["reason_code"] == ("schedule_failed" if operation == "create" else "schedule_management_failed")
 
 
+@pytest.mark.parametrize("model_name", ["GroupModelConfig", "PrivateModelConfig"])
+async def test_idle_poll_does_not_lock_unrelated_sqlite_writes(monkeypatch, model_name):
+    import uuid
+
+    from sqlalchemy import Update, delete
+    from sqlalchemy.pool import AsyncAdaptedQueuePool
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from nonebot_plugin_ai_groupmate import model, scheduled_tasks
+
+    writer_started = asyncio.Event()
+    release_writer = asyncio.Event()
+
+    class PollSession(AsyncSession):
+        async def execute(self, statement, *args, **kwargs):
+            result = await super().execute(statement, *args, **kwargs)
+            if isinstance(statement, Update):
+                # Pin the interleaving: the poll has a write transaction, while
+                # another connection attempts the DELETE reported by CI.
+                writer_started.set()
+                await release_writer.wait()
+            return result
+
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///file:poll-lock-{uuid.uuid4().hex}?mode=memory&cache=shared&uri=true",
+        poolclass=AsyncAdaptedQueuePool,
+    )
+    config_model = getattr(model, model_name)
+    async with engine.begin() as connection:
+        await connection.run_sync(model.ScheduledTask.__table__.create)
+        await connection.run_sync(config_model.__table__.create)
+    monkeypatch.setattr(scheduled_tasks, "get_session", async_sessionmaker(engine, class_=PollSession))
+    monkeypatch.setattr(scheduled_tasks, "get_bots", lambda: {})
+    poll = asyncio.create_task(scheduled_tasks.poll_scheduled_tasks())
+    writing = asyncio.create_task(writer_started.wait())
+    try:
+        done, _ = await asyncio.wait({poll, writing}, timeout=3, return_when=asyncio.FIRST_COMPLETED)
+        assert done, "Idle poll did not finish or reach a database write"
+        async with async_sessionmaker(engine)() as session:
+            await session.execute(delete(config_model))
+            await session.commit()
+    finally:
+        release_writer.set()
+        writing.cancel()
+        await asyncio.gather(poll, writing, return_exceptions=True)
+        await engine.dispose()
+    await poll
+
+
 @pytest.mark.parametrize("task_type", ["message", "agent"])
 async def test_restarted_worker_executes_latest_database_content_once(task_database, monkeypatch, task_type):
     from nonebot_plugin_ai_groupmate import scheduled_tasks
@@ -398,6 +447,53 @@ async def test_missed_and_abandoned_tasks_are_persisted_without_replay(task_data
     assert (await record(task_database, abandoned["job_id"])).status == "interrupted"
     history = json.loads(await management_tools()["list_scheduled_tasks"].ainvoke({"status": "all"}))
     assert {task["status"] for task in history["data"]["tasks"]} == {"missed", "interrupted"}
+
+
+async def test_maintenance_rechecks_rescheduled_tasks_and_renewed_leases(task_database, monkeypatch):
+    from nonebot_plugin_ai_groupmate import scheduled_tasks
+
+    expired, abandoned = await create_task(), await create_task()
+    now = scheduled_tasks.utcnow()
+    old = now - datetime.timedelta(minutes=6)
+    future = now + datetime.timedelta(hours=1)
+    await set_record(task_database, expired["job_id"], run_at=old)
+    await set_record(task_database, abandoned["job_id"], status="running", lease_until=old, claim_token="live-worker")
+    sessions_opened = 0
+
+    @asynccontextmanager
+    async def get_session():
+        nonlocal sessions_opened
+        sessions_opened += 1
+        if sessions_opened == 2:
+            # Another connection changes both rows after discovery, before the
+            # maintenance write transaction opens.
+            await set_record(task_database, expired["job_id"], run_at=future)
+            await set_record(task_database, abandoned["job_id"], lease_until=future)
+        async with task_database.sessions() as session:
+            yield session
+
+    monkeypatch.setattr(scheduled_tasks, "get_session", get_session)
+    await scheduled_tasks.poll_scheduled_tasks()
+    assert sessions_opened == 2
+    assert (await record(task_database, expired["job_id"])).status == "scheduled"
+    assert (await record(task_database, abandoned["job_id"])).status == "running"
+    assert scheduled_tasks._running_tasks == {}
+
+
+async def test_maintenance_processes_backlog_in_bounded_batches(task_database, monkeypatch):
+    from nonebot_plugin_ai_groupmate import scheduled_tasks
+
+    first, second = await create_task(), await create_task()
+    old = scheduled_tasks.utcnow() - datetime.timedelta(minutes=6)
+    await set_record(task_database, first["job_id"], run_at=old)
+    await set_record(task_database, second["job_id"], run_at=old)
+    monkeypatch.setattr(scheduled_tasks, "MAINTENANCE_BATCH_SIZE", 1)
+    await scheduled_tasks.poll_scheduled_tasks()
+    assert sorted([(await record(task_database, task["job_id"])).status for task in [first, second]]) == ["missed", "scheduled"]
+    assert scheduled_tasks._running_tasks == {}
+    await scheduled_tasks.poll_scheduled_tasks()
+    assert all([(await record(task_database, task["job_id"])).status == "missed" for task in [first, second]])
+    assert scheduled_tasks._running_tasks == {}
 
 
 async def test_execution_failure_is_recorded_and_not_retried(task_database, monkeypatch):
