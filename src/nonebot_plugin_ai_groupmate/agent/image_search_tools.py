@@ -14,7 +14,7 @@ from nonebot_plugin_alconna import Target, UniMessage
 
 from ..model import ChatHistory
 from ..reply_guard import is_request_active
-from .common_tools import _classify_web_search_error
+from .common_tools import _web_search_failure
 from .tool_results import tool_failure, tool_skipped, tool_success
 from .history_format import _image_bytes_to_data_uri
 from .web_image_search import _safe_web_url
@@ -94,11 +94,9 @@ def create_web_image_tools(
         try:
             response = await search.ainvoke({"query": query})
         except Exception as error:
-            code, message, retryable = _classify_web_search_error(error)
-            logger.warning(f"联网搜图失败 reason={code} error_type={type(error).__name__}")
-            return tool_failure(code, message, retryable=retryable)
-        if not isinstance(response, dict) or response.get("error"):
-            return tool_failure("provider_error", "搜图服务返回异常，请稍后重试。", retryable=True)
+            return _web_search_failure(error)
+        if not isinstance(response, dict) or response.get("error") is not None:
+            return _web_search_failure(response)
         raw_images = response.get("images")
         images: list[dict[str, str]] = []
         seen: set[str] = set()

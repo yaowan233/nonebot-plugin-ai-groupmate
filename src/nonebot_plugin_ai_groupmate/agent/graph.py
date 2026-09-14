@@ -30,6 +30,7 @@ MAX_REPLY_COUNT = 5
 MAX_TOOL_COUNT = 20
 MAX_REPLY_PER_ROUND = 1  # 每轮只发1条，强制模型逐条思考，上下文连续
 MAX_REACTION_PER_ROUND = 3
+TAVILY_TOOL_NAMES = frozenset({"search_web", "search_web_images"})
 PARALLEL_SAFE_TOOL_NAMES = frozenset({
     "calculate_expression",
     "qwen_code_interpreter",
@@ -658,6 +659,24 @@ def _bind_model_tools(
     return model.bind(tools=[*formatted_local_tools, *builtin_tools])
 
 
+def _tavily_quota_failure(messages: Sequence[BaseMessage]) -> str | None:
+    """A confirmed quota failure disables both Tavily tools for this request."""
+    calls: dict[str, str] = {}
+    failure = None
+    for message in messages:
+        if isinstance(message, HumanMessage):
+            calls.clear()
+            failure = None
+        elif isinstance(message, AIMessage):
+            calls.update({call["id"]: call["name"] for call in message.tool_calls if call["id"] is not None})
+        elif isinstance(message, ToolMessage) and calls.get(message.tool_call_id) in TAVILY_TOOL_NAMES:
+            if isinstance(message.content, str):
+                result = parse_tool_result(message.content)
+                if result and result.get("status") == "failed" and result.get("reason_code") == "quota_exhausted":
+                    failure = message.content
+    return failure
+
+
 def _image_search_allowed_tools(messages: Sequence[BaseMessage]) -> set[str] | None:
     """Once image evidence is available, bound verification and keep answering."""
     calls: dict[str, str] = {}
@@ -700,6 +719,8 @@ def _make_agent_node(
             tools_by_skill,
             state.get("active_skills", []),
         )
+        if _tavily_quota_failure(state["messages"]) is not None:
+            visible_tools = [tool for tool in visible_tools if tool.name not in TAVILY_TOOL_NAMES]
         image_search_tools = _image_search_allowed_tools(state["messages"])
         if image_search_tools is not None:
             visible_tools = [tool for tool in visible_tools if tool.name in image_search_tools]
@@ -1077,6 +1098,12 @@ def _make_tool_node(
                 continue
             tool_count += 1
 
+            quota_failure = _tavily_quota_failure([*state["messages"], *results])
+            if name in TAVILY_TOOL_NAMES and tc_index not in parallel_outcomes:
+                if quota_failure is not None:
+                    results.append(ToolMessage(content=quota_failure, tool_call_id=tool_call_id))
+                    continue
+
             if name == "send_web_image" and any(call["name"] == "preview_web_images" for call in tool_calls):
                 results.append(ToolMessage(
                     content=tool_skipped("preview_review_required", "请先阅读本次图片预览结果，再在下一轮决定发送哪张图片。", delivery_state="not_attempted"),
@@ -1263,6 +1290,8 @@ def _make_tool_node(
                     candidate_call = tool_calls[candidate_index]
                     candidate_name = str(candidate_call.get("name", ""))
                     if candidate_name not in PARALLEL_SAFE_TOOL_NAMES:
+                        break
+                    if candidate_name in TAVILY_TOOL_NAMES and quota_failure is not None:
                         break
                     if candidate_name not in visible_tool_names:
                         continue

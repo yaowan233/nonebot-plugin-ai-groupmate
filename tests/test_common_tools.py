@@ -249,6 +249,61 @@ async def test_search_web_preserves_rate_limit_retry_after(monkeypatch):
     assert "provider detail" not in raw_result
 
 
+@pytest.mark.parametrize("error_shape", ["payload", "exception", "tool_exception", "string", "nested", "outer_status"])
+async def test_search_web_recognizes_tavily_error_432_as_non_retryable(monkeypatch, error_shape):
+    from nonebot_plugin_ai_groupmate.agent import common_tools
+
+    class FakeSearch:
+        async def ainvoke(self, _search_input):
+            if error_shape == "exception":
+                raise RuntimeError("Error 432")
+            if error_shape == "tool_exception":
+                raise ToolException("Error 432")
+            if error_shape == "string":
+                return "Error 432: unknown status"
+            if error_shape == "nested":
+                return {"error": {"detail": {"status_code": "432", "message": "hidden detail"}}}
+            if error_shape == "outer_status":
+                return {"status_code": 432, "error": "hidden detail"}
+            return {"error": "Error 432"}
+
+    monkeypatch.setattr(common_tools, "TavilySearch", lambda **_kwargs: FakeSearch())
+    result = await _invoke_search(common_tools.create_search_web_tool("tvly-test"), common_tools)
+    assert result["reason_code"] == "quota_exhausted"
+    assert result["retryable"] is False
+    assert "额度" in result["message"]
+    assert "稍后重试" not in result["message"]
+    assert result["data"]["http_status"] == 432
+
+
+@pytest.mark.parametrize(("error", "reason", "retryable"), [
+    (RuntimeError("Error 433: unknown"), "quota_exhausted", False),
+    (RuntimeError("Error 401: unknown"), "authentication_failed", False),
+    (RuntimeError("HTTP 403 Forbidden"), "authentication_failed", False),
+    (RuntimeError("Error 429: unknown"), "rate_limited", False),
+    (RuntimeError("503 Service unavailable"), "provider_error", True),
+    (ToolException("No search results found for 'Error 432 quota'"), "no_results", True),
+    (RuntimeError("Request 432 could not complete"), "provider_error", True),
+    (RuntimeError("Error 4320"), "provider_error", True),
+])
+def test_search_error_status_classification_is_specific(error, reason, retryable):
+    from nonebot_plugin_ai_groupmate.agent.common_tools import _classify_web_search_error
+
+    code, _, can_retry = _classify_web_search_error(error)
+    assert (code, can_retry) == (reason, retryable)
+
+
+def test_quota_error_details_are_redacted_and_successful_pages_are_not_errors():
+    from nonebot_plugin_ai_groupmate.agent import common_tools
+
+    failure = common_tools._normalize_web_search_results("test", {"error": RuntimeError("Error 432: tvly-secret-value")})
+    assert "tvly-secret-value" not in failure
+    success = json.loads(common_tools._normalize_web_search_results("Error 432", {
+        "results": [{"title": "Error 432 quota", "url": "https://example.com/432", "content": "Error 432"}],
+    }))
+    assert success["status"] == "succeeded"
+
+
 @pytest.mark.asyncio
 async def test_search_web_validates_query_domains_and_dates(monkeypatch):
     from nonebot_plugin_ai_groupmate.agent import common_tools

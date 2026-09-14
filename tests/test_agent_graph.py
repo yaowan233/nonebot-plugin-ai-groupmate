@@ -209,6 +209,85 @@ class _ToolSpyModel:
         return next(self.responses)
 
 
+@pytest.mark.parametrize("first_tool", ["search_web", "search_web_images"])
+@pytest.mark.asyncio
+async def test_tavily_quota_failure_blocks_further_searches_and_hides_tools(first_tool):
+    from nonebot_plugin_ai_groupmate.agent import graph as module
+    from nonebot_plugin_ai_groupmate.agent.tool_results import tool_failure
+
+    calls = []
+
+    @tool("search_web")
+    async def search_web(query: str) -> str:
+        """Search the web."""
+        calls.append("search_web")
+        return tool_failure("quota_exhausted", "Tavily 搜索额度已用尽。", retryable=False)
+
+    @tool("search_web_images")
+    async def search_web_images(query: str) -> str:
+        """Search for web images."""
+        calls.append("search_web_images")
+        return tool_failure("quota_exhausted", "Tavily 搜索额度已用尽。", retryable=False)
+
+    @tool("reply_user")
+    async def reply_user(content: str) -> str:
+        """Reply to the user."""
+        return "sent"
+
+    @tool("calculate_expression")
+    async def calculate_expression(expression: str) -> str:
+        """Calculate an expression."""
+        return "2"
+
+    tools = [search_web, search_web_images, reply_user, calculate_expression]
+    limits = module.AgentRunLimits(max_parallel_tools=1)
+    node = module._make_tool_node({item.name: item for item in tools}, tools, {}, limits)
+    state = _state(AIMessage(content="", tool_calls=[
+        {"name": first_tool, "args": {"query": "first"}, "id": "first"},
+        {"name": "search_web", "args": {"query": "different keywords"}, "id": "retry-web"},
+        {"name": "search_web_images", "args": {"query": "different image"}, "id": "retry-image"},
+    ]))
+    result = await node(state)
+    assert calls == [first_tool]
+    assert all(json.loads(message.content)["reason_code"] == "quota_exhausted" for message in result["messages"])
+
+    state["messages"].extend(result["messages"])
+    model = _ToolSpyModel([AIMessage(content="搜索额度已用尽")])
+    await module._make_agent_node(model, tools, "system", {}, limits)(state)
+    assert model.bound_tool_names == [("reply_user", "calculate_expression")]
+    state["messages"].append(AIMessage(content="", tool_calls=[
+        {"name": "calculate_expression", "args": {"expression": "1+1"}, "id": "calculate"},
+        {"name": "search_web", "args": {"query": "next round"}, "id": "next"},
+    ]))
+    # The normal parallel path must not sneak a blocked search into a batch
+    # that starts with an unrelated, still-available tool.
+    parallel_node = module._make_tool_node({item.name: item for item in tools}, tools, {}, module.AgentRunLimits())
+    await parallel_node(state)
+    assert calls == [first_tool]
+
+
+def test_tavily_quota_guard_is_request_and_provider_scoped():
+    from langchain_core.messages import ToolMessage, HumanMessage
+
+    from nonebot_plugin_ai_groupmate.agent.graph import _tavily_quota_failure
+    from nonebot_plugin_ai_groupmate.agent.tool_results import tool_failure
+
+    failure = tool_failure("quota_exhausted", "quota exhausted")
+    messages = [
+        HumanMessage(content="search"),
+        AIMessage(content="", tool_calls=[{"name": "reverse_image_search", "args": {}, "id": "google"}]),
+        ToolMessage(content=failure, tool_call_id="google"),
+    ]
+    assert _tavily_quota_failure(messages) is None
+    messages.extend([
+        AIMessage(content="", tool_calls=[{"name": "search_web", "args": {}, "id": "tavily"}]),
+        ToolMessage(content=failure, tool_call_id="tavily"),
+    ])
+    assert _tavily_quota_failure(messages) == failure
+    messages.append(HumanMessage(content="try again after quota is restored"))
+    assert _tavily_quota_failure(messages) is None
+
+
 @pytest.mark.asyncio
 async def test_agent_binds_provider_tools_without_registering_them_locally():
     from nonebot_plugin_ai_groupmate.agent.graph import (

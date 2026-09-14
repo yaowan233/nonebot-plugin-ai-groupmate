@@ -111,6 +111,26 @@ async def test_missing_key_expired_request_and_unknown_delivery(monkeypatch):
     send.assert_awaited_once()
 
 
+@pytest.mark.parametrize("as_exception", [False, True])
+@pytest.mark.asyncio
+async def test_web_image_search_reports_quota_exhaustion(monkeypatch, as_exception):
+    from nonebot_plugin_ai_groupmate.agent import image_search_tools as module
+
+    search = AsyncMock()
+    if as_exception:
+        search.ainvoke.side_effect = RuntimeError("Error 432: tvly-secret-value")
+    else:
+        search.ainvoke.return_value = {"error": RuntimeError("Error 432: tvly-secret-value")}
+    monkeypatch.setattr(module, "TavilySearch", lambda **kwargs: search)
+    search_tool, _, _ = module.create_web_image_tools(None, "group-1", None, tavily_api_key="test", bot_name="bot")
+    raw = await search_tool.ainvoke({"query": "cat"})
+    result = json.loads(raw)
+    assert result["reason_code"] == "quota_exhausted"
+    assert result["retryable"] is False
+    assert result["data"]["http_status"] == 432
+    assert "tvly-secret-value" not in raw
+
+
 def test_image_send_is_registered_as_side_effect():
     from nonebot_plugin_ai_groupmate.agent.graph import SIDE_EFFECT_TOOL_NAMES
 

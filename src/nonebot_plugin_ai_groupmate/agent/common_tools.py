@@ -1,3 +1,4 @@
+import re
 import datetime
 from typing import Any, Literal, Annotated
 from dataclasses import dataclass
@@ -51,42 +52,81 @@ def _web_search_payload(
     )
 
 
+def _web_search_error_parts(error: Any) -> list[Any]:
+    """Unwrap provider errors without inspecting successful search results."""
+    parts: list[Any] = []
+    pending = [error]
+    seen: set[int] = set()
+    while pending and len(parts) < 16:
+        candidate = pending.pop(0)
+        if candidate is None or id(candidate) in seen:
+            continue
+        seen.add(id(candidate))
+        parts.append(candidate)
+        if isinstance(candidate, dict):
+            pending.extend(candidate.get(key) for key in ("error", "detail", "message", "response"))
+        else:
+            pending.extend((getattr(candidate, "response", None), getattr(candidate, "__cause__", None)))
+    return parts
+
+
 def _web_search_error_status(error: Any) -> int | None:
-    for candidate in (error, getattr(error, "response", None)):
-        raw_status = getattr(candidate, "status_code", None)
-        if raw_status is None:
-            continue
-        try:
-            return int(raw_status)
-        except (TypeError, ValueError):
-            continue
+    parts = _web_search_error_parts(error)
+    for candidate in parts:
+        for field in ("status_code", "status", "code"):
+            raw_status = candidate.get(field) if isinstance(candidate, dict) else getattr(candidate, field, None)
+            if raw_status is None:
+                continue
+            try:
+                status = int(raw_status)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if 400 <= status <= 599:
+                return status
+    # langchain-tavily's async wrapper drops the response and raises
+    # Exception("Error 432: ..."). Only parse a leading HTTP error signature;
+    # a quoted query or an unrelated number in a message is not a status code.
+    for candidate in parts:
+        match = re.match(
+            r"^\s*(?:(?:error(?:\s+code)?|http(?:/\d(?:\.\d)?)?|status(?:[_ ]code)?)\s*[:=]?\s*)?([45]\d{2})(?=\s|:|$)",
+            str(candidate), re.IGNORECASE,
+        )
+        if match:
+            return int(match[1])
     return None
 
 
 def _web_search_retry_after(error: Any) -> int | None:
-    response = getattr(error, "response", None)
-    headers = getattr(response, "headers", None)
-    if headers is None:
-        return None
-    try:
-        raw_value = headers.get("retry-after")
-    except Exception:
-        return None
-    try:
-        return max(0, int(float(raw_value))) if raw_value is not None else None
-    except (TypeError, ValueError):
-        return None
+    for candidate in _web_search_error_parts(error):
+        headers = candidate.get("headers") if isinstance(candidate, dict) else getattr(candidate, "headers", None)
+        if headers is None:
+            continue
+        try:
+            raw_value = headers.get("retry-after")
+            if raw_value is not None:
+                return max(0, int(float(raw_value)))
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            continue
+    return None
 
 
 def _classify_web_search_error(error: Any) -> tuple[str, str, bool]:
     status = _web_search_error_status(error)
-    error_name = type(error).__name__.lower()
-    error_text = str(error).lower()
-    if status == 432 or any(
+    parts = _web_search_error_parts(error)
+    error_names = " ".join(type(part).__name__.lower() for part in parts)
+    error_text = " ".join(str(part).lower() for part in parts)
+    if status is None and any(isinstance(part, ToolException) and str(part).lower().startswith("no search results found") for part in parts):
+        return "no_results", "没有找到相关网页；可以调整或缩短关键词后重试一次。", True
+    if status in {432, 433} or any(
         marker in error_text
         for marker in ("usage limit", "pay-as-you-go limit", "quota", "credits exhausted")
     ):
-        return "quota_exhausted", "联网搜索额度已用尽，请检查 Tavily 套餐或稍后再试。", False
+        return (
+            "quota_exhausted",
+            "Tavily 联网搜索额度已用尽，本轮停止重试。需要等待额度重置、增加额度，"
+            "或更换有剩余额度的 API Key；重启 Bot 或 NAS 无法恢复额度。",
+            False,
+        )
     if status in {401, 403} or any(
         marker in error_text
         for marker in ("unauthorized", "invalid api key", "invalid_api_key")
@@ -95,8 +135,8 @@ def _classify_web_search_error(error: Any) -> tuple[str, str, bool]:
     if status == 429 or "rate limit" in error_text or "excessive requests" in error_text:
         return "rate_limited", "联网搜索请求过于频繁，请稍后再试。", False
     if (
-        isinstance(error, TimeoutError)
-        or "timeout" in error_name
+        any(isinstance(part, TimeoutError) for part in parts)
+        or "timeout" in error_names
         or "timed out" in error_text
     ):
         return "timeout", "联网搜索暂时超时，可以缩短关键词后重试一次。", True
@@ -112,6 +152,8 @@ def _web_search_failure(error: Any) -> str:
         f"reason={reason_code}, status={status}, error_type={type(error).__name__}"
     )
     extra: dict[str, Any] = {}
+    if status is not None:
+        extra["http_status"] = status
     if retry_after_seconds is not None:
         extra["retry_after_seconds"] = retry_after_seconds
     return _web_search_payload(
@@ -125,9 +167,9 @@ def _web_search_failure(error: Any) -> str:
 
 def _normalize_web_search_results(query: str, response: Any) -> str:
     if not isinstance(response, dict):
-        return _web_search_failure(RuntimeError("unexpected Tavily response type"))
+        return _web_search_failure(response)
     if response.get("error") is not None:
-        return _web_search_failure(response["error"])
+        return _web_search_failure(response)
 
     raw_results = response.get("results")
     if not isinstance(raw_results, list) or not raw_results:
@@ -295,13 +337,6 @@ def create_search_web_tool(tavily_api_key: str | None):
 
         try:
             response = await tavily_search.ainvoke(search_input)
-        except ToolException:
-            return _web_search_payload(
-                ok=False,
-                reason_code="no_results",
-                message="没有找到相关网页；可以调整或缩短关键词后重试一次。",
-                retryable=True,
-            )
         except Exception as error:
             return _web_search_failure(error)
         return _normalize_web_search_results(normalized_query, response)
