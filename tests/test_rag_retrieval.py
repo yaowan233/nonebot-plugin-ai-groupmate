@@ -355,6 +355,9 @@ async def test_chat_chunking_keeps_overlap_but_not_across_time_gaps():
         async def execute(self, _: object) -> FakeResult:
             return FakeResult()
 
+        async def commit(self) -> None:
+            pass
+
     groups = await utils.split_chat_into_context_groups(
         FakeSession(),  # type: ignore[arg-type]
         "group-1",
@@ -399,6 +402,9 @@ async def test_chat_chunking_splits_a_single_oversized_message():
     class FakeSession:
         async def execute(self, _: object) -> FakeResult:
             return FakeResult()
+
+        async def commit(self) -> None:
+            pass
 
     groups = await utils.split_chat_into_context_groups(
         FakeSession(),  # type: ignore[arg-type]

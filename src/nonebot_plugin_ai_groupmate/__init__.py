@@ -1074,47 +1074,40 @@ async def process_image_message(
         if not file_path.exists():
             file_path.write_bytes(pic)
 
-        # 3. 数据库操作 (MediaStorage)
+        # Match text ingestion: acquire the group lock BEFORE the first SQL
+        # operation. Holding a pooled connection/write transaction while waiting
+        # for this lock can deadlock with text ingestion waiting for that resource.
+        async with _get_dedup_lock(session.scene.id):
+            # 3. 数据库操作 (MediaStorage)
+            stmt = Select(MediaStorage).where(MediaStorage.file_hash == file_hash)
+            media_obj = (await db_session.execute(stmt)).scalar_one_or_none()
 
-        # 第一步：先查一次
-        stmt = Select(MediaStorage).where(MediaStorage.file_hash == file_hash)
-        media_obj = (await db_session.execute(stmt)).scalar_one_or_none()
-
-        if media_obj:
-            # A. 如果已存在，引用计数+1
-            media_obj.references += 1
-            db_session.add(media_obj)
-        else:
-            # B. 如果不存在，尝试插入
-            new_media = MediaStorage(
-                file_hash=file_hash,
-                file_path=file_name,
-                references=1,
-                description="[图片]",  # 占位符
-            )
-            db_session.add(new_media)
-            try:
-                # 必须 flush 以触发可能的 UniqueViolation 错误
-                await db_session.flush()
-                media_obj = new_media
-
-            except Exception as e:
-                # C. 插入失败，从 session 中移除失败的对象，重新查询判断是否为唯一约束冲突
-                await db_session.rollback()  # 先回滚，清理 session 状态
-                media_obj = (await db_session.execute(stmt)).scalar_one_or_none()
-                if media_obj is None:
-                    # 非唯一约束冲突，记录错误并重新抛出
-                    logger.error(f"插入图片记录失败（非并发冲突）: {e}")
-                    raise
-                # 唯一约束冲突，说明是并发插入
-                logger.info(f"图片并发插入冲突 {file_hash}，转为更新模式")
+            if media_obj:
                 media_obj.references += 1
                 db_session.add(media_obj)
+            else:
+                new_media = MediaStorage(
+                    file_hash=file_hash,
+                    file_path=file_name,
+                    references=1,
+                    description="[图片]",
+                )
+                db_session.add(new_media)
+                try:
+                    await db_session.flush()
+                    media_obj = new_media
+                except Exception as e:
+                    await db_session.rollback()
+                    media_obj = (await db_session.execute(stmt)).scalar_one_or_none()
+                    if media_obj is None:
+                        logger.error(f"插入图片记录失败（非并发冲突）: {e}")
+                        raise
+                    logger.info(f"图片并发插入冲突 {file_hash}，转为更新模式")
+                    media_obj.references += 1
+                    db_session.add(media_obj)
 
-        # 4. 添加聊天历史 (ChatHistory)
-        # 此时 media_obj 一定是有效的 (无论是新插的还是查出来的)
-        if media_obj:
-            async with _get_dedup_lock(session.scene.id):
+            # 4. 添加聊天历史 (ChatHistory)
+            if media_obj:
                 # 确保 flush 拿到 media_id (如果是新插入的对象)
                 await db_session.flush()
 

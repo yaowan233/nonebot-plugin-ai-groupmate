@@ -5,6 +5,7 @@ import hashlib
 import traceback
 from datetime import timedelta
 from functools import lru_cache
+from collections.abc import Sequence
 
 import tiktoken
 from PIL import Image
@@ -156,7 +157,7 @@ async def split_chat_into_context_groups(
         max_token_count: int = 450,
         max_messages: int = 24,
         overlap_messages: int = 2,
-) -> list[list[ChatHistory]]:
+) -> list[list[ChatHistorySchema]]:
     """
     将一个会话内的聊天记录智能切分为多个上下文组
 
@@ -169,7 +170,7 @@ async def split_chat_into_context_groups(
         overlap_messages: 因长度切分时保留的上下文消息数；时间断层不重叠
 
     返回:
-        切分后的对话组列表，每组是ChatHistory对象列表
+        切分后的对话组列表，每组是脱离数据库的 ChatHistorySchema 列表
     """
     eligible_message_filter = or_(
         ChatHistory.content_type == "text",
@@ -212,6 +213,26 @@ async def split_chat_into_context_groups(
     all_messages = list(reversed(previous_messages)) + pending_messages
     # ✅ 转成 Pydantic 模型（一次性完全脱离数据库）
     all_messages = [ChatHistorySchema.model_validate(m) for m in all_messages]
+    # Release the SQL connection before slow tokenizer loading or CPU work.
+    await db_session.commit()
+    return await asyncio.to_thread(
+        _split_chat_messages,
+        all_messages,
+        max_time_gap,
+        max_token_count,
+        max_messages,
+        overlap_messages,
+    )
+
+
+def _split_chat_messages(
+    all_messages: list[ChatHistorySchema],
+    max_time_gap: timedelta,
+    max_token_count: int,
+    max_messages: int,
+    overlap_messages: int,
+) -> list[list[ChatHistorySchema]]:
+    """Tokenize detached history off the event loop, including cold encoder loads."""
 
     # 单条超长消息也必须切分；否则它会绕过组级 token 上限，污染召回和 Prompt。
     expanded_messages: list[ChatHistorySchema] = []
@@ -442,7 +463,7 @@ async def process_and_vectorize_session_chats(
 
 
 def combine_messages_into_context(
-        messages: list[ChatHistory]
+        messages: Sequence[ChatHistory | ChatHistorySchema]
 ) -> tuple[str, list[int]]:
     context_parts = []
     msg_ids = []
