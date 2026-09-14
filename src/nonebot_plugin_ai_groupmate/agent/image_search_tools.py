@@ -71,7 +71,7 @@ def create_web_image_tools(
         search_depth="basic",
         include_images=True,
         include_image_descriptions=True,
-        handle_tool_error=False,
+        handle_tool_error=True,
     ) if tavily_api_key else None
     candidates: dict[str, dict[str, str]] = {}
     attempted_urls: set[str] = set()

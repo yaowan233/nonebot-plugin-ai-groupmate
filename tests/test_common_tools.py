@@ -98,7 +98,7 @@ async def test_search_web_passes_filters_and_normalizes_untrusted_results(monkey
 
     assert constructor_kwargs["max_results"] == 3
     assert constructor_kwargs["search_depth"] == "basic"
-    assert constructor_kwargs["handle_tool_error"] is False
+    assert constructor_kwargs["handle_tool_error"] is True
     assert calls == [{
         "query": "最新公告",
         "topic": "news",
@@ -188,6 +188,69 @@ async def test_search_web_returns_retryable_no_results(monkeypatch):
 
     assert result["reason_code"] == "no_results"
     assert result["retryable"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("image_search", [False, True])
+async def test_tavily_empty_results_do_not_emit_unhandled_tool_error(monkeypatch, image_search):
+    from langchain_core.callbacks import AsyncCallbackHandler
+    from langchain_tavily._utilities import TavilySearchAPIWrapper
+
+    from nonebot_plugin_ai_groupmate.agent import common_tools
+
+    errors: list[BaseException] = []
+    requests: list[dict[str, Any]] = []
+
+    class Callbacks(AsyncCallbackHandler):
+        async def on_tool_error(self, error: BaseException, **kwargs: Any) -> None:
+            errors.append(error)
+
+    async def empty_response(self, **kwargs: Any):
+        requests.append(kwargs)
+        return {"results": [], "query": kwargs["query"]}
+
+    monkeypatch.setattr(TavilySearchAPIWrapper, "raw_results_async", empty_response)
+    runtime = _runtime(common_tools)
+    query = "A股收盘 沪指 创业板指 成交额 今日"
+    if image_search:
+        from nonebot_plugin_ai_groupmate.agent.image_search_tools import create_web_image_tools
+
+        search, _, _ = create_web_image_tools(None, "group-1", None, tavily_api_key="tvly-test", bot_name="bot")
+        search_input = {"query": query}
+    else:
+        search = common_tools.create_search_web_tool("tvly-test")
+        search_input = {
+            "query": query, "topic": "finance", "time_range": "day",
+            "include_domains": ["example.com"], "runtime": runtime,
+        }
+    response = await search.ainvoke(search_input, config={"callbacks": [Callbacks()]})
+
+    assert json.loads(response)["reason_code"] == "no_results"
+    assert errors == [], "An expected empty result was reported as an unhandled LangChain error"
+    assert len(requests) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("message", "reason", "retryable"), [
+    ("No search results found for 'Error 432 quota invalid api key'", "no_results", True),
+    ("Error 432: tvly-secret-value", "quota_exhausted", False),
+    ("Error 401: tvly-secret-value", "authentication_failed", False),
+    ("Error 429", "rate_limited", False),
+    ("Error 500", "provider_error", True),
+])
+async def test_handled_tavily_error_text_preserves_classification(monkeypatch, message, reason, retryable):
+    from langchain_tavily._utilities import TavilySearchAPIWrapper
+
+    from nonebot_plugin_ai_groupmate.agent import common_tools
+
+    async def raise_tool_error(self, **kwargs):
+        raise ToolException(message)
+
+    monkeypatch.setattr(TavilySearchAPIWrapper, "raw_results_async", raise_tool_error)
+    result = await _invoke_search(common_tools.create_search_web_tool("tvly-test"), common_tools)
+    assert result["reason_code"] == reason
+    assert result["retryable"] is retryable
+    assert "tvly-secret-value" not in json.dumps(result)
 
 
 @pytest.mark.asyncio

@@ -115,7 +115,9 @@ def _classify_web_search_error(error: Any) -> tuple[str, str, bool]:
     parts = _web_search_error_parts(error)
     error_names = " ".join(type(part).__name__.lower() for part in parts)
     error_text = " ".join(str(part).lower() for part in parts)
-    if status is None and any(isinstance(part, ToolException) and str(part).lower().startswith("no search results found") for part in parts):
+    # Tavily's handled ToolException is returned as text. Recognize only its
+    # leading empty-result signature, before inspecting quoted query keywords.
+    if status is None and any(isinstance(part, (str, ToolException)) and str(part).lower().startswith("no search results found") for part in parts):
         return "no_results", "没有找到相关网页；可以调整或缩短关键词后重试一次。", True
     if status in {432, 433} or any(
         marker in error_text
@@ -222,7 +224,9 @@ def create_search_web_tool(tavily_api_key: str | None):
         TavilySearch(
             max_results=3,
             search_depth="basic",
-            handle_tool_error=False,
+            # Handle expected empty-result ToolExceptions at the inner tool;
+            # catching them outside ainvoke is too late for error callbacks.
+            handle_tool_error=True,
             tavily_api_key=tavily_api_key,
         )
         if tavily_api_key
