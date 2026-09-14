@@ -55,6 +55,33 @@ class ChatHistory(Model):
     )
 
 
+class ScheduledTask(Model):
+    """Persisted one-shot tasks. All timestamps use naive UTC in the database."""
+
+    job_id: Mapped[str] = mapped_column(String(255), primary_key=True)
+    session_id: Mapped[str] = mapped_column(String(255))
+    is_private: Mapped[bool] = mapped_column(Boolean)
+    bot_id: Mapped[str | None] = mapped_column(String(255))
+    bot_name: Mapped[str] = mapped_column(String(255), default="bot")
+    task_type: Mapped[str] = mapped_column(String(16))
+    content: Mapped[str] = mapped_column(Text)
+    run_at: Mapped[datetime]
+    status: Mapped[str] = mapped_column(String(16), default="scheduled")
+    created_at: Mapped[datetime]
+    updated_at: Mapped[datetime]
+    started_at: Mapped[datetime | None]
+    finished_at: Mapped[datetime | None]
+    lease_until: Mapped[datetime | None]
+    claim_token: Mapped[str | None] = mapped_column(String(32))
+    error: Mapped[str | None] = mapped_column(Text)
+
+    __table_args__ = (
+        Index("ix_scheduled_task_due", "status", "run_at"),
+        Index("ix_scheduled_task_scope", "session_id", "is_private", "bot_id", "status"),
+        Index("ix_scheduled_task_lease", "status", "lease_until"),
+    )
+
+
 class UserRelation(Model):
     """用户关系/好感度表"""
 

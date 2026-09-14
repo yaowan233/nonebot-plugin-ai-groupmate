@@ -54,6 +54,7 @@ BUDGET_FINALIZATION_FALLBACK = (
 )
 SIDE_EFFECT_TOOL_NAMES = frozenset({
     "add_message_reaction",
+    "cancel_scheduled_task",
     "mute_user",
     "recall_message",
     "reply_user",
@@ -63,6 +64,7 @@ SIDE_EFFECT_TOOL_NAMES = frozenset({
     "send_web_image",
     "send_private_message",
     "update_group_memory",
+    "update_scheduled_task",
     "update_user_impression",
 })
 

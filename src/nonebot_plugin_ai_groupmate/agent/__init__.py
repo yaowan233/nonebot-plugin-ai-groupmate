@@ -101,6 +101,7 @@ from .history_format import (
 from .schedule_tools import (
     create_schedule_message_tool,
     create_schedule_agent_task_tool,
+    create_schedule_management_tools,
 )
 from ..runtime_config import get_runtime_config
 from ..forward_message import extract_forward_message_ids
@@ -603,8 +604,10 @@ async def _run_scheduled_agent_task(
         logger.info(f"[定时Agent任务] 已执行 {session_id}: {task}")
     except asyncio.TimeoutError:
         logger.warning(f"[定时Agent任务] 执行超时 session={session_id}: {task}")
+        raise
     except Exception as e:
         logger.exception(f"[定时Agent任务] 执行失败 {session_id}: {e}")
+        raise
 
 
 tools = [search_web, search_history_context, calculate_expression]
@@ -682,13 +685,19 @@ def _build_builtin_agent_skills(
         ),
         AgentSkill(
             name="schedule_tools",
-            description="安排延迟提醒、转告、固定消息或到点后执行复杂 agent 任务。",
+            description="创建、查看、修改和取消定时提醒、固定消息或到点后执行的 Agent 任务。",
             prompt=(
                 "定时工具规则：\n"
                 "- 用户要求几分钟/几小时后提醒、转告或发送固定消息时：调用 `schedule_message`。\n"
                 "- 用户要求到点后查询最新信息、联网搜索、选择表情包或根据当时情况处理时：调用 `schedule_agent_task`。\n"
                 "- 如果任务只是提醒/转告，优先固定消息；如果任务需要未来环境判断，使用 agent task。\n"
-                '- 安排成功后简短告知用户，使用 `reply_user(next_step="end")` 自动结束。'
+                "- 用户询问有哪些提醒/定时任务时，调用 `list_scheduled_tasks`；根据 next_offset 翻页，展示任务内容、类型、执行时间和状态。默认只查待执行任务，查看历史/取消记录/执行结果时传 status=all 或对应状态。\n"
+                "- 修改或取消已有任务前，先查询列表取得准确 job_id，不要猜测 ID；有多个符合描述的任务时，向用户确认具体目标，不要擅自批量操作。\n"
+                "- 修改内容或执行时间调用 `update_scheduled_task`，content 同时适用于固定消息和 Agent 任务描述；省略的字段保持不变，新的延迟从现在重新计时。\n"
+                "- 取消/删除提醒或定时任务调用 `cancel_scheduled_task`；已开始执行的任务不能撤回。只能管理当前会话、当前 Bot 的任务。\n"
+                "- 任务已持久保存到数据库，重启后可继续执行；超过 5 分钟宽限期标记 missed，执行中断标记 interrupted，失败或中断不会自动重试。\n"
+                "- 只有工具明确返回成功才能告知创建、修改或取消成功；失败时说明原因，不要声称操作完成。\n"
+                '- 操作完成后简短告知用户，使用 `reply_user(next_step="end")` 自动结束。'
             ),
         ),
         AgentSkill(
@@ -1319,7 +1328,12 @@ async def create_chat_graph(
         request_id,
         is_private=is_private,
         bot_id=bot_id,
-        run_agent_task=_run_scheduled_agent_task,
+    )
+    schedule_management_tools = create_schedule_management_tools(
+        session_id,
+        request_id,
+        is_private=is_private,
+        bot_id=bot_id,
     )
     reaction_tool = create_reaction_tool(
         db_session, session_id, request_id, plugin_config.bot_name, bot, event
@@ -1496,7 +1510,7 @@ async def create_chat_graph(
         ]
     tools_by_skill: dict[str, list[Any]] = {
         "search_context_tools": [search_history_context, calculate_expression],
-        "schedule_tools": [schedule_tool, schedule_agent_tool],
+        "schedule_tools": [schedule_tool, schedule_agent_tool, *schedule_management_tools],
         "profile_memory_tools": [relation_tool, report_tool],
     }
     if is_private:

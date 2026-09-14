@@ -78,6 +78,7 @@ from .runtime_config import (
 )
 from .forward_message import format_forward_reference_markers
 from .group_api_relay import delete_expired_pending_group_configs
+from .scheduled_tasks import poll_scheduled_tasks, stop_scheduled_tasks
 from .agent.reply_tools import create_reply_tool
 from .group_daily_quota import (
     GroupDailyQuotaStatus,
@@ -223,6 +224,19 @@ async def _load_webui_runtime_config() -> None:
             logger.info(f"已加载 WebUI 配置覆盖项，变更字段数={len(changed_fields)}")
     except Exception:
         logger.exception("加载 WebUI 配置失败，继续使用环境变量；请确认已执行 nb orm upgrade")
+
+
+@scheduler.scheduled_job("interval", seconds=1, max_instances=1, coalesce=True, id="ai_groupmate_poll_scheduled_tasks")
+async def _poll_scheduled_tasks() -> None:
+    try:
+        await poll_scheduled_tasks()
+    except Exception:
+        logger.exception("扫描数据库定时任务失败，将在下次扫描重试；请确认已执行 nb orm upgrade")
+
+
+@get_driver().on_shutdown
+async def _close_scheduled_tasks() -> None:
+    await stop_scheduled_tasks()
 
 
 @get_driver().on_shutdown
