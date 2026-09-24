@@ -1,14 +1,16 @@
 import datetime
-from types import SimpleNamespace
 
 import pytest
 
 
 @pytest.mark.parametrize("content_type", ["text", "bot"])
 def test_history_hides_platform_id(tmp_path, content_type):
+    from nonebot_plugin_ai_groupmate.model import ChatHistorySchema
     from nonebot_plugin_ai_groupmate.agent.history_format import format_chat_history
 
-    history = SimpleNamespace(
+    history = ChatHistorySchema(
+        msg_id=1,
+        session_id="group-1",
         content="id: 123456\nhello",
         content_type=content_type,
         user_id="bot" if content_type == "bot" else "1001",

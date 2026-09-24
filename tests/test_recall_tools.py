@@ -95,7 +95,7 @@ async def test_recall_resolves_target_without_exposing_ids(monkeypatch, argument
     monkeypatch.setattr(recall_tools, "message_recall", recall)
     reader = recall_tools.create_recall_message_tool(
         session, "group-1", None, bot_name="bot", has_admin_permission=True,
-        bot=bot, event=event, reply_to_id=reply_to_id,
+        bot=cast(Bot, bot), event=cast(Event, event), reply_to_id=reply_to_id,
     )
     assert "target_msg_id" not in reader.args
     result = json.loads(await reader.ainvoke(arguments))
