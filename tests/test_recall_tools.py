@@ -52,7 +52,7 @@ async def test_private_recall_permissions(monkeypatch, sender, age_minutes, foun
         session, "private-1", None,
         bot_name="bot", has_admin_permission=False, bot=cast(Bot, bot), event=cast(Event, event),
     )
-    result = json.loads(await reader.ainvoke({"target_msg_id": "123"}))
+    result = json.loads(await reader.ainvoke({"target": "content", "target_text": "hello"}))
 
     assert result["reason_code"] == expected
     if expected == "message_recalled":
@@ -60,6 +60,48 @@ async def test_private_recall_permissions(monkeypatch, sender, age_minutes, foun
         assert session.committed
         assert session.added[0].session_id == "private-1"
         assert result["delivery_state"] == "completed"
+        assert "123" not in json.dumps(result)
+        assert "123" not in session.added[0].content
     else:
         recall.assert_not_awaited()
         assert not session.added
+
+
+@pytest.mark.parametrize(
+    ("arguments", "rows", "reply_to_id", "expected_id", "expected_reason"),
+    [
+        ({}, [("2", "user", "request"), ("1", "bot", "hello")], None, "1", "message_recalled"),
+        ({"target": "reply"}, [("1", "bot", "hello")], "1", "1", "message_recalled"),
+        ({"target": "reply"}, [("1", "bot", "hello")], None, None, "missing_reply"),
+        ({"target": "content", "target_text": "hello"}, [("2", "bot", "hello"), ("1", "bot", "hello")], None, None, "ambiguous_message"),
+        ({"target": "content", "target_text": "hello", "sender_name": "user"}, [("2", "user", "hello"), ("1", "bot", "hello")], None, "2", "message_recalled"),
+        ({"target": "content"}, [], None, None, "missing_target_text"),
+        ({}, [("system", "bot", "action"), ("unknown", "bot", "hello")], None, None, "message_not_found"),
+    ],
+)
+async def test_recall_resolves_target_without_exposing_ids(monkeypatch, arguments, rows, reply_to_id, expected_id, expected_reason):
+    from nonebot_plugin_ai_groupmate.agent import recall_tools
+
+    history = [SimpleNamespace(
+        content=f"id: {mid}\n{body}", content_type="bot" if sender == "bot" else "text",
+        user_id=sender, user_name=sender, created_at=datetime.datetime.now(),
+    ) for mid, sender, body in rows]
+    session = SimpleNamespace(
+        execute=AsyncMock(return_value=SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: history))),
+        commit=AsyncMock(), add=lambda row: None,
+    )
+    bot, event = SimpleNamespace(), SimpleNamespace()
+    recall = AsyncMock()
+    monkeypatch.setattr(recall_tools, "message_recall", recall)
+    reader = recall_tools.create_recall_message_tool(
+        session, "group-1", None, bot_name="bot", has_admin_permission=True,
+        bot=bot, event=event, reply_to_id=reply_to_id,
+    )
+    assert "target_msg_id" not in reader.args
+    result = json.loads(await reader.ainvoke(arguments))
+    assert result["reason_code"] == expected_reason
+    assert "message_id" not in result.get("data", {})
+    if expected_id is not None:
+        recall.assert_awaited_once_with(message_id=expected_id, event=event, bot=bot)
+    else:
+        recall.assert_not_awaited()

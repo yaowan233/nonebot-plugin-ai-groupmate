@@ -1,4 +1,5 @@
 import datetime
+from typing import Literal
 
 from sqlalchemy import Select
 from nonebot.log import logger
@@ -9,6 +10,7 @@ from nonebot_plugin_alconna import message_recall
 from ..model import ChatHistory
 from ..reply_guard import is_request_active
 from .tool_results import tool_failure, tool_skipped, tool_success
+from .history_format import parse_msg_meta
 
 SELF_RECALL_WINDOW = datetime.timedelta(minutes=5)
 
@@ -18,7 +20,7 @@ def _extract_stored_message_id(content: str) -> str | None:
     if not first_line.startswith("id:"):
         return None
     message_id = first_line.split(":", 1)[1].strip()
-    if not message_id or message_id == "system":
+    if not message_id or message_id in {"system", "unknown"}:
         return None
     return message_id
 
@@ -32,9 +34,10 @@ def create_recall_message_tool(
     has_admin_permission: bool,
     bot: Bot | None,
     event: Event | None,
+    reply_to_id: str | None = None,
 ):
-    async def _find_history_by_message_id(message_id: str) -> ChatHistory | None:
-        rows = (
+    async def _recent_history() -> list[ChatHistory]:
+        return list(
             (
                 await db_session.execute(
                     Select(ChatHistory)
@@ -46,20 +49,23 @@ def create_recall_message_tool(
             .scalars()
             .all()
         )
-        for row in rows:
-            if _extract_stored_message_id(row.content) == message_id:
-                return row
-        return None
 
     @tool("recall_message")
-    async def recall_message(target_msg_id: str, reason: str | None = None) -> str:
+    async def recall_message(
+        target: Literal["latest_self", "reply", "content"] = "latest_self",
+        target_text: str | None = None,
+        sender_name: str | None = None,
+        reason: str | None = None,
+    ) -> str:
         """
         撤回当前会话历史中的一条消息。
 
         群聊管理员/群主权限下可以撤回他人消息；私聊或群聊普通权限下只能撤回 bot 自己发送且 5 分钟内的消息。
 
         Args:
-            target_msg_id: 聊天历史里 `id: xxx` 的平台消息 ID。
+            target: latest_self 撤回 bot 最近一条消息；reply 撤回用户本次引用的消息；content 按正文查找。
+            target_text: target=content 时必填，原样摘取目标消息正文的完整内容或独特片段；匹配多条时不会撤回。
+            sender_name: target=content 时可选，按聊天记录中的发送者名称进一步限定。
             reason: 撤回原因，用于日志和历史记录。
         """
         if request_id is not None and not await is_request_active(
@@ -78,15 +84,41 @@ def create_recall_message_tool(
                 delivery_state="not_attempted",
             )
 
-        target_msg_id = str(target_msg_id or "").strip()
-        if not target_msg_id or target_msg_id == "system":
+        if target == "reply" and not reply_to_id:
             return tool_failure(
-                "invalid_message_id",
-                "撤回失败：缺少有效的目标消息 ID。",
+                "missing_reply",
+                "用户本次没有引用消息，请按消息正文指定目标。",
                 delivery_state="not_attempted",
             )
-
-        history = await _find_history_by_message_id(target_msg_id)
+        target_text = (target_text or "").strip()
+        if target == "content" and not target_text:
+            return tool_failure(
+                "missing_target_text", "请提供要撤回的消息正文或独特片段。",
+                delivery_state="not_attempted",
+            )
+        candidates: dict[str, ChatHistory] = {}
+        for row in await _recent_history():
+            message_id = _extract_stored_message_id(row.content)
+            if message_id is None:
+                continue
+            if target == "latest_self":
+                matches = row.content_type == "bot" and str(row.user_id) == str(bot_name)
+            elif target == "reply":
+                matches = message_id == str(reply_to_id)
+            else:
+                matches = target_text in parse_msg_meta(row.content)[2]
+                if sender_name:
+                    matches = matches and row.user_name == sender_name
+            if matches:
+                candidates.setdefault(message_id, row)
+                if target == "latest_self":
+                    break
+        if len(candidates) > 1:
+            return tool_failure(
+                "ambiguous_message", "有多条消息匹配，未执行撤回。请补充更完整的正文、发送者名称，或请用户引用目标消息。",
+                delivery_state="not_attempted",
+            )
+        target_msg_id, history = next(iter(candidates.items()), (None, None))
         if history is None:
             return tool_failure(
                 "message_not_found",
@@ -142,7 +174,7 @@ def create_recall_message_tool(
             content_type="bot",
             content=(
                 "id: system\n"
-                f"已执行{action_scope}: message_id={target_msg_id}, "
+                f"已执行{action_scope}: "
                 f"reason={reason or '未填写原因'}"
             ),
             user_name=bot_name,
@@ -153,8 +185,8 @@ def create_recall_message_tool(
         )
         return tool_success(
             "message_recalled",
-            f"已撤回消息 {target_msg_id}。",
-            data={"message_id": target_msg_id, "scope": action_scope},
+            "已撤回目标消息。",
+            data={"scope": action_scope},
             delivery_state="completed",
         )
 

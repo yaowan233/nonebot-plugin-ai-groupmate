@@ -1084,7 +1084,8 @@ async def create_chat_graph(
 - 可使用 `recall_message` 撤回当前私聊中 bot 自己发送且 5 分钟内的消息。
 - 用户明确要求撤回，或 bot 自己误发、重复发、格式错乱、内容不合适时可以使用。
 - 不能撤回用户发送的消息。
-- target_msg_id 必须来自当前私聊历史里 bot 自己消息的 `id: xxx`，不要编造消息 ID。
+- 使用 target="latest_self" 撤回自己最近一条消息；用户引用了目标时使用 target="reply"；否则使用 target="content" 并在 target_text 中原样摘取正文，可用 sender_name 限定发送者。无需提供消息 ID。
+- 匹配多条时不要猜测，改用更完整的正文或请用户引用目标消息。
 """
         elif has_admin_permission:
             system_prompt += """
@@ -1093,7 +1094,8 @@ async def create_chat_graph(
 - 只在有明确原因时撤回，例如违规、刷屏、隐私泄露、用户明确要求撤回、误发敏感内容。
 - 不要因为观点不同、普通玩笑或轻微跑题撤回他人消息。
 - 对 bot 自己误发、重复发、格式错乱的消息，也可以用 `recall_message` 撤回。
-- target_msg_id 必须来自聊天历史里的 `id: xxx`，不要编造消息 ID。
+- 使用 target="latest_self" 撤回自己最近一条消息；用户引用了目标时使用 target="reply"；否则使用 target="content" 并在 target_text 中原样摘取正文，可用 sender_name 限定发送者。无需提供消息 ID。
+- 匹配多条时不要猜测，改用更完整的正文或请用户引用目标消息。
 """
         else:
             system_prompt += """
@@ -1101,7 +1103,8 @@ async def create_chat_graph(
 - 你当前没有管理员/群主权限，但可使用 `recall_message` 撤回 bot 自己发送且 5 分钟内的消息。
 - 只能用于 bot 自己误发、重复发、格式错乱、发错对象、内容不合适等情况。
 - 不能撤回用户或其他成员的消息；遇到他人违规消息时只能提醒、吐槽或请求管理员处理。
-- target_msg_id 必须来自聊天历史里 bot 自己消息的 `id: xxx`，不要编造消息 ID。
+- 使用 target="latest_self" 撤回自己最近一条消息；用户引用了目标时使用 target="reply"；否则使用 target="content" 并在 target_text 中原样摘取正文，可用 sender_name 限定发送者。无需提供消息 ID。
+- 匹配多条时不要猜测，改用更完整的正文或请用户引用目标消息。
 """
     model_owner = resolve_session_model_owner(
         session_id=session_id,
@@ -1347,6 +1350,7 @@ async def create_chat_graph(
             has_admin_permission=has_admin_permission,
             bot=bot,
             event=event,
+            reply_to_id=reply_to_id,
         )
         if recall_message_enabled
         else None
