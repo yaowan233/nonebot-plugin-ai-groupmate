@@ -104,6 +104,7 @@ from .schedule_tools import (
     create_schedule_management_tools,
 )
 from ..runtime_config import get_runtime_config
+from .explicit_memory import MEMORY_PROMPT, get_explicit_memory_context, create_explicit_memory_tools
 from ..forward_message import extract_forward_message_ids
 from .moderation_tools import create_mute_tool
 from .web_image_search import (
@@ -1000,6 +1001,17 @@ async def create_chat_graph(
     )
     meme_send_count = max(1, min(int(meme_send_count), MAX_MEME_SEND_COUNT))
     relation_context = await get_user_relation_context(db_session, user_id, user_name)
+    memory_context = ""
+    try:
+        async with get_session() as memory_session:
+            memory_context = await get_explicit_memory_context(
+                memory_session, session_id, str(user_id), str(bot_id or plugin_config.bot_name), is_private,
+                touch=not (proactive_meme_only or proactive_reaction_only or repeat_text is not None),
+            )
+            await memory_session.commit()
+    except Exception:
+        logger.exception("读取明确记忆失败，请确认已执行 nb orm upgrade")
+        memory_context = "【明确记忆】读取失败；不能声称没有记忆或已忘掉。"
     group_context = ""
     recent_relations_context = ""
     if not is_private:
@@ -1063,6 +1075,7 @@ async def create_chat_graph(
         reaction_tool_instruction=reaction_tool_instruction,
     )
     system_prompt = prompt_result.system_prompt
+    system_prompt += MEMORY_PROMPT
     if reaction_tool_instruction.strip():
         system_prompt += (
             "\n【消息表情回应】\n" + reaction_tool_instruction.strip() + "\n"
@@ -1493,6 +1506,10 @@ async def create_chat_graph(
         ),
         *([last_image_search_tool] if last_image_search_tool is not None else []),
         *web_image_tools,
+        *create_explicit_memory_tools(
+            session_id, str(user_id), str(bot_id or plugin_config.bot_name), is_private,
+            history or [], request_id,
+        ),
         *custom_agent_tools,
         *([code_interpreter_tool] if code_interpreter_tool is not None else []),
         *([forward_message_tool] if forward_message_tool is not None else []),
@@ -1547,6 +1564,7 @@ async def create_chat_graph(
         kept_dynamic_context_parts.append(context_part.strip())
 
     dynamic_context = "\n\n".join(kept_dynamic_context_parts)
+    dynamic_context = "\n\n".join(part for part in (dynamic_context, memory_context) if part)
     system_messages = build_system_messages(
         stable_system_prompt,
         use_cache_control=_use_explicit_prompt_cache(chat_config),

@@ -1,7 +1,7 @@
 from datetime import date, datetime
 
 from pydantic import BaseModel
-from sqlalchemy import JSON, Text, Float, Index, String, Boolean, Integer
+from sqlalchemy import JSON, Text, Float, Index, String, Boolean, Integer, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 from nonebot_plugin_orm import Model
 
@@ -122,6 +122,31 @@ class GroupMemory(Model):
     summary: Mapped[str] = mapped_column(default="")
     msg_count_at_last_update: Mapped[int] = mapped_column(default=0)
     updated_at: Mapped[datetime] = mapped_column(default=datetime.now, onupdate=datetime.now, index=True)
+
+
+class ExplicitMemory(Model):
+    """Explicit user requests scoped to a conversation and bot; naive local time."""
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    session_id: Mapped[str] = mapped_column(String(255))
+    user_id: Mapped[str] = mapped_column(String(255))
+    bot_id: Mapped[str] = mapped_column(String(255))
+    is_private: Mapped[bool] = mapped_column(Boolean)
+    title: Mapped[str] = mapped_column(String(60))
+    content: Mapped[str] = mapped_column(Text)
+    kind: Mapped[str] = mapped_column(String(16))
+    lifetime: Mapped[str] = mapped_column(String(16))
+    source_quote: Mapped[str] = mapped_column(Text)
+    source_msg_id: Mapped[int] = mapped_column(Integer)
+    created_at: Mapped[datetime]
+    updated_at: Mapped[datetime]
+    last_used_at: Mapped[datetime]
+    expires_at: Mapped[datetime | None]
+
+    __table_args__ = (
+        UniqueConstraint("session_id", "user_id", "bot_id", "is_private", "title", name="uq_explicit_memory_scope_title"),
+        Index("ix_explicit_memory_expiry", "lifetime", "expires_at", "last_used_at"),
+    )
 
 
 class TokenUsage(Model):

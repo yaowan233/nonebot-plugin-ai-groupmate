@@ -102,6 +102,7 @@ from .group_model_config import (
     load_or_create_local_encryption_key,
 )
 from .relation_maintenance import count_negative_relations, reset_negative_relations
+from .agent.explicit_memory import cleanup_explicit_memories
 from .agent.web_image_search import is_explicit_web_image_search_request
 
 
@@ -233,6 +234,16 @@ async def _poll_scheduled_tasks() -> None:
         await poll_scheduled_tasks()
     except Exception:
         logger.exception("扫描数据库定时任务失败，将在下次扫描重试；请确认已执行 nb orm upgrade")
+
+
+@scheduler.scheduled_job("interval", minutes=5, max_instances=1, coalesce=True, id="ai_groupmate_expire_explicit_memories")
+async def _expire_explicit_memories() -> None:
+    try:
+        async with get_session() as db_session:
+            await cleanup_explicit_memories(db_session)
+            await db_session.commit()
+    except Exception:
+        logger.exception("清理到期明确记忆失败，请确认已执行 nb orm upgrade")
 
 
 @get_driver().on_shutdown

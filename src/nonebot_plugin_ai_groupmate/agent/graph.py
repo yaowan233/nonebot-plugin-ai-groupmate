@@ -67,6 +67,8 @@ SIDE_EFFECT_TOOL_NAMES = frozenset({
     "update_group_memory",
     "update_scheduled_task",
     "update_user_impression",
+    "save_explicit_memory",
+    "forget_explicit_memory",
 })
 
 ContentBlock = str | dict[str, Any]
