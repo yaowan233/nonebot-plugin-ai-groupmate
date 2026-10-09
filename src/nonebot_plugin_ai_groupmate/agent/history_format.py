@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 
 from ..model import ChatHistory, ChatHistorySchema
+from ..message_metadata import deduplicate_bot_echoes, parse_message_metadata
 
 
 def _image_bytes_to_data_uri(image_bytes: bytes, *, source: str) -> str | None:
@@ -83,6 +84,7 @@ async def build_avatar_context_messages(
     max_users: int = 4,
     group_members: list[Any] | None = None,
 ) -> list[BaseMessage]:
+    history = deduplicate_bot_echoes(history)
     user_ids: list[str] = []
     if current_user_id:
         user_ids.append(str(current_user_id))
@@ -172,7 +174,7 @@ def should_include_avatar_context(
         "pfp",
     )
     checked = 0
-    for msg in reversed(history):
+    for msg in reversed(deduplicate_bot_echoes(history)):
         if msg.content_type == "bot":
             continue
         _, _, body = parse_msg_meta(msg.content)
@@ -186,24 +188,7 @@ def should_include_avatar_context(
 
 
 def parse_msg_meta(content: str) -> tuple[str | None, str | None, str]:
-    lines = content.splitlines()
-    if not lines:
-        return None, None, ""
-
-    own_id: str | None = None
-    reply_to_id: str | None = None
-    body_start = 0
-
-    if lines[0].startswith("id:"):
-        own_id = lines[0].split(":", 1)[1].strip()
-        body_start = 1
-
-        if len(lines) > 1 and lines[1].startswith("回复id:"):
-            reply_to_id = lines[1].split(":", 1)[1].strip()
-            body_start = 2
-
-    body = "\n".join(lines[body_start:]).strip()
-    return own_id, reply_to_id, body
+    return parse_message_metadata(content)
 
 
 def image_file_name_from_history(msg: ChatHistorySchema) -> str:
@@ -224,6 +209,7 @@ def current_message_images(
     history: list[ChatHistorySchema],
 ) -> list[ChatHistorySchema]:
     """返回历史中最后一条（当前）消息携带的图片记录。"""
+    history = deduplicate_bot_echoes(history)
     if not history:
         return []
     last_id, _, _ = parse_msg_meta(history[-1].content)
@@ -287,8 +273,14 @@ def format_chat_history(
     extra_inline_images: list[ChatHistorySchema] | None = None,
 ) -> list[BaseMessage]:
     messages = []
+    # Reply-image records may contain another copy of a bot's adapter echo.
+    combined = deduplicate_bot_echoes([*history, *(extra_inline_images or [])])
+    retained = {id(message) for message in combined}
+    history = [message for message in history if id(message) in retained]
     user_roles = user_roles or {}
-    extra_inline_images = extra_inline_images or []
+    extra_inline_images = [
+        message for message in (extra_inline_images or []) if id(message) in retained
+    ]
 
     def role_prefix(uid: str) -> str:
         role = user_roles.get(uid)

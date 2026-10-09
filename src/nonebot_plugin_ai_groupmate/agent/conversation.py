@@ -7,6 +7,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from langchain_core.messages import BaseMessage
 
 from ..model import ChatHistory, ChatHistorySchema
+from ..message_metadata import (
+    BOT_ECHO_LOOKBACK,
+    platform_message_ids,
+    deduplicate_bot_echoes,
+)
 
 ACTIVE_THREAD_TTL = datetime.timedelta(minutes=10)
 ACTIVE_THREAD_MAX_MESSAGES = 24
@@ -52,6 +57,9 @@ def build_append_only_history(
     extra_inline_images: list[ChatHistorySchema] | None = None,
 ) -> tuple[list[BaseMessage], list[ChatHistorySchema], bool]:
     thread = get_active_thread(session_id)
+    # Compare the full supplied window before slicing at last_msg_id, otherwise
+    # an echo arriving after the previous bot turn loses its canonical evidence.
+    history = deduplicate_bot_echoes(history)
     if not history:
         return [], [], False
 
@@ -93,8 +101,38 @@ async def update_active_thread(
     )
     if new_rows:
         new_history = [ChatHistorySchema.model_validate(row) for row in new_rows]
-        base_messages = base_messages + format_history(new_history, 0, None, None)
         last_msg_id = max(msg.msg_id for msg in new_history)
+        if any(
+            msg.content_type != "bot" and platform_message_ids(msg.content)
+            for msg in new_history
+        ):
+            # A delayed echo can sit beyond the input boundary while its bot
+            # record is already in base_messages. Load bounded evidence only;
+            # these older bot records must never be appended to the cache again.
+            earliest = min(msg.created_at for msg in new_history) - BOT_ECHO_LOOKBACK
+            latest = max(msg.created_at for msg in new_history) + BOT_ECHO_LOOKBACK
+            earlier_bot_rows = (
+                (
+                    await db_session.execute(
+                        Select(ChatHistory).where(
+                            ChatHistory.session_id == session_id,
+                            ChatHistory.content_type == "bot",
+                            ChatHistory.msg_id <= input_max_msg_id,
+                            ChatHistory.created_at >= earliest,
+                            ChatHistory.created_at <= latest,
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            earlier_bots = [ChatHistorySchema.model_validate(row) for row in earlier_bot_rows]
+            new_history = [
+                msg
+                for msg in deduplicate_bot_echoes([*earlier_bots, *new_history])
+                if msg.msg_id > input_max_msg_id
+            ]
+        base_messages = base_messages + format_history(new_history, 0, None, None)
     else:
         last_msg_id = input_max_msg_id
 

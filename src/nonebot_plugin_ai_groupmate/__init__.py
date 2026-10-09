@@ -79,6 +79,7 @@ from .runtime_config import (
 from .forward_message import format_forward_reference_markers
 from .group_api_relay import delete_expired_pending_group_configs
 from .scheduled_tasks import poll_scheduled_tasks, stop_scheduled_tasks
+from .message_metadata import BOT_ECHO_LOOKBACK, is_reliable_platform_id
 from .agent.reply_tools import create_reply_tool
 from .group_daily_quota import (
     GroupDailyQuotaStatus,
@@ -285,7 +286,7 @@ class GroupReplyState:
 # 每个群有限并发处理明确 @；非定向回复只保留最新一条，避免高峰期刷屏。
 _group_reply_states: dict[str, GroupReplyState] = {}
 _group_reply_state_lock = asyncio.Lock()
-_continuous_conversation_until: dict[tuple[str, str], datetime.datetime] = {}
+_continuous_conversation_until: dict[tuple[str, str, str], datetime.datetime] = {}
 MAX_GROUP_ADDRESSED_REQUESTS = 3
 
 # 多bot去重锁: 每个群串行化消息记录,防止并发SELECT查不到对方未提交数据
@@ -303,21 +304,40 @@ def _continuous_conversation_ttl() -> datetime.timedelta:
     return datetime.timedelta(minutes=minutes)
 
 
-def _is_continuous_conversation(session_id: str, user_id: str) -> bool:
-    expires_at = _continuous_conversation_until.get((session_id, user_id))
+def _is_continuous_conversation(session_id: str, user_id: str, bot_id: str) -> bool:
+    key = (session_id, user_id, bot_id)
+    expires_at = _continuous_conversation_until.get(key)
     if not expires_at:
         return False
     if datetime.datetime.now() > expires_at:
-        _continuous_conversation_until.pop((session_id, user_id), None)
+        _continuous_conversation_until.pop(key, None)
         return False
     return True
 
 
-def _refresh_continuous_conversation(session_id: str, user_id: str) -> None:
+def _refresh_continuous_conversation(session_id: str, user_id: str, bot_id: str) -> None:
     ttl = _continuous_conversation_ttl()
     if ttl <= datetime.timedelta(0):
         return
-    _continuous_conversation_until[(session_id, user_id)] = datetime.datetime.now() + ttl
+    _continuous_conversation_until[(session_id, user_id, bot_id)] = datetime.datetime.now() + ttl
+
+
+def _is_explicit_disengagement(text: str, bot_name: str) -> bool:
+    """Recognize direct, complete requests to leave this conversation alone."""
+    normalized = re.sub(r"\s+", "", text).casefold().strip("，。！？,!?;；")
+    name = re.sub(r"\s+", "", bot_name).casefold()
+    for prefix in (f"@{name}", name):
+        if name and normalized.startswith(prefix):
+            normalized = normalized[len(prefix):].lstrip("，,：:")
+            break
+    # Full matches deliberately leave quotes, stories and playful remarks alone.
+    return any(re.fullmatch(pattern, normalized) for pattern in (
+        r"(?:我)?(?:不是|没(?:有)?)(?:在)?(?:和|跟|对)你(?:说话|聊天|交流)(?:呢|呐|啊|了|啦)?",
+        r"(?:我)?不是(?:在)?问你(?:呢|呐|啊|了|啦)?",
+        r"(?:你|bot|ai|机器人)?(?:现在|先|暂时)?闭嘴(?:了|啦|啊|好吗|可以吗)?",
+        r"(?:我)?(?:正在|在)?(?:和|跟)(?:另一个|另个|其他|别的)(?:bot|ai|机器人)(?:说话|聊天|交流)(?:呢|呐|啊|了|啦)?(?:[，,](?:别搞混了|别弄混了|别插话|不要插话))?",
+        r"(?:你|bot|ai|机器人)?(?:现在|先|暂时)?(?:别|不要|不用)(?:插话|讲话|说话|回复|回话|接话|出声)(?:了|啦|啊|好吗|可以吗)?",
+    ))
 
 
 def _sample_proactive_reply_modes(
@@ -776,7 +796,7 @@ async def handle_message(
     videos = list(msg.include(Video))
     forward_references = list(msg.include(Reference))
     # 第1行固定是本条消息的平台 ID 元数据，格式 "id: {id}"
-    incoming_message_id = str(get_message_id())
+    incoming_message_id = str(get_message_id()).strip()
     content_prefix = f"id: {incoming_message_id}\n"
     content = content_prefix
     to_me = addressed_bot_id == str(bot.self_id) or (addressed_bot_id is None and event.is_tome())
@@ -860,12 +880,29 @@ async def handle_message(
 
     # ========== 步骤1: 处理文本消息（快速） ==========
     # 用锁保证多bot并发安全: SELECT + INSERT + COMMIT 原子化
-    if is_text and sender_is_connected_bot:
+    if (is_text or imgs) and sender_is_connected_bot:
         # 本插件的发送工具会主动写入 bot 消息。给发送侧事务一个很短的提交窗口，
         # 再按平台消息 ID 判断是否已经入库；其他插件发出的消息仍会继续记录。
         await asyncio.sleep(0.25)
     is_new_text_message = True
     async with _get_dedup_lock(session.scene.id):
+        if is_reliable_platform_id(incoming_message_id):
+            # Outbound records use bot_name rather than the QQ account. Match
+            # the transport ID before filtering by user_id, also for delayed
+            # echoes and pure images received by another Bot process.
+            recorded_bot_id = (await db_session.execute(
+                Select(ChatHistory.msg_id).where(
+                    ChatHistory.session_id == session.scene.id,
+                    ChatHistory.content_type == "bot",
+                    ChatHistory.created_at >= datetime.datetime.now() - BOT_ECHO_LOOKBACK,
+                    ChatHistory.content.startswith(content_prefix, autoescape=True)
+                    | ChatHistory.content.startswith(f"id:{incoming_message_id}\n", autoescape=True),
+                ).limit(1)
+            )).scalar_one_or_none()
+            if recorded_bot_id is not None:
+                await db_session.commit()
+                logger.debug("检测到已记录的 bot 消息回声，跳过入站记录和回复")
+                return
         if is_text:
             do_insert = True
             time_window = datetime.datetime.now() - datetime.timedelta(seconds=3)
@@ -920,12 +957,18 @@ async def handle_message(
     if stripped_plain_text.lower().startswith(plugin_config.bot_name):
         to_me = True
     explicit_to_me = to_me
-    continuous_to_me = not explicit_to_me and not command_like and not has_at_mention and not reply_id and bool(stripped_plain_text) and session.scene.type == SceneType.GROUP and _is_continuous_conversation(session.scene.id, session.user.id)
+    is_group = session.scene.type == SceneType.GROUP
+    bot_id = str(bot.self_id)
+    active_followup = is_group and _is_continuous_conversation(session.scene.id, session.user.id, bot_id)
+    disengaged = is_group and (explicit_to_me or (active_followup and not has_at_mention and not reply_id)) and _is_explicit_disengagement(stripped_plain_text, plugin_config.bot_name)
+    if disengaged:
+        _continuous_conversation_until.pop((session.scene.id, session.user.id, bot_id), None)
+        logger.debug("用户明确退出当前 bot 对话，本条保持沉默并结束跟进窗口")
+    continuous_to_me = not disengaged and not explicit_to_me and not command_like and not has_at_mention and not reply_id and bool(stripped_plain_text) and active_followup
     if continuous_to_me:
         logger.debug(f"群 {session.scene.id} 用户 {session.user.id} 命中连续对话窗口")
-    is_group = session.scene.type == SceneType.GROUP
     repeat_text = None
-    if is_group and not to_me and not continuous_to_me and not command_like and bool(stripped_plain_text):
+    if not disengaged and is_group and not to_me and not continuous_to_me and not command_like and bool(stripped_plain_text):
         repeat_text = await _load_repeat_chain_text(db_session, session.scene.id)
     repeat_reply_sample = _sample_repeat_reply(
         repeat_text=repeat_text,
@@ -966,9 +1009,9 @@ async def handle_message(
         random_reply_sample = False
         proactive_reaction_only = False
         proactive_meme_only = False
-    should_reply = to_me or continuous_to_me or random_reply_sample or proactive_reaction_only or proactive_meme_only or repeat_reply_sample
-    if explicit_to_me or continuous_to_me:
-        _refresh_continuous_conversation(session.scene.id, session.user.id)
+    should_reply = not disengaged and (to_me or continuous_to_me or random_reply_sample or proactive_reaction_only or proactive_meme_only or repeat_reply_sample)
+    if explicit_to_me and not disengaged:
+        _refresh_continuous_conversation(session.scene.id, session.user.id, bot_id)
     if not plain_text and not imgs and not forward_references and not audios and not videos:
         should_reply = False
     if command_like:
@@ -1451,6 +1494,13 @@ async def handle_reply_logic(
         if not last_msg:
             logger.info("没有历史消息，跳过回复")
             return
+
+        # A matching window is only a candidate. Refresh it after Gatekeeper
+        # accepts the follow-up, so short ignored feedback cannot extend it.
+        if is_continuous:
+            if not _is_continuous_conversation(session.scene.id, user_id, str(bot.self_id)):
+                return
+            _refresh_continuous_conversation(session.scene.id, user_id, str(bot.self_id))
 
         # A group-level API bypasses the public quota. Re-check the active
         # configuration here in case an administrator changed it while this
