@@ -63,6 +63,7 @@ SIDE_EFFECT_TOOL_NAMES = frozenset({
     "schedule_message",
     "send_meme_image",
     "send_web_image",
+    "send_file",
     "send_private_message",
     "update_group_memory",
     "update_scheduled_task",

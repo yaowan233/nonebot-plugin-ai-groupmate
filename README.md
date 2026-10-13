@@ -24,6 +24,7 @@
 - **表情包学习**（需配置 Qdrant）：默认使用 `qwen3-vl-plus` 理解图片内容，分别索引描述语义与视觉特征，自动从群内偷学表情包；回复时通过 RRF 多路召回，结合当前群的真实使用频率重排，并在发送前按当前对话审核相关性。
 - **自定义 Agent Tools**：可以注册自己的 LangChain tools 扩展 agent 能力，详见 [自定义 Agent Tools](./docs/custom-agent-tools.md)。
 - **定时任务管理**：支持通过聊天创建、查看、修改和取消定时消息及 Agent 任务，详见 [定时任务](#定时任务)。
+- **网页与文件任务**：打开公开网页、提取正文与下载链接，下载并读取 PDF、Word、Excel、CSV，按列汇总表格并发送结果文件，详见 [网页与文件](./docs/agent-web-files.md)。
 
 对于主模型选择：推荐使用支持 Function Calling 的通义千问系列模型（如 `qwen-plus`、`qwen-max`）。图片标注默认使用 `qwen3-vl-plus`，群档案摘要默认使用 `qwen-flash`，均可通过对应角色配置修改。若图片标注报 `404 model_not_found`，请核对 `tagging_model` 是否仍在服务商的可用模型列表中；已有配置可在 WebUI 中切换模型并测试连接，无需重启。
 
@@ -218,6 +219,7 @@ curl http://127.0.0.1:6333/collections/media_collection_v3
 | ai_groupmate__agent_max_llm_calls | 否 | `8` | 单次 agent 最多调用主模型次数 |
 | ai_groupmate__agent_max_total_tokens | 否 | `128000` | 单次 agent 常规工作阶段最多累计模型 token 数；达到上限且尚未回复时会额外执行一次受控收尾 |
 | ai_groupmate__agent_tool_result_max_chars | 否 | `6000` | 写回后续上下文的单次工具结果最大字符数 |
+| ai_groupmate__agent_file_tools_enabled | 否 | `true` | 启用公开网页抓取、文件下载、文档读取、表格汇总与文件发送；文件保留 24 小时，详见 [使用说明](./docs/agent-web-files.md) |
 | ai_groupmate__flash_model | 否 | `qwen-flash` | 快速判断是否需要回复的模型 |
 | ai_groupmate__flash_api_key | 否 | 无 | 快速判断模型专用 API Key |
 | ai_groupmate__flash_base_url | 否 | 无 | 快速判断模型专用 Base URL |

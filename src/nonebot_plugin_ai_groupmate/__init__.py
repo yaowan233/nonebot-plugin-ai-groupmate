@@ -246,6 +246,16 @@ async def _expire_explicit_memories() -> None:
         logger.exception("清理到期明确记忆失败，请确认已执行 nb orm upgrade")
 
 
+@scheduler.scheduled_job("interval", minutes=30, max_instances=1, coalesce=True, id="ai_groupmate_expire_agent_files")
+async def _expire_agent_files() -> None:
+    from .agent.file_workspace import cleanup_workspace
+
+    try:
+        await asyncio.to_thread(cleanup_workspace, plugin_data_dir / "agent_files")
+    except Exception:
+        logger.exception("清理到期 Agent 文件失败")
+
+
 @get_driver().on_shutdown
 async def _close_scheduled_tasks() -> None:
     await stop_scheduled_tasks()

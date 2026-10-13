@@ -47,6 +47,7 @@ from .prompts import (
     build_reaction_tool_instruction,
 )
 from .reaction import is_onebot_context, create_reaction_tool
+from .file_tools import FILE_TOOLS_PROMPT, create_file_tools
 from .meme_tools import (
     MAX_MEME_SEND_COUNT,
     create_send_meme_tool,
@@ -1473,6 +1474,19 @@ async def create_chat_graph(
 - 找图源或出处使用反向搜图；本地表情包使用表情包工具。没有可用图片或发送失败时如实说明。
 """
     reaction_enabled = is_onebot_context(bot, event)
+    file_tools = (
+        create_file_tools(
+            db_session, session_id, request_id,
+            root=plugin_data_dir / "agent_files",
+            user_id=str(user_id), bot_id=str(bot_id or plugin_config.bot_name),
+            is_private=is_private, bot_name=plugin_config.bot_name, send_target=send_target,
+        )
+        if plugin_config.agent_file_tools_enabled
+        and not proactive_meme_only and not proactive_reaction_only and repeat_text is None
+        else []
+    )
+    if file_tools:
+        system_prompt += FILE_TOOLS_PROMPT
     base_agent_tools = [
         *(
             [reply_tool]
@@ -1506,6 +1520,7 @@ async def create_chat_graph(
         ),
         *([last_image_search_tool] if last_image_search_tool is not None else []),
         *web_image_tools,
+        *file_tools,
         *create_explicit_memory_tools(
             session_id, str(user_id), str(bot_id or plugin_config.bot_name), is_private,
             history or [], request_id,
