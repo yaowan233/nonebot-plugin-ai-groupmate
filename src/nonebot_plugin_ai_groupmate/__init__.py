@@ -14,7 +14,7 @@ from collections import deque
 from dataclasses import field, dataclass
 
 import jieba
-from nonebot import logger, require, get_bots, get_driver, on_command, on_message
+from nonebot import logger, require, get_bots, on_notice, get_driver, on_command, on_message
 from wordcloud import WordCloud
 from nonebot.params import CommandArg
 from nonebot.plugin import PluginMetadata, inherit_supported_adapters
@@ -33,6 +33,7 @@ from sqlalchemy import Select
 from nonebot_plugin_orm import get_session, async_scoped_session
 from nonebot_plugin_uninfo import Uninfo, SceneType, QryItrface
 from nonebot_plugin_alconna import (
+    File,
     Image,
     Target,
     UniMessage,
@@ -79,6 +80,7 @@ from .runtime_config import (
 from .forward_message import format_forward_reference_markers
 from .group_api_relay import delete_expired_pending_group_configs
 from .scheduled_tasks import poll_scheduled_tasks, stop_scheduled_tasks
+from .agent.chat_files import chat_file_source_key
 from .message_metadata import BOT_ECHO_LOOKBACK, is_reliable_platform_id
 from .agent.reply_tools import create_reply_tool
 from .group_daily_quota import (
@@ -101,7 +103,9 @@ from .group_model_config import (
     resolve_group_reply_probability,
     load_or_create_local_encryption_key,
 )
+from .agent.file_workspace import FileWorkspace
 from .relation_maintenance import count_negative_relations, reset_negative_relations
+from .agent.chat_file_inbox import cleanup_chat_file_inbox, register_chat_file_markers
 from .agent.explicit_memory import cleanup_explicit_memories
 from .agent.web_image_search import is_explicit_web_image_search_request
 
@@ -244,6 +248,17 @@ async def _expire_explicit_memories() -> None:
             await db_session.commit()
     except Exception:
         logger.exception("清理到期明确记忆失败，请确认已执行 nb orm upgrade")
+
+
+@scheduler.scheduled_job("interval", minutes=30, max_instances=1, coalesce=True, id="ai_groupmate_expire_agent_files")
+async def _expire_agent_files() -> None:
+    from .agent.file_workspace import cleanup_workspace
+
+    try:
+        await asyncio.to_thread(cleanup_workspace, plugin_data_dir / "agent_files")
+        await asyncio.to_thread(cleanup_chat_file_inbox, plugin_data_dir / "agent_files")
+    except Exception:
+        logger.exception("清理到期 Agent 文件失败")
 
 
 @get_driver().on_shutdown
@@ -773,6 +788,58 @@ async def _run_group_reply_worker(group_id: str):
                     _start_group_reply_worker_locked(group_id, state)
 
 
+def _is_file_upload_notice(bot: Bot, event: Event) -> bool:
+    return (
+        plugin_config.agent_file_tools_enabled
+        and is_onebot_context(bot, event)
+        and getattr(event, "notice_type", None) in {"group_upload", "offline_file", "friend_upload"}
+    )
+
+
+file_upload = on_notice(rule=_is_file_upload_notice, priority=999, block=False)
+
+
+@file_upload.handle()
+async def handle_file_upload(db_session: async_scoped_session, bot: Bot, event: Event):
+    """OneBot group uploads arrive as notices rather than normal file messages."""
+    if not _is_file_upload_notice(bot, event):
+        return
+    user_id = str(getattr(event, "user_id", "") or "")
+    if not user_id or user_id in {str(bot.self_id), *map(str, get_bots())}:
+        return
+    native_file = getattr(event, "file", None)
+    data = native_file if isinstance(native_file, dict) else getattr(native_file, "model_dump", lambda: {})()
+    if not isinstance(data, dict):
+        return
+    file_id = data.get("id") or data.get("file_id")
+    if not file_id:
+        return
+    group_id = str(getattr(event, "group_id", "") or "") or None
+    session_id = group_id or user_id
+    file = File(id=str(file_id), name=str(data.get("name") or data.get("file_name") or "file.bin"),
+                url=str(data["url"]) if data.get("url") else None)
+    source_key = chat_file_source_key(file, "")
+    content_prefix = f"id: qq-file:{source_key}\n"
+    workspace = FileWorkspace(plugin_data_dir / "agent_files", session_id=session_id, user_id=user_id,
+                              bot_id=str(bot.self_id), is_private=group_id is None)
+    marker = await asyncio.to_thread(register_chat_file_markers, [file], workspace,
+                                     message_id=source_key, group_id=group_id, metadata=data)
+    # No model call on an unsolicited upload notice. A later @/private request
+    # sees the attachment marker and retrieves the current sender's workspace.
+    async with _get_dedup_lock(session_id):
+        existing = (await db_session.execute(Select(ChatHistory).where(
+            ChatHistory.session_id == session_id, ChatHistory.user_id == user_id,
+            ChatHistory.created_at >= datetime.datetime.now() - datetime.timedelta(hours=24),
+            ChatHistory.content.startswith(content_prefix, autoescape=True),
+        ).limit(1))).scalar_one_or_none()
+        if existing is None:
+            db_session.add(ChatHistory(session_id=session_id, user_id=user_id, user_name=user_id,
+                                       content_type="text", content=content_prefix + marker))
+        elif existing.content != content_prefix + marker:
+            existing.content = content_prefix + marker
+        await db_session.commit()
+
+
 record = on_message(
     priority=999,
     block=True,
@@ -806,6 +873,7 @@ async def handle_message(
     audios = list(msg.include(Audio))
     videos = list(msg.include(Video))
     forward_references = list(msg.include(Reference))
+    files = list(msg.include(File)) if plugin_config.agent_file_tools_enabled and not sender_is_connected_bot else []
     # 第1行固定是本条消息的平台 ID 元数据，格式 "id: {id}"
     incoming_message_id = str(get_message_id()).strip()
     content_prefix = f"id: {incoming_message_id}\n"
@@ -860,6 +928,16 @@ async def handle_message(
         body += media_text
         is_text = True
 
+    if files:
+        workspace = FileWorkspace(plugin_data_dir / "agent_files", session_id=session.scene.id,
+                                  user_id=session.user.id, bot_id=str(bot.self_id),
+                                  is_private=session.scene.type == SceneType.PRIVATE)
+        marker = await asyncio.to_thread(register_chat_file_markers, files, workspace,
+                                         message_id=incoming_message_id,
+                                         group_id=session.scene.id if session.scene.type == SceneType.GROUP else None)
+        body += ("\n" if body and not body.endswith("\n") else "") + marker
+        is_text = True
+
     # 私聊默认 to_me，不代表用户在正文中提及了机器人。
     if to_me and not has_at_mention and session.scene.type != SceneType.PRIVATE:
         reply_to_bot = False
@@ -871,7 +949,7 @@ async def handle_message(
             except Exception:
                 pass
         if not reply_to_bot:
-            separator = "\n" if forward_references or audios or videos else " "
+            separator = "\n" if forward_references or audios or videos or files else " "
             body = f"{plugin_config.bot_name}{separator}{body}"
 
     if not reply_id:
@@ -1025,7 +1103,10 @@ async def handle_message(
     should_reply = not disengaged and (to_me or continuous_to_me or random_reply_sample or proactive_reaction_only or proactive_meme_only or repeat_reply_sample)
     if explicit_to_me and not disengaged:
         _refresh_continuous_conversation(session.scene.id, session.user.id, bot_id)
-    if not plain_text and not imgs and not forward_references and not audios and not videos:
+    if not plain_text and not imgs and not forward_references and not audios and not videos and not files:
+        should_reply = False
+    if files and not stripped_plain_text and not imgs and not forward_references and not audios and not videos:
+        # Receiving a file is not a request to analyze it or download it.
         should_reply = False
     if command_like:
         should_reply = False
@@ -1034,6 +1115,7 @@ async def handle_message(
         and not forward_references
         and not audios
         and not videos
+        and not files
         and not (to_me or continuous_to_me)
     ):
         should_reply = False

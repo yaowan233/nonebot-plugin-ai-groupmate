@@ -11,6 +11,7 @@ from collections.abc import Callable, Sequence
 from nonebot.log import logger
 from langchain.tools import ToolRuntime
 from langgraph.graph import END, START, StateGraph
+from typing_extensions import NotRequired
 from langchain_core.tools import BaseTool
 from langchain_core.messages import AIMessage, BaseMessage, ToolMessage, HumanMessage, message_chunk_to_message
 from langgraph.graph.message import add_messages
@@ -63,6 +64,7 @@ SIDE_EFFECT_TOOL_NAMES = frozenset({
     "schedule_message",
     "send_meme_image",
     "send_web_image",
+    "send_file",
     "send_private_message",
     "update_group_memory",
     "update_scheduled_task",
@@ -262,6 +264,7 @@ class AgentState(TypedDict):
     required_side_effect_success_count: int
     required_side_effect_target_count: int
     image_input_disabled: bool
+    file_delivery_notice_pending: NotRequired[bool]
 
 
 @dataclass
@@ -992,6 +995,7 @@ def _make_tool_node(
         reply_requires_continuation = state.get("reply_requires_continuation", False)
         reaction_this_round = state.get("reaction_this_round", 0)
         called_finish = 0
+        file_delivery_notice_pending = False
         active_skills = list(state.get("active_skills", []))
         tool_timeout_count = state.get("tool_timeout_count", 0)
         tool_timeout_names = list(state.get("tool_timeout_names", []))
@@ -1392,6 +1396,7 @@ def _make_tool_node(
                         tool_call_id=tool_call_id,
                     ))
                     if delivery_unknown:
+                        file_delivery_notice_pending = name == "send_file"
                         break
                     continue
                 elapsed_ms = (
@@ -1466,6 +1471,7 @@ def _make_tool_node(
                     # platform accepted the side effect. Treat it like a timeout after
                     # dispatch: consuming the idempotency key is safer than retrying.
                     called_finish += 1
+                    file_delivery_notice_pending = name == "send_file"
                 tool_content, truncated = _truncate_tool_content(
                     tool_content,
                     limits.tool_result_max_chars,
@@ -1519,6 +1525,7 @@ def _make_tool_node(
                     # about whether a side effect reached the platform.
                     completed_side_effect_keys.append(effect_key)
                     called_finish += 1
+                    file_delivery_notice_pending = name == "send_file"
                     if name == "reply_user":
                         reply_requires_continuation = False
                 results.append(ToolMessage(
@@ -1560,9 +1567,49 @@ def _make_tool_node(
             "required_side_effect_unavailable": required_side_effect_unavailable,
             "required_side_effect_success_count": required_side_effect_success_count,
             "required_side_effect_target_count": required_side_effect_target_count,
+            "file_delivery_notice_pending": file_delivery_notice_pending,
         }
 
     return tool_node
+
+
+def _make_file_delivery_notice_node(
+    reply_tool: BaseTool | None,
+    limits: AgentRunLimits,
+    db_session: Any | None,
+) -> Any:
+    """Attempt one status notice, then end without resuming model or file sends."""
+    async def notice_node(state: AgentState) -> dict:
+        result: dict[str, Any] = {
+            "file_delivery_notice_pending": False,
+            "called_finish": max(1, state.get("called_finish", 0)),
+            "reply_requires_continuation": False,
+        }
+        request_id = state.get("request_id")
+        if reply_tool is None or (request_id and not await is_request_active(state["session_id"], request_id)):
+            return result
+        notice = "文件已尝试发送，但未确认送达。请先检查聊天中的文件；本轮不会自动重发。"
+        result["tool_count"] = state.get("tool_count", 0) + 1
+        try:
+            await _recover_db_session(db_session)
+            reply_result = await asyncio.wait_for(
+                reply_tool.ainvoke({"content": notice, "next_step": "end"}),
+                timeout=limits.tool_timeout_seconds,
+            )
+            await _commit_after_tool_success(db_session)
+            content, _ = _normalize_tool_result(reply_result)
+            if _tool_result_status(content) in {None, "succeeded"}:
+                result["messages"] = [AIMessage(content=notice)]
+                result["reply_count"] = state.get("reply_count", 0) + 1
+                result["reply_this_round"] = state.get("reply_this_round", 0) + 1
+            else:
+                logger.warning("[Agent] 文件投递状态提示未确认送达，停止且不重试")
+        except Exception as error:
+            await _rollback_after_tool_failure(db_session)
+            logger.warning(f"[Agent] 文件投递状态提示失败 error_type={type(error).__name__}，停止且不重试")
+        return result
+
+    return notice_node
 
 
 def _should_call_tools(state: AgentState) -> str:
@@ -1575,6 +1622,8 @@ def _should_call_tools(state: AgentState) -> str:
 
 
 def _should_continue(state: AgentState, limits: AgentRunLimits) -> str:
+    if state.get("file_delivery_notice_pending", False):
+        return "file_delivery_notice"
     if state.get("called_finish", 0) > 0:
         logger.info(f"[AgentTrace] 结束 session={state['session_id']} reason=finish")
         return "end"
@@ -1677,13 +1726,18 @@ def build_chat_graph(
             request_kwargs_factory,
         ),
     )
+    builder.add_node(
+        "file_delivery_notice",
+        _make_file_delivery_notice_node(tools_by_name.get("reply_user"), limits, db_session),
+    )
+    builder.add_edge("file_delivery_notice", END)
     builder.add_edge(START, "agent")
     builder.add_conditional_edges("agent", _should_call_tools, {"tools": "tools", "end": END})
     builder.add_edge("finalize", "tools")
     builder.add_conditional_edges(
         "tools",
         lambda state: _should_continue(state, limits),
-        {"agent": "agent", "finalize": "finalize", "end": END},
+        {"agent": "agent", "finalize": "finalize", "file_delivery_notice": "file_delivery_notice", "end": END},
     )
 
     return builder.compile()

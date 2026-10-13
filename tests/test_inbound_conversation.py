@@ -40,6 +40,7 @@ def deliver_message(monkeypatch):
         message=None,
         original_message=None,
         reply=None,
+        is_private=False,
     ):
         monkeypatch.setattr(plugin, "get_message_id", lambda: message_id)
         event = SimpleNamespace(
@@ -49,7 +50,7 @@ def deliver_message(monkeypatch):
             is_tome=lambda: addressed,
         )
         session = SimpleNamespace(
-            scene=SimpleNamespace(id=session_id, type=SceneType.GROUP),
+            scene=SimpleNamespace(id=session_id, type=SceneType.PRIVATE if is_private else SceneType.GROUP),
             user=SimpleNamespace(id=user_id, name=user_name if user_name is not None else user_id, nick=None),
             member=SimpleNamespace(nick=member_nick) if member_nick is not None else None,
             self_id=bot_id,

@@ -58,6 +58,7 @@ class ScopedConfig(BaseModel):
     agent_max_llm_calls: int = Field(default=8, ge=1)
     agent_max_total_tokens: int = Field(default=128000, ge=1)
     agent_tool_result_max_chars: int = Field(default=6000, ge=256)
+    agent_file_tools_enabled: bool = True
     chat_long_context_threshold_tokens: int = 256000
     chat_long_input_cost_per_million: float = 6.0
     chat_long_output_cost_per_million: float = 24.0
