@@ -36,7 +36,7 @@ def public_url(value: str) -> httpx.URL:
 
 async def _resolve_public_ip(url: httpx.URL) -> str:
     addresses = await asyncio.to_thread(socket.getaddrinfo, url.host, url.port or (443 if url.scheme == "https" else 80), type=socket.SOCK_STREAM)
-    ips = list(dict.fromkeys(item[4][0] for item in addresses))
+    ips = list(dict.fromkeys(str(item[4][0]) for item in addresses))
     if not ips or any(not ipaddress.ip_address(address).is_global for address in ips):
         raise FileTaskError("non_public_url", "只允许访问公开网络地址，不能访问内网或本机服务。")
     return ips[0]

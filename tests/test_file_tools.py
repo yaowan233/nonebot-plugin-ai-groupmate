@@ -30,6 +30,7 @@ def toolset(tmp_path, **overrides):
 
 def xlsx_bytes(rows):
     book = Workbook()
+    assert book.active is not None
     for row in rows:
         book.active.append(row)
     result = io.BytesIO()
@@ -239,6 +240,7 @@ async def test_table_summary_checks_all_rows_and_refuses_formulas(tmp_path):
     assert result["data"]["preview"] == [["A", 0.3], ["B", -3.0]]
     assert result["data"]["input_rows"] == 3
     generated = load_workbook(io.BytesIO(store.read(result["data"]["file_id"])), data_only=False)
+    assert generated.active is not None
     assert generated.active["B3"].value == -3
     generated.close()
     invalid = store.save(xlsx_bytes([["类别", "金额"], ["A", "=1+2"]]), "formula.xlsx")
@@ -251,6 +253,7 @@ async def test_creation_never_executes_spreadsheet_formulas(tmp_path):
     tools = toolset(tmp_path)
     data = json.loads(await tools["create_file"].ainvoke({"filename": "report.xlsx", "content": json.dumps([["value"], ['=WEBSERVICE("https://example.org")']])}))["data"]
     book = load_workbook(io.BytesIO(workspace(tmp_path).read(data["file_id"])))
+    assert book.active is not None
     assert book.active["A2"].data_type == "s"
     book.close()
 
@@ -349,7 +352,7 @@ async def test_full_agent_fetch_download_summarize_and_send(tmp_path, monkeypatc
             return self
 
         async def ainvoke(self, messages, **kwargs):
-            results = [json.loads(message.content) for message in messages if isinstance(message, ToolMessage) and message.content]
+            results = [json.loads(message.content) for message in messages if isinstance(message, ToolMessage) and isinstance(message.content, str) and message.content]
             if results:
                 assert results[-1]["status"] == "succeeded"
             if self.step == 0:
@@ -384,5 +387,6 @@ async def test_full_agent_fetch_download_summarize_and_send(tmp_path, monkeypatc
     assert sent[0][1]["target"].id == "group"
     segment = sent[0][0][0]
     book = load_workbook(io.BytesIO(segment.path.read_bytes()))
+    assert book.active is not None
     assert list(book.active.values) == [("Category", "Amount_sum"), ("A", 30), ("B", 5)]
     book.close()

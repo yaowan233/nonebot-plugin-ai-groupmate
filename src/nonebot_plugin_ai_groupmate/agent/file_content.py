@@ -282,7 +282,7 @@ def summarize_table(table: Table, group_by: list[str], value_columns: list[str],
                 values = [reducer(a, b) for a, b in zip(previous, values)]
         groups[key] = (count + 1, values)
     headers = group_by + (["count"] if operation == "count" else [f"{column}_{operation}" for column in value_columns])
-    result = [headers]
+    result: list[list] = [headers]
     for key, (count, values) in groups.items():
         numbers = [count] if operation == "count" else [float(value / count if operation == "mean" else value) for value in values]
         if any(not math.isfinite(value) for value in numbers):
