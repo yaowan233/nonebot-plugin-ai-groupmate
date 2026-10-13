@@ -42,9 +42,12 @@ class Artifact:
     created_at: float
     content_type: str = ""
     source_url: str = ""
+    source_key: str = ""
 
     def public(self) -> dict:
-        return {**asdict(self), "expires_at": self.created_at + FILE_TTL_SECONDS}
+        data = asdict(self)
+        data.pop("source_key", None)
+        return {**data, "expires_at": self.created_at + FILE_TTL_SECONDS}
 
 
 def _artifact_dirs(root: Path):
@@ -125,18 +128,23 @@ class FileWorkspace:
                     continue
             return sorted(artifacts, key=lambda item: item.created_at, reverse=True)
 
-    def save(self, data: bytes, name: str, *, content_type: str = "", source_url: str = "") -> Artifact:
+    def find_source(self, source_key: str) -> Artifact | None:
+        return next((item for item in self.list() if item.source_key == source_key), None)
+
+    def save(self, data: bytes, name: str, *, content_type: str = "", source_url: str = "", source_key: str = "") -> Artifact:
         if len(data) > MAX_FILE_BYTES:
             raise FileTaskError("file_too_large", "单个文件不能超过 10 MB。")
         with _STORE_LOCK:
             cleanup_workspace(self.root)
             current = self.list()
+            if source_key and (existing := next((item for item in current if item.source_key == source_key), None)):
+                return existing
             if len(current) >= MAX_SCOPE_FILES or sum(item.size for item in current) + len(data) > MAX_SCOPE_BYTES:
                 raise FileTaskError("workspace_full", "当前用户文件工作区已满（30 个文件 / 50 MB），请等待旧文件在 24 小时后过期。")
             total = sum((folder / "data").stat().st_size for folder in _artifact_dirs(self.root) if (folder / "data").is_file())
             if total + len(data) > MAX_STORE_BYTES:
                 raise FileTaskError("workspace_full", "Bot 文件存储额度已满，请稍后再试。")
-            artifact = Artifact(uuid.uuid4().hex, clean_filename(name), len(data), time.time(), content_type[:200], source_url[:4096])
+            artifact = Artifact(uuid.uuid4().hex, clean_filename(name), len(data), time.time(), content_type[:200], source_url[:4096], source_key)
             folder = self._folder(artifact.file_id)
             folder.mkdir(parents=True, exist_ok=False)
             try:
