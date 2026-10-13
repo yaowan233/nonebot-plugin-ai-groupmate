@@ -3,10 +3,11 @@ from datetime import date, datetime
 from pydantic import BaseModel
 from sqlalchemy import JSON, Text, Float, Index, String, Boolean, Integer, UniqueConstraint
 from sqlalchemy.orm import Mapped, validates, mapped_column
-from nonebot_plugin_orm import Model
+
+from .db_types import NulSafeModel
 
 
-class MediaStorage(Model):
+class MediaStorage(NulSafeModel):
     """媒体资源中心化存储"""
 
     media_id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
@@ -30,7 +31,7 @@ class MediaStorageSchema(BaseModel):
     embedding_version: int = 0
 
 
-class ChatHistory(Model):
+class ChatHistory(NulSafeModel):
     msg_id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     session_id: Mapped[str] = mapped_column(index=True)
     user_id: Mapped[str] = mapped_column(index=True)
@@ -60,7 +61,7 @@ class ChatHistory(Model):
     )
 
 
-class ScheduledTask(Model):
+class ScheduledTask(NulSafeModel):
     """Persisted one-shot tasks. All timestamps use naive UTC in the database."""
 
     job_id: Mapped[str] = mapped_column(String(255), primary_key=True)
@@ -87,7 +88,7 @@ class ScheduledTask(Model):
     )
 
 
-class UserRelation(Model):
+class UserRelation(NulSafeModel):
     """用户关系/好感度表"""
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
@@ -96,6 +97,11 @@ class UserRelation(Model):
     favorability: Mapped[int] = mapped_column(default=0)  # 好感度，默认0
     tags: Mapped[list[str]] = mapped_column(JSON, default=list)
     updated_at: Mapped[datetime] = mapped_column(default=datetime.now, onupdate=datetime.now)
+
+    @validates("user_name")
+    def _strip_nul(self, _key: str, value: str) -> str:
+        # Nicknames from adapters may contain NUL, which PostgreSQL rejects.
+        return value.replace("\x00", "")
 
     def get_status_desc(self) -> str:
         """根据分数返回关系描述"""
@@ -119,7 +125,7 @@ class UserRelation(Model):
         return "最亲近的人"
 
 
-class GroupMemory(Model):
+class GroupMemory(NulSafeModel):
     """群体认知档案（每群一条记录）"""
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
@@ -129,7 +135,7 @@ class GroupMemory(Model):
     updated_at: Mapped[datetime] = mapped_column(default=datetime.now, onupdate=datetime.now, index=True)
 
 
-class ExplicitMemory(Model):
+class ExplicitMemory(NulSafeModel):
     """Explicit user requests scoped to a conversation and bot; naive local time."""
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
@@ -154,7 +160,7 @@ class ExplicitMemory(Model):
     )
 
 
-class TokenUsage(Model):
+class TokenUsage(NulSafeModel):
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     session_id: Mapped[str] = mapped_column(index=True)
     session_type: Mapped[str] = mapped_column(String(16), default="group", index=True)
@@ -177,13 +183,18 @@ class TokenUsage(Model):
     agent_side_effect_deduplications: Mapped[int] = mapped_column(default=0)
     created_at: Mapped[datetime] = mapped_column(default=datetime.now, index=True)
 
+    @validates("user_name")
+    def _strip_nul(self, _key: str, value: str) -> str:
+        # Keep usage writes safe even when they share a transaction with replies.
+        return value.replace("\x00", "")
+
     __table_args__ = (
         Index("ix_token_usage_session_time", "session_id", "created_at"),
         Index("ix_token_usage_user_time", "user_id", "created_at"),
     )
 
 
-class RuntimeConfigOverride(Model):
+class RuntimeConfigOverride(NulSafeModel):
     """WebUI 保存的插件配置覆盖项。"""
 
     id: Mapped[int] = mapped_column(primary_key=True, default=1)
@@ -194,7 +205,7 @@ class RuntimeConfigOverride(Model):
     )
 
 
-class RelayInstanceIdentity(Model):
+class RelayInstanceIdentity(NulSafeModel):
     """Locally persisted identity used to authenticate with the relay."""
 
     id: Mapped[int] = mapped_column(primary_key=True, default=1)
@@ -207,7 +218,7 @@ class RelayInstanceIdentity(Model):
     registered_at: Mapped[datetime] = mapped_column(default=datetime.now)
 
 
-class PendingGroupConfig(Model):
+class PendingGroupConfig(NulSafeModel):
     """A short-lived relay ticket bound to one group or private user."""
 
     ticket_id: Mapped[str] = mapped_column(primary_key=True)
@@ -220,7 +231,7 @@ class PendingGroupConfig(Model):
     created_at: Mapped[datetime] = mapped_column(default=datetime.now)
 
 
-class GroupModelConfig(Model):
+class GroupModelConfig(NulSafeModel):
     """Encrypted main-chat model configuration owned by one group."""
 
     group_id: Mapped[str] = mapped_column(primary_key=True)
@@ -242,7 +253,7 @@ class GroupModelConfig(Model):
     version: Mapped[int] = mapped_column(default=1)
 
 
-class PrivateModelConfig(Model):
+class PrivateModelConfig(NulSafeModel):
     """Encrypted main-chat model configuration owned by one private user."""
 
     user_id: Mapped[str] = mapped_column(primary_key=True)
@@ -262,7 +273,7 @@ class PrivateModelConfig(Model):
     version: Mapped[int] = mapped_column(default=1)
 
 
-class GlobalModelGroupUsage(Model):
+class GlobalModelGroupUsage(NulSafeModel):
     """Current local-day public model reply usage for one group."""
 
     group_id: Mapped[str] = mapped_column(primary_key=True)
@@ -274,7 +285,7 @@ class GlobalModelGroupUsage(Model):
     )
 
 
-class GlobalModelPrivateUserUsage(Model):
+class GlobalModelPrivateUserUsage(NulSafeModel):
     """Current local-day public model private reply usage for one user."""
 
     user_id: Mapped[str] = mapped_column(primary_key=True)
@@ -286,7 +297,7 @@ class GlobalModelPrivateUserUsage(Model):
     )
 
 
-class LastImageSearch(Model):
+class LastImageSearch(NulSafeModel):
     """Last search outcome for one user in one conversation."""
 
     session_id: Mapped[str] = mapped_column(String(255), primary_key=True)
@@ -295,7 +306,7 @@ class LastImageSearch(Model):
     updated_at: Mapped[datetime] = mapped_column(default=datetime.now)
 
 
-class GoogleWebDetectionCache(Model):
+class GoogleWebDetectionCache(NulSafeModel):
     """Normalized Web Detection result cached by the image SHA-256."""
 
     image_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
@@ -307,7 +318,7 @@ class GoogleWebDetectionCache(Model):
     )
 
 
-class GoogleWebDetectionUsage(Model):
+class GoogleWebDetectionUsage(NulSafeModel):
     """Global per-Bot monthly request counter for the Google free-tier guard."""
 
     usage_month: Mapped[str] = mapped_column(String(7), primary_key=True)
