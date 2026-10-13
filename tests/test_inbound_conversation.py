@@ -34,6 +34,8 @@ def deliver_message(monkeypatch):
         *,
         bot_id="bot-1",
         user_id="member-1",
+        user_name=None,
+        member_nick=None,
         addressed=False,
         message=None,
         original_message=None,
@@ -48,8 +50,8 @@ def deliver_message(monkeypatch):
         )
         session = SimpleNamespace(
             scene=SimpleNamespace(id=session_id, type=SceneType.GROUP),
-            user=SimpleNamespace(id=user_id, name=user_id, nick=None),
-            member=None,
+            user=SimpleNamespace(id=user_id, name=user_name if user_name is not None else user_id, nick=None),
+            member=SimpleNamespace(nick=member_nick) if member_nick is not None else None,
             self_id=bot_id,
         )
         async with get_session() as db:
@@ -65,6 +67,47 @@ def deliver_message(monkeypatch):
 
     yield deliver, queued, images
     plugin._continuous_conversation_until.clear()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("user_name", "member_nick", "text"),
+    [
+        ("\n\t\n\x07$ÿĀ\x11\x10\n\x06\x12\x04\n\t\n\x07$ÿĀ\x11\x10\x10\x00", None, "太像那谁"),
+        ("Alice", "群\x00昵称", "太像那谁"),
+        ("Alice", None, "太\x00像那谁\x00\n下一行\t🙂"),
+        ("中文昵称🙂", None, "太像那谁\n下一行\t🙂"),
+    ],
+)
+async def test_inbound_text_strips_nul_before_database_write(deliver_message, user_name, member_nick, text):
+    from uuid import uuid4
+
+    from sqlalchemy import Select, event
+    from nonebot_plugin_orm import get_session
+
+    from nonebot_plugin_ai_groupmate.model import ChatHistory
+
+    # SQLite accepts NUL, so enforce PostgreSQL's restriction at the SQL boundary.
+    def reject_nul(_conn, _cursor, statement, parameters, _context, _executemany):
+        if statement.startswith("INSERT INTO nonebot_plugin_ai_groupmate_chathistory"):
+            if any(isinstance(value, str) and "\x00" in value for value in parameters):
+                raise ValueError('invalid byte sequence for encoding "UTF8": 0x00')
+
+    deliver, _, _ = deliver_message
+    session_id = f"inbound-nul-{uuid4()}"
+    async with get_session() as db:
+        engine = db.get_bind()
+        event.listen(engine, "before_cursor_execute", reject_nul)
+        try:
+            await deliver(session_id, "-2072206098", text, user_name=user_name, member_nick=member_nick)
+            # The body fallback must compare the same sanitized text across bots.
+            await deliver(session_id, "-2072206097", text, user_name=user_name, member_nick=member_nick, bot_id="bot-2")
+            rows = (await db.execute(Select(ChatHistory).where(ChatHistory.session_id == session_id))).scalars().all()
+            assert len(rows) == 1
+            assert rows[0].user_name == (member_nick or user_name).replace("\x00", "")
+            assert rows[0].content == f"id: -2072206098\n{text.replace(chr(0), '')}"
+        finally:
+            event.remove(engine, "before_cursor_execute", reject_nul)
 
 
 @pytest.mark.asyncio

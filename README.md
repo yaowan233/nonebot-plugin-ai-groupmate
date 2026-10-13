@@ -21,11 +21,11 @@
 
 - **群体认知档案**：由 bot 在发现值得长期记住的新话题、成员特征、内部梗或氛围变化时自主更新，让 bot 对群文化有持续感知。
 - **长记忆**（需配置 Qdrant）：RAG 自动存储聊天历史，学习群友发言习惯，使 bot 更像真人。
-- **表情包学习**（需配置 Qdrant）：使用 `qwen-vl-max` 理解图片内容，分别索引描述语义与视觉特征，自动从群内偷学表情包；回复时通过 RRF 多路召回，结合当前群的真实使用频率重排，并在发送前按当前对话审核相关性。
+- **表情包学习**（需配置 Qdrant）：默认使用 `qwen3-vl-plus` 理解图片内容，分别索引描述语义与视觉特征，自动从群内偷学表情包；回复时通过 RRF 多路召回，结合当前群的真实使用频率重排，并在发送前按当前对话审核相关性。
 - **自定义 Agent Tools**：可以注册自己的 LangChain tools 扩展 agent 能力，详见 [自定义 Agent Tools](./docs/custom-agent-tools.md)。
 - **定时任务管理**：支持通过聊天创建、查看、修改和取消定时消息及 Agent 任务，详见 [定时任务](#定时任务)。
 
-对于主模型选择：推荐使用支持 Function Calling 的通义千问系列模型（如 `qwen-plus`、`qwen-max`）。图片理解固定使用 `qwen-vl-max`，群档案摘要固定使用 `qwen-flash`。
+对于主模型选择：推荐使用支持 Function Calling 的通义千问系列模型（如 `qwen-plus`、`qwen-max`）。图片标注默认使用 `qwen3-vl-plus`，群档案摘要默认使用 `qwen-flash`，均可通过对应角色配置修改。若图片标注报 `404 model_not_found`，请核对 `tagging_model` 是否仍在服务商的可用模型列表中；已有配置可在 WebUI 中切换模型并测试连接，无需重启。
 
 ### 明确记忆
 
@@ -195,7 +195,7 @@ curl http://127.0.0.1:6333/collections/media_collection_v3
 | ai_groupmate__google_web_detection_cache_days | 否 | `30` | 相同图片 SHA-256 的反向搜图结果缓存天数 |
 | ai_groupmate__google_web_detection_timeout_seconds | 否 | `20` | Google Web Detection 请求超时（秒） |
 | ai_groupmate__google_web_detection_max_results | 否 | `5` | 每类匹配网页、完整匹配图、局部匹配图和相似图的最大返回数，范围 1～10 |
-| ai_groupmate__vision_model | 否 | 无 | 图片回读辅助模型（如 `qwen-vl-max`）；主模型不支持图片时用它总结工具返回的图片内容，留空则跳过图片回读 |
+| ai_groupmate__vision_model | 否 | 无 | 图片回读辅助模型（如 `qwen3-vl-plus`）；主模型不支持图片时用它总结工具返回的图片内容，留空则跳过图片回读 |
 | ai_groupmate__vision_api_key | 否 | 无 | 图片回读辅助模型专用 API Key，留空则使用 `llm_api_key` / `qwen_token` |
 | ai_groupmate__vision_base_url | 否 | 无 | 图片回读辅助模型专用 Base URL，留空则使用 `llm_base_url` |
 | ai_groupmate__vision_temperature | 否 | `0.01` | 图片回读辅助模型温度 |
@@ -228,7 +228,7 @@ curl http://127.0.0.1:6333/collections/media_collection_v3
 | ai_groupmate__summary_base_url | 否 | 无 | 群体记忆模型专用 Base URL |
 | ai_groupmate__summary_temperature | 否 | `0.3` | 群体记忆模型温度 |
 | ai_groupmate__summary_max_tokens | 否 | `800` | 群体记忆模型最大输出 token |
-| ai_groupmate__tagging_model | 否 | `qwen-vl-max` | 图片/表情包标注模型 |
+| ai_groupmate__tagging_model | 否 | `qwen3-vl-plus` | 图片/表情包标注模型；须使用服务商当前可用的视觉模型 |
 | ai_groupmate__tagging_api_key | 否 | 无 | 图片标注模型专用 API Key |
 | ai_groupmate__tagging_base_url | 否 | 无 | 图片标注模型专用 Base URL |
 | ai_groupmate__tagging_temperature | 否 | `0.01` | 图片标注模型温度 |

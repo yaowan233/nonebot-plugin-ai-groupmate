@@ -2,7 +2,7 @@ from datetime import date, datetime
 
 from pydantic import BaseModel
 from sqlalchemy import JSON, Text, Float, Index, String, Boolean, Integer, UniqueConstraint
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, validates, mapped_column
 from nonebot_plugin_orm import Model
 
 
@@ -41,6 +41,11 @@ class ChatHistory(Model):
     media_id: Mapped[int | None]  # 媒体消息专用
     vectorized: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     vectorized_version: Mapped[int] = mapped_column(Integer, default=0, index=True)
+
+    @validates("content", "user_name")
+    def _strip_nul(self, _key: str, value: str) -> str:
+        # PostgreSQL text/varchar cannot store NUL, including in adapter nicknames.
+        return value.replace("\x00", "")
 
     __table_args__ = (
         # 覆盖 group_memory 更新查询: WHERE session_id=? AND created_at>? AND content_type IN (...)

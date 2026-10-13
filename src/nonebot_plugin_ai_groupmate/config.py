@@ -130,7 +130,7 @@ class ScopedConfig(BaseModel):
     summary_max_tokens: int = 800
 
     # === 图片标注模型（表情包识别与描述） ===
-    tagging_model: str = "qwen-vl-max"
+    tagging_model: str = "qwen3-vl-plus"
     tagging_api_key: str = ""
     tagging_base_url: str = ""
     tagging_temperature: float = 0.01

@@ -4,6 +4,37 @@ import pytest
 from langchain_core.messages import AIMessage, HumanMessage
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("content_type", ["text", "bot", "image"])
+async def test_history_strips_nul_on_insert_and_update(content_type):
+    from uuid import uuid4
+
+    from nonebot_plugin_orm import get_session
+
+    from nonebot_plugin_ai_groupmate.model import ChatHistory
+
+    async with get_session() as db:
+        row = ChatHistory(
+            session_id=f"history-nul-{uuid4()}",
+            user_id="member-1",
+            user_name="中\x00文🙂",
+            content_type=content_type,
+            content="id: 42\n太\x00像那谁\t🙂",
+        )
+        db.add(row)
+        await db.commit()
+        await db.refresh(row)
+        assert row.user_name == "中文🙂"
+        assert row.content == "id: 42\n太像那谁\t🙂"
+
+        row.user_name = "新\x00昵称"
+        row.content = "id: 42\n\x00新正文\n"
+        await db.commit()
+        await db.refresh(row)
+        assert row.user_name == "新昵称"
+        assert row.content == "id: 42\n新正文\n"
+
+
 def _history(msg_id, content_type, content, *, session_id="group-1", media_id=None):
     from nonebot_plugin_ai_groupmate.model import ChatHistorySchema
 

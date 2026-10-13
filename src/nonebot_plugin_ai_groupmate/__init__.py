@@ -881,6 +881,8 @@ async def handle_message(
     if reply_id:
         content += f"回复id: {reply_id}\n"
     # 第3行起：正文
+    # Match the stored text when deduplicating messages whose bodies contain NUL.
+    body = body.replace("\x00", "")
     content += body
 
     # 构建用户名：仅保留用户真实显示名，不混入群身份标签（群主/管理员）
