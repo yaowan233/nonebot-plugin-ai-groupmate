@@ -9,7 +9,7 @@ from collections.abc import Callable
 from nonebot.log import logger
 from nonebot.adapters import Bot, Event
 from langchain_core.tools import tool
-from nonebot_plugin_alconna import File, Target, UniMessage
+from nonebot_plugin_alconna import File, Target
 
 from ..model import ChatHistory
 from .web_fetch import download_public_url
@@ -17,6 +17,7 @@ from .chat_files import import_chat_file, wait_for_chat_files
 from ..reply_guard import is_request_active
 from .file_content import read_table, extract_html, create_document, summarize_table, extract_document
 from .tool_results import tool_failure, tool_skipped, tool_success
+from .file_delivery import file_message
 from .file_workspace import FileTaskError, FileWorkspace
 from .chat_file_inbox import ChatFileInbox
 
@@ -244,7 +245,7 @@ def create_file_tools(
             await db_session.commit()
             if not await active():
                 return tool_skipped("request_expired", "请求已过期，已取消发送。", delivery_state="not_attempted")
-            message = UniMessage.file(path=path, name=artifact.name)
+            message = file_message(path, artifact.name)
             attempted_sends.add(file_id)
             started = True
             receipt = await message.send(target=send_target, fallback=False)
