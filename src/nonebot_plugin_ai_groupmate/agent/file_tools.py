@@ -97,8 +97,14 @@ def create_file_tools(
             return (await asyncio.to_thread(workspace.get, file_id)).file_id
         except FileTaskError:
             received = await asyncio.to_thread(inbox.get, file_id)
+        url = received.url
+        # v2.5.11 could persist Alconna's invented https://filename URL.
+        # Only discard legacy unverified values; explicit real URLs are valid
+        # even if their hostname happens to equal the attachment filename.
+        if not received.url_from_message and received.platform_id and url in {f"https://{received.name}", f"http://{received.name}"}:
+            url = ""
         file = File(id=received.platform_id or None, name=received.name,
-                    url=received.url or None, mimetype=received.mimetype or None)
+                    url=url or None, mimetype=received.mimetype or None)
         artifact = await import_chat_file(file, workspace, bot=bot, event=event,
                                           message_id=received.message_id, index=received.index,
                                           group_id=received.group_id,

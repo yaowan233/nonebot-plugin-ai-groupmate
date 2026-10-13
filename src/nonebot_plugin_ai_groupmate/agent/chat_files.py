@@ -28,6 +28,16 @@ def chat_file_source_key(file: File, message_id: str, index: int = 0) -> str:
     return hashlib.sha256(json.dumps(identity, ensure_ascii=False).encode()).hexdigest()
 
 
+def chat_file_download_url(file: File) -> str:
+    """OneBot's `file` field may be a filename which Alconna prefixes with HTTPS."""
+    origin = file.origin
+    if origin is not None and "onebot" in type(origin).__module__.lower():
+        candidates = [origin.data.get("url"), origin.data.get("file")]
+    else:
+        candidates = [file.url]
+    return next((value for value in candidates if isinstance(value, str) and value.startswith(("http://", "https://"))), "")
+
+
 async def wait_for_chat_files(workspace: FileWorkspace) -> list[BaseException]:
     """A follow-up can arrive while the attachment message is still downloading."""
     pending = tuple(_pending.get(str(workspace.directory), ()))
@@ -84,7 +94,7 @@ async def _import(file: File, workspace: FileWorkspace, *, bot: Bot | None, even
     if file.raw is not None:
         raw = file.raw.getvalue() if isinstance(file.raw, BytesIO) else file.raw
         return await asyncio.to_thread(workspace.save, raw, file.name, content_type=file.mimetype or "", source_key=source_key)
-    url = file.url if file.url and file.url.startswith(("http://", "https://")) else ""
+    url = chat_file_download_url(file)
     if not url and file.id and bot is not None and is_onebot_context(bot, event):
         api = "get_group_file_url" if group_id is not None else "get_private_file_url"
         params: dict[str, Any] = {"file_id": file.id}

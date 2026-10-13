@@ -9,7 +9,7 @@ from dataclasses import asdict, dataclass
 
 from nonebot_plugin_alconna import File
 
-from .chat_files import chat_file_source_key
+from .chat_files import chat_file_source_key, chat_file_download_url
 from .file_workspace import MAX_FILE_BYTES, FILE_TTL_SECONDS, FileTaskError, FileWorkspace, clean_filename
 
 MAX_INBOX_FILES = 30
@@ -33,6 +33,7 @@ class ReceivedFile:
     index: int
     group_id: str | None
     busid: int | None
+    url_from_message: bool = False
 
 
 def cleanup_chat_file_inbox(root) -> None:
@@ -112,13 +113,15 @@ class ChatFileInbox:
             raise FileTaskError("file_too_large", "文件超过 10 MiB，不下载或保存原件。")
         if size is not None and size < 0:
             raise FileTaskError("invalid_file", "文件大小不能为负数。")
-        if not file.id and not file.url:
+        url = chat_file_download_url(file)
+        if not file.id and not url:
             raise FileTaskError("chat_file_unavailable", "附件没有可供稍后下载的文件 ID 或链接，请提供公开下载链接。")
-        if len(file.id or "") > 4096 or len(file.url or "") > 4096:
+        if len(file.id or "") > 4096 or len(url) > 4096:
             raise FileTaskError("invalid_file", "附件链接或平台 ID 过长。")
         source_key = chat_file_source_key(file, message_id, index)
-        item = ReceivedFile(source_key[:32], source_key, clean_filename(file.name), file.id or "", file.url or "",
-                            (file.mimetype or "")[:200], size, time.time(), message_id, index, group_id, busid)
+        item = ReceivedFile(source_key[:32], source_key, clean_filename(file.name), file.id or "", url,
+                            (file.mimetype or "")[:200], size, time.time(), message_id, index, group_id, busid,
+                            url_from_message=bool(url))
         with _LOCK:
             path = self._path(item.file_id)
             descriptor = json.dumps(asdict(item), ensure_ascii=False)

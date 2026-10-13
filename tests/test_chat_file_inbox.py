@@ -137,3 +137,79 @@ async def test_summary_materializes_only_selected_registered_attachment(tmp_path
     assert result["data"]["preview"] == [["A", 5], ["B", 4]]
     assert {item.name for item in workspace(tmp_path).list()} == {"table.csv", "table_summary.xlsx"}
     download.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("group_id", [None, "10001"])
+@pytest.mark.parametrize("url_field", ["", None, "missing"])
+async def test_onebot_attachment_empty_url_uses_protocol_download_url(tmp_path, incoming, group_id, url_field):
+    from nonebot_plugin_alconna import File, UniMessage
+    from nonebot.adapters.onebot.v11 import Message, MessageSegment
+
+    from nonebot_plugin_ai_groupmate.agent.chat_file_inbox import ChatFileInbox
+
+    module, bot, event, download = incoming
+    data = {"file": "报表.txt", "file_id": "platform-file-id", "path": "", "file_size": 29253}
+    if url_field != "missing":
+        data["url"] = url_field
+    native = Message(MessageSegment("file", data))
+    file = list(UniMessage.of(native, adapter="OneBot V11").include(File))[0]
+    downloaded = download.return_value
+
+    async def resolve_only_actual_url(url):
+        if url != "https://cdn.example.org/table.csv":
+            raise module.FileTaskError("download_failed", "文件名被误当作下载域名。")
+        return downloaded
+
+    download.side_effect = resolve_only_actual_url
+    item = ChatFileInbox(workspace(tmp_path)).register(file, message_id="1", index=0, group_id=group_id)
+    assert item.url == ""
+    result = json.loads(await toolset(tmp_path, bot=bot, event=event)["read_file"].ainvoke({"file_id": item.file_id}))
+    assert result["reason_code"] == "file_read"
+    if group_id is None:
+        bot.call_api.assert_awaited_once_with("get_private_file_url", file_id="platform-file-id")
+    else:
+        bot.call_api.assert_awaited_once_with("get_group_file_url", file_id="platform-file-id", group_id=group_id)
+    download.assert_awaited_once_with("https://cdn.example.org/table.csv")
+
+
+@pytest.mark.asyncio
+async def test_legacy_descriptor_with_filename_url_can_be_read_without_reupload(tmp_path, incoming):
+    from nonebot_plugin_alconna import File
+
+    from nonebot_plugin_ai_groupmate.agent.chat_file_inbox import ChatFileInbox
+
+    _, bot, event, download = incoming
+    inbox = ChatFileInbox(workspace(tmp_path))
+    item = inbox.register(File(id="native", name="报表.txt"), message_id="1", index=0, group_id=None)
+    path = inbox._path(item.file_id)
+    old = json.loads(path.read_text(encoding="utf-8"))
+    old.pop("url_from_message")
+    old["url"] = "https://报表.txt"
+    path.write_text(json.dumps(old, ensure_ascii=False), encoding="utf-8")
+    result = json.loads(await toolset(tmp_path, bot=bot, event=event)["read_file"].ainvoke({"file_id": item.file_id}))
+    assert result["reason_code"] == "file_read"
+    bot.call_api.assert_awaited_once_with("get_private_file_url", file_id="native")
+    download.assert_awaited_once_with("https://cdn.example.org/table.csv")
+
+
+@pytest.mark.asyncio
+async def test_explicit_url_equal_to_filename_is_preserved(tmp_path, incoming, monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from nonebot_plugin_alconna import File, UniMessage
+    from nonebot.adapters.onebot.v11 import Message, MessageSegment
+
+    from nonebot_plugin_ai_groupmate.agent.chat_file_inbox import ChatFileInbox
+
+    _, bot, event, download = incoming
+    native = Message(MessageSegment("file", {"file": "example.zip", "url": "https://example.zip", "file_id": "native"}))
+    file = list(UniMessage.of(native, adapter="OneBot V11").include(File))[0]
+    item = ChatFileInbox(workspace(tmp_path)).register(file, message_id="1", index=0, group_id=None)
+    assert item.url_from_message
+    monkeypatch.setattr(UniMessage, "send", AsyncMock(return_value=SimpleNamespace(msg_ids=[{"message_id": "1"}])))
+    result = json.loads(await toolset(tmp_path, bot=bot, event=event)["send_file"].ainvoke({"file_id": item.file_id}))
+    assert result["reason_code"] == "file_sent"
+    download.assert_awaited_once_with("https://example.zip")
+    bot.call_api.assert_not_awaited()
