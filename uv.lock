@@ -2294,7 +2294,7 @@ wheels = [
 
 [[package]]
 name = "nonebot-plugin-ai-groupmate"
-version = "2.5.9"
+version = "2.5.10"
 source = { editable = "." }
 dependencies = [
     { name = "cryptography" },
