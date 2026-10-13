@@ -94,8 +94,12 @@ async def test_protocol_and_received_paths_are_never_read(tmp_path, incoming):
     local = tmp_path / "secret.txt"
     local.write_text("secret")
     bot.call_api.return_value = {"file": str(local)}
+    file = File(id="native", path=local)
+    # Alconna normalizes URLs with no hostname differently on POSIX/Windows.
+    # Preserve the received URI to test our rejection independently of that.
+    file.url = f"file://{local.as_posix()}"
     with pytest.raises(module.FileTaskError, match="本地路径"):
-        await module.import_chat_file(File(id="native", path=local, url=f"file://{local}"), workspace(tmp_path), bot=bot, event=event, message_id="1")
+        await module.import_chat_file(file, workspace(tmp_path), bot=bot, event=event, message_id="1")
     assert workspace(tmp_path).list() == []
     download.assert_not_awaited()
 
@@ -189,8 +193,8 @@ async def test_import_markers_limit_and_record_failure(tmp_path, incoming):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("is_private", "addressed", "expected"), [(False, False, False), (False, True, True), (True, True, True)])
-async def test_file_only_message_is_saved_and_replies_when_addressed(tmp_path, monkeypatch, deliver_message, is_private, addressed, expected):
+@pytest.mark.parametrize(("is_private", "addressed"), [(False, False), (False, True), (True, True)])
+async def test_file_only_message_registers_without_download_or_reply(tmp_path, incoming, monkeypatch, deliver_message, is_private, addressed):
     from sqlalchemy import Select
     from nonebot_plugin_orm import get_session
     from nonebot_plugin_alconna import File, UniMessage
@@ -198,15 +202,18 @@ async def test_file_only_message_is_saved_and_replies_when_addressed(tmp_path, m
     import nonebot_plugin_ai_groupmate as plugin
     from nonebot_plugin_ai_groupmate.model import ChatHistory
     from nonebot_plugin_ai_groupmate.agent.file_workspace import FileWorkspace
+    from nonebot_plugin_ai_groupmate.agent.chat_file_inbox import ChatFileInbox
 
     monkeypatch.setattr(plugin, "plugin_data_dir", tmp_path)
     monkeypatch.setattr(plugin.plugin_config, "agent_file_tools_enabled", True)
     deliver, queued, _ = deliver_message
     session_id = f"file-message-{uuid4()}"
-    await deliver(session_id, "1", "", message=UniMessage(File(name="input.csv", raw=b"a,b\n1,2")), addressed=addressed, is_private=is_private)
-    assert queued.await_count == int(expected)
+    await deliver(session_id, "1", "", message=UniMessage(File(id="native", name="input.csv", url="https://cdn.example.org/file")), addressed=addressed, is_private=is_private)
+    queued.assert_not_awaited()
     store = FileWorkspace(tmp_path / "agent_files", session_id=session_id, user_id="member-1", bot_id="bot-1", is_private=is_private)
-    assert len(store.list()) == 1
+    assert store.list() == []
+    assert len(ChatFileInbox(store).list()) == 1
+    incoming[3].assert_not_awaited()
     async with get_session() as db:
         rows = (await db.execute(Select(ChatHistory).where(ChatHistory.session_id == session_id))).scalars().all()
         assert len(rows) == 1
@@ -215,7 +222,7 @@ async def test_file_only_message_is_saved_and_replies_when_addressed(tmp_path, m
 
 
 @pytest.mark.asyncio
-async def test_file_upload_in_continuing_group_conversation(tmp_path, monkeypatch, deliver_message):
+async def test_file_only_upload_in_conversation_waits_for_processing_request(tmp_path, monkeypatch, deliver_message):
     from nonebot_plugin_alconna import File, UniMessage
 
     import nonebot_plugin_ai_groupmate as plugin
@@ -226,19 +233,22 @@ async def test_file_upload_in_continuing_group_conversation(tmp_path, monkeypatc
     session_id = f"file-followup-{uuid4()}"
     await deliver(session_id, "1", "我稍后上传表格，请汇总", addressed=True)
     queued.reset_mock()
-    await deliver(session_id, "2", "", message=UniMessage(File(name="table.csv", raw=b"a,b\n1,2")))
+    await deliver(session_id, "2", "", message=UniMessage(File(id="native", name="table.csv")))
+    queued.assert_not_awaited()
+    await deliver(session_id, "3", "请汇总刚才的表格", addressed=True)
     queued.assert_awaited_once()
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("notice_type", ["group_upload", "offline_file", "friend_upload"])
-async def test_qq_upload_notice_imports_and_records_once(tmp_path, incoming, monkeypatch, notice_type):
+async def test_qq_upload_notice_registers_without_downloading_and_records_once(tmp_path, incoming, monkeypatch, notice_type):
     from sqlalchemy import Select
     from nonebot_plugin_orm import get_session
 
     import nonebot_plugin_ai_groupmate as plugin
     from nonebot_plugin_ai_groupmate.model import ChatHistory
     from nonebot_plugin_ai_groupmate.agent.file_workspace import FileWorkspace
+    from nonebot_plugin_ai_groupmate.agent.chat_file_inbox import ChatFileInbox
 
     _, bot, _, download = incoming
     monkeypatch.setattr(plugin, "plugin_data_dir", tmp_path)
@@ -261,10 +271,12 @@ async def test_qq_upload_notice_imports_and_records_once(tmp_path, incoming, mon
         rows = (await db.execute(Select(ChatHistory).where(ChatHistory.session_id == (group_id or user_id)))).scalars().all()
         assert len(rows) == 1
         assert "上传.csv" in rows[0].content
-        assert "已保存" in rows[0].content
+        assert "已登记" in rows[0].content
     store = FileWorkspace(tmp_path / "agent_files", session_id=group_id or user_id, user_id=user_id, bot_id="bot", is_private=group_id is None)
-    assert len(store.list()) == 1
-    download.assert_awaited_once()
+    assert store.list() == []
+    assert len(ChatFileInbox(store).list()) == 1
+    download.assert_not_awaited()
+    bot.call_api.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -285,29 +297,30 @@ async def test_disabled_tools_and_self_upload_are_ignored(tmp_path, incoming, mo
 
 
 @pytest.mark.asyncio
-async def test_notice_retry_updates_failed_import_record(tmp_path, incoming, monkeypatch):
+async def test_notice_updates_changed_attachment_descriptor(tmp_path, incoming, monkeypatch):
     from sqlalchemy import Select
     from nonebot_plugin_orm import get_session
 
     import nonebot_plugin_ai_groupmate as plugin
     from nonebot_plugin_ai_groupmate.model import ChatHistory
 
-    module, bot, _, download = incoming
+    _, bot, _, download = incoming
     monkeypatch.setattr(plugin, "plugin_data_dir", tmp_path)
     monkeypatch.setattr(plugin, "is_onebot_context", lambda *_: True)
     monkeypatch.setattr(plugin, "get_bots", lambda: {})
     monkeypatch.setattr(plugin.plugin_config, "agent_file_tools_enabled", True)
     user_id = f"retry-{uuid4()}"
     event = SimpleNamespace(notice_type="offline_file", user_id=user_id, file={"id": "native", "name": "table.csv"})
-    download.side_effect = [module.FileTaskError("download_failed", "下载失败"), download.return_value]
     async with get_session() as db:
         await plugin.handle_file_upload(db, bot, event)
         failed = (await db.execute(Select(ChatHistory).where(ChatHistory.session_id == user_id))).scalar_one()
-        assert "导入失败" in failed.content
+        assert "table.csv" in failed.content
+        event.file["name"] = "新文件名.csv"
         await plugin.handle_file_upload(db, bot, event)
         rows = (await db.execute(Select(ChatHistory).where(ChatHistory.session_id == user_id))).scalars().all()
         assert len(rows) == 1
-        assert "已保存" in rows[0].content
+        assert "新文件名.csv" in rows[0].content
+    download.assert_not_awaited()
 
 
 @pytest.mark.asyncio

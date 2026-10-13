@@ -80,7 +80,7 @@ from .runtime_config import (
 from .forward_message import format_forward_reference_markers
 from .group_api_relay import delete_expired_pending_group_configs
 from .scheduled_tasks import poll_scheduled_tasks, stop_scheduled_tasks
-from .agent.chat_files import chat_file_source_key, import_chat_file_markers
+from .agent.chat_files import chat_file_source_key
 from .message_metadata import BOT_ECHO_LOOKBACK, is_reliable_platform_id
 from .agent.reply_tools import create_reply_tool
 from .group_daily_quota import (
@@ -105,6 +105,7 @@ from .group_model_config import (
 )
 from .agent.file_workspace import FileWorkspace
 from .relation_maintenance import count_negative_relations, reset_negative_relations
+from .agent.chat_file_inbox import cleanup_chat_file_inbox, register_chat_file_markers
 from .agent.explicit_memory import cleanup_explicit_memories
 from .agent.web_image_search import is_explicit_web_image_search_request
 
@@ -255,6 +256,7 @@ async def _expire_agent_files() -> None:
 
     try:
         await asyncio.to_thread(cleanup_workspace, plugin_data_dir / "agent_files")
+        await asyncio.to_thread(cleanup_chat_file_inbox, plugin_data_dir / "agent_files")
     except Exception:
         logger.exception("清理到期 Agent 文件失败")
 
@@ -820,8 +822,8 @@ async def handle_file_upload(db_session: async_scoped_session, bot: Bot, event: 
     content_prefix = f"id: qq-file:{source_key}\n"
     workspace = FileWorkspace(plugin_data_dir / "agent_files", session_id=session_id, user_id=user_id,
                               bot_id=str(bot.self_id), is_private=group_id is None)
-    marker = await import_chat_file_markers([file], workspace, bot=bot, event=event,
-                                           message_id=source_key, group_id=group_id, metadata=data)
+    marker = await asyncio.to_thread(register_chat_file_markers, [file], workspace,
+                                     message_id=source_key, group_id=group_id, metadata=data)
     # No model call on an unsolicited upload notice. A later @/private request
     # sees the attachment marker and retrieves the current sender's workspace.
     async with _get_dedup_lock(session_id):
@@ -930,9 +932,9 @@ async def handle_message(
         workspace = FileWorkspace(plugin_data_dir / "agent_files", session_id=session.scene.id,
                                   user_id=session.user.id, bot_id=str(bot.self_id),
                                   is_private=session.scene.type == SceneType.PRIVATE)
-        marker = await import_chat_file_markers(files, workspace, bot=bot, event=event,
-                                               message_id=incoming_message_id,
-                                               group_id=session.scene.id if session.scene.type == SceneType.GROUP else None)
+        marker = await asyncio.to_thread(register_chat_file_markers, files, workspace,
+                                         message_id=incoming_message_id,
+                                         group_id=session.scene.id if session.scene.type == SceneType.GROUP else None)
         body += ("\n" if body and not body.endswith("\n") else "") + marker
         is_text = True
 
@@ -1053,7 +1055,7 @@ async def handle_message(
     if disengaged:
         _continuous_conversation_until.pop((session.scene.id, session.user.id, bot_id), None)
         logger.debug("用户明确退出当前 bot 对话，本条保持沉默并结束跟进窗口")
-    continuous_to_me = not disengaged and not explicit_to_me and not command_like and not has_at_mention and not reply_id and bool(stripped_plain_text or files) and active_followup
+    continuous_to_me = not disengaged and not explicit_to_me and not command_like and not has_at_mention and not reply_id and bool(stripped_plain_text) and active_followup
     if continuous_to_me:
         logger.debug(f"群 {session.scene.id} 用户 {session.user.id} 命中连续对话窗口")
     repeat_text = None
@@ -1102,6 +1104,9 @@ async def handle_message(
     if explicit_to_me and not disengaged:
         _refresh_continuous_conversation(session.scene.id, session.user.id, bot_id)
     if not plain_text and not imgs and not forward_references and not audios and not videos and not files:
+        should_reply = False
+    if files and not stripped_plain_text and not imgs and not forward_references and not audios and not videos:
+        # Receiving a file is not a request to analyze it or download it.
         should_reply = False
     if command_like:
         should_reply = False

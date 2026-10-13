@@ -36,7 +36,7 @@ async def wait_for_chat_files(workspace: FileWorkspace) -> list[BaseException]:
 
 
 async def import_chat_file(
-    file: File, workspace: FileWorkspace, *, bot: Bot, event: Event,
+    file: File, workspace: FileWorkspace, *, bot: Bot | None, event: Event | None,
     message_id: str, index: int = 0, group_id: str | None = None, metadata: dict[str, Any] | None = None,
 ) -> Artifact:
     source_key = chat_file_source_key(file, message_id, index)
@@ -80,12 +80,12 @@ async def import_chat_file(
             _pending.pop(key, None)
 
 
-async def _import(file: File, workspace: FileWorkspace, *, bot: Bot, event: Event, group_id: str | None, data: dict[str, Any], source_key: str) -> Artifact:
+async def _import(file: File, workspace: FileWorkspace, *, bot: Bot | None, event: Event | None, group_id: str | None, data: dict[str, Any], source_key: str) -> Artifact:
     if file.raw is not None:
         raw = file.raw.getvalue() if isinstance(file.raw, BytesIO) else file.raw
         return await asyncio.to_thread(workspace.save, raw, file.name, content_type=file.mimetype or "", source_key=source_key)
     url = file.url if file.url and file.url.startswith(("http://", "https://")) else ""
-    if not url and file.id and is_onebot_context(bot, event):
+    if not url and file.id and bot is not None and is_onebot_context(bot, event):
         api = "get_group_file_url" if group_id is not None else "get_private_file_url"
         params: dict[str, Any] = {"file_id": file.id}
         if group_id is not None:

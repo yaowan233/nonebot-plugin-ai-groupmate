@@ -1480,6 +1480,7 @@ async def create_chat_graph(
             root=plugin_data_dir / "agent_files",
             user_id=str(user_id), bot_id=str(bot_id or plugin_config.bot_name),
             is_private=is_private, bot_name=plugin_config.bot_name, send_target=send_target,
+            bot=bot, event=event,
         )
         if plugin_config.agent_file_tools_enabled
         and not proactive_meme_only and not proactive_reaction_only and repeat_text is None
