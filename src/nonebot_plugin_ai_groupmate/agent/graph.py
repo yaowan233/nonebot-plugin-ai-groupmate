@@ -37,6 +37,7 @@ PARALLEL_SAFE_TOOL_NAMES = frozenset({
     "qwen_code_interpreter",
     "read_audio_message",
     "read_forward_message",
+    "read_member_history",
     "read_video_message",
     "search_web",
 })
