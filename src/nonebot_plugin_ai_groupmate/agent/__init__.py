@@ -643,6 +643,7 @@ def _build_builtin_agent_skills(
     context_name = "聊天上下文" if is_private else "群内上下文"
     interaction_instruction = "" if is_private or not interaction_history_enabled else (
         "- 群聊历史调查用于回顾话题、核对往事和约定、追溯梗或说法、比较成员观点及其变化、理解共同经历和多人互动；按当前问题选择工具。\n"
+        "- 用户明确要求群内比较、评价或排名时，先查阅历史证据，再作有范围的判断；不能用调侃代替调查，也不能未经查询就声称工具查不了。成绩、段位或真实身份未必能从聊天确定；区分自述、玩笑与可核实记录，查不到就说明，不据发言猜测真人是否为 BOT。\n"
         "- 已知成员时优先 `read_member_history(member=用户ID或唯一昵称, keyword=关键词)`，可限定日期及用 next_before_msg_id 翻页；不必先扫描全群。查具体话题或未知说话者时使用 `search_history_context`。\n"
         "- 需要查清谁在回应谁、原话对象和事件进展时，用 `read_member_history(anchor_msg_id=...)` 展开前后文；只用工具返回的数据库 msg_id。RAG 片段没有 msg_id 时，可按成员与关键词定位原文，不能猜 ID。\n"
         "- 需要发现多人跟读、梗的传播或代表互动时用 `search_group_interactions`；它只找短时间内多人发送相同文本的事件，不覆盖全部聊天，不能用来证明完整话题热度或全群共识。\n"
@@ -690,7 +691,7 @@ def _build_builtin_agent_skills(
             description=(
                 "历史聊天检索和数学计算；联网搜索 search_web 已直接可用。用户问之前/"
                 "上次/以前/曾说过/约定/代号/历史偏好时必须使用此技能。"
-                + ("" if is_private or not interaction_history_enabled else "支持群内话题回顾、往事与约定核对、梗的溯源、成员观点比较及变化、共同经历和多人互动调查。")
+                + ("" if is_private or not interaction_history_enabled else "当前用户在查询群内历史或成员情况：必须先加载本技能，查阅历史证据后回答。适用于话题回顾、往事与约定核对、梗溯源、成员能力/行为/观点的比较评价或排名、共同经历及多人互动；证据不足如实说明。")
             ),
             prompt=(
                 "历史上下文和计算工具规则：\n"

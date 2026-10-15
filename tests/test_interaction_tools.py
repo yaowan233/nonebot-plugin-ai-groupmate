@@ -158,6 +158,13 @@ def test_group_skill_exposes_interaction_guidance():
     [
         ("谁是群里的神人？", True),
         ("给这个群的神人排个前五，举真实事例。", True),
+        ("miyuki 你给这个群里的猪排个名", True),
+        ("那这个群里谁猪", True),
+        ("miyuki 那这个群里谁最会玩ctb", True),
+        ("miyuki 那你分析一下这个群里谁最会玩舞萌", True),
+        ("miyuki 哪些群友可能是bot", True),
+        ("你给本群的摄影爱好者排一下名", True),
+        ("我们群里谁更擅长写代码？", True),
         ("给上周的聊天做个总结", True),
         ("为群友的经典发言排一下名", True),
         ("miyuki 你用Excel统计一下这个群的神人发言", True),
@@ -185,6 +192,12 @@ def test_group_skill_exposes_interaction_guidance():
         ("这个梗真好笑", False),
         ("小王之前说过他喜欢这个游戏", False),
         ("今天群里讨论得好热闹", False),
+        ("我不知道这个群里谁最会玩ctb", False),
+        ("他问我们群里谁更擅长写代码", False),
+        ("群里谁想一起吃饭", False),
+        ("我们群谁有空帮忙", False),
+        ("他刚才说“那这个群里谁猪”", False),
+        ("别分析这个群里谁最会玩舞萌了", False),
         ("他刚才说“回顾一下上周大家聊了什么”", False),
         ("别查之前的聊天了", False),
         ("我以前最喜欢这个游戏了", False),
@@ -220,6 +233,18 @@ def test_general_history_followup_requires_recent_query_from_same_user():
     assert not interaction_history_requested([followup], "1")
     other_user = HistoryMessage(1, "g", "2", "乙", "text", prior.content, prior.created_at)
     assert not interaction_history_requested([other_user, followup], "1")
+
+
+def test_history_tool_retry_requires_own_recent_investigation():
+    from nonebot_plugin_ai_groupmate.interaction_history import HistoryMessage, interaction_history_requested
+
+    now = datetime.now()
+    prior = HistoryMessage(1, "g", "1", "甲", "text", "这个群里谁最会玩ctb", now - timedelta(minutes=1))
+    retry = HistoryMessage(2, "g", "1", "甲", "text", "怎么就是不用新的tools", now)
+    assert interaction_history_requested([prior, retry], "1")
+    assert not interaction_history_requested([retry], "1")
+    other_user = HistoryMessage(1, "g", "2", "乙", "text", prior.content, prior.created_at)
+    assert not interaction_history_requested([other_user, retry], "1")
 
 
 async def test_member_history_compares_views_without_a_repeat_event(history_db):
