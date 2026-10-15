@@ -99,6 +99,7 @@ typeCheckingMode = "standard"
 disableBytesTypePromotions = true
 
 [tool.pytest.ini_options]
+testpaths = ["tests"]
 addopts = [
   "-v",  # 详细输出
   "-s",  # 显示打印信息

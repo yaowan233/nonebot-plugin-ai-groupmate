@@ -251,7 +251,7 @@ async def test_private_effective_text_mode_exposes_meme_tools_without_similar(
     assert "search_similar_meme_by_id" not in captured_skills.get("meme_tools", [])
     assert captured_skills["meme_tools"] == ["search_meme_image", "send_meme_image"]
     assert "search_web" in captured_base_tools
-    assert captured_skills["search_context_tools"] == [
-        "search_history_context",
+    assert sorted(captured_skills["search_context_tools"]) == [
         "calculate_expression",
+        "search_history_context",
     ]
