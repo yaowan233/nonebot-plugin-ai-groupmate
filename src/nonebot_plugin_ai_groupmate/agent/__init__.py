@@ -642,14 +642,14 @@ def _build_builtin_agent_skills(
 ) -> list[AgentSkill]:
     context_name = "聊天上下文" if is_private else "群内上下文"
     interaction_instruction = "" if is_private or not interaction_history_enabled else (
-        "- 用户问群内神人、整活、经典发言或成员排名时，先调用 `search_group_interactions` 获取互动候选，不要求原话包含这些评价词。\n"
-        "- 用 `read_member_history(anchor_msg_id=...)` 展开候选前后文；按 member 用户ID及 keyword 补查其他日期的独立事例，next_before_msg_id 可翻页。\n"
-        "- 首次查询返回 member_candidates 及 example_msg_ids，直接选有代表事例的成员展开；通常一页候选足够，不要为了排名穷尽所有分页。翻页须使用返回的 next_offset，不能自行加 limit。\n"
-        "- 通常一次候选查询及每位候选一次上下文读取即可，只有事例或归属不清楚时补查；按预算及时给出已有证据支持的结果。\n"
-        "- 先取得少量具体事例，再按已核实材料给出判断；不足五人时给有依据的候选并说明范围，不为凑名次反复搜索或编造。\n"
-        "- 复读统计只是发现材料，不能直接当神人分数；最早可见说话者不等于原创作者，金句作者、被吐槽者、跟读者必须区分。\n"
-        "- 引用一句话评价某人前，核对 source_message.user_id 和说话者；不能把上下文里的跟读者当成说话者，也不能宣称已经证明原创。\n"
-        "- 排名属于带证据的主观判断，说明已查时间窗口并举原始事例；不得把 BOT 总结、转述或一次玩笑当成真人的长期事实。\n"
+        "- 群聊历史调查用于回顾话题、核对往事和约定、追溯梗或说法、比较成员观点及其变化、理解共同经历和多人互动；按当前问题选择工具。\n"
+        "- 已知成员时优先 `read_member_history(member=用户ID或唯一昵称, keyword=关键词)`，可限定日期及用 next_before_msg_id 翻页；不必先扫描全群。查具体话题或未知说话者时使用 `search_history_context`。\n"
+        "- 需要查清谁在回应谁、原话对象和事件进展时，用 `read_member_history(anchor_msg_id=...)` 展开前后文；只用工具返回的数据库 msg_id。RAG 片段没有 msg_id 时，可按成员与关键词定位原文，不能猜 ID。\n"
+        "- 需要发现多人跟读、梗的传播或代表互动时用 `search_group_interactions`；它只找短时间内多人发送相同文本的事件，不覆盖全部聊天，不能用来证明完整话题热度或全群共识。\n"
+        "- 互动结果中的 member_candidates 和 example_msg_ids 可直接用于展开代表事件；翻页须使用 next_offset，不能自行加 limit。先读少量相关证据，只有信息缺口明确时补查，不穷尽全群记录。\n"
+        "- 比较观点或追踪变化要核对时间、不同日期的独立原话和后续更正。说明已查时间窗口及遗漏；空结果不等于从未发生，也不能从少量片段还原完整历史。\n"
+        "- 引用事实前核对 source_message.user_id，区分原话作者、被评价者、引用者和跟读者；最早可见不证明原创，BOT 总结、转述和一次玩笑不能直接当作真人的长期事实。\n"
+        "- 用户要求评价或排名时，再基于核实的具体事例给主观判断；统计只用于提供线索，材料不足就说明，不为凑名次反复搜索或编造。公开资料和实时信息仍使用联网搜索。\n"
     )
     meme_similarity_instruction = _meme_similarity_skill_instruction(
         meme_similar_enabled=meme_similar_enabled,
@@ -690,7 +690,7 @@ def _build_builtin_agent_skills(
             description=(
                 "历史聊天检索和数学计算；联网搜索 search_web 已直接可用。用户问之前/"
                 "上次/以前/曾说过/约定/代号/历史偏好时必须使用此技能。"
-                + ("" if is_private or not interaction_history_enabled else "群内神人、整活、经典语录和成员排名也使用此技能查互动及原始证据。")
+                + ("" if is_private or not interaction_history_enabled else "支持群内话题回顾、往事与约定核对、梗的溯源、成员观点比较及变化、共同经历和多人互动调查。")
             ),
             prompt=(
                 "历史上下文和计算工具规则：\n"

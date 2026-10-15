@@ -45,12 +45,23 @@ class _QueryMessage(Protocol):
     def created_at(self) -> datetime: ...
 
 
-_INTERACTION_TOPIC = re.compile(r"神人|整活|经典|语录|群友|复读|群.{0,12}(?:排名|排行|历史|发言)|历史|以前|过去|之前|往事|上次")
+_HISTORY_TOPIC = re.compile(
+    r"聊天|聊过|聊了|聊什么|发言|讨论|说过|提过|提到过|群友|成员|复读|梗|来历|出处|约定|观点|看法|态度|共同经历|时间线|上下文|前后文"
+    r"|群.{0,12}(?:排名|排行|历史)|历史|以前|过去|之前|往事|上次|神人|整活|经典|语录"
+)
 _QUERY_INTENT = re.compile(
     r"^(?:(?:那|那么|请|帮我|帮忙|给我|麻烦|再|继续|顺便|你|能不能|可以|能|用\S+)[，,：:\s]*)*"
-    r"(?:查|搜|统计|盘点|回顾|整理|分析|总结|排名|排行|排个|排一下|排一|列|举|看看|看一下|给个)"
+    r"(?:查|搜|找|翻翻|翻一下|追溯|核对|确认|对比|比较|回忆|展开|梳理|复盘|统计|盘点|回顾|整理|分析|总结|排名|排行|排个|排一下|排一|列|举|看看|看一下|给个)"
+    r"|^(?:(?:请|帮我|麻烦)\s*)?(?:把|将).{1,100}(?:整理|总结|梳理|复盘|做成|串成|列成|画成|汇总)"
     r"|谁(?:是|最|算|的|有)|哪些|哪几|有没有|说过什么"
 )
+_HISTORY_QUESTION = re.compile(
+    r"(?:聊|讨论|说|提|约定).{0,10}(?:什么|啥|何时|什么时候|哪些|哪几)"
+    r"|(?:谁|哪位|哪个).{0,8}(?:先说|说过|提过|提到)"
+    r"|(?:梗|说法|话).{0,8}(?:怎么来|哪来|出自|来源)"
+    r"|(?:什么时候|何时).{0,8}(?:约好|说好|讨论|提到)"
+)
+_HISTORY_FOLLOWUP = re.compile(r"^(?:那|那么)?(?:后来呢|然后呢|前后文呢|还有谁|还有其他人吗)[？?。！!\s]*$")
 _QUOTED_TEXT = re.compile(r'“[^”]*”|「[^」]*」|‘[^’]*’|"[^"\n]*"')
 
 
@@ -63,7 +74,7 @@ def interaction_history_requested(
     """Conservatively expose expensive history tools for the current user's query.
 
     This is a deterministic entry gate, not perfect semantic intent detection.
-    A brief ranking follow-up may reuse that same user's query within two hours.
+    Brief history follow-ups may reuse that same user's query within two hours.
     """
     rows = sorted((row for row in messages if str(row.user_id) == str(user_id) and row.content_type == "text"), key=lambda row: row.msg_id)
     if not rows:
@@ -79,11 +90,17 @@ def interaction_history_requested(
     current = text(rows[-1])
     if re.match(r"^(?:那|你|请|还是|现在|再|先)*\s*(?:不要|别|不用|停止|取消)", current):
         return False
-    if not _QUERY_INTENT.search(_QUOTED_TEXT.sub("[引用]", current)):
-        return False
-    if _INTERACTION_TOPIC.search(current):
+
+    def explicit_query(body: str) -> bool:
+        unquoted = _QUOTED_TEXT.sub("[引用]", body)
+        return bool((_QUERY_INTENT.search(unquoted) or _HISTORY_QUESTION.search(unquoted)) and _HISTORY_TOPIC.search(body))
+
+    if explicit_query(current):
         return True
-    return any(timedelta(0) <= rows[-1].created_at - row.created_at <= timedelta(hours=2) and _QUERY_INTENT.search(_QUOTED_TEXT.sub("[引用]", text(row))) and _INTERACTION_TOPIC.search(text(row)) for row in rows[-4:-1])
+    unquoted = _QUOTED_TEXT.sub("[引用]", current)
+    if not (_QUERY_INTENT.search(unquoted) or _HISTORY_FOLLOWUP.fullmatch(unquoted)):
+        return False
+    return any(timedelta(0) <= rows[-1].created_at - row.created_at <= timedelta(hours=2) and explicit_query(text(row)) for row in rows[-4:-1])
 
 
 def prepare_history(
