@@ -28,7 +28,7 @@ from .tool_results import (
 )
 
 MAX_REPLY_COUNT = 5
-MAX_TOOL_COUNT = 20
+MAX_TOOL_COUNT = 30
 MAX_REPLY_PER_ROUND = 1  # 每轮只发1条，强制模型逐条思考，上下文连续
 MAX_REACTION_PER_ROUND = 3
 TAVILY_TOOL_NAMES = frozenset({"search_web", "search_web_images"})
@@ -1632,11 +1632,16 @@ def _should_continue(state: AgentState, limits: AgentRunLimits) -> str:
         logger.info("[Agent] 已达最大回复次数，结束本轮对话")
         return "end"
     if (
-        _image_search_allowed_tools(state["messages"]) is not None
-        and state.get("reply_count", 0) == 0
+        (state.get("reply_count", 0) == 0 or state.get("reply_requires_continuation", False))
         and not state.get("budget_finalization_attempted", False)
-        and (state.get("tool_count", 0) >= MAX_TOOL_COUNT or state.get("llm_call_count", 0) >= limits.max_llm_calls)
+        and (
+            state.get("tool_count", 0) >= MAX_TOOL_COUNT
+            or state.get("llm_call_count", 0) >= limits.max_llm_calls
+            or state.get("llm_total_tokens", 0) >= limits.max_total_tokens
+        )
     ):
+        # Reserve one tool-free answer for unfinished work, including ordinary
+        # history searches. Reaching a cap must not silently discard evidence.
         return "finalize"
     if state.get("tool_count", 0) >= MAX_TOOL_COUNT:
         logger.info("[Agent] 已达最大工具调用次数，结束本轮对话")

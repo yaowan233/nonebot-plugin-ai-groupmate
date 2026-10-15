@@ -1521,7 +1521,7 @@ async def test_provider_reported_search_timeout_cannot_finish_without_replying()
 
 
 @pytest.mark.asyncio
-async def test_llm_call_budget_stops_before_another_model_turn():
+async def test_llm_call_budget_reserves_one_tool_free_answer():
     from nonebot_plugin_ai_groupmate.agent.graph import AgentRunLimits, build_chat_graph
 
     @tool("search_web")
@@ -1534,23 +1534,70 @@ async def test_llm_call_budget_stops_before_another_model_turn():
         """End this test graph."""
         return ""
 
+    replies: list[str] = []
+
+    @tool("reply_user")
+    async def reply_user(content: str, next_step: str = "end") -> str:
+        """Capture the final answer."""
+        replies.append(content)
+        return next_step
+
     model = _ToolSpyModel(
         [
             AIMessage(content="", tool_calls=[{"name": "search_web", "args": {"query": "x"}, "id": "search-1"}]),
-            AIMessage(content="", tool_calls=[{"name": "finish", "args": {}, "id": "finish-1"}]),
+            AIMessage(content="根据已取得的证据，结论如下。"),
         ]
     )
     graph = build_chat_graph(
         model,
-        [search_web, finish],
+        [search_web, finish, reply_user],
         "system",
         limits=AgentRunLimits(max_llm_calls=1),
     )
 
     result = await graph.ainvoke(_state(AIMessage(content="placeholder")))
 
-    assert model.invoke_count == 1
-    assert result["llm_call_count"] == 1
+    assert model.invoke_count == 2
+    assert result["llm_call_count"] == 2
+    assert result["budget_finalization_attempted"] is True
+    assert replies == ["根据已取得的证据，结论如下。"]
+
+
+@pytest.mark.asyncio
+async def test_thirty_tool_calls_stop_search_and_deliver_one_final_answer():
+    from nonebot_plugin_ai_groupmate.agent.graph import build_chat_graph
+
+    searches: list[str] = []
+    replies: list[str] = []
+
+    @tool("search_history_context")
+    async def search_history_context(query: str) -> str:
+        """Capture a history search."""
+        searches.append(query)
+        return "已核实的历史证据"
+
+    @tool("reply_user")
+    async def reply_user(content: str, next_step: str = "end") -> str:
+        """Capture the final answer."""
+        replies.append(content)
+        return next_step
+
+    model = _ToolSpyModel([
+        AIMessage(content="", tool_calls=[
+            {"name": "search_history_context", "args": {"query": str(i)}, "id": f"search-{i}"}
+            for i in range(31)
+        ]),
+        AIMessage(content="这些是已经核实的往事；其他资料不足。"),
+    ])
+    graph = build_chat_graph(model, [search_history_context, reply_user], "system")
+    result = await graph.ainvoke(_state(AIMessage(content="question")))
+
+    assert searches == [str(i) for i in range(30)]
+    assert result["tool_count"] == 30
+    assert result["budget_finalization_attempted"] is True
+    assert model.invoke_count == 2
+    assert len(model.bound_tool_names) == 1
+    assert replies == ["这些是已经核实的往事；其他资料不足。"]
 
 
 def test_token_budget_routes_to_finalization_before_ending():
@@ -1560,6 +1607,25 @@ def test_token_budget_routes_to_finalization_before_ending():
     state["llm_total_tokens"] = 10
 
     assert _should_continue(state, AgentRunLimits(max_total_tokens=10)) == "finalize"
+
+
+@pytest.mark.parametrize("budget", ["tools", "model_calls", "tokens"])
+def test_budget_finishes_a_partial_answer_once(budget):
+    from nonebot_plugin_ai_groupmate.agent import graph as module
+
+    state = _state(AIMessage(content="已有一条事例，还需整理结论"))
+    state["reply_count"] = 1
+    state["reply_requires_continuation"] = True
+    limits = module.AgentRunLimits()
+    if budget == "tools":
+        state["tool_count"] = module.MAX_TOOL_COUNT
+    elif budget == "model_calls":
+        state["llm_call_count"] = limits.max_llm_calls
+    else:
+        state["llm_total_tokens"] = limits.max_total_tokens
+    assert module._should_continue(state, limits) == "finalize"
+    state["budget_finalization_attempted"] = True
+    assert module._should_continue(state, limits) == "end"
 
 
 @pytest.mark.asyncio

@@ -143,6 +143,8 @@ Bot 会先查询任务列表，再定位需要修改或取消的任务；存在�
 
 新版聊天 RAG 会创建 `chat_collection_v2`，并在启动后于后台从 SQL 历史记录重建干净的 Dense + 稀疏混合索引。升级前需要先执行 `nb orm upgrade`；旧 `chat_collection` 会保留且不会阻塞 Bot 启动。待日志显示历史会话向量化完成、RAG 查询正常后，可按需人工删除旧集合。
 
+历史检索在重排后按索引中的来源消息 ID 回查当前会话的 SQL 原文，返回每条消息的稳定 `user_id`、数据库 `msg_id`、发言时昵称和 `role`。同一用户改名后仍按 ID 识别，同名但不同 ID 不合并；`msg_id` 可用于展开前后文。现有 v2 索引无需重新生成向量。缺少来源 ID 或回查失败的片段会标明来源未核实；已删除或属于其他会话的来源不从向量文本恢复。
+
 可用下面的命令确认 v3 集合存在并查看向量数量（请按实际地址修改 Qdrant URL）：
 
 ```bash
@@ -216,8 +218,8 @@ curl http://127.0.0.1:6333/collections/media_collection_v3
 | ai_groupmate__media_vectorize_batch_size | 否 | `1000` | 每轮最多处理的新图片数及旧向量重建数 |
 | ai_groupmate__media_vectorize_concurrency | 否 | `8` | 表情包标注与向量化的并发数（过高可能触发接口限流） |
 | ai_groupmate__group_memory_update_timeout_seconds | 否 | `120` | 群档案后台更新超时（秒） |
-| ai_groupmate__agent_max_llm_calls | 否 | `8` | 单次 agent 最多调用主模型次数 |
-| ai_groupmate__agent_max_total_tokens | 否 | `128000` | 单次 agent 常规工作阶段最多累计模型 token 数；达到上限且尚未回复时会额外执行一次受控收尾 |
+| ai_groupmate__agent_max_llm_calls | 否 | `8` | 单次 agent 常规处理阶段最多调用主模型次数；任务尚未完成时额外允许一次无工具收尾 |
+| ai_groupmate__agent_max_total_tokens | 否 | `128000` | 单次 agent 常规工作阶段最多累计模型 token 数；达到上限且任务尚未完成时会额外执行一次受控收尾 |
 | ai_groupmate__agent_tool_result_max_chars | 否 | `6000` | 写回后续上下文的单次工具结果最大字符数 |
 | ai_groupmate__agent_file_tools_enabled | 否 | `true` | 启用公开网页抓取、文件下载、文档读取、表格汇总与文件发送；文件保留 24 小时，详见 [使用说明](./docs/agent-web-files.md) |
 | ai_groupmate__flash_model | 否 | `qwen-flash` | 快速判断是否需要回复的模型 |
@@ -412,6 +414,8 @@ AI_GROUPMATE__CHAT_RESPONSES_ENABLE_THINKING=true
 群聊历史工具可用于话题回顾、梗或说法的来历、成员过往发言及观点变化、约定和事件核对、共同经历与多人互动调查。例如“回顾一下上周大家聊了什么”“这个梗是怎么来的”“对比小王前后对这个游戏的看法”。成员评价或排名只是其中一种用法。
 
 Agent 按问题选择工具：具体话题用现有 `search_history_context` RAG；已知成员可用 `read_member_history` 按成员、正文关键词和日期读取原话，或按来源消息 ID 展开前后文；需要发现多人跟读和代表互动时才用 `search_group_interactions`。后者只统计短时间内多人发送相同文本的事件，不能代表全部讨论、完整话题热度或全群共识。
+
+每轮 Agent 的常规工具调用上限为 30 次。达到工具次数、模型次数或累计 token 的处理预算时，若尚未交付完整回复，会停止搜索并额外执行至多一次无工具的模型调用，整理已取得的证据；这次收尾的 token 仍计入实际用量。资料不足时应说明限制，不为补足排名或结论继续检索。
 
 两个 SQL 工具不依赖 Qdrant，也不调用后台提炼模型；读取的片段会占用回复模型输入。互动扫描最多读取日期范围内最近 12 万条文本/BOT记录，结果可翻页；消息包含说话者、时间和来源消息 ID，需结合上下文核对。
 

@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import math
 import time
 import uuid
@@ -1297,6 +1298,90 @@ class VectorDBOperator:
     # ================= 聊天记录功能 (RAG) =================
 
     @staticmethod
+    async def _read_chat_sources(session_id: str, msg_ids: list[int]) -> list[Any]:
+        from sqlalchemy import select
+        from nonebot_plugin_orm import get_session
+
+        from .model import ChatHistory, ChatHistorySchema
+
+        async with get_session() as session:
+            rows = (await session.scalars(select(ChatHistory).where(
+                ChatHistory.session_id == session_id,
+                ChatHistory.msg_id.in_(msg_ids),
+                ChatHistory.content_type.in_(("text", "bot")),
+            ))).all()
+            return [ChatHistorySchema.model_validate(row) for row in rows]
+
+    @staticmethod
+    def _format_chat_source(query: str, message: Any) -> str:
+        from .message_metadata import parse_message_metadata
+
+        body = parse_message_metadata(message.content)[2]
+        # Keep a long source's matching passage and its owner together. Escaping
+        # newlines prevents trimming a continuation away from the source header.
+        terms = sorted(_chat_search_terms(query), key=len, reverse=True)
+        normalized_body = unicodedata.normalize("NFKC", body).lower()
+        offsets = [normalized_body.find(term) for term in terms if term in normalized_body]
+        center = offsets[0] if offsets and len(normalized_body) == len(body) else 0
+        start = max(0, center - 100) if len(body) > 500 else 0
+        excerpt = ("…" if start else "") + body[start:start + 500]
+        if start + 500 < len(body):
+            excerpt += "…"
+        identity = (
+            f"[{message.created_at:%Y-%m-%d %H:%M:%S}] "
+            f"[user_id={json.dumps(str(message.user_id), ensure_ascii=False)} "
+            f"msg_id={message.msg_id} role={'bot' if message.content_type == 'bot' else 'user'}] "
+            f"{json.dumps(message.user_name[:80], ensure_ascii=False)}: "
+        )
+        return (identity + json.dumps(excerpt, ensure_ascii=False)).translate({
+            0x85: r"\u0085", 0x2028: r"\u2028", 0x2029: r"\u2029",
+        })
+
+    async def _hydrate_chat_sources(
+        self, query: str, session_id: str, texts: list[str], points: Sequence[Any],
+    ) -> list[tuple[str, str]]:
+        """Resolve retained hits through SQL IDs, including existing v2 indexes.
+
+        Ranking still uses indexed text; only the small final result is hydrated.
+        Never infer an identity from a nickname or zip missing rows by position.
+        """
+        source_ids: dict[str, list[int]] = {}
+        for point in points:
+            payload = getattr(point, "payload", None)
+            if not isinstance(payload, dict) or not isinstance(payload.get("text"), str):
+                continue
+            raw_ids = payload.get("msg_ids", [])
+            if not isinstance(raw_ids, list):
+                continue
+            ids = []
+            for value in raw_ids[:100]:
+                if (type(value) is int or isinstance(value, str) and value.isascii() and value.isdigit() and len(value) <= 10) and 0 < int(value) <= 2**31 - 1:
+                    ids.append(int(value))
+            source_ids.setdefault(payload["text"].strip(), list(dict.fromkeys(ids)))
+        needed = sorted({msg_id for text in texts for msg_id in source_ids.get(text, [])})
+        unverified = "来源未核实：稳定用户ID、消息ID及角色不可用；不得按昵称合并或认定人物。"
+        if not needed:
+            return [(text, unverified) for text in texts]
+        try:
+            rows = await self._read_chat_sources(session_id, needed)
+        except Exception as error:
+            logger.warning(f"RAG 来源回查失败，返回未核实片段: {type(error).__name__}")
+            return [(text, unverified) for text in texts]
+        by_id = {row.msg_id: row for row in rows}
+        hydrated = []
+        for text in texts:
+            ids = source_ids.get(text, [])
+            if not ids:
+                hydrated.append((text, unverified))
+                continue
+            found = [by_id[msg_id] for msg_id in ids if msg_id in by_id]
+            # Deleted or cross-session sources must not reappear from vector text.
+            if found:
+                note = "部分来源缺失，仅显示可核对的原文。" if len(found) != len(ids) else ""
+                hydrated.append(("\n".join(self._format_chat_source(query, row) for row in found), note))
+        return hydrated
+
+    @staticmethod
     def _chat_point_id(session_id: str, msg_ids: Sequence[int], text: str) -> str:
         identity = (
             f"{CHAT_INDEX_VERSION}\0{session_id}\0"
@@ -1429,14 +1514,19 @@ class VectorDBOperator:
             return "未找到相关历史记录"
         fragments: list[str] = []
         total_chars = 0
-        for text in best_texts:
+        sources = await self._hydrate_chat_sources(normalized_query, session_id, best_texts, search_result.points)
+        for text, source_notice in sources:
             fragment = self._trim_chat_fragment(normalized_query, text)
             if not fragment:
                 continue
             remaining = CHAT_RESULT_TOTAL_MAX_CHARS - total_chars
             if remaining <= 0:
                 break
-            fragment = fragment[:remaining].rstrip()
+            if source_notice:
+                fragment = f"（{source_notice}）\n{fragment}"
+            if len(fragment) > remaining:
+                # Never cut a stable identifier or leave a detached body behind.
+                continue
             if fragment:
                 fragments.append(fragment)
                 total_chars += len(fragment)

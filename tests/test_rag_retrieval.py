@@ -112,6 +112,8 @@ async def test_search_chat_returns_labeled_locally_reranked_fragments():
 
 @pytest.mark.asyncio
 async def test_search_chat_v2_uses_dense_sparse_fusion_and_time_filter():
+    from unittest.mock import AsyncMock
+
     from nonebot_plugin_ai_groupmate.memory import (
         CHAT_COLLECTION,
         CHAT_DENSE_VECTOR,
@@ -124,6 +126,10 @@ async def test_search_chat_v2_uses_dense_sparse_fusion_and_time_filter():
     operator.chat_col = CHAT_COLLECTION
     operator.rerank_url = ""
     operator.rerank_key = ""
+    operator._read_chat_sources = AsyncMock(return_value=[SimpleNamespace(
+        msg_id=1, user_id="alice-id", user_name="Alice", content_type="text",
+        content="部署口令是蓝鲸", created_at=datetime(2026, 8, 12, 10),
+    )])
     calls: dict[str, Any] = {}
 
     async def ensure_collections(_: set[str]) -> None:
