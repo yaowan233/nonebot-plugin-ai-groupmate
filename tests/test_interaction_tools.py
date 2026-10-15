@@ -1,4 +1,8 @@
+import ast
 import json
+from types import SimpleNamespace
+from typing import Any
+from pathlib import Path
 from datetime import datetime, timedelta
 
 import pytest
@@ -143,6 +147,37 @@ async def test_expired_request_does_not_read_database(monkeypatch):
         assert (await invoke(tool))["status"] == "skipped"
 
 
+@pytest.mark.parametrize("mode", ["group", "private", "repeat", "reaction", "meme"])
+def test_history_tools_visible_on_first_group_turn_without_loading_a_skill(mode):
+    """Exercise the production registration and first-turn tool selection."""
+    from nonebot_plugin_ai_groupmate.agent import interaction_tools
+    from nonebot_plugin_ai_groupmate.agent.graph import _active_tools
+
+    source = Path(interaction_tools.__file__).with_name("__init__.py")
+    tree = ast.parse(source.read_text(encoding="utf-8"))
+    create = next(node for node in tree.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "create_chat_graph")
+    nodes = []
+    for node in create.body:
+        if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id in {"base_agent_tools", "history_tools"} for target in node.targets):
+            nodes.append(node)
+        elif isinstance(node, ast.If) and any(isinstance(child, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "base_agent_tools" for target in child.targets) for child in ast.walk(node)):
+            nodes.append(node)
+    env: dict[str, Any] = {node.id: SimpleNamespace(name=node.id) for statement in nodes for node in ast.walk(statement) if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)}
+    env.update(
+        is_private=mode == "private", proactive_meme_only=mode == "meme", proactive_reaction_only=mode == "reaction",
+        repeat_text="跟读" if mode == "repeat" else None, meme_similar_enabled=False, reaction_enabled=True,
+        web_image_tools=[], file_tools=[], custom_agent_tools=[], lazy_attachment_tools=[],
+        create_explicit_memory_tools=lambda *_: [], create_interaction_history_tools=interaction_tools.create_interaction_history_tools,
+        session_id="group-1", request_id=None, bot_id="bot-id", plugin_config=SimpleNamespace(bot_name="miyuki"),
+        get_bots=lambda: {"bot-id": object()}, str=str, tuple=tuple, set=set,
+        user_id="1", history=[],
+    )
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), env)
+    names = {tool.name for tool in _active_tools(env["base_agent_tools"], {}, [])}
+    history_names = {"search_history_context", "search_group_interactions", "read_member_history"}
+    assert names & history_names == (history_names if mode == "group" else set())
+
+
 def test_group_skill_exposes_interaction_guidance():
     from nonebot_plugin_ai_groupmate.agent import _build_builtin_agent_skills
 
@@ -153,103 +188,7 @@ def test_group_skill_exposes_interaction_guidance():
         assert ("search_group_interactions" in skill.prompt) == (not private)
 
 
-@pytest.mark.parametrize(
-    ("message", "expected"),
-    [
-        ("谁是群里的神人？", True),
-        ("给这个群的神人排个前五，举真实事例。", True),
-        ("miyuki 你给这个群里的猪排个名", True),
-        ("那这个群里谁猪", True),
-        ("miyuki 那这个群里谁最会玩ctb", True),
-        ("miyuki 那你分析一下这个群里谁最会玩舞萌", True),
-        ("miyuki 哪些群友可能是bot", True),
-        ("你给本群的摄影爱好者排一下名", True),
-        ("我们群里谁更擅长写代码？", True),
-        ("给上周的聊天做个总结", True),
-        ("为群友的经典发言排一下名", True),
-        ("miyuki 你用Excel统计一下这个群的神人发言", True),
-        ("查一下小王之前说过什么", True),
-        ("回顾一下上周大家都聊了什么", True),
-        ("群里最近在讨论什么", True),
-        ("这个梗是怎么来的", True),
-        ("谁最早提过这个梗", True),
-        ("追溯一下这句话的出处", True),
-        ("核对之前关于聚餐的约定", True),
-        ("小王上次说什么时候面试", True),
-        ("对比小王前后对这个游戏的看法", True),
-        ("找小李上周关于面试的发言", True),
-        ("把上周的聊天整理成时间线", True),
-        ("展开这段讨论的前后文", True),
-        ("我也是神人了", False),
-        ("神人来了哈哈哈哈", False),
-        ("给群友的礼物都准备好了", False),
-        ("他刚才说“给这个群的神人排个前五”", False),
-        ("不用给这个群的神人排个前五了", False),
-        ("今天吃啥", False),
-        ("不用查群里的神人了", False),
-        ("他刚才说：查一下群里的神人", False),
-        ("他刚才说“谁是群里的神人”", False),
-        ("这个梗真好笑", False),
-        ("小王之前说过他喜欢这个游戏", False),
-        ("今天群里讨论得好热闹", False),
-        ("我不知道这个群里谁最会玩ctb", False),
-        ("他问我们群里谁更擅长写代码", False),
-        ("群里谁想一起吃饭", False),
-        ("我们群谁有空帮忙", False),
-        ("他刚才说“那这个群里谁猪”", False),
-        ("别分析这个群里谁最会玩舞萌了", False),
-        ("他刚才说“回顾一下上周大家聊了什么”", False),
-        ("别查之前的聊天了", False),
-        ("我以前最喜欢这个游戏了", False),
-    ],
-)
-def test_interaction_tools_entry_requires_current_user_query(message, expected):
-    from nonebot_plugin_ai_groupmate.interaction_history import HistoryMessage, interaction_history_requested
-
-    row = HistoryMessage(1, "group-1", "1", "小王", "text", message, datetime.now())
-    assert interaction_history_requested([row], "1", bot_name="miyuki") == expected
-    assert not interaction_history_requested([row], "2", bot_name="miyuki")
-
-
-def test_short_followup_uses_only_same_user_recent_query():
-    from nonebot_plugin_ai_groupmate.interaction_history import HistoryMessage, interaction_history_requested
-
-    now = datetime.now()
-    prior = HistoryMessage(1, "g", "1", "甲", "text", "谁是群里的神人", now - timedelta(minutes=1))
-    followup = HistoryMessage(2, "g", "1", "甲", "text", "那你给个排名", now)
-    assert interaction_history_requested([prior, followup], "1")
-    assert not interaction_history_requested([followup], "1")
-    old = HistoryMessage(1, "g", "1", "甲", "text", prior.content, now - timedelta(hours=3))
-    assert not interaction_history_requested([old, followup], "1")
-
-
-def test_general_history_followup_requires_recent_query_from_same_user():
-    from nonebot_plugin_ai_groupmate.interaction_history import HistoryMessage, interaction_history_requested
-
-    now = datetime.now()
-    prior = HistoryMessage(1, "g", "1", "甲", "text", "核对之前关于聚餐的约定", now - timedelta(minutes=1))
-    followup = HistoryMessage(2, "g", "1", "甲", "text", "那后来呢？", now)
-    assert interaction_history_requested([prior, followup], "1")
-    assert not interaction_history_requested([followup], "1")
-    other_user = HistoryMessage(1, "g", "2", "乙", "text", prior.content, prior.created_at)
-    assert not interaction_history_requested([other_user, followup], "1")
-
-
-def test_history_tool_retry_requires_own_recent_investigation():
-    from nonebot_plugin_ai_groupmate.interaction_history import HistoryMessage, interaction_history_requested
-
-    now = datetime.now()
-    prior = HistoryMessage(1, "g", "1", "甲", "text", "这个群里谁最会玩ctb", now - timedelta(minutes=1))
-    retry = HistoryMessage(2, "g", "1", "甲", "text", "怎么就是不用新的tools", now)
-    assert interaction_history_requested([prior, retry], "1")
-    assert not interaction_history_requested([retry], "1")
-    other_user = HistoryMessage(1, "g", "2", "乙", "text", prior.content, prior.created_at)
-    assert not interaction_history_requested([other_user, retry], "1")
-
-
 async def test_member_history_compares_views_without_a_repeat_event(history_db):
-    from nonebot_plugin_ai_groupmate.interaction_history import HistoryMessage, interaction_history_requested
-
     await seed(
         history_db,
         [
@@ -258,8 +197,6 @@ async def test_member_history_compares_views_without_a_repeat_event(history_db):
             {"user_id": "1", "user_name": "小王的新昵称", "content": "游戏A更新后省事了，现在愿意推荐。", "created_at": datetime(2026, 7, 9)},
         ],
     )
-    query = HistoryMessage(100, "group-1", "3", "丙", "text", "对比小王前后对游戏A的看法", datetime(2026, 7, 10))
-    assert interaction_history_requested([query], "3")
     bundle = tools()
     result = await invoke(bundle["read_member_history"], member="小王", keyword="游戏A")
     evidence = result["data"]["messages"]
@@ -269,16 +206,6 @@ async def test_member_history_compares_views_without_a_repeat_event(history_db):
     assert "暂时不推荐" in evidence[1]["content"]
     interactions = await invoke(bundle["search_group_interactions"])
     assert interactions["data"]["candidate_events"] == 0
-
-
-def test_disabled_entry_removes_interaction_skill_guidance():
-    from nonebot_plugin_ai_groupmate.agent import _build_builtin_agent_skills
-
-    skills = _build_builtin_agent_skills(is_private=False, has_admin_permission=False, mute_tool_instruction="", meme_similar_enabled=False, interaction_history_enabled=False)
-    skill = next(item for item in skills if item.name == "search_context_tools")
-    assert isinstance(skill.prompt, str)
-    assert "search_group_interactions" not in skill.prompt
-    assert "神人" not in skill.description
 
 
 async def test_interaction_pages_and_changed_date_window_do_not_skip_sources(history_db, monkeypatch):

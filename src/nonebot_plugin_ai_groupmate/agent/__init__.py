@@ -121,7 +121,6 @@ from ..group_model_config import (
     resolve_session_chat_config,
     resolve_session_model_owner,
 )
-from ..interaction_history import interaction_history_requested
 from .qwen_responses_tools import create_qwen_code_interpreter_tool
 
 
@@ -638,10 +637,10 @@ def _build_builtin_agent_skills(
     has_admin_permission: bool,
     mute_tool_instruction: str,
     meme_similar_enabled: bool,
-    interaction_history_enabled: bool = True,
 ) -> list[AgentSkill]:
     context_name = "聊天上下文" if is_private else "群内上下文"
-    interaction_instruction = "" if is_private or not interaction_history_enabled else (
+    interaction_instruction = "" if is_private else (
+        "- `search_history_context`、`read_member_history`、`search_group_interactions` 在群聊中已直接可用，无需先加载技能；按问题需要使用，普通闲聊无需检索。\n"
         "- 群聊历史调查用于回顾话题、核对往事和约定、追溯梗或说法、比较成员观点及其变化、理解共同经历和多人互动；按当前问题选择工具。\n"
         "- 用户明确要求群内比较、评价或排名时，先查阅历史证据，再作有范围的判断；不能用调侃代替调查，也不能未经查询就声称工具查不了。成绩、段位或真实身份未必能从聊天确定；区分自述、玩笑与可核实记录，查不到就说明，不据发言猜测真人是否为 BOT。\n"
         "- 已知成员时优先 `read_member_history(member=用户ID或唯一昵称, keyword=关键词)`，可限定日期及用 next_before_msg_id 翻页；不必先扫描全群。查具体话题或未知说话者时使用 `search_history_context`。\n"
@@ -689,9 +688,8 @@ def _build_builtin_agent_skills(
         AgentSkill(
             name="search_context_tools",
             description=(
-                "历史聊天检索和数学计算；联网搜索 search_web 已直接可用。用户问之前/"
-                "上次/以前/曾说过/约定/代号/历史偏好时必须使用此技能。"
-                + ("" if is_private or not interaction_history_enabled else "当前用户在查询群内历史或成员情况：必须先加载本技能，查阅历史证据后回答。适用于话题回顾、往事与约定核对、梗溯源、成员能力/行为/观点的比较评价或排名、共同经历及多人互动；证据不足如实说明。")
+                "历史聊天查询规则和数学计算；联网搜索 search_web 已直接可用。"
+                + ("用户问之前/上次/以前/曾说过/约定/代号/历史偏好时使用此技能。" if is_private else "群聊历史工具已直接可用，本技能补充查询规则。支持话题回顾、往事与约定核对、梗溯源、成员能力/行为/观点的比较评价或排名、共同经历及多人互动；按需查阅证据，资料不足如实说明。")
             ),
             prompt=(
                 "历史上下文和计算工具规则：\n"
@@ -726,7 +724,7 @@ def _build_builtin_agent_skills(
             ),
             prompt=(
                 "用户画像和年度报告工具规则：\n"
-                "- 本技能不用于查询用户以前说过什么、历史约定或代号；这类问题必须加载 `search_context_tools` 并检索聊天历史。\n"
+                "- 本技能不用于查询用户以前说过什么、历史约定或代号；这类问题必须检索聊天历史，历史工具未开放时加载 `search_context_tools`。\n"
                 "- 用户情绪或你们的关系变化明显时，调用 `update_user_impression` 更新好感度和标签；普通闲聊不要频繁更新。\n"
                 "- `score_change` 表示本次互动带来的好感变化，正数增加、负数降低；必须独立评价当前互动，不受旧分数和旧标签影响。\n"
                 "- 标签只是可能过时的弱参考；仅记录多次表现一致的简短稳定特征，不要把一次性事件、短暂情绪或争执写成标签。\n"
@@ -1423,16 +1421,12 @@ async def create_chat_graph(
         system_prompt += (
             "\n【自定义工具】\n" + "\n".join(custom_tool_instructions) + "\n"
         )
-    interaction_history_enabled = not is_private and interaction_history_requested(
-        history or [], str(user_id), bot_name=plugin_config.bot_name,
-    )
     agent_skills = [
         *_build_builtin_agent_skills(
             is_private=is_private,
             has_admin_permission=has_admin_permission,
             mute_tool_instruction=mute_tool_instruction,
             meme_similar_enabled=meme_similar_enabled,
-            interaction_history_enabled=interaction_history_enabled,
         ),
         *custom_agent_skills,
     ]
@@ -1441,6 +1435,10 @@ async def create_chat_graph(
     skill_index = build_agent_skill_index(agent_skills)
     if skill_index:
         system_prompt += "\n" + skill_index
+    if not is_private and not proactive_meme_only and not proactive_reaction_only and repeat_text is None:
+        history_skill = next(skill for skill in agent_skills if skill.name == "search_context_tools")
+        assert isinstance(history_skill.prompt, str)
+        system_prompt += "\n【群聊历史查询】\n" + history_skill.prompt
     skill_loader_tool = create_agent_skill_loader_tool(
         agent_skills,
         AgentToolContext(
@@ -1509,6 +1507,12 @@ async def create_chat_graph(
     )
     if file_tools:
         system_prompt += FILE_TOOLS_PROMPT
+    history_tools = [] if is_private else [
+        search_history_context,
+        *create_interaction_history_tools(
+            session_id, request_id, bot_user_ids=tuple({str(uid) for uid in get_bots()} | ({str(bot_id)} if bot_id else set())),
+        ),
+    ]
     base_agent_tools = [
         *(
             [reply_tool]
@@ -1543,6 +1547,7 @@ async def create_chat_graph(
         *([last_image_search_tool] if last_image_search_tool is not None else []),
         *web_image_tools,
         *file_tools,
+        *history_tools,
         *create_explicit_memory_tools(
             session_id, str(user_id), str(bot_id or plugin_config.bot_name), is_private,
             history or [], request_id,
@@ -1568,10 +1573,8 @@ async def create_chat_graph(
         ]
     tools_by_skill: dict[str, list[Any]] = {
         "search_context_tools": [
-            search_history_context, calculate_expression,
-            *([] if not interaction_history_enabled else create_interaction_history_tools(
-                session_id, request_id, bot_user_ids=tuple({str(uid) for uid in get_bots()} | ({str(bot_id)} if bot_id else set())),
-            )),
+            calculate_expression,
+            *([search_history_context] if is_private else []),
         ],
         "schedule_tools": [schedule_tool, schedule_agent_tool, *schedule_management_tools],
         "profile_memory_tools": [relation_tool, report_tool],
