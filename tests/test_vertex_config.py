@@ -37,6 +37,7 @@ def test_vertex_chat_model_uses_vertex_settings_and_normalizes_openrouter_name(
         "model": "gemini-3.7-flash",
         "vertexai": True,
         "temperature": 0.7,
+        "max_tokens": 32768,
         "api_key": SecretStr("vertex-key"),
     }
 
