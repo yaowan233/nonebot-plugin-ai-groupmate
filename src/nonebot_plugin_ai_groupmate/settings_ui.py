@@ -62,6 +62,8 @@ SETTING_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
             "chat_api_key",
             "chat_base_url",
             "chat_temperature",
+            "chat_reasoning_effort",
+            "chat_max_tokens",
             "chat_api_format",
             "chat_multimodal",
             "chat_responses_builtin_tools",
@@ -214,6 +216,8 @@ _DIRECT_LABELS = {
     "chat_multimodal": "主模型支持图片",
     "chat_responses_builtin_tools": "千问官方工具",
     "chat_responses_enable_thinking": "Responses API 启用思考",
+    "chat_reasoning_effort": "主模型思考强度",
+    "chat_max_tokens": "主模型单次输出上限",
     "vertex_project": "Google Cloud 项目 ID",
     "vertex_location": "Vertex 区域",
     "vertex_api_key": "Vertex API Key",
@@ -239,6 +243,8 @@ _DIRECT_LABELS = {
     "qwen_token": "旧版 Qwen Token",
 }
 _FIELD_HINTS = {
+    "chat_reasoning_effort": "用于 OpenAI 兼容接口，留空保持供应商默认（DeepSeek 默认 low）；须选择当前模型支持的档位。",
+    "chat_max_tokens": "主模型输出 Token 上限，留空使用供应商默认（DeepSeek 默认 8192）；推理是否计入由供应商决定。",
     "google_web_detection_enabled": (
         "开启后也只会在用户明确说“以图搜图、找原图、找图源、查图片出处”等请求中向 Agent 暴露工具。"
     ),

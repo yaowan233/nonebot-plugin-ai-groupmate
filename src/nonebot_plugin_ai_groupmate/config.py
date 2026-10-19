@@ -5,6 +5,8 @@ from urllib.parse import urlparse
 from pydantic import Field, BaseModel, SecretStr, field_validator
 from langchain_openai import ChatOpenAI
 
+from .deepseek import DeepSeekChatOpenAI, is_deepseek_endpoint
+
 
 class ScopedConfig(BaseModel):
     bot_name: str = "bot"
@@ -77,6 +79,12 @@ class ScopedConfig(BaseModel):
     chat_api_key: str = ""
     chat_base_url: str = ""
     chat_temperature: float = 0.7
+    chat_reasoning_effort: Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"] | None = Field(
+        default=None, description="OpenAI 兼容主模型思考强度；留空使用供应商默认，取值须受模型支持",
+    )
+    chat_max_tokens: int | None = Field(
+        default=None, ge=1, description="主模型单次输出上限；留空使用供应商默认，推理是否计入由供应商决定",
+    )
     chat_api_format: Literal["openai", "anthropic", "vertex"] = "openai"
     chat_multimodal: bool = True  # 主聊天模型是否支持图片输入
     chat_responses_builtin_tools: list[
@@ -260,6 +268,20 @@ def create_chat_openai(
     }
     if max_tokens is not None:
         kwargs["max_completion_tokens"] = max_tokens
+    effort = cfg.chat_reasoning_effort if role == "chat" else None
+    if effort is not None:
+        kwargs["reasoning_effort"] = effort
+        if effort != "none":
+            kwargs.pop("temperature", None)
+    if is_deepseek_endpoint(base_url):
+        effort = (effort or "low") if role == "chat" else "none"
+        kwargs["reasoning_effort"] = effort
+        kwargs["extra_body"] = {"thinking": {"type": "disabled" if effort == "none" else "enabled"}}
+        if effort != "none":
+            kwargs.pop("temperature", None)
+        if role == "chat" and max_tokens is None:
+            kwargs["max_completion_tokens"] = 8192
+        return DeepSeekChatOpenAI(**kwargs)
     if role == "chat" and resolve_chat_responses_builtin_tools(cfg):
         kwargs["use_responses_api"] = True
         kwargs["output_version"] = "responses/v1"
@@ -269,7 +291,8 @@ def create_chat_openai(
         ):
             # DashScope recommends the Responses reasoning parameter for new code;
             # the older extra_body.enable_thinking form is being phased out.
-            kwargs["reasoning"] = {"effort": "medium"}
+            kwargs["reasoning"] = {"effort": effort or "medium"}
+            kwargs.pop("reasoning_effort", None)
     return ChatOpenAI(**kwargs)
 
 
@@ -347,7 +370,7 @@ def create_chat_llm(cfg: ScopedConfig) -> Any:
             api_key=SecretStr(api_key),
             base_url=base_url,
             temperature=cfg.chat_temperature,
-            max_tokens_to_sample=4096,
+            max_tokens_to_sample=cfg.chat_max_tokens or 4096,
             timeout=None,
             stop=None,
         )

@@ -176,6 +176,8 @@ curl http://127.0.0.1:6333/collections/media_collection_v3
 | ai_groupmate__chat_api_key | 否 | 无 | 主聊天模型专用 API Key，留空则使用 `llm_api_key` / `qwen_token` |
 | ai_groupmate__chat_base_url | 否 | 无 | 主聊天模型专用 Base URL，留空则使用 `llm_base_url` |
 | ai_groupmate__chat_temperature | 否 | `0.7` | 主聊天模型温度 |
+| ai_groupmate__chat_reasoning_effort | 否 | 留空 | OpenAI 兼容主模型思考强度：`none`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max`；须选择模型支持的值，DeepSeek 留空默认 `low` |
+| ai_groupmate__chat_max_tokens | 否 | 留空 | 主模型单次输出 Token 上限；推理是否计入由供应商决定，DeepSeek 留空默认 `8192` |
 | ai_groupmate__chat_api_format | 否 | `openai` | 主聊天接口格式，可选 `openai` / `anthropic` / `vertex` |
 | ai_groupmate__chat_multimodal | 否 | `true` | 主聊天模型是否支持图片输入；若使用纯文本模型请设为 `false`，将跳过图片上传只发文本 |
 | ai_groupmate__chat_responses_builtin_tools | 否 | `[]` | 千问 Responses API 官方工具白名单，可选 `code_interpreter`、`web_search`、`web_extractor`、`web_search_image`、`image_search`；仅官方百炼 OpenAI 兼容地址生效，留空完全关闭 |
@@ -302,6 +304,23 @@ AI_GROUPMATE__BOT_NAME=bot
 AI_GROUPMATE__LLM_API_KEY=sk-xxxx
 AI_GROUPMATE__CHAT_MODEL=qwen3.5-plus
 ```
+
+DeepSeek 官方主模型示例：
+
+```dotenv
+AI_GROUPMATE__CHAT_API_FORMAT=openai
+AI_GROUPMATE__CHAT_BASE_URL=https://api.deepseek.com/v1
+AI_GROUPMATE__CHAT_API_KEY=你的DeepSeek密钥
+AI_GROUPMATE__CHAT_MODEL=deepseek-flash
+AI_GROUPMATE__CHAT_REASONING_EFFORT=low
+AI_GROUPMATE__CHAT_MAX_TOKENS=8192
+```
+
+官方地址会自动使用保留推理字段的 Chat Completions 适配器，支持连续工具调用。
+`chat_reasoning_effort` 和 `chat_max_tokens` 是通用配置，不限定 DeepSeek。OpenAI 兼容接口会传递显式配置的思考强度；留空不发送该参数，DeepSeek 内部默认 `low`。开启思考时不传温度。不同模型支持的档位不同，请按模型能力配置。
+快速判断、摘要等辅助角色使用官方 DeepSeek 地址时关闭思考，继续遵守各角色的输出上限。
+这些设置不会切换其他角色的模型或密钥，也不会向百炼、OpenRouter 或其他中转地址添加 DeepSeek 专用参数；中转服务需单独核对协议。
+分群/私聊配置为官方地址时同样自动适配，思考强度和输出上限继承全局配置。
 
 Vertex AI 主模型示例（推荐使用服务账号或其他 ADC，不要把 JSON 内容写进 `.env`）：
 
