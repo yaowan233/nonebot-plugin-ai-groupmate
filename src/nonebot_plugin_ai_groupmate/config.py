@@ -61,10 +61,11 @@ class ScopedConfig(BaseModel):
     agent_max_total_tokens: int = Field(default=2000000, ge=1)
     agent_tool_result_max_chars: int = Field(default=6000, ge=256)
     agent_file_tools_enabled: bool = True
-    agent_execution_backend: Literal["disabled", "local", "docker", "remote"] = "disabled"
+    agent_execution_backend: Literal["disabled", "local", "sandbox", "docker", "remote"] = "disabled"
     agent_execution_image: str = "ai-groupmate-executor:local"
     agent_execution_url: str = ""
     agent_execution_token: str = ""
+    agent_execution_sandbox_windows_runner: str = ""
     agent_execution_timeout_seconds: float = Field(default=20.0, ge=1, le=120)
     chat_long_context_threshold_tokens: int = 256000
     chat_long_input_cost_per_million: float = 6.0

@@ -32,6 +32,16 @@ def execution_prompt(backend: str) -> str:
             "cwd 为临时目录，不是 /workspace。环境不保证安装了浏览器；可探测已安装的 Playwright 浏览器或系统浏览器。"
             "此模式具有 Bot 用户的文件和网络权限，并非沙盒；只操作任务文件，不修改主机配置或安装全局依赖。"
         )
+    elif backend == "sandbox":
+        import os
+        import platform
+
+        shell = "PowerShell" if os.name == "nt" else "/bin/sh"
+        environment = (
+            f"当前使用 {platform.system()} 平台的写入沙箱，shell 为 {shell}。使用 Bot 本机的 Python 依赖和 Node；浏览器需探测是否已安装。"
+            "cwd 为独立临时目录，使用 inputs/、out/ 相对路径；只允许写入本次工作目录及私有临时区（Unix 另允许 /dev/null）。"
+            "不能修改工作区外文件，不要尝试绕过沙箱。此模式不限制读取或网络；不要访问凭据或任务无关文件。沙箱不可用会直接拒绝执行。"
+        )
     else:
         environment = "当前使用隔离容器，cwd=/workspace，无网络或宿主机挂载；不在运行中安装依赖。标准镜像预装 Python、Node、Pillow、NumPy、pandas、matplotlib、openpyxl、Python Playwright/Chromium。"
     return EXECUTION_PROMPT + "\n" + environment
@@ -70,6 +80,8 @@ def create_execution_tool(cfg: ScopedConfig, workspace: FileWorkspace, session_i
                 timeout = min(cfg.agent_execution_timeout_seconds, max(1, cfg.agent_tool_timeout_seconds - 7))
                 if cfg.agent_execution_backend == "local":
                     result = await run_local(request, timeout=timeout)
+                elif cfg.agent_execution_backend == "sandbox":
+                    result = await run_local(request, timeout=timeout, sandbox=True, sandbox_windows_runner=cfg.agent_execution_sandbox_windows_runner)
                 elif cfg.agent_execution_backend == "docker":
                     result = await run_docker(request, image=cfg.agent_execution_image, timeout=timeout)
                 else:

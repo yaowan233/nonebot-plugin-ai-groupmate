@@ -2,6 +2,8 @@
 
 import io
 import os
+import re
+import csv
 import sys
 import json
 import stat
@@ -14,6 +16,7 @@ import tarfile
 import tempfile
 from typing import Literal
 from pathlib import Path, PurePosixPath
+from contextlib import ExitStack
 
 import httpx
 
@@ -161,9 +164,32 @@ async def _command(*args: str, stdin: bytes | None = None, limit: int = MAX_LOG_
             await process.wait()
 
 
-async def run_local(request: dict, *, timeout: float = 20) -> dict:
+async def _prepare_windows_sandbox_dirs(paths: list[Path]) -> None:
+    """Give the current user Modify on our fresh private dirs, not ambient users.
+
+    Python 3.13 mkdtemp uses OWNER RIGHTS; DSH's LUA token cannot use that ACE
+    to access task files. An explicit user SID ACE survives token lowering;
+    the restricting SID and Low integrity still confine writes to granted roots.
+    """
+    status, stdout, _ = await asyncio.wait_for(_command("whoami.exe", "/user", "/fo", "csv", "/nh"), timeout=5)
+    rows = list(csv.reader(io.StringIO(stdout.decode("utf-8", "replace"))))
+    sid = rows[0][-1].strip() if rows and rows[0] else ""
+    if status or not re.fullmatch(r"S-1-\d+(?:-\d+)+", sid):
+        raise ExecutionError("无法确定 Windows 沙箱用户 SID；未执行代码。")
+    for path in paths:
+        status, _, _ = await asyncio.wait_for(_command("icacls.exe", str(path), "/grant", f"*{sid}:(OI)(CI)(M)", "/Q"), timeout=5)
+        if status:
+            raise ExecutionError("无法准备 Windows 沙箱临时目录的用户权限；未执行代码。")
+
+
+async def run_local(request: dict, *, timeout: float = 20, sandbox: bool = False, sandbox_windows_runner: str = "") -> dict:
     """Execute as the Bot OS user. A temporary cwd is NOT a security boundary."""
     validate_request(request)
+    if sandbox:
+        from .sandbox_platform import supported_platform
+
+        if not supported_platform():
+            raise ExecutionError("当前平台不支持 sandbox；未降级为 local。")
     language = request["language"]
     if language == "python":
         command, suffix = [sys.executable, "-u"], ".py"
@@ -184,7 +210,8 @@ async def run_local(request: dict, *, timeout: float = 20) -> dict:
                "APPDATA", "LOCALAPPDATA", "LANG", "LC_ALL", "PLAYWRIGHT_BROWSERS_PATH", "FONTCONFIG_PATH"}
     env = {key: value for key, value in os.environ.items() if key.upper() in allowed}
     env.update(PYTHONIOENCODING="utf-8", PYTHONUTF8="1", PYTHONDONTWRITEBYTECODE="1")
-    with tempfile.TemporaryDirectory(prefix="groupmate-local-") as directory:
+    with ExitStack() as cleanup:
+        directory = cleanup.enter_context(tempfile.TemporaryDirectory(prefix="groupmate-local-"))
         root = Path(directory).resolve()
         (root / "inputs").mkdir()
         (root / "out").mkdir()
@@ -194,8 +221,22 @@ async def run_local(request: dict, *, timeout: float = 20) -> dict:
             target.write_bytes(data)
         program = root / ("program" + suffix)
         program.write_text(request["code"], encoding="utf-8-sig" if suffix == ".ps1" else "utf-8")
+        argv = [*command, str(program)]
+        if sandbox:
+            private_temp = root / "tmp"
+            private_temp.mkdir()
+            env.update(TMPDIR=str(private_temp), TMP=str(private_temp), TEMP=str(private_temp), XDG_CACHE_HOME=str(private_temp / "cache"), MPLCONFIGDIR=str(private_temp / "matplotlib"))
+            from .sandbox_platform import SandboxUnavailable, sandbox_command
+
+            windows_temp = Path(cleanup.enter_context(tempfile.TemporaryDirectory(prefix="groupmate-sandbox-temp-"))).resolve() if sys.platform == "win32" else None
+            if windows_temp is not None:
+                await _prepare_windows_sandbox_dirs([root, windows_temp])
+            try:
+                argv = sandbox_command(argv, root, windows_temp=windows_temp, runner=sandbox_windows_runner)
+            except SandboxUnavailable as error:
+                raise ExecutionError(str(error)) from error
         try:
-            exit_code, stdout, stderr = await asyncio.wait_for(_command(*command, str(program), cwd=root, env=env, local=True), timeout=timeout)
+            exit_code, stdout, stderr = await asyncio.wait_for(_command(*argv, cwd=root, env=env, local=True), timeout=timeout)
         except asyncio.TimeoutError:
             raise ExecutionError("本机代码执行超时，已尝试终止执行进程及子进程。") from None
         files = []

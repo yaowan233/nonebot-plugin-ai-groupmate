@@ -67,6 +67,42 @@ Bot 主机需要能够解析目标域名并直接访问公网 HTTP/HTTPS。下�
 
 `run_code` 默认关闭，需要保持 `agent_file_tools_enabled=true`。它按需加载，不限定绘图流程或修改轮数，不改变模型的思考强度。每次执行使用新工作目录，输入在 `inputs/`，产物写入 `out/`；后续执行通过返回的文件 ID 接续。容器模式的工作目录为 `/workspace`，标准镜像预装 Python、Node、Pillow、NumPy、pandas、matplotlib、openpyxl 和 Python Playwright/Chromium。本机模式使用 Bot 主机现有环境。图像模型可以通过 `read_file(mode="image", frame=0)` 查看渲染图片或动画帧；纯文本模型无法获得视觉反馈。
 
+### 按平台选择的写入沙箱（sandbox）
+
+统一配置，不需要子容器或 Docker-in-Docker：
+
+```dotenv
+AI_GROUPMATE__AGENT_EXECUTION_BACKEND=sandbox
+```
+
+| Bot 实际运行平台 | 自动选择 | 依赖 |
+| --- | --- | --- |
+| Linux x86_64/aarch64，64 位 Python | Landlock | 内核启用 ABI 3 或以上，允许相关系统调用 |
+| macOS | Seatbelt | 系统 `/usr/bin/sandbox-exec` 可用 |
+| Windows | DSH ACL 受限令牌 | Node.js 与 `@deepseek-ai/dsh-sandbox-windows-acl` |
+
+Docker Desktop 的 Linux 容器和 WSL 按 Linux 处理，不按宿主桌面系统处理。缺少依赖、不支持的平台或限制初始化失败，均拒绝执行，**不自动降级为 local**。不要求特权容器，也不会为了兼容自动放宽权限。
+
+Windows 可复用已有 DSH 安装，或者由管理员安装独立运行器（本项目验证版本为 `0.2.1-rc.2`）：
+
+```sh
+npm install -g @deepseek-ai/dsh-sandbox-windows-acl@0.2.1-rc.2
+```
+
+默认从 Node 安装目录、用户 npm 全局目录及其中 DSH 的依赖目录查找；不从模型任务目录加载运行器。自定义 npm 安装目录可显式指定运行器绝对路径：
+
+```dotenv
+AI_GROUPMATE__AGENT_EXECUTION_SANDBOX_WINDOWS_RUNNER=C:/path/to/node_modules/@deepseek-ai/dsh-sandbox-windows-acl/lib/runner.js
+```
+
+任务运行时不自动安装 npm 包。Node 和运行器必须对 Bot 服务账号可用；Windows ACL 模式会修改本次临时工作目录的安全描述符，按 DSH 设计保留工作目录授权到目录删除，并在退出时尝试撤销私有临时区授权。不会对仓库或用户指定目录添加授权。为兼容 Python 3.13 的私有临时目录 ACL，启动前只在本次新建目录上为当前用户添加显式 Modify 权限；降权后的限制仍由 DSH 的能力 SID 与完整性级别共同执行，不给 Everyone 增加允许权限。
+
+三个平台都在执行模型代码前施加文件写入限制，后代进程继承限制。允许写入本次工作目录及私有临时区，Unix 另允许 `/dev/null`。文件内容写入、创建、删除等操作受到平台策略限制；日志、输出文件大小和执行时限沿用现有接口。Windows Shell 为 PowerShell，Linux/macOS 为 `/bin/sh`。
+
+这是 DSH 式的**文件写入限制**，不是完整容器隔离：读取和网络仍可用，不提供统一的 IPC、文件元数据、CPU、内存或磁盘隔离。Windows 后端还有上游记录的硬链接和 ACL 边界。凭据读取风险仍存在；宿主机与资源隔离由外层运行环境负责。Linux 使用独立实现的 Landlock UAPI 启动器，macOS 的策略参考 DSH，Windows 调用上游运行器。许可声明见 [DSH MIT notice](../LICENSES/DSH-MIT.txt)。参考 [Linux 官方说明](https://docs.kernel.org/userspace-api/landlock.html)、[DSH 文件策略](https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/sandbox/sandbox-local/src/profiles.ts) 和 [Windows 后端说明](https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/sandbox/sandbox-windows-acl/README.md)。
+
+验证：`tests/test_execution_sandbox.py` 包含不可用时拒绝执行，以及各平台的真实限制测试。运行在其他系统上的内核测试会明确跳过；Windows 缺少运行器、Linux 内核未开放 Landlock 时也会跳过对应实测，不能据此声称该部署环境已经验收通过。
+
 ### 本机执行（local）
 
 无需 Docker，显式配置后重启 Bot：

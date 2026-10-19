@@ -224,7 +224,8 @@ curl http://127.0.0.1:6333/collections/media_collection_v3
 | ai_groupmate__agent_max_total_tokens | 否 | `2000000` | 单次 agent 常规工作阶段最多累计模型 token 数；达到上限且任务尚未完成时会额外执行一次受控收尾 |
 | ai_groupmate__agent_tool_result_max_chars | 否 | `6000` | 写回后续上下文的单次工具结果最大字符数 |
 | ai_groupmate__agent_file_tools_enabled | 否 | `true` | 启用公开网页抓取、文件下载、文档读取、表格汇总与文件发送；文件保留 24 小时，详见 [使用说明](./docs/agent-web-files.md) |
-| ai_groupmate__agent_execution_backend | 否 | `disabled` | 通用代码执行：`local` 本机执行（无隔离）、`docker` 临时容器或 `remote` 独立服务；容器模式需构建执行镜像，详见 [部署说明](./docs/agent-web-files.md#可选的通用执行环境) |
+| ai_groupmate__agent_execution_backend | 否 | `disabled` | 通用代码执行：`local` 本机执行（无隔离）、`sandbox` 按平台自动选择写入限制、`docker` 临时容器或 `remote` 独立服务；容器模式需构建执行镜像，详见 [部署说明](./docs/agent-web-files.md#可选的通用执行环境) |
+| ai_groupmate__agent_execution_sandbox_windows_runner | 否 | 空 | Windows 沙箱 runner.js 绝对路径；留空查找管理员安装的 DSH ACL 运行器 |
 | ai_groupmate__agent_execution_image | 否 | `ai-groupmate-executor:local` | 直接 Docker 模式使用的执行镜像 |
 | ai_groupmate__agent_execution_url | 否 | 空 | 远程执行服务地址，仅管理员配置 |
 | ai_groupmate__agent_execution_token | 否 | 空 | 远程执行服务访问令牌 |
