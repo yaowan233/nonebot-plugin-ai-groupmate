@@ -37,10 +37,11 @@ Bot 主机需要能够解析目标域名并直接访问公网 HTTP/HTTPS。下�
 | --- | --- |
 | `fetch_url` | 保存网页或文档原件，返回正文预览、来源、文件 ID；HTML 同时返回下载链接等页面链接 |
 | `download_file` | 下载原件并返回文件 ID；不会自动发送 |
-| `read_file` | 按需下载选中的聊天附件，提取正文并分页；Excel 可以选择工作表 |
+| `read_file` | 提取正文并分页；`mode=source` 读取源码；`mode=image` 查看图片或 GIF 的指定帧（需要模型支持图片输入） |
 | `list_files` | 查询收到/已保存的文件元信息，不下载附件，支持分页 |
 | `summarize_table` | 对完整表格按列分组求和、计数、均值、最小值或最大值，生成 XLSX |
-| `create_file` | 将整理结果保存为 TXT、Markdown、JSON、CSV、TSV 或 XLSX |
+| `create_file` | 保存文本、表格以及 HTML、SVG、CSS、JavaScript、Python、YAML、TOML 源码 |
+| `run_code` | 管理员配置执行后端后，可运行 Python、JavaScript、Shell，输入和产物均通过文件 ID 传递 |
 | `send_file` | 调用当前聊天平台的文件发送接口，成功后才报告已发送 |
 
 例如 Excel 任务会依次读取网页、取得附件链接、下载、确认表头、统计、检查汇总结果、发送文件。统计遍历完整工作表，不用正文预览代替全表计算。模型仍负责选择链接和列名；工具接通不等于所有模型都会可靠完成每种任务。
@@ -60,7 +61,75 @@ Bot 主机需要能够解析目标域名并直接访问公网 HTTP/HTTPS。下�
 
 单个表格最多 10,000 行数据和 100 列，提取文字最多 100 万字符。统计数值列遇到空值、公式、带单位的文字或非有限数字时会报错，不静默跳过。均值按组内行数计算；计数统计行数。结果写入 Excel 数值单元格，受 Excel 数值精度限制。生成表格时，疑似公式的文本单元格转为普通文本。
 
-没有通用 Python 执行器、浏览器、OCR 或复杂数据清洗功能。对不支持的文件，可以保存和发送原件，但不能声称已经解析。
+默认没有启用代码执行；配置下述执行环境后，模型可自行编写处理、转换和验证代码。对未实际解析的文件，不能声称已经读取。
+
+## 可选的通用执行环境
+
+`run_code` 默认关闭，需要保持 `agent_file_tools_enabled=true`。它按需加载，不限定绘图流程或修改轮数，不改变模型的思考强度。每次执行使用新工作目录，输入在 `inputs/`，产物写入 `out/`；后续执行通过返回的文件 ID 接续。容器模式的工作目录为 `/workspace`，标准镜像预装 Python、Node、Pillow、NumPy、pandas、matplotlib、openpyxl 和 Python Playwright/Chromium。本机模式使用 Bot 主机现有环境。图像模型可以通过 `read_file(mode="image", frame=0)` 查看渲染图片或动画帧；纯文本模型无法获得视觉反馈。
+
+### 本机执行（local）
+
+无需 Docker，显式配置后重启 Bot：
+
+```dotenv
+AI_GROUPMATE__AGENT_EXECUTION_BACKEND=local
+AI_GROUPMATE__AGENT_EXECUTION_TIMEOUT_SECONDS=20
+```
+
+Python 使用运行 Bot 的同一解释器及依赖；JavaScript 使用 PATH 中的 Node.js；`shell` 在 Windows 使用 PowerShell（优先 pwsh），在 Linux/macOS 使用 `/bin/sh`。每次运行在新的临时目录中，使用相对路径 `inputs/` 和 `out/`。需要跨次保留的文件必须放到 `out/`，再通过文件 ID 传入下一次运行。缺失 Node、Playwright 或浏览器时，需管理员在本机准备对应依赖；后端不自动安装。
+
+**本机后端不是沙盒**：代码拥有 Bot 运行用户的文件和网络权限，没有容器的 CPU、内存、磁盘限额。它仅适用于可信使用者和允许本机代码执行的部署。子进程不会直接继承 API key 等任意 Bot 环境变量，但这不阻止代码通过主机文件访问凭据。临时目录也不构成文件访问隔离。
+
+超时或取消会尝试结束进程树并清理临时目录（Windows 使用 taskkill，POSIX 使用进程组）；主动脱离进程树的程序不能保证被回收。返回日志和文件仍有大小限制。此配置不改变默认模型或思考强度。
+
+### Bot 能访问 Docker
+
+在 Docker 主机上从仓库根目录构建镜像：
+
+```sh
+docker build -t ai-groupmate-executor:local -f deploy/executor/Dockerfile .
+```
+
+配置 Bot 并重启：
+
+```dotenv
+AI_GROUPMATE__AGENT_EXECUTION_BACKEND=docker
+AI_GROUPMATE__AGENT_EXECUTION_IMAGE=ai-groupmate-executor:local
+AI_GROUPMATE__AGENT_EXECUTION_TIMEOUT_SECONDS=20
+```
+
+Bot 进程需要 Docker CLI 和 daemon 访问权限。文件经 Docker API 传递，不依赖 Bot 与 Docker 主机共享目录。Bot 本身在容器中时，也可使用下面的独立服务方式。
+
+### Bot 通过独立执行服务访问
+
+在有 Docker 的机器构建上述镜像，并准备 Python 和 `httpx`。将 `agent/execution_service.py` 与 `agent/execution_backend.py` 放在同一目录，设置以下服务环境变量后运行 `python execution_service.py`：
+
+```dotenv
+EXECUTION_SERVICE_TOKEN=<至少16字符的随机令牌>
+EXECUTION_SERVICE_HOST=127.0.0.1
+EXECUTION_SERVICE_PORT=8091
+EXECUTION_SERVICE_IMAGE=ai-groupmate-executor:local
+EXECUTION_SERVICE_TIMEOUT=20
+```
+
+服务默认仅监听本机。跨机器或跨容器部署时，改为实际监听地址，并通过受限的内网或 HTTPS 反向代理提供给 Bot；不要直接向公网开放开发用 HTTP 服务。Bot 中配置：
+
+```dotenv
+AI_GROUPMATE__AGENT_EXECUTION_BACKEND=remote
+AI_GROUPMATE__AGENT_EXECUTION_URL=http://executor:8091
+AI_GROUPMATE__AGENT_EXECUTION_TOKEN=<与服务相同的令牌>
+AI_GROUPMATE__AGENT_EXECUTION_TIMEOUT_SECONDS=20
+```
+
+`executor` 是示例服务名，须替换为 Bot 实际可达的地址；Bot 容器中的 `localhost` 指向 Bot 容器自身。此方式不需要给 Bot 安装 Docker、挂载 Docker socket 或共享文件目录。服务端仍需 Docker CLI 和 daemon 权限。通过容器运行服务时应自行配置这些管理权限；执行任务的临时容器不会获得它们。
+
+### 限制与验证
+
+临时容器无网络、无宿主机目录挂载，根文件系统只读，限制为 1 CPU、512 MiB 内存、128 个进程；工作目录和临时目录为限额内存文件系统。不传入 Bot 的环境变量或密钥。依赖需要在管理员构建镜像时安装，任务中不能联网安装。Docker 隔离依赖宿主机和 daemon 的安全配置。
+
+单次最多传入 12 个文件、总计 10 MiB；输出最多 12 个文件，单个 10 MiB、总计 20 MiB，同时计入既有文件工作区额度。输出子目录会展开为文件名，不允许同名冲突或符号链接。超时和取消会请求删除容器；容器自身也有到时退出机制。服务进程异常退出后可能留下已停止的容器，可由管理员清理 `groupmate-job-` 前缀的容器。
+
+执行时限同时受 Agent 工具时限与总预算约束；本机和直接 Docker 模式会预留清理时间。远程服务使用服务端时限，建议与 Bot 配置一致，调高执行时限时也应相应调高 `agent_tool_timeout_seconds`。自动化测试覆盖协议、鉴权、资源限制参数、超时清理和模拟模型的生成→看图→修改→交付流程；真实 Docker/Chromium 和聊天平台投递仍需在部署环境验收。
 
 ## 文件保存与交付
 

@@ -149,7 +149,7 @@ def test_deepseek_defaults_remain_low_with_default_cap():
     cfg = ScopedConfig(chat_api_key="test", chat_base_url="https://api.deepseek.com/v1")
     payload = create_chat_openai(cfg)._get_request_payload("hello")
     assert payload["reasoning_effort"] == "low"
-    assert payload["max_tokens"] == 8192
+    assert payload["max_tokens"] == 32768
 
 
 def test_responses_tools_respect_explicit_effort():

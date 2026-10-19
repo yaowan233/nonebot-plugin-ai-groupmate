@@ -88,6 +88,7 @@ from .forward_tools import create_read_forward_message_tool
 from .private_tools import create_private_message_tool
 from .profile_tools import create_report_tool, create_relation_tool
 from ..media_message import LazyMediaRegistry, extract_media_message_refs
+from .file_workspace import FileWorkspace
 from .history_format import (
     parse_msg_meta,
     is_image_history,
@@ -105,6 +106,7 @@ from .schedule_tools import (
     create_schedule_management_tools,
 )
 from ..runtime_config import get_runtime_config
+from .execution_tools import execution_prompt, create_execution_tool
 from .explicit_memory import MEMORY_PROMPT, get_explicit_memory_context, create_explicit_memory_tools
 from ..forward_message import extract_forward_message_ids
 from .moderation_tools import create_mute_tool
@@ -1430,6 +1432,9 @@ async def create_chat_graph(
         ),
         *custom_agent_skills,
     ]
+    execution_enabled = plugin_config.agent_file_tools_enabled and plugin_config.agent_execution_backend != "disabled"
+    if execution_enabled:
+        agent_skills.append(AgentSkill(name="execution_tools", description="通用代码执行：计算、数据处理、文件转换、程序、图形与动画；可读写文件和检查生成图片。", prompt=execution_prompt(plugin_config.agent_execution_backend)))
     if proactive_meme_only or proactive_reaction_only or repeat_text is not None:
         agent_skills = []
     skill_index = build_agent_skill_index(agent_skills)
@@ -1585,6 +1590,12 @@ async def create_chat_graph(
             if meme_similar_enabled
             else [search_meme_tool, send_meme_tool]
         )
+    if execution_enabled:
+        tools_by_skill["execution_tools"] = [create_execution_tool(
+            plugin_config,
+            FileWorkspace(plugin_data_dir / "agent_files", session_id=session_id, user_id=str(user_id), bot_id=str(bot_id or plugin_config.bot_name), is_private=is_private),
+            session_id, request_id,
+        )]
     if proactive_meme_only or proactive_reaction_only or repeat_text is not None:
         tools_by_skill = {}
     if group_memory_tool is not None:

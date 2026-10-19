@@ -39,6 +39,37 @@ def xlsx_bytes(rows):
     return result.getvalue()
 
 
+@pytest.mark.parametrize("suffix", ["html", "svg", "py", "js", "css", "yaml", "toml"])
+async def test_source_files_are_saved_and_read_without_execution(tmp_path, suffix):
+    tools = toolset(tmp_path)
+    source = '<script>throw new Error("not executed")</script>'
+    created = json.loads(await tools["create_file"].ainvoke({"filename": "sample." + suffix, "content": source}))
+    assert created["status"] == "succeeded"
+    result = json.loads(await tools["read_file"].ainvoke({"file_id": created["data"]["file_id"], "mode": "source"}))
+    assert result["data"]["text"] == source
+
+
+async def test_image_read_selects_gif_frame_and_preserves_scope(tmp_path):
+    import base64
+
+    from PIL import Image
+
+    stream = io.BytesIO()
+    Image.new("RGB", (8, 8), "red").save(stream, format="GIF", save_all=True, append_images=[Image.new("RGB", (8, 8), "blue")], duration=100, loop=0)
+    artifact = workspace(tmp_path).save(stream.getvalue(), "animation.gif")
+    result = await toolset(tmp_path)["read_file"].ainvoke({"file_id": artifact.file_id, "mode": "image", "frame": 1})
+    assert isinstance(result, list)
+    assert json.loads(result[0]["text"])["data"]["frame"] == 1
+    image = Image.open(io.BytesIO(base64.b64decode(result[1]["image_url"]["url"].split(",")[1])))
+    pixel = image.convert("RGB").getpixel((0, 0))
+    assert isinstance(pixel, tuple)
+    assert pixel[2] > 240
+    denied = json.loads(await toolset(tmp_path, user_id="other")["read_file"].ainvoke({"file_id": artifact.file_id, "mode": "image"}))
+    assert denied["status"] == "failed"
+    missing = json.loads(await toolset(tmp_path)["read_file"].ainvoke({"file_id": artifact.file_id, "mode": "image", "frame": 3}))
+    assert missing["reason_code"] == "invalid_frame"
+
+
 def test_workspace_isolation_persistence_and_expiry(tmp_path, monkeypatch):
     from nonebot_plugin_ai_groupmate.agent import file_workspace as module
 

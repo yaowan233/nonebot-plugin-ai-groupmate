@@ -1734,12 +1734,12 @@ async def test_token_budget_finalizer_failure_still_sends_fallback_reply():
     assert replies == [BUDGET_FINALIZATION_FALLBACK]
 
 
-def test_default_agent_token_budget_is_128k():
+def test_default_agent_token_budget_is_2m():
     from nonebot_plugin_ai_groupmate.config import ScopedConfig
     from nonebot_plugin_ai_groupmate.agent.graph import AgentRunLimits
 
-    assert ScopedConfig().agent_max_total_tokens == 128_000
-    assert AgentRunLimits().max_total_tokens == 128_000
+    assert ScopedConfig().agent_max_total_tokens == 2_000_000
+    assert AgentRunLimits().max_total_tokens == 2_000_000
 
 
 @pytest.mark.asyncio

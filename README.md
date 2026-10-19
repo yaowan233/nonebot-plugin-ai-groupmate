@@ -177,7 +177,7 @@ curl http://127.0.0.1:6333/collections/media_collection_v3
 | ai_groupmate__chat_base_url | 否 | 无 | 主聊天模型专用 Base URL，留空则使用 `llm_base_url` |
 | ai_groupmate__chat_temperature | 否 | `0.7` | 主聊天模型温度 |
 | ai_groupmate__chat_reasoning_effort | 否 | 留空 | OpenAI 兼容主模型思考强度：`none`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max`；须选择模型支持的值，DeepSeek 留空默认 `low` |
-| ai_groupmate__chat_max_tokens | 否 | 留空 | 主模型单次输出 Token 上限；推理是否计入由供应商决定，DeepSeek 留空默认 `8192` |
+| ai_groupmate__chat_max_tokens | 否 | `32768` | 主模型单次输出 Token 上限；推理是否计入由供应商决定，显式留空使用供应商默认 |
 | ai_groupmate__chat_api_format | 否 | `openai` | 主聊天接口格式，可选 `openai` / `anthropic` / `vertex` |
 | ai_groupmate__chat_multimodal | 否 | `true` | 主聊天模型是否支持图片输入；若使用纯文本模型请设为 `false`，将跳过图片上传只发文本 |
 | ai_groupmate__chat_responses_builtin_tools | 否 | `[]` | 千问 Responses API 官方工具白名单，可选 `code_interpreter`、`web_search`、`web_extractor`、`web_search_image`、`image_search`；仅官方百炼 OpenAI 兼容地址生效，留空完全关闭 |
@@ -221,9 +221,14 @@ curl http://127.0.0.1:6333/collections/media_collection_v3
 | ai_groupmate__media_vectorize_concurrency | 否 | `8` | 表情包标注与向量化的并发数（过高可能触发接口限流） |
 | ai_groupmate__group_memory_update_timeout_seconds | 否 | `120` | 群档案后台更新超时（秒） |
 | ai_groupmate__agent_max_llm_calls | 否 | `8` | 单次 agent 常规处理阶段最多调用主模型次数；任务尚未完成时额外允许一次无工具收尾 |
-| ai_groupmate__agent_max_total_tokens | 否 | `128000` | 单次 agent 常规工作阶段最多累计模型 token 数；达到上限且任务尚未完成时会额外执行一次受控收尾 |
+| ai_groupmate__agent_max_total_tokens | 否 | `2000000` | 单次 agent 常规工作阶段最多累计模型 token 数；达到上限且任务尚未完成时会额外执行一次受控收尾 |
 | ai_groupmate__agent_tool_result_max_chars | 否 | `6000` | 写回后续上下文的单次工具结果最大字符数 |
 | ai_groupmate__agent_file_tools_enabled | 否 | `true` | 启用公开网页抓取、文件下载、文档读取、表格汇总与文件发送；文件保留 24 小时，详见 [使用说明](./docs/agent-web-files.md) |
+| ai_groupmate__agent_execution_backend | 否 | `disabled` | 通用代码执行：`local` 本机执行（无隔离）、`docker` 临时容器或 `remote` 独立服务；容器模式需构建执行镜像，详见 [部署说明](./docs/agent-web-files.md#可选的通用执行环境) |
+| ai_groupmate__agent_execution_image | 否 | `ai-groupmate-executor:local` | 直接 Docker 模式使用的执行镜像 |
+| ai_groupmate__agent_execution_url | 否 | 空 | 远程执行服务地址，仅管理员配置 |
+| ai_groupmate__agent_execution_token | 否 | 空 | 远程执行服务访问令牌 |
+| ai_groupmate__agent_execution_timeout_seconds | 否 | `20` | 单次执行时限，1–120 秒，同时受工具时限和 Agent 总预算约束 |
 | ai_groupmate__flash_model | 否 | `qwen-flash` | 快速判断是否需要回复的模型 |
 | ai_groupmate__flash_api_key | 否 | 无 | 快速判断模型专用 API Key |
 | ai_groupmate__flash_base_url | 否 | 无 | 快速判断模型专用 Base URL |
@@ -313,7 +318,7 @@ AI_GROUPMATE__CHAT_BASE_URL=https://api.deepseek.com/v1
 AI_GROUPMATE__CHAT_API_KEY=你的DeepSeek密钥
 AI_GROUPMATE__CHAT_MODEL=deepseek-flash
 AI_GROUPMATE__CHAT_REASONING_EFFORT=low
-AI_GROUPMATE__CHAT_MAX_TOKENS=8192
+AI_GROUPMATE__CHAT_MAX_TOKENS=32768
 ```
 
 官方地址会自动使用保留推理字段的 Chat Completions 适配器，支持连续工具调用。

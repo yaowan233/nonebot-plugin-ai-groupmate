@@ -58,9 +58,14 @@ class ScopedConfig(BaseModel):
     media_vectorize_concurrency: int = Field(default=8, ge=1, le=32)
     group_memory_update_timeout_seconds: float = Field(default=120.0, gt=0)
     agent_max_llm_calls: int = Field(default=8, ge=1)
-    agent_max_total_tokens: int = Field(default=128000, ge=1)
+    agent_max_total_tokens: int = Field(default=2000000, ge=1)
     agent_tool_result_max_chars: int = Field(default=6000, ge=256)
     agent_file_tools_enabled: bool = True
+    agent_execution_backend: Literal["disabled", "local", "docker", "remote"] = "disabled"
+    agent_execution_image: str = "ai-groupmate-executor:local"
+    agent_execution_url: str = ""
+    agent_execution_token: str = ""
+    agent_execution_timeout_seconds: float = Field(default=20.0, ge=1, le=120)
     chat_long_context_threshold_tokens: int = 256000
     chat_long_input_cost_per_million: float = 6.0
     chat_long_output_cost_per_million: float = 24.0
@@ -83,7 +88,7 @@ class ScopedConfig(BaseModel):
         default=None, description="OpenAI 兼容主模型思考强度；留空使用供应商默认，取值须受模型支持",
     )
     chat_max_tokens: int | None = Field(
-        default=None, ge=1, description="主模型单次输出上限；留空使用供应商默认，推理是否计入由供应商决定",
+        default=32768, ge=1, description="主模型单次输出上限；留空使用供应商默认，推理是否计入由供应商决定",
     )
     chat_api_format: Literal["openai", "anthropic", "vertex"] = "openai"
     chat_multimodal: bool = True  # 主聊天模型是否支持图片输入
@@ -279,8 +284,6 @@ def create_chat_openai(
         kwargs["extra_body"] = {"thinking": {"type": "disabled" if effort == "none" else "enabled"}}
         if effort != "none":
             kwargs.pop("temperature", None)
-        if role == "chat" and max_tokens is None:
-            kwargs["max_completion_tokens"] = 8192
         return DeepSeekChatOpenAI(**kwargs)
     if role == "chat" and resolve_chat_responses_builtin_tools(cfg):
         kwargs["use_responses_api"] = True

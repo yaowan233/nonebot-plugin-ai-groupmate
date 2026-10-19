@@ -4,6 +4,7 @@ import io
 import csv
 import json
 import math
+import base64
 import codecs
 import zipfile
 from decimal import Decimal, InvalidOperation
@@ -19,6 +20,35 @@ MAX_TEXT_CHARS = 1_000_000
 MAX_TABLE_ROWS = 10_000
 MAX_TABLE_COLUMNS = 100
 MAX_UNPACKED_BYTES = 50 * 1024 * 1024
+SOURCE_SUFFIXES = {".txt", ".md", ".json", ".html", ".htm", ".svg", ".css", ".js", ".mjs", ".py", ".yaml", ".yml", ".toml"}
+
+
+def image_preview(data: bytes, frame: int = 0) -> tuple[dict, str]:
+    """Decode a bounded raster frame for model vision; never execute SVG/HTML."""
+    from PIL import Image, UnidentifiedImageError
+
+    if not 0 <= frame <= 120:
+        raise FileTaskError("invalid_frame", "frame 范围为 0～120，静态图片使用 0。")
+    try:
+        with Image.open(io.BytesIO(data)) as picture:
+            if picture.width * picture.height > 16_000_000:
+                raise FileTaskError("image_too_large", "图片不能超过 1600 万像素。")
+            picture.seek(frame)
+            picture.thumbnail((1024, 1024))
+            rgba = picture.convert("RGBA")
+            flattened = Image.new("RGB", rgba.size, "white")
+            flattened.paste(rgba, mask=rgba.getchannel("A"))
+            output = io.BytesIO()
+            flattened.save(output, format="JPEG", quality=85)
+            details = {"frame": frame, "width": flattened.width, "height": flattened.height,
+                       "frame_duration_ms": picture.info.get("duration", 0)}
+            return details, "data:image/jpeg;base64," + base64.b64encode(output.getvalue()).decode("ascii")
+    except EOFError:
+        raise FileTaskError("invalid_frame", "图片没有该帧，请选择较小的 frame。") from None
+    except (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError) as error:
+        if isinstance(error, FileTaskError):
+            raise
+        raise FileTaskError("unsupported_image", "无法读取图片；支持 PNG/JPEG/GIF/WebP 等位图，HTML/SVG 需先在执行环境中渲染。") from None
 
 
 def decode_text(data: bytes, content_type: str = "") -> str:
@@ -240,14 +270,14 @@ def create_document(name: str, content: str) -> bytes:
         for row in csv.reader(io.StringIO(content), delimiter=delimiter):
             writer.writerow([_safe_cell(value) for value in row])
         return buffer.getvalue().encode("utf-8-sig")
-    if suffix in {".txt", ".md", ".json"}:
+    if suffix in SOURCE_SUFFIXES:
         if suffix == ".json":
             try:
                 json.loads(content)
             except ValueError:
                 raise FileTaskError("invalid_json", "文件内容不是有效的 JSON。") from None
         return content.encode("utf-8")
-    raise FileTaskError("unsupported_output", "可生成 TXT、Markdown、JSON、CSV、TSV 或 XLSX 文件。")
+    raise FileTaskError("unsupported_output", "可生成文本、HTML/SVG、Python/JavaScript/CSS、JSON/YAML/TOML、CSV/TSV 或 XLSX 文件。")
 
 
 def summarize_table(table: Table, group_by: list[str], value_columns: list[str], operation: str) -> tuple[list[list], int]:

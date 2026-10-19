@@ -80,7 +80,7 @@ ContentBlock = str | dict[str, Any]
 @dataclass(frozen=True)
 class AgentRunLimits:
     max_llm_calls: int = 8
-    max_total_tokens: int = 128_000
+    max_total_tokens: int = 2_000_000
     llm_timeout_seconds: float = 60.0
     tool_timeout_seconds: float = 30.0
     max_parallel_tools: int = 4
