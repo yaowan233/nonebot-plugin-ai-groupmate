@@ -66,7 +66,7 @@ class CalculateArgs(BaseModel):
 class ReplyArgs(BaseModel):
     content: str = Field(description="要发送给当前用户的文本")
     next_step: Literal["end", "continue"] = Field(
-        description="本条说完用 end；确实需要继续发送新信息时用 continue"
+        description="当前请求已处理并交付结果或明确说明阻塞后用 end；还需发送有新增信息的消息时用 continue"
     )
 
 
@@ -1203,14 +1203,18 @@ def _create_model(args: argparse.Namespace, model_name: str) -> Any:
             stop=None,
         )
 
-    from langchain_openai import ChatOpenAI
+    _ensure_nonebot()
+    from nonebot_plugin_ai_groupmate.config import ScopedConfig, create_chat_openai
 
-    return ChatOpenAI(
-        model=model_name,
-        api_key=SecretStr(api_key),
-        base_url=args.base_url,
-        temperature=args.temperature,
-        timeout=None,
+    return create_chat_openai(
+        ScopedConfig(
+            chat_model=model_name,
+            chat_api_key=api_key,
+            chat_base_url=args.base_url,
+            chat_temperature=args.temperature,
+            chat_deepseek_reasoning_effort=getattr(args, "deepseek_reasoning_effort", "low"),
+            chat_deepseek_max_tokens=getattr(args, "deepseek_max_tokens", 8192),
+        ),
     )
 
 
@@ -1232,6 +1236,8 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--api-key-env", default="EVAL_API_KEY", help="保存 API Key 的环境变量名")
     parser.add_argument("--base-url", default=os.getenv("EVAL_BASE_URL", DEFAULT_BASE_URL))
     parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--deepseek-reasoning-effort", choices=("none", "low", "high", "max"), default="low")
+    parser.add_argument("--deepseek-max-tokens", type=int, default=8192)
     parser.add_argument("--repeat", type=int, default=1)
     parser.add_argument("--concurrency", type=int, default=1)
     parser.add_argument("--llm-timeout", type=float, default=60)

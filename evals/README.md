@@ -73,6 +73,11 @@ Runner 复用仓库当前的 LangGraph Agent，但会把联网搜索、历史数
 
 设置专用评测 API Key，然后先运行单条用例：
 
+DeepSeek 官方地址的评测复用生产模型工厂，保留工具轮和后续用户轮的推理字段。
+使用 `--base-url https://api.deepseek.com/v1 --model deepseek-flash`，可设置
+`--deepseek-reasoning-effort none|low|high|max`（默认 `low`）和
+`--deepseek-max-tokens 8192`（单次输出含推理上限）。密钥通过 `EVAL_API_KEY` 等环境变量传递，不写入命令行或报告。
+
 ```powershell
 $env:EVAL_API_KEY="你的 API Key"
 .venv\Scripts\python.exe -m evals.runner `

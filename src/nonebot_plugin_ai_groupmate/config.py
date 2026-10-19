@@ -5,6 +5,8 @@ from urllib.parse import urlparse
 from pydantic import Field, BaseModel, SecretStr, field_validator
 from langchain_openai import ChatOpenAI
 
+from .deepseek import DeepSeekChatOpenAI, is_deepseek_endpoint
+
 
 class ScopedConfig(BaseModel):
     bot_name: str = "bot"
@@ -77,6 +79,12 @@ class ScopedConfig(BaseModel):
     chat_api_key: str = ""
     chat_base_url: str = ""
     chat_temperature: float = 0.7
+    chat_deepseek_reasoning_effort: Literal["none", "low", "high", "max"] = Field(
+        default="low", description="DeepSeek 官方 Chat API 思考强度；none 关闭思考，仅主模型生效",
+    )
+    chat_deepseek_max_tokens: int = Field(
+        default=8192, ge=1, le=384000, description="DeepSeek 主模型单次输出上限（含推理）",
+    )
     chat_api_format: Literal["openai", "anthropic", "vertex"] = "openai"
     chat_multimodal: bool = True  # 主聊天模型是否支持图片输入
     chat_responses_builtin_tools: list[
@@ -260,6 +268,15 @@ def create_chat_openai(
     }
     if max_tokens is not None:
         kwargs["max_completion_tokens"] = max_tokens
+    if is_deepseek_endpoint(base_url):
+        effort = cfg.chat_deepseek_reasoning_effort if role == "chat" else "none"
+        kwargs["reasoning_effort"] = effort
+        kwargs["extra_body"] = {"thinking": {"type": "disabled" if effort == "none" else "enabled"}}
+        if effort != "none":
+            kwargs.pop("temperature", None)
+        if role == "chat" and max_tokens is None:
+            kwargs["max_completion_tokens"] = cfg.chat_deepseek_max_tokens
+        return DeepSeekChatOpenAI(**kwargs)
     if role == "chat" and resolve_chat_responses_builtin_tools(cfg):
         kwargs["use_responses_api"] = True
         kwargs["output_version"] = "responses/v1"
