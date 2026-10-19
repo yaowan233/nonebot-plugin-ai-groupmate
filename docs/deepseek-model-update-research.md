@@ -81,7 +81,7 @@
 已实施：
 
 - 新增 `deepseek.py` 的专用 Chat Completions 适配器，保留普通响应与流式响应的 `reasoning_content`，在工具轮与后续用户轮请求中完整回传所持有的字段，并记录 DeepSeek 缓存命中 Token。历史消息本来没有推理时传空字段，不生成或恢复不存在的推理。原有群聊历史管理未改造为持久化完整推理轨迹。
-- `config.py` 对官方主机 `api.deepseek.com` 自动选用适配器；新增 `chat_deepseek_reasoning_effort`（默认 low）与 `chat_deepseek_max_tokens`（默认 8192，包含推理）。思考开启时不传 temperature，辅助角色默认关闭思考。分群/私聊工厂同样适用，其他主机不自动推断协议。
+- `config.py` 对官方主机 `api.deepseek.com` 自动选用适配器；新增 `chat_reasoning_effort`（默认 low）与 `chat_max_tokens`（默认 8192，包含推理）。思考开启时不传 temperature，辅助角色默认关闭思考。分群/私聊工厂同样适用，其他主机不自动推断协议。
 - WebUI 和 README 提供新配置；评测 runner 复用生产模型工厂，支持相同的 DeepSeek 参数。
 - 统一 `next_step=end` 的任务完成语义；任务型回答默认整合成一条，资料足够时不再无关检索，不用短句风格省略必要内容，明确禁止将证据补写成未支持的事实。
 
@@ -111,3 +111,7 @@
 记录：[第一轮](../evals/results/deepseek-flash-1017-fixtures.json)、[第二轮原始结果](../evals/results/deepseek-flash-1017-fixtures-refined.json)、[仅补判裁判解析失败的结果](../evals/results/deepseek-flash-1017-fixtures-reviewed.json)。`evals/results` 按仓库现有规则忽略提交，这些是本地验证产物。
 
 **限制与仍存在的行为问题：** 16/16 是现有阈值的通过数，不代表所有检查满分。第二轮金额差计算正确但跳过了要求的计算工具；空结果搜图额外查了一次；年度报告把“最活跃月份”补成“基本天天冒泡”，违反新增事实约束，Judge 未识别这项补写；另有 `10 月` / `10月` 字面匹配差异造成扣分。没有为提高分数修改评测。这只是单次小样本比较，不能证明生产通过率或全面优于旧模型；目前证据支持协议修复有效，以及合并任务型回复能减少本组不必要拆条，不能声称已经消除幻觉或工具遗漏。
+
+### 配置通用化
+
+公开配置统一为 `chat_reasoning_effort` 与 `chat_max_tokens`，不再提供 DeepSeek 专属配置项。两项留空时保持供应商默认；DeepSeek 内部继续使用 low / 8192。显式思考档位会传递至 OpenAI 兼容主模型（包括中转地址），由用户选择模型支持的值。协议所需的推理字段回传和 thinking 参数仍由内部适配器处理。

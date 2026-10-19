@@ -1212,8 +1212,8 @@ def _create_model(args: argparse.Namespace, model_name: str) -> Any:
             chat_api_key=api_key,
             chat_base_url=args.base_url,
             chat_temperature=args.temperature,
-            chat_deepseek_reasoning_effort=getattr(args, "deepseek_reasoning_effort", "low"),
-            chat_deepseek_max_tokens=getattr(args, "deepseek_max_tokens", 8192),
+            chat_reasoning_effort=getattr(args, "reasoning_effort", None),
+            chat_max_tokens=getattr(args, "max_tokens", None),
         ),
     )
 
@@ -1236,8 +1236,8 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--api-key-env", default="EVAL_API_KEY", help="保存 API Key 的环境变量名")
     parser.add_argument("--base-url", default=os.getenv("EVAL_BASE_URL", DEFAULT_BASE_URL))
     parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--deepseek-reasoning-effort", choices=("none", "low", "high", "max"), default="low")
-    parser.add_argument("--deepseek-max-tokens", type=int, default=8192)
+    parser.add_argument("--reasoning-effort", choices=("none", "minimal", "low", "medium", "high", "xhigh", "max"), default=None)
+    parser.add_argument("--max-tokens", type=int, default=None)
     parser.add_argument("--repeat", type=int, default=1)
     parser.add_argument("--concurrency", type=int, default=1)
     parser.add_argument("--llm-timeout", type=float, default=60)

@@ -69,7 +69,7 @@ async def test_deepseek_replays_reasoning_across_tool_and_user_turns(streaming):
 def test_deepseek_request_settings(effort):
     from nonebot_plugin_ai_groupmate.config import ScopedConfig, create_chat_openai
 
-    cfg = ScopedConfig(chat_model="deepseek-flash", chat_base_url="https://api.deepseek.com/v1", chat_api_key="test", chat_deepseek_reasoning_effort=effort, chat_deepseek_max_tokens=4096)
+    cfg = ScopedConfig(chat_model="deepseek-flash", chat_base_url="https://api.deepseek.com/v1", chat_api_key="test", chat_reasoning_effort=effort, chat_max_tokens=4096)
     model = create_chat_openai(cfg)
     payload = model._get_request_payload([HumanMessage(content="hello")])
     assert payload["reasoning_effort"] == effort
@@ -105,7 +105,7 @@ def test_group_override_selects_deepseek_adapter_with_inherited_effort():
     from nonebot_plugin_ai_groupmate.deepseek import DeepSeekChatOpenAI
     from nonebot_plugin_ai_groupmate.group_model_config import ActiveGroupModelConfig, _resolve_active_chat_config
 
-    global_config = ScopedConfig(chat_api_key="global-test", chat_deepseek_reasoning_effort="high")
+    global_config = ScopedConfig(chat_api_key="global-test", chat_reasoning_effort="high")
     scoped = ActiveGroupModelConfig(group_id="1", api_format="openai", base_url="https://api.deepseek.com/v1", api_key="scoped-test", chat_model="deepseek-flash", chat_multimodal=True)
     resolved = _resolve_active_chat_config(scoped, global_config)
     model = create_chat_llm(resolved)
@@ -120,7 +120,38 @@ def test_eval_runner_uses_production_deepseek_transport(monkeypatch):
     from nonebot_plugin_ai_groupmate.deepseek import DeepSeekChatOpenAI
 
     monkeypatch.setenv("EVAL_API_KEY", "test")
-    args = build_argument_parser().parse_args(["--model", "deepseek-flash", "--base-url", "https://api.deepseek.com/v1", "--deepseek-reasoning-effort", "none"])
+    args = build_argument_parser().parse_args(["--model", "deepseek-flash", "--base-url", "https://api.deepseek.com/v1", "--reasoning-effort", "none"])
     model = _create_model(args, args.model)
     assert isinstance(model, DeepSeekChatOpenAI)
     assert model.reasoning_effort == "none"
+
+
+@pytest.mark.parametrize("effort", ["none", "minimal", "low", "medium", "high", "xhigh", "max"])
+def test_generic_reasoning_and_output_cap_reach_compatible_endpoint(effort):
+    from nonebot_plugin_ai_groupmate.config import ScopedConfig, create_chat_openai
+
+    cfg = ScopedConfig(chat_api_key="test", chat_base_url="https://gateway.example/v1", chat_model="reasoning-model", chat_reasoning_effort=effort, chat_max_tokens=16384)
+    payload = create_chat_openai(cfg)._get_request_payload("hello")
+    assert payload["reasoning_effort"] == effort
+    assert payload["max_completion_tokens"] == 16384
+    assert "extra_body" not in payload
+    assert ("temperature" in payload) == (effort == "none")
+    assert create_chat_openai(cfg, max_tokens=512)._get_request_payload("hello")["max_completion_tokens"] == 512
+
+
+def test_deepseek_defaults_remain_low_with_default_cap():
+    from nonebot_plugin_ai_groupmate.config import ScopedConfig, create_chat_openai
+
+    cfg = ScopedConfig(chat_api_key="test", chat_base_url="https://api.deepseek.com/v1")
+    payload = create_chat_openai(cfg)._get_request_payload("hello")
+    assert payload["reasoning_effort"] == "low"
+    assert payload["max_tokens"] == 8192
+
+
+def test_responses_tools_respect_explicit_effort():
+    from nonebot_plugin_ai_groupmate.config import ScopedConfig, create_chat_openai
+
+    cfg = ScopedConfig(chat_api_key="test", chat_base_url="https://dashscope.aliyuncs.com/compatible-mode/v1", chat_responses_builtin_tools=["code_interpreter"], chat_reasoning_effort="high")
+    model = create_chat_openai(cfg)
+    assert model.reasoning == {"effort": "high"}
+    assert model.reasoning_effort is None
