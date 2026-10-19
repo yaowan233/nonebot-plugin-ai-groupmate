@@ -4,7 +4,8 @@ from typing import Any
 from urllib.parse import urlparse
 
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, BaseMessage
+from langchain_core.messages.ai import InputTokenDetails
 
 
 def is_deepseek_endpoint(base_url: str) -> bool:
@@ -19,7 +20,7 @@ class DeepSeekChatOpenAI(ChatOpenAI):
     our supported langchain-openai version. Reasoning never becomes reply text.
     """
 
-    use_responses_api: bool = False
+    use_responses_api: bool | None = False
 
     def _get_request_payload(self, input_: Any, *, stop=None, **kwargs: Any) -> dict:
         messages = self._convert_input(input_).to_messages()
@@ -34,10 +35,10 @@ class DeepSeekChatOpenAI(ChatOpenAI):
         return payload
 
     @staticmethod
-    def _preserve_cache_usage(message: AIMessage, usage: dict) -> None:
+    def _preserve_cache_usage(message: BaseMessage, usage: dict) -> None:
         cached = usage.get("prompt_cache_hit_tokens")
-        if isinstance(cached, int) and message.usage_metadata is not None:
-            details = dict(message.usage_metadata.get("input_token_details") or {})
+        if isinstance(message, AIMessage) and isinstance(cached, int) and message.usage_metadata is not None:
+            details: InputTokenDetails = {**(message.usage_metadata.get("input_token_details") or {})}
             details["cache_read"] = cached
             message.usage_metadata = {**message.usage_metadata, "input_token_details": details}
 

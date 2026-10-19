@@ -399,7 +399,7 @@ def _render_field(
             f'<input type="number" step="{step}" data-setting="{key}" '
             f'value="{escape(str(value))}" />'
         )
-    elif value is None and field_name.endswith("_dimension"):
+    elif value is None and (field_name.endswith("_dimension") or field_name == "chat_max_tokens"):
         # 可空数值字段（如 embedding_dimension）值为 None 时渲染为空白，
         # 避免显示字面量 "None" 导致保存时解析失败。
         control = (
@@ -408,7 +408,7 @@ def _render_field(
     else:
         control = (
             f'<input type="text" data-setting="{key}" '
-            f'value="{escape(str(value))}" />'
+            f'value="{escape(str(value)) if value is not None else ""}" />'
         )
 
     field_hint = _FIELD_HINTS.get(field_name)

@@ -653,3 +653,14 @@ def test_group_model_admin_routes_are_authenticated_and_never_return_api_key(
         assert removed.status_code == 200
         assert removed.json()["deleted"] is True
         assert cleared_groups == ["10001", "10001", "10001"]
+
+
+@pytest.mark.parametrize("field", ["chat_reasoning_effort", "chat_max_tokens"])
+def test_blank_optional_model_settings_round_trip(field):
+    from nonebot_plugin_ai_groupmate.config import ScopedConfig
+    from nonebot_plugin_ai_groupmate.runtime_config import preview_runtime_config_update
+
+    candidate = ScopedConfig.model_validate({field: ""})
+    assert getattr(candidate, field) is None
+    candidate, _overrides, _changed = preview_runtime_config_update({field: ""})
+    assert getattr(candidate, field) is None

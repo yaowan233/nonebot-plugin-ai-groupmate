@@ -172,9 +172,9 @@ class ScopedConfig(BaseModel):
     #   若模型不支持 dimensions 参数，启动探测会报配置错误。
     embedding_dimension: int | None = Field(default=None, ge=1)
 
-    @field_validator("embedding_dimension", mode="before")
+    @field_validator("embedding_dimension", "chat_reasoning_effort", "chat_max_tokens", mode="before")
     @classmethod
-    def _blank_embedding_dimension_to_none(cls, value: Any) -> Any:
+    def _blank_optional_setting_to_none(cls, value: Any) -> Any:
         # WebUI 提交空白输入时值为 ""，转换为 None 以保持"未配置"语义。
         if isinstance(value, str) and value.strip() == "":
             return None

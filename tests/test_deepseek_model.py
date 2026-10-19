@@ -1,9 +1,11 @@
 import json
+from typing import Any
 
 import httpx
 import pytest
 from openai import AsyncOpenAI
-from langchain_core.messages import ToolMessage, HumanMessage
+from pydantic import SecretStr
+from langchain_core.messages import BaseMessage, ToolMessage, HumanMessage
 
 
 @pytest.mark.parametrize("streaming", [False, True])
@@ -22,7 +24,7 @@ async def test_deepseek_replays_reasoning_across_tool_and_user_turns(streaming):
             assert [m.get("reasoning_content") for m in assistants] == [
                 "reasoning-1", *(["reasoning-2"] if turn == 3 else [])
             ]
-        message = {"role": "assistant", "content": "done" if turn > 1 else "", "reasoning_content": f"reasoning-{turn}"}
+        message: dict[str, Any] = {"role": "assistant", "content": "done" if turn > 1 else "", "reasoning_content": f"reasoning-{turn}"}
         if turn == 1:
             message["tool_calls"] = [{"id": "call-1", "type": "function", "function": {"name": "lookup", "arguments": "{}"}}]
         usage = {"prompt_tokens": 20, "completion_tokens": 10, "total_tokens": 30, "prompt_cache_hit_tokens": 12}
@@ -48,14 +50,15 @@ async def test_deepseek_replays_reasoning_across_tool_and_user_turns(streaming):
         model.root_async_client = sdk
         model.async_client = sdk.chat.completions
         bound = model.bind_tools([{"type": "function", "function": {"name": "lookup", "description": "Read fixture", "parameters": {"type": "object", "properties": {}}}}])
-        history = [HumanMessage(content="Look up the fixture")]
+        history: list[BaseMessage] = [HumanMessage(content="Look up the fixture")]
         for turn in range(3):
             if streaming:
                 response = await _invoke_model_with_idle_timeout(bound, history, timeout_seconds=5, session_id="test", request_kwargs={})
             else:
                 response = await bound.ainvoke(history)
             assert response.additional_kwargs.get("reasoning_content") == f"reasoning-{turn + 1}"
-            assert response.usage_metadata["input_token_details"]["cache_read"] == 12
+            assert response.usage_metadata is not None
+            assert response.usage_metadata.get("input_token_details", {}).get("cache_read") == 12
             assert "reasoning-" not in response.content
             history.append(response)
             if turn == 0:
@@ -111,6 +114,7 @@ def test_group_override_selects_deepseek_adapter_with_inherited_effort():
     model = create_chat_llm(resolved)
     assert isinstance(model, DeepSeekChatOpenAI)
     assert model.reasoning_effort == "high"
+    assert isinstance(model.openai_api_key, SecretStr)
     assert model.openai_api_key.get_secret_value() == "scoped-test"
     assert global_config.chat_model == "qwen3.7-plus"
 
