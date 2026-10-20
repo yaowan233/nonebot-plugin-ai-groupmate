@@ -1,5 +1,7 @@
 import asyncio
 
+from .participation import group_delivery_allowed
+
 _lock = asyncio.Lock()
 _active_request_ids: dict[str, set[str]] = {}
 
@@ -27,5 +29,7 @@ async def deactivate_request_id(session_id: str, request_id: str) -> None:
 
 
 async def is_request_active(session_id: str, request_id: str) -> bool:
+    if not group_delivery_allowed(session_id):
+        return False
     async with _lock:
         return request_id in _active_request_ids.get(session_id, set())

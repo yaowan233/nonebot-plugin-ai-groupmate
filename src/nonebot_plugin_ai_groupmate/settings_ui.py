@@ -190,7 +190,7 @@ SETTING_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
 
 _DIRECT_LABELS = {
     "bot_name": "Bot 名称",
-    "reply_probability": "随机回复概率",
+    "reply_probability": "主动参与倾向（0 关闭）",
     "global_model_daily_group_limit_enabled": "启用每群每日公共模型额度",
     "global_model_daily_group_limit": "每群每日公共模型额度（0 为不限）",
     "global_model_daily_private_user_limit_enabled": "启用每人每日私聊公共模型额度",

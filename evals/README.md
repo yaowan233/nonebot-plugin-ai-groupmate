@@ -157,3 +157,11 @@ Runner 默认使用 8 次 LLM 调用作为单用例硬安全上限，可用 `--m
 结果文件顺序不影响匹配，Runner 始终按 `custom_id` 关联。当前波次如果有多个分片，可重复传入 `--result` 和 `--error`。如果缺少任何当前波次的 `custom_id`，Runner 会拒绝推进状态，避免结果错配。
 
 批量任务的单请求耗时不可从结果文件获得，因此批量报告中的 P50/P95 记为 0，不能与实时 Runner 的延迟直接比较。批量推理按实时推理价格的 50% 计费，但不支持上下文缓存；思考 Token 仍会产生费用。具体限制以[阿里云百炼批量推理文档](https://help.aliyun.com/zh/model-studio/batch-inference)为准。
+# 主动接话判断回放
+
+运行 `uv run python -m evals.participation_runner`，会调用当前配置的 Flash 模型，
+比较旧过滤提示词与动态参与提示词在 12 个模拟场景上的结果，保存到
+`evals/results/participation/results.json`。它不发送群消息、不执行 Agent 工具。
+输出包括原始判断，可区分格式错误与模型选择沉默；结果是提示词级回放，
+不代表真实群聊效果或整个调度链路的成功率。调度、退让、发送计数和并发叫停
+由 `tests/test_participation.py` 与 `tests/test_inbound_conversation.py` 验证。

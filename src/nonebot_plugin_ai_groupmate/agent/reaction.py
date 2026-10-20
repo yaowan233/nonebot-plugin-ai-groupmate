@@ -10,6 +10,7 @@ from nonebot_plugin_alconna import message_reaction
 from ..model import ChatHistory
 from ..reply_guard import is_request_active
 from .tool_results import tool_failure, tool_skipped, tool_success
+from ..participation import record_group_delivery
 
 ReactionMood = Literal[
     "like",
@@ -257,6 +258,8 @@ def create_reaction_tool(
                     else:
                         raise
             action = "取消" if delete else "添加"
+            if not delete:
+                record_group_delivery(session_id)
             reacted_message_desc = f"消息 {message_id}" if message_id else "当前触发消息"
             reaction_emoji_text = ",".join(reaction_emojis)
             chat_history = ChatHistory(

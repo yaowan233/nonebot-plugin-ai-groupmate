@@ -75,9 +75,9 @@ def render_group_api_settings_page(
   </style>
 </head>
 <body>
-  <header><div class="header-inner"><div><h1>群聊 API</h1><div class="subtitle">为指定群配置独立的主聊天模型和主动发言概率。</div></div><nav><a href="{escape(settings_path)}">全局配置</a><a href="{escape(dashboard_path)}">运行概览</a></nav></div></header>
+  <header><div class="header-inner"><div><h1>群聊 API</h1><div class="subtitle">为指定群配置独立的主聊天模型和主动参与倾向。</div></div><nav><a href="{escape(settings_path)}">全局配置</a><a href="{escape(dashboard_path)}">运行概览</a></nav></div></header>
   <main>
-    <div class="notice">未配置独立大模型 API 的群继续使用全局主聊天 API 和主动发言概率。群级概率只能随独立 API 配置保存，最高为 0.1；API Key 加密保存且不会回显，编辑时留空即可保留原 Key。</div>
+    <div class="notice">未配置独立大模型 API 的群继续使用全局主聊天 API 和主动参与倾向。群级倾向值只能随独立 API 配置保存，最高为 0.1，0 关闭；实际接话受语境和冷却限制；API Key 加密保存且不会回显，编辑时留空即可保留原 Key。</div>
     <div class="layout">
       <section>
         <div class="section-head"><div><h2 id="form-title">新增群配置</h2><p>保存前会实际调用一次模型验证连接。</p></div></div>
@@ -104,7 +104,7 @@ def render_group_api_settings_page(
           <label>模型名称
             <input id="chat-model" name="chat_model" type="text" maxlength="256" required placeholder="例如：gpt-4.1-mini" />
           </label>
-          <label>主动发言概率
+          <label>主动参与倾向
             <input id="reply-probability" name="reply_probability" type="number" min="0" max="0.1" step="0.001" placeholder="留空跟随全局配置" />
             <small>仅影响未呼叫 Bot 的普通群消息；0 表示关闭，最高 0.1（10%）。</small>
           </label>
@@ -178,7 +178,7 @@ def render_group_api_settings_page(
         const body = document.createElement("tbody");
         groups.forEach(item => {{
           const row = document.createElement("tr");
-          const probability = item.reply_probability == null ? "跟随全局" : `${{(item.reply_probability * 100).toFixed(1)}}%`;
+          const probability = item.reply_probability == null ? "跟随全局" : String(item.reply_probability);
           const values = [item.group_id,item.api_format,item.provider_host,item.chat_model,probability,item.chat_multimodal?"开启":"关闭",`v${{item.version}}`];
           values.forEach((value,index) => {{ const cell=document.createElement("td"); if(index===0){{const code=document.createElement("code");code.textContent=value;cell.append(code);}}else{{cell.textContent=value;}} if(index===2)cell.className="provider"; row.append(cell); }});
           const actions = document.createElement("td");

@@ -70,6 +70,7 @@ from .reply_guard import (
     set_latest_request_id,
 )
 from .media_message import format_media_markers
+from .participation import participation, delivery_context
 from .agent.reaction import is_onebot_context
 from .runtime_config import (
     RESTART_REQUIRED_FIELDS,
@@ -375,15 +376,19 @@ def _sample_proactive_reply_modes(
     is_group: bool,
     reaction_supported: bool,
     reply_probability: float,
+    participation_key: tuple[str, str] | None = None,
 ) -> tuple[bool, bool, bool]:
     """返回（普通回复、reaction 专用、图片表情专用）。
 
-    未提及 Bot 的消息只保留低概率普通插话。reaction 和图片表情必须先命中
-    定向/连续对话规则，再由正常 Agent 自行选择或按用户明确要求执行，避免对
-    每条普通群消息额外调用 Gatekeeper 和主模型。
+    群聊按短期参与状态积累普通接话机会；不单独采样 reaction 或图片表情，
+    避免对每条普通消息额外调用 Gatekeeper 和主模型。
     """
     if addressed or continuous:
         return False, False, False
+    if participation_key is not None:
+        if command_like or not has_text or not is_group:
+            return False, False, False
+        return participation.candidate(participation_key, reply_probability), False, False
     random_reply = random.random() < reply_probability
     return random_reply, False, False
 
@@ -1051,13 +1056,20 @@ async def handle_message(
     is_group = session.scene.type == SceneType.GROUP
     bot_id = str(bot.self_id)
     active_followup = is_group and _is_continuous_conversation(session.scene.id, session.user.id, bot_id)
-    disengaged = is_group and (explicit_to_me or (active_followup and not has_at_mention and not reply_id)) and _is_explicit_disengagement(stripped_plain_text, plugin_config.bot_name)
+    group_followup = is_group and time.monotonic() - participation.state((bot_id, session.scene.id)).last_sent < 300
+    disengaged = is_group and (explicit_to_me or ((active_followup or group_followup) and not has_at_mention and not reply_id)) and _is_explicit_disengagement(stripped_plain_text, plugin_config.bot_name)
     if disengaged:
         _continuous_conversation_until.pop((session.scene.id, session.user.id, bot_id), None)
         logger.debug("用户明确退出当前 bot 对话，本条保持沉默并结束跟进窗口")
     continuous_to_me = not disengaged and not explicit_to_me and not command_like and not has_at_mention and not reply_id and bool(stripped_plain_text) and active_followup
     if continuous_to_me:
         logger.debug(f"群 {session.scene.id} 用户 {session.user.id} 命中连续对话窗口")
+    if is_group and stripped_plain_text and not command_like:
+        participation.observe(
+            (bot_id, session.scene.id),
+            addressed=explicit_to_me,
+            disengaged=disengaged,
+        )
     repeat_text = None
     if not disengaged and is_group and not to_me and not continuous_to_me and not command_like and bool(stripped_plain_text):
         repeat_text = await _load_repeat_chain_text(db_session, session.scene.id)
@@ -1081,13 +1093,14 @@ async def handle_message(
         ) = _sample_proactive_reply_modes(
             addressed=to_me,
             continuous=continuous_to_me,
-            command_like=command_like,
+            command_like=command_like or has_at_mention or bool(reply_id),
             has_text=bool(stripped_plain_text),
             is_group=is_group,
             reaction_supported=is_onebot_context(bot, event),
             reply_probability=resolve_group_reply_probability(
                 session.scene.id if is_group else None
             ),
+            participation_key=(bot_id, session.scene.id) if is_group else None,
         )
     meme_required = (to_me or continuous_to_me) and _is_explicit_meme_request(stripped_plain_text)
     meme_send_count = _get_explicit_meme_send_count(stripped_plain_text) if meme_required else 1
@@ -1430,6 +1443,11 @@ async def handle_reply_logic(
 ):
     """处理回复逻辑"""
     is_private = session.scene.type == SceneType.PRIVATE
+    participation_key = (str(session.self_id), session.scene.id)
+    autonomous = not is_private and not is_tome and not is_continuous and repeat_text is None
+    delivery_token = delivery_context.set(
+        None if is_private else (participation_key, autonomous)
+    )
     group_quota_limit = plugin_config.global_model_daily_group_limit
     private_quota_limit = plugin_config.global_model_daily_private_user_limit
     uses_global_model_quota = (
@@ -1445,6 +1463,11 @@ async def handle_reply_logic(
         and not has_private_model_config(user_id)
     )
     try:
+        if autonomous and (
+            resolve_group_reply_probability(session.scene.id) <= 0
+            or not participation.can_reply(participation_key)
+        ):
+            return
         if repeat_text is not None and not is_private:
             # 复读采样已经代表“加入队形”的决定，直接发送，避免模型二次犹豫或点评。
             async with get_session() as repeat_session:
@@ -1511,10 +1534,9 @@ async def handle_reply_logic(
                         Select(ChatHistory)
                         .where(
                             ChatHistory.session_id == session.scene.id,
-                            ChatHistory.content_type != "bot",
                         )
                         .order_by(ChatHistory.msg_id.desc())
-                        .limit(3)
+                        .limit(12)
                     )
                 )
                 .scalars()
@@ -1554,12 +1576,16 @@ async def handle_reply_logic(
         # 简单的文本摘要用于 Gatekeeper
         history_summary = ""
         for m in recent_msgs:
+            role = "Bot" if m.content_type == "bot" else f"群友 user_id={m.user_id}"
             if m.content_type == "image":
-                history_summary += f"{m.user_name}: [发送了一张图片/表情包，可能只是随手发的]\n"
+                history_summary += f"[{role}] {m.user_name}: [发送了一张图片/表情包，可能只是随手发的]\n"
             else:
-                history_summary += f"{m.user_name}: {m.content}\n"
+                history_summary += f"[{role}] {m.user_name}: {m.content[:1200]}\n"
 
-        current_msg_text = recent_msgs[-1].content if recent_msgs[-1].content_type == "text" else "[图片/表情包。除非用户明确在问这张图、@bot、回复bot或正在延续图片话题，否则通常不需要回应]"
+        latest_human = next((m for m in reversed(recent_msgs) if m.content_type != "bot"), None)
+        if latest_human is None:
+            return
+        current_msg_text = latest_human.content[:1200] if latest_human.content_type == "text" else "[图片/表情包。除非用户明确在问这张图、@bot、回复bot或正在延续图片话题，否则通常不需要回应]"
         gatekeeper_msg_text = current_msg_text
         if is_continuous:
             gatekeeper_msg_text = f"这是用户在刚才主动呼叫 bot 后的连续对话消息。如果像追问、补充、回应 bot 或继续话题，应倾向回复；如果只是“嗯”“哈哈”“行”等无需回应的短反馈，可以不回复。\n{current_msg_text}"
@@ -1570,6 +1596,7 @@ async def handle_reply_logic(
 
         # === Gatekeeper 判断 ===
         if not is_tome and repeat_text is None:
+            observed_sent = participation.state(participation_key).last_sent
             should_reply = await check_if_should_reply(
                 history_summary,
                 gatekeeper_msg_text,
@@ -1577,8 +1604,17 @@ async def handle_reply_logic(
                 is_private=is_private,
                 proactive_meme_only=proactive_meme_only,
                 proactive_reaction_only=proactive_reaction_only,
+                participation_context=participation.context(participation_key) if autonomous else "",
+                on_continuation=(
+                    lambda: participation.engaged(participation_key, expected_sent=observed_sent)
+                ) if autonomous else None,
             )
             if not should_reply:
+                return
+            if autonomous and (
+                resolve_group_reply_probability(session.scene.id) <= 0
+                or not participation.can_reply(participation_key)
+            ):
                 return
 
         # === 获取详细历史给 Agent ===
@@ -1715,6 +1751,8 @@ async def handle_reply_logic(
     except Exception as e:
         logger.error(f"回复逻辑执行失败: {e}")
         print(traceback.format_exc())
+    finally:
+        delivery_context.reset(delivery_token)
 
 
 def _build_wordcloud_image(words: str) -> BytesIO:

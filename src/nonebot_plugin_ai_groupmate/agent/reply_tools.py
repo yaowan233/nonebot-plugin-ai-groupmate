@@ -14,6 +14,7 @@ from nonebot_plugin_alconna import Target, UniMessage
 from ..model import ChatHistory
 from ..reply_guard import is_request_active
 from .tool_results import tool_failure, tool_skipped, tool_success
+from ..participation import record_group_delivery
 
 
 def create_reply_tool(
@@ -233,6 +234,7 @@ def create_reply_tool(
                 if send_target is not None
                 else outgoing.send()
             )
+            record_group_delivery(session_id)
             msg_id = res.msg_ids[-1]["message_id"] if res.msg_ids else "unknown"
             chat_history = ChatHistory(
                 session_id=session_id,

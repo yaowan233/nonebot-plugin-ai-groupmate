@@ -21,6 +21,7 @@ from ..model import ChatHistory, MediaStorage, ChatHistorySchema
 from ..memory import DB, expand_meme_search_terms
 from ..reply_guard import is_request_active
 from .tool_results import tool_failure, tool_skipped, tool_success
+from ..participation import record_group_delivery
 
 RECENT_MEME_EXCLUSION_COUNT = 10
 MEME_SEARCH_CANDIDATE_LIMIT = 50
@@ -999,6 +1000,7 @@ def create_send_meme_tool(
                 else message.send()
             )
             msg_id = "unknown"
+            record_group_delivery(session_id)
             if res.msg_ids:
                 raw_msg_id = res.msg_ids[-1].get("message_id") or res.msg_ids[-1].get(
                     "msg_id"

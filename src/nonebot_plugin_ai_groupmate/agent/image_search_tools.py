@@ -16,6 +16,7 @@ from ..model import ChatHistory
 from ..reply_guard import is_request_active
 from .common_tools import _web_search_failure
 from .tool_results import tool_failure, tool_skipped, tool_success
+from ..participation import record_group_delivery
 from .history_format import _image_bytes_to_data_uri
 from .web_image_search import _safe_web_url
 
@@ -188,6 +189,7 @@ def create_web_image_tools(
             attempted_urls.add(url)
             send_started = True
             receipt = await (message.send(target=send_target) if send_target is not None else message.send())
+            record_group_delivery(session_id)
             message_id = "unknown"
             if receipt.msg_ids:
                 raw_id = receipt.msg_ids[-1]

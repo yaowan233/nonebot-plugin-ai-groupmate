@@ -26,6 +26,7 @@ def deliver_message(monkeypatch):
     monkeypatch.setattr(plugin.plugin_config, "bot_name", "咕咕")
     monkeypatch.setattr(plugin.plugin_config, "continuous_conversation_minutes", 5)
     plugin._continuous_conversation_until.clear()
+    plugin.participation.states.clear()
 
     async def deliver(
         session_id,
@@ -68,6 +69,7 @@ def deliver_message(monkeypatch):
 
     yield deliver, queued, images
     plugin._continuous_conversation_until.clear()
+    plugin.participation.states.clear()
 
 
 @pytest.mark.asyncio
@@ -333,6 +335,55 @@ async def test_followup_refresh_requires_gatekeeper_acceptance(deliver_message, 
     else:
         assert plugin._continuous_conversation_until == original
         agent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stop_while_judging", [False, True])
+async def test_adaptive_reply_sees_bot_history_and_rechecks_stop(deliver_message, monkeypatch, stop_while_judging):
+    from nonebot.adapters import Bot, Event
+    from nonebot_plugin_orm import get_session
+    from nonebot_plugin_uninfo import Uninfo, SceneType, QryItrface
+
+    import nonebot_plugin_ai_groupmate as plugin
+    from nonebot_plugin_ai_groupmate.model import ChatHistory
+
+    deliver, _, _ = deliver_message
+    session_id = f"adaptive-history-{stop_while_judging}"
+    key = ("bot-1", session_id)
+    async with get_session() as db:
+        db.add(ChatHistory(session_id=session_id, user_id="bot-1", user_name="咕咕", content_type="bot", content="先把大任务拆成三个步骤。"))
+        await db.commit()
+    await deliver(session_id, "1", "你刚才说的三个步骤怎么分？", user_id="member-2")
+    captured = []
+
+    async def gatekeeper(history, current, *args, **kwargs):
+        captured.append(history)
+        assert "[Bot]" in history
+        assert "先把大任务拆成三个步骤" in history
+        assert "member-2" in history
+        assert "三个步骤怎么分" in current
+        assert kwargs["participation_context"]
+        if stop_while_judging:
+            plugin.participation.observe(key, addressed=False, disengaged=True)
+        kwargs["on_continuation"]()
+        return True
+
+    agent = AsyncMock(return_value=SimpleNamespace(need_reply=False, text=None))
+    monkeypatch.setattr(plugin, "check_if_should_reply", gatekeeper)
+    monkeypatch.setattr(plugin, "choice_response_strategy", agent)
+    monkeypatch.setattr(plugin, "resolve_group_reply_probability", lambda _: 0.01)
+    monkeypatch.setattr(plugin.plugin_config, "global_model_daily_group_limit_enabled", False)
+    await plugin.handle_reply_logic(
+        "adaptive-request",
+        cast(Uninfo, SimpleNamespace(scene=SimpleNamespace(id=session_id, type=SceneType.GROUP), self_id="bot-1")),
+        cast(QryItrface, SimpleNamespace(get_members=AsyncMock(return_value=[]))),
+        cast(Bot, SimpleNamespace(self_id="bot-1")),
+        cast(Event, SimpleNamespace()),
+        "咕咕", "member-2", "Bob", False, False, None,
+    )
+    assert len(captured) == 1
+    assert agent.await_count == int(not stop_while_judging)
+    assert plugin.delivery_context.get() is None
 
 
 @pytest.mark.asyncio

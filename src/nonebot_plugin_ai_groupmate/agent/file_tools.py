@@ -18,6 +18,7 @@ from ..reply_guard import is_request_active
 from .file_content import SOURCE_SUFFIXES, read_table, decode_text, bounded_text, extract_html, image_preview, create_document, summarize_table, extract_document
 from .tool_results import tool_failure, tool_skipped, tool_success
 from .file_delivery import file_message
+from ..participation import record_group_delivery
 from .file_workspace import FileTaskError, FileWorkspace
 from .chat_file_inbox import ChatFileInbox
 
@@ -281,6 +282,7 @@ def create_file_tools(
             attempted_sends.add(file_id)
             started = True
             receipt = await message.send(target=send_target, fallback=False)
+            record_group_delivery(session_id)
             ids = getattr(receipt, "msg_ids", None) or []
             message_id = str(ids[-1].get("message_id") or ids[-1].get("msg_id") or "unknown") if ids and isinstance(ids[-1], dict) else "unknown"
             db_session.add(ChatHistory(session_id=session_id, user_id=bot_name, user_name=bot_name, content_type="bot",
