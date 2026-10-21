@@ -28,6 +28,7 @@ def deliver_message(monkeypatch):
     monkeypatch.setattr(plugin.plugin_config, "continuous_conversation_minutes", 5)
     plugin._continuous_conversation_until.clear()
     plugin.participation.states.clear()
+    plugin._observation_schedule.clear()
 
     async def deliver(
         session_id,
@@ -71,6 +72,7 @@ def deliver_message(monkeypatch):
     yield deliver, queued, images
     plugin._continuous_conversation_until.clear()
     plugin.participation.states.clear()
+    plugin._observation_schedule.clear()
 
 
 @pytest.mark.asyncio
@@ -95,10 +97,130 @@ async def test_only_new_group_text_feeds_affinity_with_public_api(deliver_messag
     assert note.call_count == 1
 
 
+@pytest.mark.asyncio
+async def test_ordinary_chat_is_counted_locally_and_only_due_looks_are_queued(deliver_message, monkeypatch):
+    import nonebot_plugin_ai_groupmate as plugin
+    from nonebot_plugin_ai_groupmate.observation import ObservationSchedule
+
+    deliver, queued, _ = deliver_message
+    now = [1000.0]
+    observer = ObservationSchedule(lambda: now[0], lambda: 2700)
+    monkeypatch.setattr(plugin, "_observation_schedule", observer)
+    monkeypatch.setattr(plugin.plugin_config, "proactive_observation_enabled", True)
+    monkeypatch.setattr(plugin, "resolve_group_reply_probability", lambda *_: 0.01)
+    gatekeeper, agent = AsyncMock(), AsyncMock()
+    monkeypatch.setattr(plugin, "check_if_should_reply", gatekeeper)
+    monkeypatch.setattr(plugin, "choice_response_strategy", agent)
+    for number in range(12):
+        await deliver("observation-inbound", str(number), f"最近听的第{number}首歌")
+    await deliver("observation-inbound", "11", "最近听的第11首歌")  # Duplicate.
+    await deliver("observation-inbound", "command", "/查看群API")
+    await deliver("observation-private", "private", "私聊不观察", is_private=True)
+    queued.reset_mock()  # Private delivery is an addressed request.
+    assert observer.watches[("bot-1", "observation-inbound")].messages == 12
+    assert len(observer.watches) == 1
+    await plugin._occasionally_observe_groups()
+    queued.assert_not_awaited()
+    gatekeeper.assert_not_awaited()
+    agent.assert_not_awaited()
+    now[0] += 2700
+    await deliver("observation-inbound", "latest", "这个谱面还挺好玩的")
+    await plugin._occasionally_observe_groups()
+    queued.assert_awaited_once()
+    request = queued.await_args.args[1]
+    assert request.proactive_observation
+    assert not request.is_tome
+    assert not request.is_continuous
+    assert request.reply_to_id is None
+    assert request.repeat_text is None
+    queued.reset_mock()
+    for _ in range(10):
+        await plugin._occasionally_observe_groups()
+    queued.assert_not_awaited()
+    gatekeeper.assert_not_awaited()
+    agent.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("suppressed", ["disabled", "probability_zero", "recent_reply", "recent_check", "disconnected", "stopped"])
+async def test_due_observation_respects_live_controls(deliver_message, monkeypatch, suppressed):
+    import nonebot_plugin_ai_groupmate as plugin
+    from nonebot_plugin_ai_groupmate.observation import ObservationSchedule
+    from nonebot_plugin_ai_groupmate.participation import ParticipationPolicy
+
+    deliver, queued, _ = deliver_message
+    now = [1000.0]
+    observer = ObservationSchedule(lambda: now[0], lambda: 2700)
+    monkeypatch.setattr(plugin, "_observation_schedule", observer)
+    monkeypatch.setattr(plugin, "participation", ParticipationPolicy(lambda: now[0]))
+    monkeypatch.setattr(plugin.plugin_config, "proactive_observation_enabled", True)
+    monkeypatch.setattr(plugin, "resolve_group_reply_probability", lambda *_: 0.01)
+    for number in range(12):
+        await deliver("observation-controls", str(number), f"第{number}条新聊天")
+    now[0] += 2700
+    await deliver("observation-controls", "latest", "继续这个话题")
+    if suppressed == "disabled":
+        monkeypatch.setattr(plugin.plugin_config, "proactive_observation_enabled", False)
+    elif suppressed == "probability_zero":
+        monkeypatch.setattr(plugin, "resolve_group_reply_probability", lambda *_: 0)
+    elif suppressed == "recent_reply":
+        plugin.participation.sent(("bot-1", "observation-controls"), proactive=False)
+    elif suppressed == "recent_check":
+        plugin.participation.state(("bot-1", "observation-controls")).last_check = now[0]
+    elif suppressed == "disconnected":
+        monkeypatch.setattr(plugin, "get_bots", lambda: {})
+    else:
+        await deliver("observation-controls", "stop", "别插话", addressed=True)
+    queued.reset_mock()
+    await plugin._occasionally_observe_groups()
+    queued.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_observation_uses_only_bounded_recent_text_and_can_be_disabled_inflight(deliver_message, monkeypatch):
+    from nonebot.adapters import Bot, Event
+    from nonebot_plugin_orm import get_session
+    from nonebot_plugin_uninfo import Uninfo, SceneType, QryItrface
+
+    import nonebot_plugin_ai_groupmate as plugin
+    from nonebot_plugin_ai_groupmate.model import ChatHistory
+    from nonebot_plugin_ai_groupmate.participation import observation_guard, group_delivery_allowed
+
+    session_id = "observation-bounded-context"
+    async with get_session() as db:
+        for number in range(30):
+            db.add(ChatHistory(session_id=session_id, user_id="member-1", user_name="Alice", content_type="text", content=f"第{number}条" + "聊天正文" * 300, created_at=datetime.datetime.now() - datetime.timedelta(seconds=60 - number)))
+        db.add(ChatHistory(session_id=session_id, user_id="member-1", user_name="Alice", content_type="image", content="图片不分析"))
+        db.add(ChatHistory(session_id="other-group", user_id="member-1", user_name="Alice", content_type="text", content="别的群不读取"))
+        await db.commit()
+    monkeypatch.setattr(plugin.plugin_config, "proactive_observation_enabled", True)
+    monkeypatch.setattr(plugin.plugin_config, "global_model_daily_group_limit_enabled", False)
+    monkeypatch.setattr(plugin, "resolve_group_reply_probability", lambda *_: 0.01)
+    gatekeeper, history_loader = AsyncMock(), AsyncMock()
+    monkeypatch.setattr(plugin, "check_if_should_reply", gatekeeper)
+    monkeypatch.setattr(plugin, "_load_agent_history", history_loader)
+
+    async def choose(db, group, request_id, history, *args, **kwargs):
+        assert len(history) == 20
+        assert all(row.session_id == session_id and row.content_type == "text" and len(row.content) <= 600 for row in history)
+        assert kwargs["proactive_observation"] is True
+        assert group_delivery_allowed(session_id)
+        monkeypatch.setattr(plugin.plugin_config, "proactive_observation_enabled", False)
+        assert not group_delivery_allowed(session_id)
+        return SimpleNamespace(need_reply=False, text=None)
+
+    agent = AsyncMock(side_effect=choose)
+    monkeypatch.setattr(plugin, "choice_response_strategy", agent)
+    await plugin.handle_reply_logic(
+        "observation-test", cast(Uninfo, SimpleNamespace(scene=SimpleNamespace(id=session_id, type=SceneType.GROUP), self_id="bot-1")),
+        cast(QryItrface, SimpleNamespace(get_members=AsyncMock(return_value=[]))), cast(Bot, SimpleNamespace(self_id="bot-1")),
+        cast(Event, SimpleNamespace()), "咕咕", "member-1", "Alice", False, False, None, proactive_observation=True,
+    )
+    agent.assert_awaited_once()
+    gatekeeper.assert_not_awaited()
+    history_loader.assert_not_awaited()
+    assert observation_guard.get() is None
+    assert plugin.delivery_context.get() is None
 
 
 @pytest.mark.asyncio
@@ -366,6 +488,54 @@ async def test_followup_refresh_requires_gatekeeper_acceptance(deliver_message, 
         agent.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stop_while_judging", [False, True])
+async def test_adaptive_reply_sees_bot_history_and_rechecks_stop(deliver_message, monkeypatch, stop_while_judging):
+    from nonebot.adapters import Bot, Event
+    from nonebot_plugin_orm import get_session
+    from nonebot_plugin_uninfo import Uninfo, SceneType, QryItrface
+
+    import nonebot_plugin_ai_groupmate as plugin
+    from nonebot_plugin_ai_groupmate.model import ChatHistory
+
+    deliver, _, _ = deliver_message
+    session_id = f"adaptive-history-{stop_while_judging}"
+    key = ("bot-1", session_id)
+    async with get_session() as db:
+        db.add(ChatHistory(session_id=session_id, user_id="bot-1", user_name="咕咕", content_type="bot", content="先把大任务拆成三个步骤。"))
+        await db.commit()
+    await deliver(session_id, "1", "你刚才说的三个步骤怎么分？", user_id="member-2")
+    captured = []
+
+    async def gatekeeper(history, current, *args, **kwargs):
+        captured.append(history)
+        assert "[Bot]" in history
+        assert "先把大任务拆成三个步骤" in history
+        assert "member-2" in history
+        assert "三个步骤怎么分" in current
+        assert kwargs["participation_context"]
+        assert "affinity_review" not in kwargs
+        if stop_while_judging:
+            plugin.participation.observe(key, addressed=False, disengaged=True)
+        kwargs["on_continuation"]()
+        return True
+
+    agent = AsyncMock(return_value=SimpleNamespace(need_reply=False, text=None))
+    monkeypatch.setattr(plugin, "check_if_should_reply", gatekeeper)
+    monkeypatch.setattr(plugin, "choice_response_strategy", agent)
+    monkeypatch.setattr(plugin, "resolve_group_reply_probability", lambda _: 0.01)
+    monkeypatch.setattr(plugin.plugin_config, "global_model_daily_group_limit_enabled", False)
+    await plugin.handle_reply_logic(
+        "adaptive-request",
+        cast(Uninfo, SimpleNamespace(scene=SimpleNamespace(id=session_id, type=SceneType.GROUP), self_id="bot-1")),
+        cast(QryItrface, SimpleNamespace(get_members=AsyncMock(return_value=[]))),
+        cast(Bot, SimpleNamespace(self_id="bot-1")),
+        cast(Event, SimpleNamespace()),
+        "咕咕", "member-2", "Bob", False, False, None,
+    )
+    assert len(captured) == 1
+    assert agent.await_count == int(not stop_while_judging)
+    assert plugin.delivery_context.get() is None
 
 
 @pytest.mark.asyncio

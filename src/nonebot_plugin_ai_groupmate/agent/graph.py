@@ -94,6 +94,8 @@ class AgentRunLimits:
     tool_timeout_seconds: float = 30.0
     max_parallel_tools: int = 4
     tool_result_max_chars: int = 6_000
+    max_replies: int = MAX_REPLY_COUNT
+    finalize_on_budget_exhaustion: bool = True
 
 
 @dataclass(frozen=True)
@@ -848,7 +850,7 @@ def _make_agent_node(
                     f"call={call_number} corrections={rejected_progress_replies}"
                 )
                 if rejected_progress_replies >= 2 or call_number >= limits.max_llm_calls or total_tokens >= limits.max_total_tokens:
-                    response = AIMessage(content=INCOMPLETE_REPLY_FALLBACK)
+                    response = AIMessage(content=INCOMPLETE_REPLY_FALLBACK if limits.finalize_on_budget_exhaustion else "")
                     break
                 # Nothing in this batch has run yet. Resolve every tool-call ID
                 # before retrying, including a simultaneous premature finish.
@@ -1671,8 +1673,14 @@ def _should_continue(state: AgentState, limits: AgentRunLimits) -> str:
     if state.get("called_finish", 0) > 0:
         logger.info(f"[AgentTrace] 结束 session={state['session_id']} reason=finish")
         return "end"
-    if state.get("reply_count", 0) >= MAX_REPLY_COUNT:
+    if state.get("reply_count", 0) >= limits.max_replies:
         logger.info("[Agent] 已达最大回复次数，结束本轮对话")
+        return "end"
+    if not limits.finalize_on_budget_exhaustion and (
+        state.get("tool_count", 0) >= MAX_TOOL_COUNT
+        or state.get("llm_call_count", 0) >= limits.max_llm_calls
+        or state.get("llm_total_tokens", 0) >= limits.max_total_tokens
+    ):
         return "end"
     if (
         (state.get("reply_count", 0) == 0 or state.get("reply_requires_continuation", False))

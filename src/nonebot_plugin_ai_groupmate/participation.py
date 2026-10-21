@@ -138,6 +138,7 @@ participation = ParticipationPolicy()
 delivery_context: ContextVar[tuple[tuple[str, str], bool] | None] = ContextVar(
     "group_participation_delivery", default=None
 )
+observation_guard: ContextVar[Callable[[], bool] | None] = ContextVar("group_observation_guard", default=None)
 
 
 def record_group_delivery(session_id: str) -> None:
@@ -148,6 +149,9 @@ def record_group_delivery(session_id: str) -> None:
 
 def group_delivery_allowed(session_id: str) -> bool:
     context = delivery_context.get()
+    guard = observation_guard.get()
+    if context is not None and context[0][1] == session_id and guard is not None and not guard():
+        return False
     if context is None or not context[1] or context[0][1] != session_id:
         return True
     state = participation.state(context[0])

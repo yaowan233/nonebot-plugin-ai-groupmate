@@ -11,7 +11,7 @@ from typing import Any
 from pathlib import Path
 from functools import lru_cache
 from collections import deque
-from dataclasses import field, dataclass
+from dataclasses import field, replace, dataclass
 
 import jieba
 from nonebot import logger, require, get_bots, on_notice, get_driver, on_command, on_message
@@ -64,13 +64,14 @@ from .memory import (
     CollectionEmbeddingConfigMismatchError,
 )
 from .concurrency import agent_run_gate, maintenance_gate, background_image_gate
+from .observation import RECENT_PARTICIPATION_SECONDS, ObservationSchedule
 from .reply_guard import (
     activate_request_id,
     deactivate_request_id,
     set_latest_request_id,
 )
 from .media_message import format_media_markers
-from .participation import participation, delivery_context
+from .participation import participation, delivery_context, observation_guard
 from .agent.reaction import is_onebot_context
 from .group_affinity import note_group_activity, load_group_affinities
 from .runtime_config import (
@@ -151,6 +152,8 @@ def get_tagging_model():
 
 
 def _refresh_runtime_resources(_changed_fields: set[str]) -> None:
+    if "proactive_observation_enabled" in _changed_fields and not plugin_config.proactive_observation_enabled:
+        _observation_schedule.clear()
     get_tagging_model.cache_clear()
     from .agent import refresh_runtime_resources as refresh_agent_resources
     from .group_memory import get_summary_model
@@ -309,6 +312,48 @@ class ReplyRequest:
     proactive_reaction_only: bool = False
     reaction_required: bool = False
     repeat_text: str | None = None
+    proactive_observation: bool = False
+
+
+_observation_schedule: ObservationSchedule[ReplyRequest] = ObservationSchedule()
+
+
+def _observation_enabled(key: tuple[str, str]) -> bool:
+    watch = _observation_schedule.watches.get(key)
+    return (
+        plugin_config.proactive_observation_enabled
+        and (watch is None or not watch.paused)
+        and key[0] in get_bots()
+        and resolve_group_reply_probability(key[1]) > 0
+    )
+
+
+def _observation_allowed(key: tuple[str, str]) -> bool:
+    return (
+        _observation_enabled(key)
+        and participation.clock() - participation.state(key).last_sent >= RECENT_PARTICIPATION_SECONDS
+        and participation.clock() - participation.state(key).last_check >= 300
+        and participation.can_reply(key)
+    )
+
+
+@scheduler.scheduled_job("interval", minutes=1, max_instances=1, coalesce=True, id="ai_groupmate_observe_groups")
+async def _occasionally_observe_groups() -> None:
+    if not plugin_config.proactive_observation_enabled:
+        _observation_schedule.clear()
+        return
+    request = _observation_schedule.take_due(_observation_allowed)
+    if request is not None:
+        try:
+            await _queue_group_reply_request(request.session.scene.id, replace(
+                request, request_id=f"observation:{request.session.scene.id}:{time.monotonic()}",
+                is_tome=False, is_continuous=False, reply_to_id=None,
+                proactive_meme_only=False, meme_required=False, meme_send_count=1,
+                proactive_reaction_only=False, reaction_required=False, repeat_text=None,
+                proactive_observation=True,
+            ))
+        except Exception:
+            logger.exception("主动查看群聊未能入队，等待下次机会")
 
 
 @dataclass
@@ -391,7 +436,7 @@ def _sample_proactive_reply_modes(
 ) -> tuple[bool, bool, bool]:
     """返回（普通回复、reaction 专用、图片表情专用）。
 
-    群聊按短期参与状态积累普通接话机会；不单独采样 reaction 或图片表情，
+    群聊先在本地以低概率独立抽样；不单独采样 reaction 或图片表情，
     避免对每条普通消息额外调用 Gatekeeper 和主模型。
     """
     if addressed or continuous:
@@ -676,6 +721,7 @@ async def _execute_reply_request(request: ReplyRequest) -> None:
             getattr(request, "proactive_reaction_only", False),
             getattr(request, "reaction_required", False),
             getattr(request, "repeat_text", None),
+            getattr(request, "proactive_observation", False),
         )
 
 
@@ -732,6 +778,11 @@ async def _queue_group_reply_request(
     async with _group_reply_state_lock:
         reply_state = _group_reply_states.setdefault(group_id, GroupReplyState())
         active_is_addressed = bool(reply_state.addressed_tasks)
+
+        if getattr(request, "proactive_observation", False) and (
+            active_is_addressed or reply_state.addressed or reply_state.running or reply_state.latest is not None
+        ):
+            return False
 
         if _is_addressed_reply_request(request):
             addressed_count = len(reply_state.addressed) + len(
@@ -1178,7 +1229,13 @@ async def handle_message(
     # Always keep the real sender identity so bound custom tools can resolve
     # requests such as "查询我的成绩" without asking the model for an ID.
     user_id = session.user.id
-    if should_reply:
+    track_observation = (
+        plugin_config.proactive_observation_enabled and is_group and is_new_text_message
+        and bool(stripped_plain_text) and not command_like and not sender_is_connected_bot
+        and (explicit_to_me or disengaged or (not has_at_mention and not reply_id))
+        and resolve_group_reply_probability(session.scene.id) > 0
+    )
+    if should_reply or track_observation:
         group_id = session.scene.id
         request = ReplyRequest(
             request_id=f"{group_id}:{datetime.datetime.now().timestamp()}:{random.random()}",
@@ -1199,7 +1256,10 @@ async def handle_message(
             reaction_required=reaction_required,
             repeat_text=repeat_text if repeat_reply_sample else None,
         )
-        await _queue_group_reply_request(group_id, request)
+        if track_observation:
+            _observation_schedule.note((bot_id, group_id), request, addressed=explicit_to_me, disengaged=disengaged)
+        if should_reply:
+            await _queue_group_reply_request(group_id, request)
 
     await db_session.commit()
 
@@ -1453,6 +1513,7 @@ async def handle_reply_logic(
     proactive_reaction_only: bool = False,
     reaction_required: bool = False,
     repeat_text: str | None = None,
+    proactive_observation: bool = False,
 ):
     """处理回复逻辑"""
     is_private = session.scene.type == SceneType.PRIVATE
@@ -1461,6 +1522,8 @@ async def handle_reply_logic(
     delivery_token = delivery_context.set(
         None if is_private else (participation_key, autonomous)
     )
+    observation_token = observation_guard.set((lambda: _observation_enabled(participation_key)) if proactive_observation else None)
+    previous_sent = participation.state(participation_key).last_sent
     group_quota_limit = plugin_config.global_model_daily_group_limit
     private_quota_limit = plugin_config.global_model_daily_private_user_limit
     uses_global_model_quota = (
@@ -1476,6 +1539,8 @@ async def handle_reply_logic(
         and not has_private_model_config(user_id)
     )
     try:
+        if proactive_observation and (is_private or not _observation_allowed(participation_key)):
+            return
         if autonomous and (
             resolve_group_reply_probability(session.scene.id) <= 0
             or not participation.can_reply(participation_key)
@@ -1541,21 +1606,27 @@ async def handle_reply_logic(
                     else None
                 )
             )
+            recent_query = Select(ChatHistory).where(ChatHistory.session_id == session.scene.id)
+            if proactive_observation:
+                recent_query = recent_query.where(
+                    ChatHistory.created_at >= datetime.datetime.now() - datetime.timedelta(hours=1),
+                    ChatHistory.content_type.in_(("text", "bot")),
+                    ChatHistory.media_id.is_(None),
+                )
             recent_msgs = (
                 (
                     await history_session.execute(
-                        Select(ChatHistory)
-                        .where(
-                            ChatHistory.session_id == session.scene.id,
-                        )
+                        recent_query
                         .order_by(ChatHistory.msg_id.desc())
-                        .limit(12)
+                        .limit(20 if proactive_observation else 12)
                     )
                 )
                 .scalars()
                 .all()
             )
             recent_msgs = [ChatHistorySchema.model_validate(row) for row in recent_msgs[::-1]]
+            if proactive_observation:
+                recent_msgs = [row.model_copy(update={"content": row.content[:600]}) for row in recent_msgs]
             await history_session.commit()
 
         if quota_status is not None and not quota_status.allowed:
@@ -1598,6 +1669,8 @@ async def handle_reply_logic(
         latest_human = next((m for m in reversed(recent_msgs) if m.content_type != "bot"), None)
         if latest_human is None:
             return
+        if proactive_observation and latest_human.created_at < datetime.datetime.now() - datetime.timedelta(minutes=15):
+            return
         current_msg_text = latest_human.content[:1200] if latest_human.content_type == "text" else "[图片/表情包。除非用户明确在问这张图、@bot、回复bot或正在延续图片话题，否则通常不需要回应]"
         gatekeeper_msg_text = current_msg_text
         if is_continuous:
@@ -1608,7 +1681,7 @@ async def handle_reply_logic(
             gatekeeper_msg_text = f"这条群消息命中了低概率主动表情包采样。只要一张表情包能大致作为群友式接梗、吐槽或情绪反应就可以回复，允许轻微偏题，不要求完全精确；认真求助、事实问题、敏感/沉重话题、真实冲突、他人之间的定向对话，以及普通到没有反应价值的消息都应保持沉默。\n{current_msg_text}"
 
         # === Gatekeeper 判断 ===
-        if not is_tome and repeat_text is None:
+        if not is_tome and repeat_text is None and not proactive_observation:
             observed_sent = participation.state(participation_key).last_sent
             should_reply = await check_if_should_reply(
                 history_summary,
@@ -1631,12 +1704,18 @@ async def handle_reply_logic(
                 return
 
         # === 获取详细历史给 Agent ===
-        async with get_session() as history_session:
-            last_msg = await _load_agent_history(history_session, session.scene.id)
-            await history_session.commit()
+        if proactive_observation:
+            last_msg = recent_msgs
+        else:
+            async with get_session() as history_session:
+                last_msg = await _load_agent_history(history_session, session.scene.id)
+                await history_session.commit()
 
         if not last_msg:
             logger.info("没有历史消息，跳过回复")
+            return
+
+        if proactive_observation and not _observation_allowed(participation_key):
             return
 
         # A matching window is only a candidate. Refresh it after Gatekeeper
@@ -1694,8 +1773,8 @@ async def handle_reply_logic(
                     return
 
         role_map: dict[str, str] = {}
-        group_members: list[Any] | None = None
-        if not is_private:
+        group_members: list[Any] | None = [] if proactive_observation else None
+        if not is_private and not proactive_observation:
             try:
                 group_members = list(await interface.get_members(SceneType.GROUP, session.scene.id))
                 for member in group_members:
@@ -1705,6 +1784,10 @@ async def handle_reply_logic(
             except Exception as e:
                 logger.warning(f"获取群成员身份信息失败，降级为无身份标注: {e}")
 
+        if proactive_observation:
+            if not _observation_allowed(participation_key):
+                return
+            participation.state(participation_key).last_check = participation.clock()
         logger.info("开始调用Agent决策...")
         try:
             async with get_session() as tool_session:
@@ -1722,7 +1805,7 @@ async def handle_reply_logic(
                         session.self_id,  # 传递bot的ID
                         reply_to_id,
                         bot,
-                        event,
+                        None if proactive_observation else event,
                         is_private=is_private,
                         group_members=group_members,
                         proactive_meme_only=proactive_meme_only,
@@ -1731,6 +1814,7 @@ async def handle_reply_logic(
                         proactive_reaction_only=proactive_reaction_only,
                         reaction_required=reaction_required,
                         repeat_text=repeat_text,
+                        proactive_observation=proactive_observation,
                     ),
                     timeout=plugin_config.agent_timeout_seconds,
                 )
@@ -1765,6 +1849,9 @@ async def handle_reply_logic(
         logger.error(f"回复逻辑执行失败: {e}")
         print(traceback.format_exc())
     finally:
+        if not is_private and participation.state(participation_key).last_sent > previous_sent:
+            _observation_schedule.participated(participation_key)
+        observation_guard.reset(observation_token)
         delivery_context.reset(delivery_token)
 
 

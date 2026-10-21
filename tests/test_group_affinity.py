@@ -144,7 +144,7 @@ async def test_ineligible_judgment_keeps_its_original_token_budget(monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("mode", ["normal", "private", "meme", "reaction", "repeat"])
+@pytest.mark.parametrize("mode", ["normal", "private", "meme", "reaction", "repeat", "observation"])
 async def test_main_review_uses_full_loaded_context_and_only_normal_group_turns(monkeypatch, isolated_affinity, mode):
     from types import SimpleNamespace
 
@@ -172,13 +172,21 @@ async def test_main_review_uses_full_loaded_context_and_only_normal_group_turns(
         SimpleNamespace(commit=AsyncMock()), key[1], None, "user", "User", history=history, bot_id=key[0],
         is_private=mode == "private", proactive_meme_only=mode == "meme", proactive_reaction_only=mode == "reaction",
         repeat_text="哈哈哈" if mode == "repeat" else None,
+        proactive_observation=mode == "observation",
     )
-    if mode == "normal":
+    if mode in {"normal", "observation"}:
         prepare.assert_awaited_once_with(key[0], key[1], history, None)
         assert captured["terminal_metadata"] is metadata
         assert "主循环感受更新说明" in context
         assert "已有群文化档案" in context
         assert any(personality in str(message.content) for message in captured["system"])
+        if mode == "observation":
+            assert {tool.name for tool in captured["base_tools"]} == {"reply_user", "finish"}
+            assert captured["tools_by_skill"] == {}
+            assert captured["builtin_tools"] == []
+            assert captured["limits"].max_replies == 1
+            assert captured["limits"].max_llm_calls <= 2
+            assert not captured["limits"].finalize_on_budget_exhaustion
     else:
         prepare.assert_not_awaited()
         assert captured["terminal_metadata"] is None

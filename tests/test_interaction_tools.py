@@ -147,7 +147,7 @@ async def test_expired_request_does_not_read_database(monkeypatch):
         assert (await invoke(tool))["status"] == "skipped"
 
 
-@pytest.mark.parametrize("mode", ["group", "private", "repeat", "reaction", "meme"])
+@pytest.mark.parametrize("mode", ["group", "private", "repeat", "reaction", "meme", "observation"])
 def test_history_tools_visible_on_first_group_turn_without_loading_a_skill(mode):
     """Exercise the production registration and first-turn tool selection."""
     from nonebot_plugin_ai_groupmate.agent import interaction_tools
@@ -164,7 +164,7 @@ def test_history_tools_visible_on_first_group_turn_without_loading_a_skill(mode)
             nodes.append(node)
     env: dict[str, Any] = {node.id: SimpleNamespace(name=node.id) for statement in nodes for node in ast.walk(statement) if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)}
     env.update(
-        is_private=mode == "private", proactive_meme_only=mode == "meme", proactive_reaction_only=mode == "reaction",
+        is_private=mode == "private", proactive_meme_only=mode == "meme", proactive_reaction_only=mode == "reaction", proactive_observation=mode == "observation",
         repeat_text="跟读" if mode == "repeat" else None, meme_similar_enabled=False, reaction_enabled=True,
         web_image_tools=[], file_tools=[], custom_agent_tools=[], lazy_attachment_tools=[],
         create_explicit_memory_tools=lambda *_: [], create_interaction_history_tools=interaction_tools.create_interaction_history_tools,

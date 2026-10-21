@@ -11,6 +11,7 @@ from .deepseek import DeepSeekChatOpenAI, is_deepseek_endpoint
 class ScopedConfig(BaseModel):
     bot_name: str = "bot"
     reply_probability: float = 0.01
+    proactive_observation_enabled: bool = True
     global_model_daily_group_limit_enabled: bool = True
     global_model_daily_group_limit: int = Field(
         default=50,
