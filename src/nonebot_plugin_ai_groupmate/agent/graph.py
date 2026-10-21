@@ -6,7 +6,7 @@ import asyncio
 import hashlib
 from typing import Any, Annotated, TypedDict
 from dataclasses import dataclass
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Sequence, Awaitable
 
 from nonebot.log import logger
 from langchain.tools import ToolRuntime
@@ -31,7 +31,7 @@ MAX_REPLY_COUNT = 5
 MAX_TOOL_COUNT = 30
 MAX_REPLY_PER_ROUND = 1  # 每轮只发1条，强制模型逐条思考，上下文连续
 MAX_REACTION_PER_ROUND = 3
-TAVILY_TOOL_NAMES = frozenset({"search_web", "search_web_images"})
+WEB_SEARCH_TOOL_NAMES = frozenset({"search_web", "search_web_images"})
 PARALLEL_SAFE_TOOL_NAMES = frozenset({
     "calculate_expression",
     "qwen_code_interpreter",
@@ -75,6 +75,15 @@ SIDE_EFFECT_TOOL_NAMES = frozenset({
 })
 
 ContentBlock = str | dict[str, Any]
+
+
+@dataclass(frozen=True)
+class TerminalMetadata:
+    """Optional private metadata attached to an existing terminal action."""
+
+    argument_name: str
+    schema: dict[str, Any]
+    on_complete: Callable[[object], Awaitable[None]]
 
 
 @dataclass(frozen=True)
@@ -654,33 +663,49 @@ def _bind_model_tools(
     model: Any,
     visible_tools: list[BaseTool],
     builtin_tools: Sequence[dict[str, Any]],
+    terminal_metadata: TerminalMetadata | None = None,
 ) -> Any:
-    if not builtin_tools:
+    if not builtin_tools and terminal_metadata is None:
         return model.bind_tools(visible_tools)
 
     # langchain-openai only recognizes OpenAI's built-in tool names. DashScope
     # adds web_extractor/web_search_image/image_search, so bypass bind_tools'
     # allowlist after converting the bot's local functions ourselves.
     formatted_local_tools = [convert_to_openai_tool(tool) for tool in visible_tools]
+    if terminal_metadata is not None:
+        for tool_schema in formatted_local_tools:
+            function = tool_schema.get("function", {})
+            if function.get("name") in {"reply_user", "finish"}:
+                function.setdefault("parameters", {}).setdefault("properties", {})[terminal_metadata.argument_name] = terminal_metadata.schema
+    if not builtin_tools:
+        return model.bind_tools(formatted_local_tools)
     return model.bind(tools=[*formatted_local_tools, *builtin_tools])
 
 
-def _tavily_quota_failure(messages: Sequence[BaseMessage]) -> str | None:
-    """A confirmed quota failure disables both Tavily tools for this request."""
+def _web_search_quota_failures(messages: Sequence[BaseMessage]) -> dict[str, str]:
+    """Only disable tools sharing the exhausted provider, within this request."""
     calls: dict[str, str] = {}
-    failure = None
+    failures: dict[str, str] = {}
     for message in messages:
         if isinstance(message, HumanMessage):
             calls.clear()
-            failure = None
+            failures.clear()
         elif isinstance(message, AIMessage):
             calls.update({call["id"]: call["name"] for call in message.tool_calls if call["id"] is not None})
-        elif isinstance(message, ToolMessage) and calls.get(message.tool_call_id) in TAVILY_TOOL_NAMES:
+        elif isinstance(message, ToolMessage) and calls.get(message.tool_call_id) in WEB_SEARCH_TOOL_NAMES:
             if isinstance(message.content, str):
                 result = parse_tool_result(message.content)
                 if result and result.get("status") == "failed" and result.get("reason_code") == "quota_exhausted":
-                    failure = message.content
-    return failure
+                    provider = (result.get("data") or {}).get("provider", "tavily")
+                    failures[provider] = message.content
+    return failures
+
+
+def _search_tool_quota_failure(tool: BaseTool | None, failures: dict[str, str]) -> str | None:
+    if tool is None or tool.name not in WEB_SEARCH_TOOL_NAMES:
+        return None
+    provider = (tool.metadata or {}).get("search_provider", "tavily")
+    return failures.get(provider)
 
 
 def _image_search_allowed_tools(messages: Sequence[BaseMessage]) -> set[str] | None:
@@ -715,6 +740,7 @@ def _make_agent_node(
     limits: AgentRunLimits,
     request_kwargs_factory: Callable[[str], dict[str, Any]] | None = None,
     builtin_tools: Sequence[dict[str, Any]] = (),
+    terminal_metadata: TerminalMetadata | None = None,
 ) -> Any:
     system_messages = normalize_system_messages(system_prompt)
     bound_models: dict[tuple[str, ...], Any] = {}
@@ -725,8 +751,8 @@ def _make_agent_node(
             tools_by_skill,
             state.get("active_skills", []),
         )
-        if _tavily_quota_failure(state["messages"]) is not None:
-            visible_tools = [tool for tool in visible_tools if tool.name not in TAVILY_TOOL_NAMES]
+        quota_failures = _web_search_quota_failures(state["messages"])
+        visible_tools = [tool for tool in visible_tools if _search_tool_quota_failure(tool, quota_failures) is None]
         image_search_tools = _image_search_allowed_tools(state["messages"])
         if image_search_tools is not None:
             visible_tools = [tool for tool in visible_tools if tool.name in image_search_tools]
@@ -736,7 +762,7 @@ def _make_agent_node(
             # Provider-side Responses tools execute inside the model request and
             # therefore must be bound to the model, but not registered in the
             # local tool node.
-            bound_model = _bind_model_tools(model, visible_tools, builtin_tools if image_search_tools is None else ())
+            bound_model = _bind_model_tools(model, visible_tools, builtin_tools if image_search_tools is None else (), terminal_metadata)
             bound_models[tool_names] = bound_model
         full: list[BaseMessage] = system_messages + [HumanMessage(content=COMPLETION_RULE)] + list(state["messages"])
         if image_search_tools is not None:
@@ -981,7 +1007,15 @@ def _make_tool_node(
     image_summarizer: Any | None = None,
     required_side_effect_tool: str | None = None,
     required_side_effect_count: int = 1,
+    terminal_metadata: TerminalMetadata | None = None,
 ):
+    async def observe_terminal(value: object) -> None:
+        if terminal_metadata is not None:
+            try:
+                await asyncio.wait_for(terminal_metadata.on_complete(value), timeout=min(5.0, limits.tool_timeout_seconds))
+            except Exception:
+                logger.exception("保存本轮内部状态失败，保留原有对话结果")
+
     async def tool_node(state: AgentState) -> dict:
         messages = state["messages"]
         last_message = messages[-1]
@@ -1062,6 +1096,8 @@ def _make_tool_node(
                         )
                         logger.info(f"[Agent] 已兜底发送模型直接回复: {result}")
                         reply_count += 1
+                        if _tool_result_status(_normalize_tool_result(result)[0]) in {None, "succeeded"}:
+                            await observe_terminal(None)
                     except Exception as e:
                         logger.error(f"[Agent] 兜底发送模型直接回复失败: {e}")
             return {
@@ -1090,7 +1126,10 @@ def _make_tool_node(
         for tc_index, tc in enumerate(tool_calls):
             name: str = tc["name"]
             tool_call_id = tc.get("id") or ""
-            args: dict[str, Any] = tc.get("args", {})
+            args: dict[str, Any] = dict(tc.get("args", {}))
+            metadata_value: object = None
+            if terminal_metadata is not None and name in {"reply_user", "finish"}:
+                metadata_value = args.pop(terminal_metadata.argument_name, None)
 
             await _recover_db_session(db_session)
 
@@ -1105,8 +1144,9 @@ def _make_tool_node(
                 continue
             tool_count += 1
 
-            quota_failure = _tavily_quota_failure([*state["messages"], *results])
-            if name in TAVILY_TOOL_NAMES and tc_index not in parallel_outcomes:
+            quota_failures = _web_search_quota_failures([*state["messages"], *results])
+            quota_failure = _search_tool_quota_failure(tools_by_name.get(name), quota_failures)
+            if name in WEB_SEARCH_TOOL_NAMES and tc_index not in parallel_outcomes:
                 if quota_failure is not None:
                     results.append(ToolMessage(content=quota_failure, tool_call_id=tool_call_id))
                     continue
@@ -1174,6 +1214,7 @@ def _make_tool_node(
                     continue
                 called_finish += 1
                 results.append(ToolMessage(content="", tool_call_id=tool_call_id))
+                await observe_terminal(metadata_value)
                 break
 
             if request_id and not await is_request_active(session_id, request_id):
@@ -1298,7 +1339,7 @@ def _make_tool_node(
                     candidate_name = str(candidate_call.get("name", ""))
                     if candidate_name not in PARALLEL_SAFE_TOOL_NAMES:
                         break
-                    if candidate_name in TAVILY_TOOL_NAMES and quota_failure is not None:
+                    if _search_tool_quota_failure(tools_by_name.get(candidate_name), quota_failures) is not None:
                         break
                     if candidate_name not in visible_tool_names:
                         continue
@@ -1491,6 +1532,8 @@ def _make_tool_node(
                             if tool_status in {None, "succeeded"}
                             else False
                         )
+                        if tool_status in {None, "succeeded"} and not reply_requires_continuation:
+                            await observe_terminal(metadata_value)
                 if name == "load_agent_skill" and tool_status != "failed":
                     skill_name = str(args.get("skill_name", "")).strip()
                     if skill_name in tools_by_skill and skill_name not in active_skills:
@@ -1690,6 +1733,7 @@ def build_chat_graph(
     required_side_effect_count: int = 1,
     request_kwargs_factory: Callable[[str], dict[str, Any]] | None = None,
     builtin_tools: Sequence[dict[str, Any]] = (),
+    terminal_metadata: TerminalMetadata | None = None,
 ) -> Any:
     tools_by_name: dict[str, BaseTool] = {t.name: t for t in tools}
     base_tools = list(base_tools) if base_tools is not None else list(tools)
@@ -1707,6 +1751,7 @@ def build_chat_graph(
             limits,
             request_kwargs_factory,
             builtin_tools,
+            terminal_metadata,
         ),
     )
     builder.add_node(
@@ -1721,6 +1766,7 @@ def build_chat_graph(
             image_summarizer=image_summarizer,
             required_side_effect_tool=required_side_effect_tool,
             required_side_effect_count=required_side_effect_count,
+            terminal_metadata=terminal_metadata,
         ),
     )
     builder.add_node(

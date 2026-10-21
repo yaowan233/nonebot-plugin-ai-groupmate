@@ -415,6 +415,89 @@ def test_calculate_expression_returns_shared_protocol():
 
 
 @pytest.mark.asyncio
+async def test_deepseek_search_uses_official_api_and_normalizes_summary(monkeypatch):
+    import httpx
+
+    from nonebot_plugin_ai_groupmate.agent import common_tools, deepseek_search
+
+    requests = []
+
+    def respond(request):
+        requests.append(request)
+        return httpx.Response(200, json={"results": [{
+            "title": "官方公告", "url": "https://example.com/news", "summary": "摘要" * 1000,
+            "snippet": "短片段", "content": "", "date": "2026-10-16T00:00:00Z", "rerank_score": 2.4,
+        }]})
+
+    client = httpx.AsyncClient
+    monkeypatch.setattr(deepseek_search.httpx, "AsyncClient", lambda **kwargs: client(transport=httpx.MockTransport(respond), **kwargs))
+    search = common_tools.create_search_web_tool("unused-tavily", provider="deepseek", deepseek_api_key="sk-test")
+    result = await _invoke_search(search, common_tools, query="公告", topic="news", include_domains=["Example.com"], start_date="2026-10-01")
+    assert str(requests[0].url) == "https://api.deepseek.com/v1/tools/search"
+    assert requests[0].headers["authorization"] == "Bearer sk-test"
+    assert json.loads(requests[0].content) == {"query": "公告 site:example.com after:2026-10-01", "count": 3, "need_content": False}
+    assert result["data"]["provider"] == "deepseek"
+    assert result["data"]["results"][0] == {
+        "title": "官方公告", "url": "https://example.com/news", "content": "摘要" * 600,
+        "published_date": "2026-10-16T00:00:00Z", "score": 2.4,
+    }
+    assert search.metadata == {"search_provider": "deepseek"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("status", "reason", "retryable"), [
+    (401, "authentication_failed", False), (402, "quota_exhausted", False),
+    (429, "rate_limited", False), (503, "provider_error", True),
+])
+async def test_deepseek_search_sanitizes_errors_and_retains_provider(monkeypatch, status, reason, retryable):
+    import httpx
+
+    from nonebot_plugin_ai_groupmate.agent import common_tools, deepseek_search
+
+    client = httpx.AsyncClient
+    transport = httpx.MockTransport(lambda _: httpx.Response(status, json={"error": "sk-private-value"}, headers={"retry-after": "5"}))
+    monkeypatch.setattr(deepseek_search.httpx, "AsyncClient", lambda **kwargs: client(transport=transport, **kwargs))
+    result = await _invoke_search(common_tools.create_search_web_tool(None, provider="deepseek", deepseek_api_key="sk-private-value"), common_tools)
+    assert result["reason_code"] == reason
+    assert result["retryable"] is retryable
+    assert result["data"]["provider"] == "deepseek"
+    assert result["data"]["http_status"] == status
+    assert result["data"]["retry_after_seconds"] == 5
+    assert "sk-private-value" not in json.dumps(result)
+    assert "Tavily" not in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_deepseek_search_requires_its_own_key_and_rejects_long_queries():
+    from nonebot_plugin_ai_groupmate.agent import common_tools
+
+    result = await _invoke_search(common_tools.create_search_web_tool("tavily-key", provider="deepseek"), common_tools)
+    assert result["reason_code"] == "not_configured"
+    assert "DeepSeek" in result["message"]
+    search = common_tools.create_search_web_tool(None, provider="deepseek", deepseek_api_key="test")
+    result = await _invoke_search(search, common_tools, query="字" * 129)
+    assert result["reason_code"] == "invalid_query"
+    assert result["retryable"] is False
+
+
+def test_deepseek_filters_are_validated_and_combined_without_losing_keywords():
+    import datetime
+
+    from nonebot_plugin_ai_groupmate.agent.deepseek_search import SearchFilterError, build_search_query
+
+    after = (datetime.date.today() - datetime.timedelta(days=7)).isoformat()
+    query = build_search_query({"query": "DeepSeek 更新", "include_domains": ["example.com", "example.org"], "time_range": "week", "start_date": "2020-01-01"})
+    assert query == f"DeepSeek 更新 site:example.com OR site:example.org after:{after}"
+    assert build_search_query({"query": "字" * 128}) == "字" * 128
+    with pytest.raises(SearchFilterError):
+        build_search_query({"query": "字" * 120, "include_domains": ["example.com"]})
+    with pytest.raises(SearchFilterError):
+        build_search_query({"query": "test", "include_domains": ["example.com OR other.com"]})
+    with pytest.raises(SearchFilterError):
+        build_search_query({"query": "test", "start_date": "2026-10-02", "end_date": "2026-10-01"})
+
+
+@pytest.mark.asyncio
 async def test_search_history_context_returns_shared_protocol(monkeypatch):
     from nonebot_plugin_ai_groupmate.agent import common_tools
 

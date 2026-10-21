@@ -150,6 +150,8 @@ SETTING_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         "联网搜索立即生效；Qdrant 服务端须为 1.16 或更高版本；Qdrant、Embedding 与 Rerank 连接配置重启后生效；注意：修改 Embedding 模型或者维度后需要人工重建向量。",
         (
             "tavily_api_key",
+            "web_search_provider",
+            "deepseek_search_api_key",
             "qdrant_uri",
             "qdrant_api_key",
             "embedding_api_key",
@@ -190,7 +192,7 @@ SETTING_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
 
 _DIRECT_LABELS = {
     "bot_name": "Bot 名称",
-    "reply_probability": "主动参与倾向（0 关闭）",
+    "reply_probability": "主动接话抽样概率（0 关闭）",
     "global_model_daily_group_limit_enabled": "启用每群每日公共模型额度",
     "global_model_daily_group_limit": "每群每日公共模型额度（0 为不限）",
     "global_model_daily_private_user_limit_enabled": "启用每人每日私聊公共模型额度",
@@ -242,6 +244,8 @@ _DIRECT_LABELS = {
     "google_web_detection_timeout_seconds": "反向搜图超时（秒）",
     "google_web_detection_max_results": "每类最大结果数",
     "tavily_api_key": "Tavily API Key",
+    "web_search_provider": "网页搜索服务（Tavily / DeepSeek）",
+    "deepseek_search_api_key": "DeepSeek 搜索 API Key",
     "qdrant_uri": "Qdrant 地址",
     "qdrant_api_key": "Qdrant API Key",
     "embedding_api_key": "Embedding API Key",

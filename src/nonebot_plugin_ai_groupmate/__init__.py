@@ -72,6 +72,7 @@ from .reply_guard import (
 from .media_message import format_media_markers
 from .participation import participation, delivery_context
 from .agent.reaction import is_onebot_context
+from .group_affinity import note_group_activity, load_group_affinities
 from .runtime_config import (
     RESTART_REQUIRED_FIELDS,
     get_runtime_config,
@@ -166,6 +167,16 @@ register_usage_webui(
 # Register the group-owned model configuration commands. The public Mayumi
 # relay is the default; deployments can still override it with their own URL.
 from . import group_api_commands as group_api_commands
+
+
+@get_driver().on_startup
+async def _load_group_affinity_state() -> None:
+    try:
+        async with get_session() as db_session:
+            loaded = await load_group_affinities(db_session)
+        logger.info(f"已加载 {loaded} 个群相处感受")
+    except Exception:
+        logger.exception("加载群相处感受失败，暂按中性参与；请确认已执行 nb orm upgrade")
 
 
 @get_driver().on_startup
@@ -1070,6 +1081,8 @@ async def handle_message(
             addressed=explicit_to_me,
             disengaged=disengaged,
         )
+        if is_new_text_message and resolve_group_reply_probability(session.scene.id) > 0:
+            note_group_activity((bot_id, session.scene.id), interaction=explicit_to_me or disengaged)
     repeat_text = None
     if not disengaged and is_group and not to_me and not continuous_to_me and not command_like and bool(stripped_plain_text):
         repeat_text = await _load_repeat_chain_text(db_session, session.scene.id)

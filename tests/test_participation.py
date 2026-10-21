@@ -12,29 +12,41 @@ def policy():
     from nonebot_plugin_ai_groupmate.participation import ParticipationPolicy
 
     now = [1000.0]
-    return ParticipationPolicy(lambda: now[0]), now
+    return ParticipationPolicy(lambda: now[0], random_sample=lambda: 0.005), now
 
 
-def test_default_accumulates_opportunities_and_zero_disables(policy):
+def test_default_draws_independently_without_accumulating_and_zero_disables(policy):
     scheduler, now = policy
-    assert not any(scheduler.candidate(KEY, 0.01) for _ in range(9))
+    sample = Mock(return_value=0.02)
+    scheduler.random_sample = sample
+    assert not any(scheduler.candidate(KEY, 0.01) for _ in range(1000))
+    assert sample.call_count == 1000
+    now[0] += 1000
+    assert not scheduler.candidate(KEY, 0.01)
+    sample.return_value = 0.01
+    assert not scheduler.candidate(KEY, 0.01)  # Exactly 1% is outside the draw.
+    sample.return_value = 0.009
     assert scheduler.candidate(KEY, 0.01)
+    sample.reset_mock()
     assert not any(scheduler.candidate(KEY, 0.1) for _ in range(100))
+    sample.assert_not_called()  # Recent model checks retain their cooldown.
     now[0] += 20
     assert scheduler.candidate(KEY, 0.01)
+    sample.reset_mock()
     assert not scheduler.candidate(KEY, 0)
-    now[0] += 1000
-    # No opportunity is earned by silence.
-    assert not scheduler.candidate(KEY, 0.01)
+    sample.assert_not_called()
 
 
-def test_recent_participation_follows_other_members_with_cooldown(policy):
+def test_recent_participation_keeps_low_probability_and_send_cooldown(policy):
     scheduler, now = policy
+    sample = Mock(return_value=0.02)
+    scheduler.random_sample = sample
     scheduler.sent(KEY, proactive=False)
     assert not scheduler.candidate(KEY, 0.1)
+    sample.assert_not_called()
     now[0] += 45
-    scheduler.observe(KEY, addressed=False, disengaged=False)
-    assert not scheduler.candidate(KEY, 0.01)
+    assert not any(scheduler.candidate(KEY, 0.01) for _ in range(100))
+    sample.return_value = 0.009
     scheduler.observe(KEY, addressed=False, disengaged=False)
     assert scheduler.candidate(KEY, 0.01)
 

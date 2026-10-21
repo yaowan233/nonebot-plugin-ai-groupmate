@@ -75,6 +75,8 @@ class ScopedConfig(BaseModel):
     chat_long_cache_creation_input_cost_per_million: float = 7.5
     personality_setting: str = ""
     tavily_api_key: str = ""
+    web_search_provider: Literal["tavily", "deepseek"] = "tavily"
+    deepseek_search_api_key: str = ""
 
     # === LLM 通用配置（作为各角色的默认值） ===
     llm_api_key: str = ""

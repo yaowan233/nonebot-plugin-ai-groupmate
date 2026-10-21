@@ -135,6 +135,20 @@ class GroupMemory(NulSafeModel):
     updated_at: Mapped[datetime] = mapped_column(default=datetime.now, onupdate=datetime.now, index=True)
 
 
+class GroupAffinity(NulSafeModel):
+    """One bot's slowly learned group preference; timestamps are naive UTC."""
+
+    bot_id: Mapped[str] = mapped_column(String(255), primary_key=True)
+    session_id: Mapped[str] = mapped_column(String(255), primary_key=True)
+    score: Mapped[float] = mapped_column(Float, default=0.0)
+    impression: Mapped[str] = mapped_column(Text, default="")
+    evidence: Mapped[list[dict]] = mapped_column(JSON, default=list)
+    last_message_id: Mapped[int] = mapped_column(Integer, default=0)
+    updated_at: Mapped[datetime]
+    review_after: Mapped[datetime | None] = mapped_column(nullable=True)
+    review_interval: Mapped[int] = mapped_column(Integer, default=900)
+
+
 class ExplicitMemory(NulSafeModel):
     """Explicit user requests scoped to a conversation and bot; naive local time."""
 

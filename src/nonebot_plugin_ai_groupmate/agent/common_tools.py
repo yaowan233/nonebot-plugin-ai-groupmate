@@ -13,6 +13,7 @@ from langchain_core.tools import ToolException
 from ..memory import DB
 from ..reply_guard import is_request_active
 from .tool_results import tool_failure, tool_skipped, tool_success
+from .deepseek_search import DeepSeekSearch, SearchFilterError
 
 
 @dataclass
@@ -110,11 +111,13 @@ def _web_search_retry_after(error: Any) -> int | None:
     return None
 
 
-def _classify_web_search_error(error: Any) -> tuple[str, str, bool]:
+def _classify_web_search_error(error: Any, provider: str = "tavily") -> tuple[str, str, bool]:
     status = _web_search_error_status(error)
     parts = _web_search_error_parts(error)
     error_names = " ".join(type(part).__name__.lower() for part in parts)
     error_text = " ".join(str(part).lower() for part in parts)
+    if provider == "deepseek" and status == 402:
+        return "quota_exhausted", "DeepSeek 搜索余额不足，本轮停止重试，请充值或更换有余额的搜索 API Key。", False
     # Tavily's handled ToolException is returned as text. Recognize only its
     # leading empty-result signature, before inspecting quoted query keywords.
     if status is None and any(isinstance(part, (str, ToolException)) and str(part).lower().startswith("no search results found") for part in parts):
@@ -133,7 +136,8 @@ def _classify_web_search_error(error: Any) -> tuple[str, str, bool]:
         marker in error_text
         for marker in ("unauthorized", "invalid api key", "invalid_api_key")
     ):
-        return "authentication_failed", "联网搜索认证失败，请检查 Tavily API Key。", False
+        provider_name = "DeepSeek" if provider == "deepseek" else "Tavily"
+        return "authentication_failed", f"联网搜索认证失败，请检查 {provider_name} API Key。", False
     if status == 429 or "rate limit" in error_text or "excessive requests" in error_text:
         return "rate_limited", "联网搜索请求过于频繁，请稍后再试。", False
     if (
@@ -145,8 +149,8 @@ def _classify_web_search_error(error: Any) -> tuple[str, str, bool]:
     return "provider_error", "联网搜索服务暂时不可用，可以稍后重试。", True
 
 
-def _web_search_failure(error: Any) -> str:
-    reason_code, message, retryable = _classify_web_search_error(error)
+def _web_search_failure(error: Any, provider: str = "tavily") -> str:
+    reason_code, message, retryable = _classify_web_search_error(error, provider)
     status = _web_search_error_status(error)
     retry_after_seconds = _web_search_retry_after(error)
     logger.warning(
@@ -154,6 +158,8 @@ def _web_search_failure(error: Any) -> str:
         f"reason={reason_code}, status={status}, error_type={type(error).__name__}"
     )
     extra: dict[str, Any] = {}
+    if provider != "tavily":
+        extra["provider"] = provider
     if status is not None:
         extra["http_status"] = status
     if retry_after_seconds is not None:
@@ -167,11 +173,11 @@ def _web_search_failure(error: Any) -> str:
     )
 
 
-def _normalize_web_search_results(query: str, response: Any) -> str:
+def _normalize_web_search_results(query: str, response: Any, provider: str = "tavily") -> str:
     if not isinstance(response, dict):
-        return _web_search_failure(response)
+        return _web_search_failure(response, provider)
     if response.get("error") is not None:
-        return _web_search_failure(response)
+        return _web_search_failure(response, provider)
 
     raw_results = response.get("results")
     if not isinstance(raw_results, list) or not raw_results:
@@ -214,13 +220,21 @@ def _normalize_web_search_results(query: str, response: Any) -> str:
     return _web_search_payload(
         ok=True,
         query=query,
+        provider=provider,
         safety_notice=WEB_SEARCH_UNTRUSTED_NOTICE,
         results=results,
     )
 
 
-def create_search_web_tool(tavily_api_key: str | None):
-    tavily_search = (
+def create_search_web_tool(
+    tavily_api_key: str | None,
+    *,
+    provider: Literal["tavily", "deepseek"] = "tavily",
+    deepseek_api_key: str | None = None,
+):
+    if provider not in {"tavily", "deepseek"}:
+        raise ValueError("Unknown web search provider")
+    search_client = (
         TavilySearch(
             max_results=3,
             search_depth="basic",
@@ -229,9 +243,11 @@ def create_search_web_tool(tavily_api_key: str | None):
             handle_tool_error=True,
             tavily_api_key=tavily_api_key,
         )
-        if tavily_api_key
+        if provider == "tavily" and tavily_api_key
         else None
     )
+    if provider == "deepseek" and deepseek_api_key:
+        search_client = DeepSeekSearch(deepseek_api_key)
 
     @tool("search_web")
     async def search_web(
@@ -280,12 +296,12 @@ def create_search_web_tool(tavily_api_key: str | None):
                 retryable=False,
             )
 
-        if not tavily_search:
-            logger.error("没有配置 tavily_api_key, 无法进行搜索")
+        if search_client is None:
+            provider_name = "DeepSeek" if provider == "deepseek" else "Tavily"
             return _web_search_payload(
                 ok=False,
                 reason_code="not_configured",
-                message="没有配置 Tavily API Key，无法进行联网搜索。",
+                message=f"没有配置 {provider_name} API Key，无法进行联网搜索。",
                 retryable=False,
             )
 
@@ -340,11 +356,16 @@ def create_search_web_tool(tavily_api_key: str | None):
         search_input.update(normalized_dates)
 
         try:
-            response = await tavily_search.ainvoke(search_input)
+            response = await search_client.ainvoke(search_input)
+        except SearchFilterError as error:
+            return _web_search_payload(ok=False, reason_code="invalid_query", message=str(error), retryable=False)
         except Exception as error:
-            return _web_search_failure(error)
-        return _normalize_web_search_results(normalized_query, response)
+            return _web_search_failure(error, provider)
+        return _normalize_web_search_results(normalized_query, response, provider)
 
+    search_web.metadata = {"search_provider": provider}
+    if provider == "deepseek":
+        search_web.description += "\n当前使用 DeepSeek：关键词连同来源、日期筛选条件最多 128 个字符；请保持查询简洁。"
     return search_web
 
 

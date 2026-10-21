@@ -269,7 +269,7 @@ async def test_tavily_quota_failure_blocks_further_searches_and_hides_tools(firs
 def test_tavily_quota_guard_is_request_and_provider_scoped():
     from langchain_core.messages import ToolMessage, HumanMessage
 
-    from nonebot_plugin_ai_groupmate.agent.graph import _tavily_quota_failure
+    from nonebot_plugin_ai_groupmate.agent.graph import _web_search_quota_failures
     from nonebot_plugin_ai_groupmate.agent.tool_results import tool_failure
 
     failure = tool_failure("quota_exhausted", "quota exhausted")
@@ -278,14 +278,53 @@ def test_tavily_quota_guard_is_request_and_provider_scoped():
         AIMessage(content="", tool_calls=[{"name": "reverse_image_search", "args": {}, "id": "google"}]),
         ToolMessage(content=failure, tool_call_id="google"),
     ]
-    assert _tavily_quota_failure(messages) is None
+    assert _web_search_quota_failures(messages) == {}
     messages.extend([
         AIMessage(content="", tool_calls=[{"name": "search_web", "args": {}, "id": "tavily"}]),
         ToolMessage(content=failure, tool_call_id="tavily"),
     ])
-    assert _tavily_quota_failure(messages) == failure
+    assert _web_search_quota_failures(messages) == {"tavily": failure}
     messages.append(HumanMessage(content="try again after quota is restored"))
-    assert _tavily_quota_failure(messages) is None
+    assert _web_search_quota_failures(messages) == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exhausted", ["deepseek", "tavily"])
+async def test_search_quota_does_not_disable_another_provider(exhausted):
+    from nonebot_plugin_ai_groupmate.agent import graph as module
+    from nonebot_plugin_ai_groupmate.agent.tool_results import tool_failure, tool_success
+
+    calls = []
+
+    @tool("search_web")
+    async def search_web(query: str) -> str:
+        """Search with DeepSeek."""
+        calls.append("deepseek")
+        return tool_failure("quota_exhausted", "DeepSeek 余额不足", data={"provider": "deepseek"}) if exhausted == "deepseek" else tool_success("search_completed", "found")
+
+    search_web.metadata = {"search_provider": "deepseek"}
+
+    @tool("search_web_images")
+    async def search_web_images(query: str) -> str:
+        """Search with Tavily."""
+        calls.append("tavily")
+        return tool_failure("quota_exhausted", "Tavily 额度不足") if exhausted == "tavily" else tool_success("search_completed", "found")
+
+    tools = [search_web, search_web_images]
+    names = {"deepseek": "search_web", "tavily": "search_web_images"}
+    other = "tavily" if exhausted == "deepseek" else "deepseek"
+    state = _state(AIMessage(content="", tool_calls=[
+        {"name": names[exhausted], "args": {"query": "first"}, "id": "first"},
+        {"name": names[exhausted], "args": {"query": "retry"}, "id": "retry"},
+        {"name": names[other], "args": {"query": "independent"}, "id": "other"},
+    ]))
+    limits = module.AgentRunLimits(max_parallel_tools=1)
+    result = await module._make_tool_node({item.name: item for item in tools}, tools, {}, limits)(state)
+    assert calls == [exhausted, other]
+    state["messages"].extend(result["messages"])
+    model = _ToolSpyModel([AIMessage(content="done")])
+    await module._make_agent_node(model, tools, "system", {}, limits)(state)
+    assert model.bound_tool_names == [(names[other],)]
 
 
 @pytest.mark.asyncio

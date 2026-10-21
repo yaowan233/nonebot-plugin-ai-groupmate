@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import time
+import random
 from collections import OrderedDict, deque
 from contextvars import ContextVar
 from dataclasses import field, dataclass
 from collections.abc import Callable
+
+from .group_affinity import affinity_multiplier, group_feeling_context
 
 
 @dataclass
@@ -16,7 +19,6 @@ class Participation:
     last_check: float = float("-inf")
     engaged_until: float = 0
     quiet_until: float = 0
-    credit: float = 0
     unanswered: int = 0
     last_backoff: float = 0
     pending_since: float | None = None
@@ -26,8 +28,13 @@ class Participation:
 
 
 class ParticipationPolicy:
-    def __init__(self, clock: Callable[[], float] = time.monotonic):
+    def __init__(
+        self,
+        clock: Callable[[], float] = time.monotonic,
+        random_sample: Callable[[], float] = random.random,
+    ):
         self.clock = clock
+        self.random_sample = random_sample
         self.states: OrderedDict[tuple[str, str], Participation] = OrderedDict()
 
     def state(self, key: tuple[str, str]) -> Participation:
@@ -60,7 +67,6 @@ class ParticipationPolicy:
         if disengaged:
             state.quiet_until = now + 300
             state.engaged_until = 0
-            state.credit = 0
             state.pending_since = None
         elif addressed:
             state.quiet_until = 0
@@ -88,19 +94,15 @@ class ParticipationPolicy:
     def candidate(self, key: tuple[str, str], probability: float) -> bool:
         state = self.state(key)
         if probability <= 0:
-            state.credit = 0
             return False
         now = self.clock()
-        if not self.can_reply(key):
-            state.credit = 0
+        if not self.can_reply(key) or now - state.last_check < 20 * (2 ** state.unanswered):
             return False
-        # Probability becomes a participation preference. Accumulation avoids
-        # starving quiet groups forever, while elapsed time alone earns nothing.
-        boost = 50 if now < state.engaged_until else 10
-        state.credit = min(1.0, state.credit + min(probability * boost, 1.0))
-        if state.credit < 0.999 or now - state.last_check < 20 * (2 ** state.unanswered):
+        # Each eligible message gets an independent draw. Recent participation
+        # and missed draws never increase the probability of the next message.
+        probability = min(0.1, probability * affinity_multiplier(key))
+        if self.random_sample() >= probability:
             return False
-        state.credit = 0
         state.last_check = now
         return True
 
@@ -109,7 +111,6 @@ class ParticipationPolicy:
         now = self.clock()
         state.last_sent = now
         state.activity.append((now, True))
-        state.credit = 0
         if proactive:
             state.engaged_until = now + 300
             # Multiple sends in one turn count toward the cap, but don't erase
@@ -128,6 +129,7 @@ class ParticipationPolicy:
             f"Bot 最近参与对话：{'是' if active else '否'}；"
             f"近期主动发言后未发现明确承接的次数：{state.unanswered}。"
             "这只是频率信号，不能代替语义判断；后续有人发消息不等于回应 Bot。"
+            f"\n{group_feeling_context(key)}"
         )
 
 

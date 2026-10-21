@@ -251,6 +251,7 @@ def test_settings_page_groups_all_fields_and_never_renders_secrets():
     config = ScopedConfig(
         llm_api_key="sk-do-not-render",
         qdrant_api_key="qdrant-do-not-render",
+        deepseek_search_api_key="deepseek-do-not-render",
         embedding_model="Qwen/Qwen3-Embedding-0.6B",
         embedding_dimension=1536,
     )
@@ -271,6 +272,7 @@ def test_settings_page_groups_all_fields_and_never_renders_secrets():
     assert grouped_fields == CONFIGURABLE_FIELDS
     assert "sk-do-not-render" not in html
     assert "qdrant-do-not-render" not in html
+    assert "deepseek-do-not-render" not in html
     assert "Qwen/Qwen3-Embedding-0.6B" in html
     assert "1536" in html
     assert 'data-setting="embedding_model"' in html
