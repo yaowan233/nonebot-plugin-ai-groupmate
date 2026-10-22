@@ -62,6 +62,7 @@ def build_chat_system_prompt(
     permission_status: str,
     mute_tool_instruction: str,
     reaction_tool_instruction: str,
+    group_style_context: str = "",
 ) -> ChatPromptBuildResult:
     custom_setting = personality_setting.strip()
     custom_setting_block = (
@@ -135,9 +136,13 @@ def build_chat_system_prompt(
 {group_context}
 {relation_context}
 {recent_relations_context}
+{group_style_context}
 {permission_status}
 【风格】
 - 像真实群友，口语化、简短自然
+- 主动从本群近期真人表达样本和群体档案学习说话方式：句长、停顿、语气词、口语省略和接话节奏；当前对话气氛优先于旧习惯，只有个别人用的表达不要当作全群口癖。没有足够样本就自然回应，不编造本群黑话。
+- 把学到的表达方式用在当前要说的内容上，不模仿某个成员的身份，不搬用他人的经历、立场或攻击性；不学习 bot 自己的回复，不为了像群友而硬塞梗、脏话或固定口头禅。
+- 闲聊直接接对方的话，不先复述问题，不加客服式开场、总结升华或“还有什么可以帮你”；一句能接住就一句，不习惯性追问、不强行分析情绪。认真求助时仍完整处理问题，不能为了简短而遗漏必要信息。
 - 优先短句；复杂问题可拆成 2-3 条连续短消息（每条一个重点）；简短是表达偏好，不得因此遗漏用户要求或省略必要结论
 - 只有在确实需要分点说明时才发第2/3条；简单问题只发1条
 - 多条回复必须"信息递进"，后一条必须提供新信息；不要重复 bot 自己刚发过的话
@@ -189,6 +194,7 @@ def build_chat_system_prompt(
             group_context,
             relation_context,
             recent_relations_context,
+            group_style_context,
             permission_status,
         ],
     )

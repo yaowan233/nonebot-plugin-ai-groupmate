@@ -49,6 +49,7 @@ from .prompts import (
     build_reaction_tool_instruction,
 )
 from .reaction import is_onebot_context, create_reaction_tool
+from .chat_style import build_group_style_context
 from .file_tools import FILE_TOOLS_PROMPT, create_file_tools
 from .meme_tools import (
     MAX_MEME_SEND_COUNT,
@@ -1120,6 +1121,13 @@ async def create_chat_graph(
         permission_status=permission_status,
         mute_tool_instruction=mute_tool_instruction,
         reaction_tool_instruction=reaction_tool_instruction,
+        group_style_context=(
+            build_group_style_context(
+                history or [], session_id,
+                tuple({str(uid) for uid in get_bots()} | ({str(bot_id)} if bot_id else set())),
+            )
+            if not is_private else ""
+        ),
     )
     system_prompt = prompt_result.system_prompt
     system_prompt += MEMORY_PROMPT
