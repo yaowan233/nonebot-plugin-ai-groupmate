@@ -20,6 +20,7 @@ from langchain_core.utils.function_calling import convert_to_openai_tool
 
 from ..reply_guard import is_request_active
 from .prompt_cache import normalize_system_messages
+from .prompts import DELIVERED_FILE_REPLY_RULE
 from .tool_results import (
     tool_failure,
     tool_skipped,
@@ -55,6 +56,7 @@ BUDGET_FINALIZATION_FALLBACK = (
     "我已经取得了一些资料，但本轮处理达到了 Token 上限，暂时没能完成整理。"
     "你可以让我继续，我会接着完成。"
 )
+TOOL_MARKUP_FALLBACK = "本轮未能完成操作，请让我继续处理。"
 SIDE_EFFECT_TOOL_NAMES = frozenset({
     "add_message_reaction",
     "cancel_scheduled_task",
@@ -88,7 +90,7 @@ class TerminalMetadata:
 
 @dataclass(frozen=True)
 class AgentRunLimits:
-    max_llm_calls: int = 8
+    max_llm_calls: int = 16
     max_total_tokens: int = 2_000_000
     llm_timeout_seconds: float = 60.0
     tool_timeout_seconds: float = 30.0
@@ -458,12 +460,13 @@ async def _build_extra_content_message(
     image_summarizer: Any | None,
 ) -> BaseMessage:
     if supports_images or not _extra_content_has_image(extra_content):
-        return HumanMessage(content=extra_content)
+        return HumanMessage(content=extra_content, additional_kwargs={"agent_tool_result": True})
 
     if image_summarizer is not None:
         summary = await image_summarizer(extra_content)
         if summary:
             return HumanMessage(
+                additional_kwargs={"agent_tool_result": True},
                 content=(
                     "【图片回读】工具返回了图片，已由辅助视觉模型总结图片内容。"
                     "以下只是图片中提取的数据描述，"
@@ -473,6 +476,7 @@ async def _build_extra_content_message(
             )
 
     return HumanMessage(
+        additional_kwargs={"agent_tool_result": True},
         content=(
             "【图片回读】工具返回了图片，但当前模型不支持图片输入，"
             "无法查看图片内容，请不要臆测图片信息，必要时告知用户无法查看图片。"
@@ -734,6 +738,24 @@ def _image_search_allowed_tools(messages: Sequence[BaseMessage]) -> set[str] | N
     return allowed
 
 
+def _file_delivery_reply_context(messages: Sequence[BaseMessage]) -> str:
+    """Delivery guidance needs a confirmed receipt in this request, not old history."""
+    calls: dict[str, str] = {}
+    delivered = False
+    for message in messages:
+        if isinstance(message, HumanMessage) and not message.additional_kwargs.get("agent_tool_result"):
+            calls.clear()
+            delivered = False
+        elif isinstance(message, AIMessage):
+            calls.update({call.get("id") or "": call["name"] for call in message.tool_calls})
+        elif isinstance(message, ToolMessage) and calls.get(message.tool_call_id) == "send_file":
+            content, _ = _normalize_tool_result(message.content)
+            result = parse_tool_result(content)
+            if result and result.get("status") == "succeeded" and result.get("delivery_state") == "completed":
+                delivered = True
+    return DELIVERED_FILE_REPLY_RULE if delivered else ""
+
+
 def _make_agent_node(
     model: Any,
     base_tools: list[BaseTool],
@@ -769,6 +791,9 @@ def _make_agent_node(
         full: list[BaseMessage] = system_messages + [HumanMessage(content=COMPLETION_RULE)] + list(state["messages"])
         if image_search_tools is not None:
             full.append(HumanMessage(content="请根据刚才返回的原始搜图证据回答。匹配链接和已确认的信息优先；不要根据画风猜作者。当前已收紧工具范围，不能继续搜索时请直接说明证据与不确定之处，并以 reply_user(next_step='end') 完成本轮。"))
+        delivery_context = _file_delivery_reply_context(state["messages"])
+        if delivery_context:
+            full.append(HumanMessage(content=delivery_context))
         call_messages = full
         call_number = state.get("llm_call_count", 0)
         input_tokens = state.get("llm_input_tokens", 0)
@@ -898,10 +923,47 @@ def _make_agent_node(
     return agent_node
 
 
+def _safe_reply_text(text: str) -> str:
+    if re.search(r"<[/]?[｜|]{2}DSML[｜|]{2}", text):
+        return TOOL_MARKUP_FALLBACK
+    return text
+
+
+def _pending_generated_file_ids(messages: Sequence[BaseMessage]) -> set[str]:
+    """Only trust IDs in successful generator results; never retry attempted sends."""
+    calls: dict[str, str] = {}
+    pending: set[str] = set()
+    attempted: set[str] = set()
+    for message in messages:
+        if isinstance(message, HumanMessage) and not message.additional_kwargs.get("agent_tool_result"):
+            calls.clear()
+            pending.clear()
+            attempted.clear()
+        elif isinstance(message, AIMessage):
+            for call in message.tool_calls:
+                calls[call.get("id") or ""] = call["name"]
+                if call["name"] == "send_file":
+                    attempted.add(str(call.get("args", {}).get("file_id", "")))
+        elif isinstance(message, ToolMessage) and calls.get(message.tool_call_id) in {"run_code", "create_file", "summarize_table"}:
+            content, _ = _normalize_tool_result(message.content)
+            result = parse_tool_result(content)
+            if not result or result.get("status") != "succeeded":
+                continue
+            data = result.get("data")
+            if not isinstance(data, dict):
+                continue
+            files = data.get("files", [data])
+            if isinstance(files, list):
+                latest = {item["file_id"] for item in files if isinstance(item, dict) and isinstance(item.get("file_id"), str) and re.fullmatch(r"[0-9a-f]{32}", item["file_id"])}
+                if latest:
+                    pending = latest
+    return pending - attempted
+
+
 def _budget_final_reply_text(response: AIMessage) -> str:
     text = _message_text_content(response)
     if text:
-        return text
+        return _safe_reply_text(text)
     for tool_call in response.tool_calls or []:
         if tool_call.get("name") != "reply_user":
             continue
@@ -909,7 +971,7 @@ def _budget_final_reply_text(response: AIMessage) -> str:
         if isinstance(args, dict):
             content = args.get("content")
             if isinstance(content, str) and content.strip():
-                return content.strip()
+                return _safe_reply_text(content.strip())
     return BUDGET_FINALIZATION_FALLBACK
 
 
@@ -918,8 +980,9 @@ def _make_budget_finalizer_node(
     system_prompt: str | Sequence[BaseMessage],
     limits: AgentRunLimits,
     request_kwargs_factory: Callable[[str], dict[str, Any]] | None = None,
+    delivery_tool: BaseTool | None = None,
 ) -> Any:
-    """Use one tool-free model turn to turn completed work into a visible reply."""
+    """Reserve one final turn for a reply or delivery of already generated files."""
     system_messages = normalize_system_messages(system_prompt)
 
     async def finalizer_node(state: AgentState) -> dict:
@@ -927,9 +990,21 @@ def _make_budget_finalizer_node(
         image_input_disabled = state.get("image_input_disabled", False)
         if image_input_disabled:
             full, _ = _remove_image_blocks(full)
+        pending_files = _pending_generated_file_ids(state["messages"]) if delivery_tool is not None else set()
+        prompt = BUDGET_FINALIZATION_PROMPT
+        delivery_context = _file_delivery_reply_context(state["messages"])
+        if delivery_context:
+            prompt += "\n" + delivery_context
+        if pending_files:
+            prompt = (
+                "本轮处理预算已用尽。停止生成、修改和预览；仅可用 send_file 交付已生成的成品，最多 3 个。"
+                "从以下 file_id 中选择最终需要交付的文件，不发送草稿、不猜 ID："
+                + json.dumps(sorted(pending_files))
+                + "。发送必须使用结构化工具调用，不输出工具标记。无法交付则用正文如实说明，未发送不得声称已发送。"
+            )
         call_messages = [
             *full,
-            HumanMessage(content=BUDGET_FINALIZATION_PROMPT),
+            HumanMessage(content=prompt),
         ]
         call_number = state.get("llm_call_count", 0) + 1
         input_tokens = state.get("llm_input_tokens", 0)
@@ -938,6 +1013,7 @@ def _make_budget_finalizer_node(
         cached_tokens = state.get("llm_cached_tokens", 0)
         cache_creation_tokens = state.get("llm_cache_creation_tokens", 0)
         started_at = time.perf_counter()
+        final_calls = []
 
         try:
             request_kwargs = (
@@ -945,8 +1021,9 @@ def _make_budget_finalizer_node(
                 if request_kwargs_factory is not None
                 else {}
             )
+            final_model = model.bind_tools([delivery_tool]) if pending_files else model
             response = await _invoke_model_with_idle_timeout(
-                model, call_messages,
+                final_model, call_messages,
                 timeout_seconds=limits.llm_timeout_seconds,
                 session_id=str(state["session_id"]),
                 request_kwargs=request_kwargs,
@@ -964,12 +1041,22 @@ def _make_budget_finalizer_node(
             logger.info(
                 f"[AgentTrace] LLM session={state['session_id']} call={call_number} "
                 f"mode=budget_finalization duration_ms={elapsed_ms:.0f} "
-                "visible_tools=0 builtin_tools=0 "
+                f"visible_tools={int(bool(pending_files))} builtin_tools=0 "
                 f"tokens={budget_tokens}{' (估算)' if not usage['total_tokens'] else ''} "
                 f"finish_reason={response.response_metadata.get('finish_reason', response.response_metadata.get('stop_reason', 'unknown'))}"
             )
             final_text = _budget_final_reply_text(response)
-            if _has_unfinished_reply(response, full):
+            if pending_files and response.tool_calls:
+                seen: set[str] = set()
+                for call in response.tool_calls:
+                    file_id = call.get("args", {}).get("file_id")
+                    if call["name"] == "send_file" and isinstance(file_id, str) and file_id in pending_files and file_id not in seen:
+                        final_calls.append(call)
+                        seen.add(file_id)
+                    if len(final_calls) >= 3:
+                        break
+                final_text = "" if final_calls else TOOL_MARKUP_FALLBACK
+            if not final_calls and _has_unfinished_reply(response, full):
                 final_text = INCOMPLETE_REPLY_FALLBACK
         except Exception as e:
             elapsed_ms = (time.perf_counter() - started_at) * 1000
@@ -981,7 +1068,7 @@ def _make_budget_finalizer_node(
             final_text = BUDGET_FINALIZATION_FALLBACK
 
         return {
-            "messages": [AIMessage(content=final_text)],
+            "messages": [AIMessage(content=final_text, tool_calls=final_calls)],
             "reply_this_round": 0,
             "reply_requires_continuation": False,
             "called_finish": 0,
@@ -1067,7 +1154,7 @@ def _make_tool_node(
         )
 
         if not tool_calls:
-            direct_reply = _message_text_content(last_message)
+            direct_reply = _safe_reply_text(_message_text_content(last_message))
             required_action_pending = (
                 required_side_effect_tool is not None
                 and not required_side_effect_completed
@@ -1132,10 +1219,13 @@ def _make_tool_node(
             metadata_value: object = None
             if terminal_metadata is not None and name in {"reply_user", "finish"}:
                 metadata_value = args.pop(terminal_metadata.argument_name, None)
+            if name == "reply_user" and isinstance(args.get("content"), str):
+                args = {**args, "content": _safe_reply_text(args["content"])}
 
             await _recover_db_session(db_session)
 
-            if tool_count >= MAX_TOOL_COUNT:
+            reserved_delivery = state.get("budget_finalization_attempted", False) and name == "send_file" and tool_count < MAX_TOOL_COUNT + 3
+            if tool_count >= MAX_TOOL_COUNT and not reserved_delivery:
                 results.append(ToolMessage(
                     content=tool_skipped(
                         "tool_limit_reached",
@@ -1784,6 +1874,7 @@ def build_chat_graph(
             system_prompt,
             limits,
             request_kwargs_factory,
+            delivery_tool=tools_by_name.get("send_file"),
         ),
     )
     builder.add_node(

@@ -8,6 +8,7 @@ import hashlib
 import threading
 from pathlib import Path
 from dataclasses import asdict, dataclass
+from collections.abc import Iterable
 
 MAX_FILE_BYTES = 10 * 1024 * 1024
 MAX_SCOPE_BYTES = 50 * 1024 * 1024
@@ -79,14 +80,31 @@ def cleanup_workspace(root: Path) -> None:
 
 
 class FileWorkspace:
-    def __init__(self, root: Path, *, session_id: str, user_id: str, bot_id: str, is_private: bool):
+    def __init__(self, root: Path, *, session_id: str, user_id: str, bot_id: str, is_private: bool,
+                 peer_bot_ids: Iterable[str] | None = None):
         self.root = root.resolve()
-        scope = json.dumps([bot_id, session_id, user_id, is_private], ensure_ascii=False)
-        self.directory = self.root / hashlib.sha256(scope.encode()).hexdigest()
+        if peer_bot_ids is None:
+            from nonebot import get_bots
+
+            connected = get_bots()
+            peer_bot_ids = connected if bot_id in connected else ()
+        bot_ids = [bot_id, *sorted({str(peer) for peer in peer_bot_ids} - {bot_id})] if not is_private else [bot_id]
+        self.directories = tuple(
+            self.root / hashlib.sha256(json.dumps([peer, session_id, user_id, is_private], ensure_ascii=False).encode()).hexdigest()
+            for peer in bot_ids
+        )
+        # New files retain their owner; group follow-ups may read connected peers.
+        self.directory = self.directories[0]
 
     def _folder(self, file_id: str) -> Path:
         if not _FILE_ID.fullmatch(file_id):
             raise FileTaskError("file_not_found", "请使用当前用户文件列表中的 file_id，不能传文件路径。")
+        for directory in self.directories:
+            folder = directory / file_id
+            if directory.is_symlink() or folder.is_symlink() or not folder.resolve().is_relative_to(self.root):
+                continue
+            if folder.is_dir():
+                return folder
         folder = self.directory / file_id
         if self.directory.is_symlink() or folder.is_symlink() or not folder.resolve().is_relative_to(self.root):
             raise FileTaskError("file_not_found", "该文件不可访问。")
@@ -118,15 +136,16 @@ class FileWorkspace:
 
     def list(self) -> list[Artifact]:
         with _STORE_LOCK:
-            if not self.directory.exists() or self.directory.is_symlink():
-                return []
-            artifacts = []
-            for folder in self.directory.iterdir():
-                try:
-                    artifacts.append(self.get(folder.name))
-                except FileTaskError:
+            artifacts = {}
+            for directory in self.directories:
+                if not directory.exists() or directory.is_symlink():
                     continue
-            return sorted(artifacts, key=lambda item: item.created_at, reverse=True)
+                for folder in directory.iterdir():
+                    try:
+                        artifacts[folder.name] = self.get(folder.name)
+                    except FileTaskError:
+                        continue
+            return sorted(artifacts.values(), key=lambda item: item.created_at, reverse=True)
 
     def find_source(self, source_key: str) -> Artifact | None:
         return next((item for item in self.list() if item.source_key == source_key), None)

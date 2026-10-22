@@ -34,7 +34,7 @@ def test_image_search_followup_answers_from_record_and_budget_finalizes():
     state = _state(AIMessage(content="", tool_calls=[{"name": "get_last_image_search_result", "args": {}, "id": "record"}]))
     state["messages"].append(ToolMessage(content=tool_success("last_image_search_loaded", "record"), tool_call_id="record"))
     assert module._image_search_allowed_tools(state["messages"]) == {"reply_user", "finish"}
-    state["llm_call_count"] = 8
+    state["llm_call_count"] = module.AgentRunLimits().max_llm_calls
     assert module._should_continue(state, module.AgentRunLimits()) == "finalize"
 
 
@@ -2062,3 +2062,164 @@ async def test_progress_correction_respects_model_call_budget():
     result = await node(_state(AIMessage(content="question")))
     assert result["messages"][0].content == INCOMPLETE_REPLY_FALLBACK
     assert model.invoke_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("budget", ["model_calls", "tokens", "tools"])
+@pytest.mark.parametrize("preview", [False, True])
+async def test_generated_file_can_be_delivered_after_processing_budget(budget, preview, monkeypatch):
+    from nonebot_plugin_ai_groupmate.agent import graph as module
+    from nonebot_plugin_ai_groupmate.agent.graph import AgentRunLimits, build_chat_graph
+    from nonebot_plugin_ai_groupmate.agent.tool_results import tool_success
+
+    file_id = "b" * 32
+    sent, replies = [], []
+
+    @tool("run_code")
+    async def run_code() -> str:
+        """Generate an image."""
+        return tool_success("code_executed", "generated", data={"files": [{"file_id": file_id, "name": "desert_boss.png"}]})
+
+    @tool("send_file")
+    async def send_file(file_id: str) -> str:
+        """Deliver a saved file."""
+        sent.append(file_id)
+        return tool_success("file_sent", "sent", delivery_state="completed")
+
+    @tool("read_file")
+    async def read_file(file_id: str) -> list[dict]:
+        """Return a real multimodal preview result."""
+        return [{"type": "text", "text": tool_success("image_read", "previewed", data={"file_id": file_id})},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,cGljdHVyZQ=="}}]
+
+    @tool("reply_user")
+    async def reply_user(content: str, next_step: str = "end") -> str:
+        """Capture visible text."""
+        replies.append(content)
+        return "sent"
+
+    responses = [
+        AIMessage(content="", tool_calls=[{"name": "run_code", "args": {}, "id": "generate"}], usage_metadata={"input_tokens": 8, "output_tokens": 2, "total_tokens": 10}),
+        AIMessage(content="", tool_calls=[{"name": "send_file", "args": {"file_id": file_id}, "id": "deliver"}]),
+    ]
+    if preview:
+        responses.insert(1, AIMessage(content="", tool_calls=[{"name": "read_file", "args": {"file_id": file_id}, "id": "preview"}], usage_metadata={"input_tokens": 8, "output_tokens": 2, "total_tokens": 10}))
+    model = _ToolSpyModel(responses)
+    steps = 2 if preview else 1
+    limits = AgentRunLimits(max_llm_calls=steps) if budget == "model_calls" else AgentRunLimits(max_total_tokens=steps * 10 if budget == "tokens" else 128000)
+    if budget == "tools":
+        monkeypatch.setattr(module, "MAX_TOOL_COUNT", steps)
+    graph = build_chat_graph(model, [run_code, read_file, send_file, reply_user], "system", limits=limits)
+    result = await graph.ainvoke(_state(AIMessage(content="画好后发给我")))
+    assert sent == [file_id]
+    assert replies == []
+    assert model.bound_tool_names[-1] == ("send_file",)
+    assert result["budget_finalization_attempted"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("finalize", [False, True])
+async def test_raw_dsml_is_never_forwarded_as_a_reply(finalize):
+    from nonebot_plugin_ai_groupmate.agent.graph import AgentRunLimits, build_chat_graph
+
+    replies = []
+
+    @tool("search_web")
+    async def search_web() -> str:
+        """Return evidence."""
+        return "found"
+
+    @tool("reply_user")
+    async def reply_user(content: str, next_step: str = "end") -> str:
+        """Capture visible text."""
+        replies.append(content)
+        return "sent"
+
+    raw = '<｜｜DSML｜｜ calls><｜｜DSML｜｜ invoke name="send_file">internal-file-id</｜｜DSML｜｜ invoke></｜｜DSML｜｜ calls>'
+    responses = [AIMessage(content=raw)]
+    if finalize:
+        responses.insert(0, AIMessage(content="", tool_calls=[{"name": "search_web", "args": {}, "id": "search"}]))
+    graph = build_chat_graph(_ToolSpyModel(responses), [search_web, reply_user], "system", limits=AgentRunLimits(max_llm_calls=1))
+    await graph.ainvoke(_state(AIMessage(content="发图")))
+    assert len(replies) == 1
+    assert "DSML" not in replies[0]
+    assert "internal-file-id" not in replies[0]
+
+
+@pytest.mark.asyncio
+async def test_sixteen_model_calls_fit_graph_recursion_budget():
+    from nonebot_plugin_ai_groupmate.agent.graph import build_chat_graph
+
+    @tool("search_web")
+    async def search_web() -> str:
+        """Return evidence."""
+        return "found"
+
+    @tool("finish")
+    def finish() -> str:
+        """Finish the task."""
+        return ""
+
+    model = _ToolSpyModel([
+        *[AIMessage(content="", tool_calls=[{"name": "search_web", "args": {}, "id": str(i)}]) for i in range(15)],
+        AIMessage(content="", tool_calls=[{"name": "finish", "args": {}, "id": "done"}]),
+    ])
+    result = await build_chat_graph(model, [search_web, finish], "system").ainvoke(_state(AIMessage(content="question")))
+    assert result["llm_call_count"] == 16
+    assert model.invoke_count == 16
+    assert result["called_finish"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("requested", ["unknown_file", "run_code"])
+async def test_delivery_finalizer_rejects_new_work_and_unknown_files(requested):
+    from langchain_core.messages import ToolMessage
+    from nonebot_plugin_ai_groupmate.agent import graph as module
+    from nonebot_plugin_ai_groupmate.agent.tool_results import tool_success
+
+    @tool("send_file")
+    async def send_file(file_id: str) -> str:
+        """Deliver a saved file."""
+        raise AssertionError("the finalizer must not dispatch tools itself")
+
+    file_id = "b" * 32
+    state = _state(AIMessage(content="", tool_calls=[{"name": "run_code", "args": {}, "id": "generate"}]))
+    state["messages"].append(ToolMessage(content=tool_success("code_executed", "generated", data={"files": [{"file_id": file_id}]}), tool_call_id="generate"))
+    call = {"name": "send_file", "args": {"file_id": "c" * 32}, "id": "bad"} if requested == "unknown_file" else {"name": "run_code", "args": {"code": "print(1)"}, "id": "bad"}
+    model = _ToolSpyModel([AIMessage(content="", tool_calls=[call])])
+    result = await module._make_budget_finalizer_node(model, "system", module.AgentRunLimits(), delivery_tool=send_file)(state)
+    assert result["messages"][0].tool_calls == []
+    assert result["messages"][0].content == module.TOOL_MARKUP_FALLBACK
+
+
+def test_delivery_finalizer_never_retries_a_previously_attempted_file():
+    from langchain_core.messages import ToolMessage
+    from nonebot_plugin_ai_groupmate.agent.graph import _pending_generated_file_ids
+    from nonebot_plugin_ai_groupmate.agent.tool_results import tool_success, tool_failure
+
+    file_id = "b" * 32
+    messages = [
+        AIMessage(content="", tool_calls=[{"name": "run_code", "args": {}, "id": "generate"}]),
+        ToolMessage(content=tool_success("code_executed", "generated", data={"files": [{"file_id": file_id}]}), tool_call_id="generate"),
+        AIMessage(content="", tool_calls=[{"name": "send_file", "args": {"file_id": file_id}, "id": "send"}]),
+        ToolMessage(content=tool_failure("file_send_failed", "unknown", delivery_state="unknown"), tool_call_id="send"),
+    ]
+    assert _pending_generated_file_ids(messages) == set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["completed", "unknown", "failed", "previous_request"])
+async def test_delivery_reply_guidance_only_follows_confirmed_current_file_delivery(outcome):
+    from langchain_core.messages import HumanMessage, ToolMessage
+    from nonebot_plugin_ai_groupmate.agent import graph as module
+    from nonebot_plugin_ai_groupmate.agent.tool_results import tool_failure, tool_success
+
+    result = tool_success("file_sent", "sent", delivery_state="completed") if outcome in {"completed", "previous_request"} else tool_failure("file_send_failed", "not confirmed", delivery_state="unknown" if outcome == "unknown" else "not_attempted")
+    state = _state(AIMessage(content="", tool_calls=[{"name": "send_file", "args": {"file_id": "b" * 32}, "id": "send"}]))
+    state["messages"].append(ToolMessage(content=result, tool_call_id="send"))
+    if outcome == "previous_request":
+        state["messages"].append(HumanMessage(content="下一个问题"))
+    model = _ToolSpyModel([AIMessage(content="这轮结果。")])
+    await module._make_agent_node(model, [], "system", {}, module.AgentRunLimits())(state)
+    injected = any("【本轮文件已送达】" in str(message.content) for message in model.invoke_messages[0])
+    assert injected is (outcome == "completed")

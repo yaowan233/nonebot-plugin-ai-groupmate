@@ -421,3 +421,26 @@ async def test_full_agent_fetch_download_summarize_and_send(tmp_path, monkeypatc
     assert book.active is not None
     assert list(book.active.values) == [("Category", "Amount_sum"), ("A", 30), ("B", 5)]
     book.close()
+
+
+@pytest.mark.asyncio
+async def test_connected_group_bots_can_deliver_existing_files_without_crossing_users(tmp_path, monkeypatch):
+    from nonebot_plugin_ai_groupmate.agent import file_workspace as module
+    import nonebot
+
+    monkeypatch.setattr(nonebot, "get_bots", lambda: {"bot": object(), "peer": object()})
+    old = workspace(tmp_path).save(b"picture", "desert_boss.png")
+    peer = workspace(tmp_path, bot_id="peer")
+    assert peer.read(old.file_id) == b"picture"
+    assert old.file_id in [item.file_id for item in peer.list()]
+    for scope in ({"user_id": "other"}, {"session_id": "other"}, {"bot_id": "unconnected"}, {"is_private": True}):
+        with pytest.raises(module.FileTaskError):
+            workspace(tmp_path, **{"bot_id": "peer", **scope}).read(old.file_id)
+    tools = toolset(tmp_path, bot_id="peer")
+    from nonebot_plugin_alconna import UniMessage
+
+    sender = AsyncMock(return_value=SimpleNamespace(msg_ids=[{"message_id": "42"}]))
+    monkeypatch.setattr(UniMessage, "send", sender)
+    result = json.loads(await tools["send_file"].ainvoke({"file_id": old.file_id}))
+    assert result["status"] == "succeeded"
+    sender.assert_awaited_once()

@@ -51,6 +51,7 @@ from .prompts import (
     build_reaction_tool_instruction,
 )
 from .reaction import is_onebot_context, create_reaction_tool
+from .chat_style import build_group_style_context, load_group_style_context
 from .file_tools import FILE_TOOLS_PROMPT, create_file_tools
 from .meme_tools import (
     MAX_MEME_SEND_COUNT,
@@ -1067,12 +1068,24 @@ async def create_chat_graph(
         memory_context = "【明确记忆】读取失败；不能声称没有记忆或已忘掉。"
     group_context = ""
     recent_relations_context = ""
+    group_style_context = ""
     if not is_private:
         group_context = await get_group_context(db_session, session_id)
         group_context += "\n" + group_feeling_context((str(bot_id or plugin_config.bot_name), session_id))
         recent_relations_context = await get_recent_relations_context(
             db_session, history or []
         )
+        style_bot_ids = tuple({str(uid) for uid in get_bots()} | ({str(bot_id)} if bot_id else set()))
+        try:
+            group_style_context = await load_group_style_context(
+                db_session, session_id, style_bot_ids, bot_names=(plugin_config.bot_name,),
+            )
+        except Exception as error:
+            logger.warning(f"读取群表达习惯失败 error_type={type(error).__name__}，回退到近期样本")
+            await _safe_rollback(db_session)
+            group_style_context = build_group_style_context(
+                history or [], session_id, style_bot_ids, bot_names=(plugin_config.bot_name,),
+            )
 
     # The member lookup below is an adapter/network operation.  End the
     # read-only transaction first so a slow adapter cannot occupy a pooled
@@ -1127,6 +1140,7 @@ async def create_chat_graph(
         permission_status=permission_status,
         mute_tool_instruction=mute_tool_instruction,
         reaction_tool_instruction=reaction_tool_instruction,
+        group_style_context=group_style_context,
     )
     system_prompt = prompt_result.system_prompt
     system_prompt += MEMORY_PROMPT

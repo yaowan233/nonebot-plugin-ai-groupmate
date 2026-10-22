@@ -20,6 +20,7 @@
 本插件主体使用 langchain 的 agent 进行决策，由 langchain 调用 tools 进行一系列任务。
 
 - **群体认知档案**：由 bot 在发现值得长期记住的新话题、成员特征、内部梗或氛围变化时自主更新，让 bot 对群文化有持续感知。
+- **群聊表达学习**：独立读取本群近7天的历史，按天各取最多100条候选，每5分钟按需刷新，不受回复上下文最近20条或图片刷屏影响。过滤已知 bot 发言和明显的任务请求，按日期和成员分散选取最多12条例句、每人最多3条；样本足够时统计句长、标点及跨成员重复出现的收尾形式，供当前回复参考。无需额外模型调用，样本不足时不编造群内习惯。任务完成后自然收尾，文件确认送达后不自动追加修改邀请，用户要求的说明和必要结论仍完整保留。
 - **长记忆**（需配置 Qdrant）：RAG 自动存储聊天历史，学习群友发言习惯，使 bot 更像真人。
 - **表情包学习**（需配置 Qdrant）：默认使用 `qwen3-vl-plus` 理解图片内容，分别索引描述语义与视觉特征，自动从群内偷学表情包；回复时通过 RRF 多路召回，结合当前群的真实使用频率重排，并在发送前按当前对话审核相关性。
 - **自定义 Agent Tools**：可以注册自己的 LangChain tools 扩展 agent 能力，详见 [自定义 Agent Tools](./docs/custom-agent-tools.md)。
@@ -223,7 +224,7 @@ curl http://127.0.0.1:6333/collections/media_collection_v3
 | ai_groupmate__media_vectorize_batch_size | 否 | `1000` | 每轮最多处理的新图片数及旧向量重建数 |
 | ai_groupmate__media_vectorize_concurrency | 否 | `8` | 表情包标注与向量化的并发数（过高可能触发接口限流） |
 | ai_groupmate__group_memory_update_timeout_seconds | 否 | `120` | 群档案后台更新超时（秒） |
-| ai_groupmate__agent_max_llm_calls | 否 | `8` | 单次 agent 常规处理阶段最多调用主模型次数；任务尚未完成时额外允许一次无工具收尾 |
+| ai_groupmate__agent_max_llm_calls | 否 | `16` | 单次 agent 常规处理阶段最多调用主模型次数；任务尚未完成时额外允许一次收尾，可交付已生成的成品文件 |
 | ai_groupmate__agent_max_total_tokens | 否 | `2000000` | 单次 agent 常规工作阶段最多累计模型 token 数；达到上限且任务尚未完成时会额外执行一次受控收尾 |
 | ai_groupmate__agent_tool_result_max_chars | 否 | `6000` | 写回后续上下文的单次工具结果最大字符数 |
 | ai_groupmate__agent_file_tools_enabled | 否 | `true` | 启用公开网页抓取、文件下载、文档读取、表格汇总与文件发送；文件保留 24 小时，详见 [使用说明](./docs/agent-web-files.md) |
