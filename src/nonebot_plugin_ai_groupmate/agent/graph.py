@@ -790,7 +790,7 @@ def _make_agent_node(
             bound_models[tool_names] = bound_model
         full: list[BaseMessage] = system_messages + [HumanMessage(content=COMPLETION_RULE)] + list(state["messages"])
         if image_search_tools is not None:
-            full.append(HumanMessage(content="请根据刚才返回的原始搜图证据回答。匹配链接和已确认的信息优先；不要根据画风猜作者。当前已收紧工具范围，不能继续搜索时请直接说明证据与不确定之处，并以 reply_user(next_step='end') 完成本轮。"))
+            full.append(HumanMessage(content="请按用户当前问题结合原图和原始搜图证据回答：查出处时优先匹配链接；辨认虚构角色时，cartoon/anime 等泛化标签和视觉相似图不能证明角色身份，没有图源匹配也不能推出是原创或没有对应角色。不要根据画风猜作者，不要为圆候选而编造改发色、换校服。当前已收紧工具范围，不能继续搜索时请说明证据与不确定之处，并以 reply_user(next_step='end') 完成本轮。"))
         delivery_context = _file_delivery_reply_context(state["messages"])
         if delivery_context:
             full.append(HumanMessage(content=delivery_context))

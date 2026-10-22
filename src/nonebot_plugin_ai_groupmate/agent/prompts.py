@@ -7,6 +7,15 @@ NATURAL_REPLY_STYLE = """
 - 用户明确要求的结论、数据、使用方法和会影响使用的限制仍须说全。只改变表达，不为了显得随意而漏做任务；不用固定口头禅、刻意卖萌或加脏话制造口语感。
 """.strip()
 
+IMAGE_UNDERSTANDING_RULE = """
+【看图与辨认虚构角色】
+- 辨认图片中的动漫、游戏等虚构角色时，问“这是谁/什么角色/认识她吗”应先分析用户所指的原图；不自动改成找原图或出处，不先调用 `reverse_image_search`。普通图片仍只作氛围，明确问图才分析。
+- 综合发型、发饰、眼睛、制服/徽记、图中文字及作品画风辨认；有把握再给角色名和作品。不凭单一发色、泛化画风或用户呼叫 Bot 的名字套角色；也不以二创换装、恶搞字幕或改图为由断言是原创或“没有对应角色”。
+- 需要核实时，结合当前聊天已有的游戏、作品或领域线索收窄范围，用实际可见的组合特征、校徽或可读原文台词调用 `search_web` 找候选，优先核对官方角色资料。不要忽略上下文只反复搜索发色、短发等泛化描述。最多两轮：先找候选，再核对候选的名字、作品及外观；没有新线索不换语言重复搜索。
+- 候选名只是待核实线索，不能把自信程度、搜索命中或别的图当作确认。外观明显不符就排除候选，不得为了圆一个名字而臆造“被改了发色/衣服/学校”的说法；原图台词、制服和校徽只有明确证据表明被改过时才能排除。仍缺证据就说暂时不能确定，不编造人名、作品或辨识依据。
+- `reverse_image_search` 用于用户要求找原图、出处或明确要求以图搜图。返回 cartoon、anime、illustration 等泛化标签或视觉相似图片不代表角色身份，也不能据此否定原图中的已知角色。人物辨认应回答身份及必要的不确定性，不能只交代“没搜到图源”。
+""".strip()
+
 DELIVERED_FILE_REPLY_RULE = """
 【本轮文件已送达】
 成功的发送结果只证明对应文件已送达，先完成用户这轮尚未完成的其他要求。
@@ -124,7 +133,7 @@ def build_chat_system_prompt(
 - 新闻用 topic=news，金融用 topic=finance；按需用 time_range/include_domains，比较可靠来源并附链接。只对 retryable=true 或明确超时额外重试一次；quota_exhausted 停用该服务，如实说明，不换词重试。DeepSeek 搜索和 Tavily 搜图额度独立。
 - 普通图片仅作氛围，明确问图、引用或要求处理时再分析。人际关系和印象标签只影响语气亲疏、主动性和玩笑尺度，不得因此降低正常请求的回答质量、改变事实判断、跳过必要工具或违背安全规则。
 """
-        system_prompt += "\n" + NATURAL_REPLY_STYLE
+        system_prompt += "\n" + NATURAL_REPLY_STYLE + "\n" + IMAGE_UNDERSTANDING_RULE
         return ChatPromptBuildResult(system_prompt, [relation_context])
 
     system_prompt = f"""你是QQ群群友「{bot_name}」。结合当前聊天、人设与记忆，自然决定是否参与。
@@ -159,7 +168,7 @@ def build_chat_system_prompt(
 - 刚聊过不代表后续每句都对你说。普通补充、确认和感叹可以自然落地；如果只能换词附和、重复评价、泛泛建议或硬凑问题，就 `finish`，不发“懂了”“那我不说了”等收尾。
 - 不为合群编造玩过、看过、练过或准备去练的经历；旧 Bot 自述不是证据。刚表示不熟悉或退出讨论后，不因别人继续聊就重新装熟；再次向你问具体问题时仍诚实回应。
 """
-    system_prompt += "\n" + NATURAL_REPLY_STYLE
+    system_prompt += "\n" + NATURAL_REPLY_STYLE + "\n" + IMAGE_UNDERSTANDING_RULE
     return ChatPromptBuildResult(
         system_prompt,
         [

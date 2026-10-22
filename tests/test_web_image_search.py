@@ -3,10 +3,37 @@ from __future__ import annotations
 import uuid
 import datetime
 from typing import cast
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from nonebot.adapters import Bot, Event
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("matching_key", [None, "pages_with_matching_images", "full_matching_images", "partial_matching_images"])
+async def test_reverse_search_does_not_promote_generic_labels_or_similar_images_to_matches(monkeypatch, tmp_path, matching_key):
+    import json
+    from types import SimpleNamespace
+    from nonebot_plugin_ai_groupmate.agent import web_image_search as module
+    from nonebot_plugin_ai_groupmate.config import ScopedConfig
+
+    evidence = {
+        "best_guess_labels": [{"label": "cartoon"}],
+        "web_entities": [{"description": "Illustration", "score": 0.5}],
+        "visually_similar_images": [{"url": "https://example.com/unrelated-anime.jpg"}],
+    }
+    if matching_key:
+        evidence[matching_key] = [{"url": "https://example.com/matching-image.jpg"}]
+    message = SimpleNamespace(msg_id=1, content="id: source-image\npicture.jpg")
+    media = SimpleNamespace(media_id=2, file_path="picture.jpg")
+    monkeypatch.setattr(module, "_find_source_media", AsyncMock(return_value=(message, media)))
+    monkeypatch.setattr(module, "_read_source_image", lambda *args: b"original image")
+    monkeypatch.setattr(module, "perform_web_detection", AsyncMock(return_value=module.WebDetectionSearchResult(evidence, True, 1, 900)))
+    search = module.create_reverse_image_search_tool(object(), "group", None, None, reply_to_id="source-image", pic_dir=tmp_path, config=ScopedConfig(google_web_detection_enabled=True))
+    result = json.loads(await search.ainvoke({}))
+    assert result["reason_code"] == ("web_detection_matches_found" if matching_key else "web_detection_no_matches")
+    assert result["data"]["result"] == evidence
+    assert "不代表角色身份" in result["data"]["identity_notice"]
 
 
 def test_web_detection_defaults_stay_inside_free_tier():
@@ -503,6 +530,7 @@ async def test_last_search_persists_evidence_and_failure_without_cross_user_leak
         reader = create_last_image_search_tool(db, group, "alice")
         result = json.loads(await reader.ainvoke({}))
         assert result["data"]["search_result"] == json.loads(success)
+        assert "不代表角色身份" in result["data"]["identity_notice"]
         other_user = json.loads(await create_last_image_search_tool(db, group, "bob").ainvoke({}))
         other_group = json.loads(await create_last_image_search_tool(db, group + "other", "alice").ainvoke({}))
         assert other_user["ok"] is False
