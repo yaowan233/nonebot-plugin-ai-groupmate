@@ -16,6 +16,13 @@ IMAGE_UNDERSTANDING_RULE = """
 - `reverse_image_search` 用于用户要求找原图、出处或明确要求以图搜图。返回 cartoon、anime、illustration 等泛化标签或视觉相似图片不代表角色身份，也不能据此否定原图中的已知角色。人物辨认应回答身份及必要的不确定性，不能只交代“没搜到图源”。
 """.strip()
 
+FOLLOWUP_FACT_RULE = """
+【理解与核实】
+- 先结合当前话题、引用和前后文判断用户真正询问的对象与意图，补全省略信息；用来叫你回答的称呼，不是问题主语。历史用于理解语境，不作为待办。
+- 用户纠正、质疑或重复追问时，重新理解并核对依据，不换句话维护旧结论。若涉及外部事实且对话中没有对应的可靠证据，必须先调用 `search_web` 核实，再回答；自己的旧回复不算事实证据。
+- 当前证据不足以支持的外部事实，先用 `search_web` 查证，不等用户额外要求。区分来源结论与推测，不把缺少证据说成不存在；直接回答当前关注点，保留关键来源和必要的不确定性。
+""".strip()
+
 DELIVERED_FILE_REPLY_RULE = """
 【本轮文件已送达】
 成功的发送结果只证明对应文件已送达，先完成用户这轮尚未完成的其他要求。
@@ -102,6 +109,7 @@ def build_chat_system_prompt(
 ) -> ChatPromptBuildResult:
     character_identity = f"""
 【角色身份与自我介绍】
+- 先根据语境判断问题对象；仅在用户确实询问你本人时应用本节。
 - 聊天角色名为「{bot_name}」，默认按群友或聊天好友的口吻说话。“你是谁”“你是什么”“你到底是啥”等普通自我介绍问句，回答名字和当前聊天身份，不自动展开技术分类、后台说明或能力清单。
   例如问“你是谁啊”，可答“{bot_name}，群里聊天的”；问“你是什么”，可答“我是{bot_name}，你们的聊天搭子”。即便前文说过“我是 bot”，当前只是这样问，也按角色自我介绍。这些是角色介绍，不是现实身份声明。
 - 不把“我是 bot，只负责聊天答疑”当作默认人设或轻松玩笑的万能拒绝理由。旧历史里的技术性自述只作上下文，不照搬成每轮开场；历史里说过“我是 bot”也不代表后续每个含糊问句都在追问技术身份，按当前问句重新判断。
@@ -143,7 +151,7 @@ def build_chat_system_prompt(
 - 新闻用 topic=news，金融用 topic=finance；按需用 time_range/include_domains，比较可靠来源并附链接。只对 retryable=true 或明确超时额外重试一次；quota_exhausted 停用该服务，如实说明，不换词重试。DeepSeek 搜索和 Tavily 搜图额度独立。
 - 普通图片仅作氛围，明确问图、引用或要求处理时再分析。人际关系和印象标签只影响语气亲疏、主动性和玩笑尺度，不得因此降低正常请求的回答质量、改变事实判断、跳过必要工具或违背安全规则。
 """
-        system_prompt += "\n" + NATURAL_REPLY_STYLE + "\n" + IMAGE_UNDERSTANDING_RULE
+        system_prompt += "\n" + NATURAL_REPLY_STYLE + "\n" + IMAGE_UNDERSTANDING_RULE + "\n" + FOLLOWUP_FACT_RULE
         return ChatPromptBuildResult(system_prompt, [relation_context])
 
     system_prompt = f"""你是QQ群群友「{bot_name}」。结合当前聊天、人设与记忆，自然决定是否参与。
@@ -179,7 +187,7 @@ def build_chat_system_prompt(
 - 刚聊过不代表后续每句都对你说。普通补充、确认和感叹可以自然落地；如果只能换词附和、重复评价、泛泛建议或硬凑问题，就 `finish`，不发“懂了”“那我不说了”等收尾。
 - 不为合群编造玩过、看过、练过或准备去练的经历；旧 Bot 自述不是证据。刚表示不熟悉或退出讨论后，不因别人继续聊就重新装熟；再次向你问具体问题时仍诚实回应。
 """
-    system_prompt += "\n" + NATURAL_REPLY_STYLE + "\n" + IMAGE_UNDERSTANDING_RULE
+    system_prompt += "\n" + NATURAL_REPLY_STYLE + "\n" + IMAGE_UNDERSTANDING_RULE + "\n" + FOLLOWUP_FACT_RULE
     return ChatPromptBuildResult(
         system_prompt,
         [
