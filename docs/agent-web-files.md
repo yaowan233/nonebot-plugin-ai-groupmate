@@ -134,7 +134,9 @@ AI_GROUPMATE__AGENT_EXECUTION_IMAGE=ai-groupmate-executor:local
 AI_GROUPMATE__AGENT_EXECUTION_TIMEOUT_SECONDS=20
 ```
 
-Bot 进程需要 Docker CLI 和 daemon 访问权限。文件经 Docker API 传递，不依赖 Bot 与 Docker 主机共享目录。Bot 本身在容器中时，也可使用下面的独立服务方式。
+Bot 进程需要 Docker CLI 和 daemon 访问权限。文件通过 `docker exec` 中的 tar 流写入和读取容器的 tmpfs 工作目录，不依赖 Bot 与 Docker 主机共享目录；执行镜像需要提供 `tar`。Bot 本身在容器中时，也可使用下面的独立服务方式。
+
+构建镜像后，可运行 `uv run pytest tests/test_execution_docker.py` 验证真实容器的内联代码、输入/输出文件传输和输出目录删除错误。默认使用 `ai-groupmate-executor:local`，可通过 `AI_GROUPMATE_TEST_EXECUTION_IMAGE` 指定已存在的兼容镜像。Docker 或镜像不可用时明确跳过，测试不会拉取镜像。
 
 ### Bot 通过独立执行服务访问
 

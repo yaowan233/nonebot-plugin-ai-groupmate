@@ -110,24 +110,56 @@ async def test_docker_job_is_offline_bounded_and_always_removed(monkeypatch):
 
     async def command(*args, **kwargs):
         calls.append((args, kwargs))
+        if args[:2] == ("docker", "cp"):
+            return 1, b"", b"Error response from daemon: container rootfs is marked read-only"
+        if args[:2] == ("docker", "exec") and "tar" in args:
+            return (0, b"", b"") if "stdin" in kwargs else (0, output_tar("./result.txt"), b"")
         if args[:2] == ("docker", "exec"):
-            return 0, b"done", b""
-        if args[:2] == ("docker", "cp") and args[-1] == "-":
-            return 0, output_tar(), b""
+            return 3, b"done", b"program warning"
         return 0, b"", b""
 
     monkeypatch.setattr(module, "_command", command)
     result = await module.run_docker({"code": "print('done')", "language": "python"}, image="test-image")
     assert result["stdout"] == "done"
+    assert result["exit_code"] == 3
+    assert result["stderr"] == "program warning"
     assert module.decode_files(result["files"], limit=100) == [("result.txt", b"result")]
     create = calls[0][0]
-    for flag in ("--network=none", "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges", "--memory=512m", "--pids-limit=128", "--pull=never"):
+    for flag in ("--network=none", "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges", "--memory=512m", "--pids-limit=128", "--pull=never", "--tmpfs=/workspace:rw,nosuid,nodev,size=64m"):
         assert flag in create
     assert not any("mount" in flag or "socket" in flag for flag in create)
     assert calls[-1][0][:4] == ("docker", "rm", "--force", "--volumes")
-    inputs = next(kwargs["stdin"] for args, kwargs in calls if args[:3] == ("docker", "cp", "-"))
+    transfer, options = next((args, kwargs) for args, kwargs in calls if "stdin" in kwargs)
+    assert transfer[:3] == ("docker", "exec", "-i")
+    assert transfer[4:] == ("tar", "-xof", "-", "-C", "/workspace")
+    inputs = options["stdin"]
     with tarfile.open(fileobj=io.BytesIO(inputs)) as archive:
         assert set(archive.getnames()) == {"inputs", "out", "program"}
+    collect, options = next((args, kwargs) for args, kwargs in calls if kwargs.get("strict"))
+    assert collect[:2] == ("docker", "exec")
+    assert collect[3:] == ("tar", "-cf", "-", "-C", "/workspace/out", ".")
+    assert options["limit"] == module.MAX_OUTPUT_BYTES + 1024 * 1024
+
+
+@pytest.mark.parametrize("stage", ["input", "output"])
+async def test_docker_transfer_errors_include_bounded_diagnostics_and_cleanup(monkeypatch, stage):
+    from nonebot_plugin_ai_groupmate.agent import execution_backend as module
+
+    calls = []
+    diagnostic = b"tar: transfer failed: \xff" + b"x" * 500
+
+    async def command(*args, **kwargs):
+        calls.append(args)
+        if (stage == "input" and "stdin" in kwargs) or (stage == "output" and kwargs.get("strict")):
+            return 2, b"", diagnostic
+        return 0, b"", b""
+
+    monkeypatch.setattr(module, "_command", command)
+    message = "无法传入执行文件。" if stage == "input" else "无法收集输出文件，请勿删除 out 目录。"
+    with pytest.raises(module.ExecutionError) as error:
+        await module.run_docker({"code": "pass", "language": "python"}, image="test-image")
+    assert str(error.value) == message + diagnostic.decode("utf-8", "replace")[:200]
+    assert calls[-1][:4] == ("docker", "rm", "--force", "--volumes")
 
 
 @pytest.mark.parametrize("cancel", [False, True])
