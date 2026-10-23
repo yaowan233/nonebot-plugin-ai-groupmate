@@ -181,7 +181,8 @@ async def test_context_reranker_filters_low_scores_and_unknown_ids():
     captured_messages = []
 
     class FakeReviewer:
-        async def ainvoke(self, messages):
+        async def ainvoke(self, messages, **kwargs):
+            assert kwargs["max_tokens"] == 1200
             captured_messages.extend(messages)
             return {
                 "should_send": True,
@@ -233,7 +234,7 @@ async def test_content_reranker_treats_character_quote_and_meme_as_hard_constrai
     captured_messages = []
 
     class FakeReviewer:
-        async def ainvoke(self, messages):
+        async def ainvoke(self, messages, **kwargs):
             captured_messages.extend(messages)
             return {
                 "should_send": True,
@@ -346,7 +347,7 @@ async def test_context_reranker_fails_closed():
 
 
 @pytest.mark.asyncio
-async def test_explicit_meme_request_preserves_original_text_in_multimodal_fallback(
+async def test_explicit_meme_request_preserves_original_text_without_bypassing_review(
     monkeypatch,
 ):
     from nonebot_plugin_ai_groupmate.agent import meme_tools
@@ -407,11 +408,10 @@ async def test_explicit_meme_request_preserves_original_text_in_multimodal_fallb
         "match_type": "content",
     }))
 
-    assert result["status"] == "succeeded"
-    assert result["data"]["match_type"] == "content"
-    assert result["data"]["images"][0]["pic_id"] == 1
-    assert "回退" in result["data"]["note"]
-    assert approved == {1}
+    assert result["status"] == "failed"
+    assert result["reason_code"] == "no_candidates"
+    assert result["data"]["images"] == []
+    assert approved == set()
     assert search_calls == [
         (
             "开心的二次元表情\n用户原始找图要求：发一个初音未来拿着葱的表情包",

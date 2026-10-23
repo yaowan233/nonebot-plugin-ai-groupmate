@@ -122,6 +122,7 @@ from .web_image_search import (
     create_reverse_image_search_tool,
     is_explicit_web_image_search_request,
 )
+from ..message_batching import current_input_batch
 from .interaction_tools import create_interaction_history_tools
 from .group_memory_tools import create_group_memory_tool
 from .image_search_tools import create_web_image_tools
@@ -891,6 +892,12 @@ def _build_current_request_boundary(
         except Exception:
             current_text = ""
     current_text = current_text or fallback_text or "[非文本消息]"
+    batch = current_input_batch.get()
+    if len(batch) > 1:
+        current_text = (
+            "同一用户在短时间内连续发送的本轮输入，按顺序一起理解；补充或纠正以前后关系理解，独立问题都保留：\n"
+            + json.dumps([{"message_id": mid, "text": text or "[非文本消息，查看对应历史原图]"} for mid, text in batch], ensure_ascii=False)
+        )
     requester_name = requester_name or "当前触发用户"
 
     return f"""【本轮当前请求】
@@ -1082,6 +1089,11 @@ async def create_chat_graph(
         try:
             group_style_context = await load_group_style_context(
                 db_session, session_id, style_bot_ids, bot_names=(plugin_config.bot_name,),
+                current_history=history or [],
+                model_factory=get_flash_model if plugin_config.group_style_learning_enabled and (
+                    plugin_config.flash_api_key or plugin_config.llm_api_key or plugin_config.qwen_token
+                ) else None,
+                store_root=plugin_data_dir / "group_expressions",
             )
         except Exception as error:
             logger.warning(f"读取群表达习惯失败 error_type={type(error).__name__}，回退到近期样本")
@@ -1276,6 +1288,8 @@ async def create_chat_graph(
             current_request_text = event.get_plaintext().strip()
         except Exception:
             current_request_text = ""
+    if len(current_input_batch.get()) > 1:
+        current_request_text = "\n".join(text for _, text in current_input_batch.get() if text)
     explicit_web_image_search = is_explicit_web_image_search_request(
         current_request_text, has_image_context=bool(reply_to_id)
     )
@@ -1337,6 +1351,8 @@ async def create_chat_graph(
             explicit_meme_request_text = event.get_plaintext().strip() or None
         except Exception:
             explicit_meme_request_text = None
+    if meme_required and len(current_input_batch.get()) > 1:
+        explicit_meme_request_text = current_request_text or explicit_meme_request_text
     search_meme_tool = create_search_meme_tool(
         db_session,
         session_id,
@@ -1345,6 +1361,8 @@ async def create_chat_graph(
         # 二次审核耗时，也避免主模型偶发超过工具时限。工厂只在真正
         # 搜索表情包时执行，其他 Agent 路径无需提前初始化模型客户端。
         model_factory=get_flash_model,
+        vision_model_factory=(lambda: get_vision_model() or (model if _chat_supports_images(chat_config) else None))
+        if plugin_config.meme_visual_selection_enabled else None,
         history=history or [],
         approved_meme_ids=approved_meme_ids,
         allow_context_fallback=meme_required or proactive_meme_only,

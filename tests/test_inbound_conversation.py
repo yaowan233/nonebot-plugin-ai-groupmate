@@ -1,9 +1,62 @@
+import asyncio
 import datetime
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock
 
 import pytest
+
+
+async def test_real_inbound_burst_commits_both_messages_before_one_queue_admission(deliver_message, monkeypatch):
+    from uuid import uuid4
+
+    from sqlalchemy import select
+    from nonebot_plugin_orm import get_session
+
+    import nonebot_plugin_ai_groupmate as plugin
+    from nonebot_plugin_ai_groupmate.model import ChatHistory
+    from nonebot_plugin_ai_groupmate.message_batching import InputBatcher
+
+    deliver, _, _ = deliver_message
+    batcher = InputBatcher()
+    monkeypatch.setattr(plugin, "_input_batcher", batcher)
+    monkeypatch.setattr(plugin.plugin_config, "group_message_debounce_seconds", 0.02)
+    group = f"batched-inbound-{uuid4()}"
+    captured = []
+
+    async def queue(_group, request):
+        async with get_session() as db:
+            rows = (await db.scalars(select(ChatHistory).where(ChatHistory.session_id == group))).all()
+            assert len(rows) == 2
+        captured.append(request)
+        return True
+    monkeypatch.setattr(plugin, "_queue_group_reply_request", queue)
+    try:
+        await deliver(group, "10001", "这个是什么厂的", addressed=True)
+        await deliver(group, "10002", "我说右边那个")
+        await asyncio.gather(*list(batcher.tasks))
+        assert len(captured) == 1
+        assert captured[0].is_tome
+        assert captured[0].input_batch == (("10001", "这个是什么厂的"), ("10002", "我说右边那个"))
+    finally:
+        await batcher.close()
+
+
+async def test_inbound_stop_cancels_waiting_burst(deliver_message, monkeypatch):
+    import nonebot_plugin_ai_groupmate as plugin
+    from nonebot_plugin_ai_groupmate.message_batching import InputBatcher
+
+    deliver, queued, _ = deliver_message
+    batcher = InputBatcher()
+    monkeypatch.setattr(plugin, "_input_batcher", batcher)
+    monkeypatch.setattr(plugin.plugin_config, "group_message_debounce_seconds", 0.02)
+    try:
+        await deliver("batch-stop", "10001", "说点什么", addressed=True)
+        await deliver("batch-stop", "10002", "别插话")
+        await asyncio.gather(*list(batcher.tasks))
+        queued.assert_not_awaited()
+    finally:
+        await batcher.close()
 
 
 @pytest.fixture
@@ -26,6 +79,8 @@ def deliver_message(monkeypatch):
     monkeypatch.setattr(plugin, "_start_background_image_task", lambda *args: images.append(args))
     monkeypatch.setattr(plugin.plugin_config, "bot_name", "咕咕")
     monkeypatch.setattr(plugin.plugin_config, "continuous_conversation_minutes", 5)
+    # These tests assert admission policy; burst collection has separate coverage.
+    monkeypatch.setattr(plugin.plugin_config, "group_message_debounce_seconds", 0)
     plugin._continuous_conversation_until.clear()
     plugin.participation.states.clear()
     plugin._observation_schedule.clear()

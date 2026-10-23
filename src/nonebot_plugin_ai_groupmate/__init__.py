@@ -84,6 +84,7 @@ from .forward_message import format_forward_reference_markers
 from .group_api_relay import delete_expired_pending_group_configs
 from .scheduled_tasks import poll_scheduled_tasks, stop_scheduled_tasks
 from .agent.chat_files import chat_file_source_key
+from .message_batching import InputBatcher, current_input_batch
 from .message_metadata import BOT_ECHO_LOOKBACK, is_reliable_platform_id
 from .agent.reply_tools import create_reply_tool
 from .group_daily_quota import (
@@ -313,6 +314,7 @@ class ReplyRequest:
     reaction_required: bool = False
     repeat_text: str | None = None
     proactive_observation: bool = False
+    input_batch: tuple[tuple[str, str], ...] = ()
 
 
 _observation_schedule: ObservationSchedule[ReplyRequest] = ObservationSchedule()
@@ -369,8 +371,52 @@ class GroupReplyState:
 # 每个群有限并发处理明确 @；非定向回复只保留最新一条，避免高峰期刷屏。
 _group_reply_states: dict[str, GroupReplyState] = {}
 _group_reply_state_lock = asyncio.Lock()
+_input_batcher: InputBatcher[ReplyRequest] = InputBatcher()
 _continuous_conversation_until: dict[tuple[str, str, str], datetime.datetime] = {}
 MAX_GROUP_ADDRESSED_REQUESTS = 3
+
+
+@get_driver().on_shutdown
+async def _stop_input_learning_tasks() -> None:
+    from .agent.style_learning import stop_style_learning
+
+    await _input_batcher.close()
+    await stop_style_learning()
+
+
+def _input_batch_key(bot_id: str, group_id: str, user_id: str, reply_id: str | None) -> tuple[str, ...]:
+    key = bot_id, group_id, user_id, reply_id or ""
+    if not reply_id and key not in _input_batcher.pending:
+        candidates = [item for item in _input_batcher.pending if item[:3] == key[:3]]
+        if len(candidates) == 1:
+            return candidates[0]
+    return key
+
+
+async def _submit_reply_input(group_id: str, request: ReplyRequest, message_id: str, text: str) -> None:
+    if (request.session.scene.type != SceneType.GROUP or request.proactive_meme_only
+            or request.proactive_reaction_only or request.repeat_text is not None or request.proactive_observation):
+        await _queue_group_reply_request(group_id, request)
+        return
+
+    def merge(previous: ReplyRequest, latest: ReplyRequest) -> ReplyRequest:
+        return replace(latest, is_tome=previous.is_tome or latest.is_tome,
+                       is_continuous=previous.is_continuous or latest.is_continuous,
+                       meme_required=previous.meme_required or latest.meme_required,
+                       meme_send_count=max(previous.meme_send_count, latest.meme_send_count),
+                       reply_to_id=latest.reply_to_id or previous.reply_to_id,
+                       reaction_required=previous.reaction_required or latest.reaction_required)
+
+    async def deliver(ready: ReplyRequest) -> None:
+        messages = current_input_batch.get()
+        logger.info(f"[InputBatch] group={group_id} messages={len(messages)} ids={[mid for mid, _ in messages]}")
+        await _queue_group_reply_request(group_id, replace(ready, input_batch=messages))
+
+    await _input_batcher.submit(
+        _input_batch_key(str(request.bot.self_id), group_id, request.user_id, request.reply_to_id), request,
+        message_id=message_id if is_reliable_platform_id(message_id) else "", text=text, delay=plugin_config.group_message_debounce_seconds,
+        max_wait=plugin_config.group_message_debounce_max_seconds, merge=merge, deliver=deliver,
+    )
 
 # 多bot去重锁: 每个群串行化消息记录,防止并发SELECT查不到对方未提交数据
 _dedup_locks: dict[str, asyncio.Lock] = {}
@@ -703,26 +749,34 @@ async def _execute_reply_request(request: ReplyRequest) -> None:
     # Wait for a global Agent slot before opening a database session. This
     # bounds cross-group concurrency without consuming pool capacity while queued.
     async with agent_run_gate.slot():
-        await handle_reply_logic(
-            request.request_id,
-            request.session,
-            request.interface,
-            request.bot,
-            request.event,
-            request.bot_name,
-            request.user_id,
-            request.user_name,
-            request.is_tome,
-            request.is_continuous,
-            request.reply_to_id,
-            getattr(request, "proactive_meme_only", False),
-            getattr(request, "meme_required", False),
-            getattr(request, "meme_send_count", 1),
-            getattr(request, "proactive_reaction_only", False),
-            getattr(request, "reaction_required", False),
-            getattr(request, "repeat_text", None),
-            getattr(request, "proactive_observation", False),
-        )
+        token = current_input_batch.set(getattr(request, "input_batch", ()))
+        try:
+            await _handle_batched_reply_request(request)
+        finally:
+            current_input_batch.reset(token)
+
+
+async def _handle_batched_reply_request(request: ReplyRequest) -> None:
+    await handle_reply_logic(
+        request.request_id,
+        request.session,
+        request.interface,
+        request.bot,
+        request.event,
+        request.bot_name,
+        request.user_id,
+        request.user_name,
+        request.is_tome,
+        request.is_continuous,
+        request.reply_to_id,
+        getattr(request, "proactive_meme_only", False),
+        getattr(request, "meme_required", False),
+        getattr(request, "meme_send_count", 1),
+        getattr(request, "proactive_reaction_only", False),
+        getattr(request, "reaction_required", False),
+        getattr(request, "repeat_text", None),
+        getattr(request, "proactive_observation", False),
+    )
 
 
 def _start_addressed_workers_locked(
@@ -1121,6 +1175,7 @@ async def handle_message(
     group_followup = is_group and time.monotonic() - participation.state((bot_id, session.scene.id)).last_sent < 300
     disengaged = is_group and (explicit_to_me or ((active_followup or group_followup) and not has_at_mention and not reply_id)) and _is_explicit_disengagement(stripped_plain_text, plugin_config.bot_name)
     if disengaged:
+        _input_batcher.discard_speaker((bot_id, session.scene.id, session.user.id))
         _continuous_conversation_until.pop((session.scene.id, session.user.id, bot_id), None)
         logger.debug("用户明确退出当前 bot 对话，本条保持沉默并结束跟进窗口")
     continuous_to_me = not disengaged and not explicit_to_me and not command_like and not has_at_mention and not reply_id and bool(stripped_plain_text) and active_followup
@@ -1235,7 +1290,9 @@ async def handle_message(
         and (explicit_to_me or disengaged or (not has_at_mention and not reply_id))
         and resolve_group_reply_probability(session.scene.id) > 0
     )
-    if should_reply or track_observation:
+    pending_input = (is_group and not command_like and not disengaged and (not has_at_mention or explicit_to_me)
+                     and _input_batch_key(bot_id, session.scene.id, user_id, reply_id) in _input_batcher.pending)
+    if should_reply or track_observation or pending_input:
         group_id = session.scene.id
         request = ReplyRequest(
             request_id=f"{group_id}:{datetime.datetime.now().timestamp()}:{random.random()}",
@@ -1258,10 +1315,12 @@ async def handle_message(
         )
         if track_observation:
             _observation_schedule.note((bot_id, group_id), request, addressed=explicit_to_me, disengaged=disengaged)
-        if should_reply:
-            await _queue_group_reply_request(group_id, request)
-
-    await db_session.commit()
+        # Commit all text/image rows before the batch can wake a reader.
+        await db_session.commit()
+        if should_reply or pending_input:
+            await _submit_reply_input(group_id, request, str(incoming_message_id), plain_text)
+    else:
+        await db_session.commit()
 
 
 async def process_image_message(

@@ -19,8 +19,10 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from ..model import ChatHistory, MediaStorage, ChatHistorySchema
 from ..memory import DB, expand_meme_search_terms
+from ..deepseek import DeepSeekChatOpenAI
 from .reply_tools import record_image_reply, compose_image_reply, resolve_reply_target
 from ..reply_guard import is_request_active
+from .meme_visuals import VISUAL_CANDIDATE_LIMIT, build_meme_contact_sheet
 from .tool_results import tool_failure, tool_skipped, tool_success
 from ..participation import record_group_delivery
 
@@ -48,6 +50,17 @@ class MemeContextCandidateScore(BaseModel):
 class MemeContextReview(BaseModel):
     should_send: bool
     candidates: list[MemeContextCandidateScore] = Field(default_factory=list)
+
+
+def _parse_meme_visual_review(content: Any) -> MemeContextReview:
+    if isinstance(content, list):
+        content = "".join(part.get("text", "") for part in content if isinstance(part, dict) and part.get("type") == "text")
+    if not isinstance(content, str):
+        raise ValueError("Visual review did not return text")
+    body = content.strip()
+    if body.startswith("```") and body.endswith("```"):
+        body = body.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+    return MemeContextReview.model_validate_json(body)
 
 
 def _meme_perceptual_hash(image_data: bytes) -> int | None:
@@ -334,10 +347,15 @@ async def _rerank_meme_candidates_for_context(
     history: Sequence[ChatHistorySchema],
     candidates: Sequence[tuple[int, str]],
     match_type: MemeSearchType = "context",
+    candidate_grid: str | None = None,
+    review_metadata: dict[str, Any] | None = None,
+    planned_reply: str = "",
 ) -> list[tuple[int, float]]:
     """用当前对话审核候选；调用失败时由调用方决定是否回退。"""
     if not candidates:
         return []
+    if review_metadata is not None:
+        review_metadata.update(reviewed=False, mode="visual" if candidate_grid else "text")
 
     candidate_payload = [
         {"pic_id": media_id, "description": description}
@@ -374,22 +392,38 @@ async def _rerank_meme_candidates_for_context(
             "recent_chat": context,
             "search_request": search_intent,
             "match_type": match_type,
+            "planned_reply": planned_reply[:1000],
             "candidates": candidate_payload,
         },
         ensure_ascii=False,
     )
     try:
-        reviewer = model.with_structured_output(MemeContextReview)
-        raw_review = await asyncio.wait_for(
-            reviewer.ainvoke(
-                [
-                    SystemMessage(content=system_prompt),
-                    HumanMessage(content=input_payload),
-                ]
-            ),
-            timeout=MEME_CONTEXT_RERANK_TIMEOUT_SECONDS,
-        )
-        review = MemeContextReview.model_validate(raw_review)
+        if candidate_grid:
+            # Some configured vision gateways accept images but reject both
+            # response_format and tool-based structured output. Use ordinary
+            # text JSON, then apply the same local schema/ID/score validation.
+            invoke_kwargs: dict[str, Any] = {"max_tokens": 1200}
+            if isinstance(model, DeepSeekChatOpenAI):
+                invoke_kwargs.update(reasoning_effort="none", extra_body={"thinking": {"type": "disabled"}})
+            response = await asyncio.wait_for(model.ainvoke([
+                SystemMessage(content=system_prompt + "\n只输出符合以下结构的JSON，不要解释：" + json.dumps(MemeContextReview.model_json_schema(), ensure_ascii=False)),
+                HumanMessage(content=[
+                        {"type": "text", "text": input_payload + "\n候选原图拼图中的 pic_id 与候选对应。结合实际表情和图中文字审核；描述与原图冲突时以图为准。"},
+                        {"type": "image_url", "image_url": {"url": candidate_grid}},
+                ]),
+            ], **invoke_kwargs), timeout=MEME_CONTEXT_RERANK_TIMEOUT_SECONDS)
+            if review_metadata is not None:
+                review_metadata["usage"] = getattr(response, "usage_metadata", None)
+                review_metadata["finish_reason"] = getattr(response, "response_metadata", {}).get("finish_reason")
+            review = _parse_meme_visual_review(response.content)
+        else:
+            raw_review = await asyncio.wait_for(model.with_structured_output(MemeContextReview).ainvoke([
+                SystemMessage(content=system_prompt), HumanMessage(content=input_payload),
+            ], max_tokens=1200), timeout=MEME_CONTEXT_RERANK_TIMEOUT_SECONDS)
+            review = MemeContextReview.model_validate(raw_review)
+        if review_metadata is not None:
+            review_metadata.update(reviewed=True, should_send=review.should_send)
+        logger.info(f"[MemeSelection] reviewed mode={'visual' if candidate_grid else 'text'} should_send={review.should_send} candidates={len(candidates)}")
     except Exception as e:
         logger.warning(f"表情包上下文审核失败，返回空审核结果: {e}")
         return []
@@ -614,6 +648,7 @@ def create_search_meme_tool(
     *,
     model: Any | None = None,
     model_factory: Callable[[], Any] | None = None,
+    vision_model_factory: Callable[[], Any | None] | None = None,
     history: Sequence[ChatHistorySchema],
     approved_meme_ids: set[int] | None = None,
     allow_context_fallback: bool = False,
@@ -623,12 +658,16 @@ def create_search_meme_tool(
 ):
     """
     创建一个带数据库会话的表情包搜索工具
+
+    allow_context_fallback is retained for caller compatibility; an empty
+    review never approves candidates, regardless of this legacy flag.
     """
 
     @tool("search_meme_image")
     async def search_meme_image(
         description: str,
         match_type: MemeSearchType | None = None,
+        reply_text: str = "",
     ) -> str:
         """
         根据描述搜索合适的表情包图片。
@@ -636,6 +675,7 @@ def create_search_meme_tool(
         支持三种检索：context=根据对话选择自然反应；content=严格匹配用户指定的
         角色/形象/物体/动作/场景/画风/台词/梗/情绪；random=用户没有条件、随便发一张。
         description 必须保留用户点名的专有名词、原句和所有视觉条件，不能只改写成情绪。
+        若准备图文一起回复，reply_text 填拟发送的文字，选图时会一起检查语气和图中文字是否连贯。
         这个工具只负责搜索，不会发送图片。搜索后会返回匹配的图片列表及其详细描述。
         你可以查看这些图片的描述，判断是否合适，然后使用 send_meme_image 工具发送。
         """
@@ -698,11 +738,33 @@ def create_search_meme_tool(
                 ]
             else:
                 review_model = model
+                candidate_grid = None
                 if model_factory is not None:
                     try:
                         review_model = model_factory()
                     except Exception as e:
                         logger.warning(f"表情包审核模型初始化失败: {e}")
+                        review_model = None
+                if vision_model_factory is not None and pic_dir is not None:
+                    try:
+                        visual_model = vision_model_factory()
+                        if visual_model is not None:
+                            review_candidates = review_candidates[:VISUAL_CANDIDATE_LIMIT]
+                            image_rows = (await db_session.execute(Select(MediaStorage).where(
+                                MediaStorage.media_id.in_([item[0] for item in review_candidates]),
+                            ))).scalars().all()
+                            paths = {row.media_id: row.file_path for row in image_rows}
+                            await db_session.commit()
+                            candidate_grid, readable_ids = await asyncio.to_thread(
+                                build_meme_contact_sheet, pic_dir,
+                                [(media_id, paths[media_id]) for media_id, _ in review_candidates if media_id in paths],
+                            )
+                            review_candidates = [item for item in review_candidates if item[0] in readable_ids]
+                            review_model = visual_model
+                            logger.info(f"[MemeSelection] visual_candidates={len(review_candidates)}")
+                    except Exception as error:
+                        logger.warning(f"[MemeSelection] visual_failed error_type={type(error).__name__}")
+                        review_candidates = []
                         review_model = None
                 context_candidates = (
                     await _rerank_meme_candidates_for_context(
@@ -711,25 +773,14 @@ def create_search_meme_tool(
                         history=history,
                         candidates=review_candidates,
                         match_type=effective_match_type,
+                        candidate_grid=candidate_grid,
+                        planned_reply=reply_text,
                     )
                     if review_model is not None
                     else []
                 )
-            used_explicit_fallback = False
-            if not context_candidates and allow_context_fallback:
-                # 明确索图或主动表情轮次已经通过前置语境判断时，不再因为
-                # 二次审核过于保守而清空所有候选。保留多路召回和群常用池，
-                # 允许表情包有一点不精确的随机感。
-                context_candidates = [
-                    (media_id, max(0.6, 1.0 - rank * 0.01))
-                    for rank, (media_id, _) in enumerate(review_candidates)
-                ]
-                used_explicit_fallback = bool(context_candidates)
-                if used_explicit_fallback:
-                    logger.info(
-                        "表情包上下文审核未通过，回退到多路召回候选: "
-                        f"{search_query}"
-                    )
+            # Empty/failed review is intentional: never approve an unreviewed
+            # image merely because the request explicitly asked for a meme.
             if effective_match_type == "content":
                 pic_ids = _select_content_meme_ids(
                     context_candidates,
@@ -810,11 +861,7 @@ def create_search_meme_tool(
                 )
 
             logger.info(f"找到 {len(images_info)} 张匹配的表情包: {search_query}")
-            if used_explicit_fallback and effective_match_type == "content":
-                result_note = "按用户指定内容回退到文本与视觉语义召回候选，请选择最匹配的一张发送"
-            elif used_explicit_fallback:
-                result_note = "上下文审核未选出候选，已宽松回退到语义召回与本群常用候选，请选择大致合拍的一张发送"
-            elif effective_match_type == "random":
+            if effective_match_type == "random":
                 result_note = "用户未指定内容条件，已返回语义候选与本群常用候选"
             else:
                 result_note = "候选已按当前对话或用户指定内容审核，请选择最匹配的一张"

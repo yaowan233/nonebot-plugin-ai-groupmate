@@ -1,26 +1,27 @@
 """Bounded, group-local speech examples for in-context style adaptation."""
 
-import json
 import re
+import json
 import time
-from collections import Counter
-from collections import OrderedDict, defaultdict
-from collections.abc import Sequence
+from typing import Any
+from pathlib import Path
 from datetime import datetime, timedelta
 from statistics import median
+from collections import Counter, OrderedDict, defaultdict
+from collections.abc import Callable, Sequence
 
-from nonebot.log import logger
 from sqlalchemy import Select, func
+from nonebot.log import logger
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..model import ChatHistory, ChatHistorySchema
+from .style_learning import contextual_style
 from ..message_metadata import deduplicate_bot_echoes, parse_message_metadata
-
 
 STYLE_HISTORY_DAYS = 7
 STYLE_ROWS_PER_DAY = 100
 STYLE_CACHE_SECONDS = 300
-_style_cache: OrderedDict[tuple[str, tuple[str, ...], tuple[str, ...]], tuple[float, str]] = OrderedDict()
+_style_cache: OrderedDict[tuple[str, tuple[str, ...], tuple[str, ...]], tuple[float, list[ChatHistorySchema]]] = OrderedDict()
 
 
 def _human_expressions(
@@ -136,33 +137,54 @@ async def load_group_style_context(
     *,
     bot_names: Sequence[str] = (),
     now: datetime | None = None,
+    current_history: Sequence[ChatHistorySchema] = (),
+    model_factory: Callable[[], Any] | None = None,
+    store_root: Path | None = None,
 ) -> str:
     """Rebuild from stored chat, independently of the 20-message reply window."""
     key = (session_id, tuple(sorted(set(bot_user_ids))), tuple(sorted(set(bot_names))))
     cached = _style_cache.get(key) if now is None else None
     if cached is not None and time.monotonic() - cached[0] < STYLE_CACHE_SECONDS:
         _style_cache.move_to_end(key)
-        return cached[1]
-    end = now or datetime.now()
-    rows = []
-    for day in range(STYLE_HISTORY_DAYS):
-        upper = end - timedelta(days=day)
-        lower = upper - timedelta(days=1)
-        result = await db_session.execute(Select(ChatHistory).where(
-            ChatHistory.session_id == session_id,
-            ChatHistory.created_at > lower,
-            ChatHistory.created_at <= upper,
-            ChatHistory.content_type.in_(("text", "bot")),
-            ChatHistory.media_id.is_(None),
-            func.length(ChatHistory.content) <= 1200,
-        ).order_by(ChatHistory.created_at.desc(), ChatHistory.msg_id.desc()).limit(STYLE_ROWS_PER_DAY))
-        rows.extend(result.scalars().all())
-    history = [ChatHistorySchema.model_validate(row) for row in sorted(rows, key=lambda row: (row.created_at, row.msg_id))]
+        history = cached[1]
+    else:
+        end = now or datetime.now()
+        rows = []
+        for day in range(STYLE_HISTORY_DAYS):
+            upper = end - timedelta(days=day)
+            lower = upper - timedelta(days=1)
+            result = await db_session.execute(Select(ChatHistory).where(
+                ChatHistory.session_id == session_id,
+                ChatHistory.created_at > lower,
+                ChatHistory.created_at <= upper,
+                ChatHistory.content_type.in_(("text", "bot")),
+                ChatHistory.media_id.is_(None),
+                func.length(ChatHistory.content) <= 1200,
+            ).order_by(ChatHistory.created_at.desc(), ChatHistory.msg_id.desc()).limit(STYLE_ROWS_PER_DAY))
+            rows.extend(result.scalars().all())
+        history = [ChatHistorySchema.model_validate(row) for row in sorted(rows, key=lambda row: (row.created_at, row.msg_id))]
+        if now is None:
+            _style_cache[key] = (time.monotonic(), history)
+            _style_cache.move_to_end(key)
+            while len(_style_cache) > 128:
+                _style_cache.popitem(last=False)
     context = build_group_style_context(history, session_id, bot_user_ids, bot_names=bot_names)
-    if now is None:
-        _style_cache[key] = (time.monotonic(), context)
-        _style_cache.move_to_end(key)
-        while len(_style_cache) > 128:
-            _style_cache.popitem(last=False)
+    if model_factory is not None and store_root is not None:
+        await db_session.commit()  # Do not hold a pooled connection during model I/O.
+        recent = []
+        for row in current_history[-12:]:
+            if row.session_id == session_id and row.content_type in {"text", "bot", "image"}:
+                body = "[图片]" if row.content_type == "image" else parse_message_metadata(row.content)[2][:500]
+                recent.append({"speaker": row.user_id, "kind": row.content_type, "text": body})
+        selected = await contextual_style(
+            root=store_root, session_id=session_id,
+            sources=_human_expressions(history, session_id, bot_user_ids, bot_names=bot_names),
+            recent_chat=json.dumps(recent, ensure_ascii=False) if recent else "",
+            model_factory=model_factory, excluded_users=bot_user_ids,
+        )
+        if selected is not None:
+            # Keep aggregate observations; never refill an intentional empty choice
+            # with unrelated historical examples.
+            context = context.split("【本群近期表达样本", 1)[0] + selected
     logger.info(f"[ChatStyle] group={session_id} rows={len(history)} context_chars={len(context)} window_days={STYLE_HISTORY_DAYS}")
     return context

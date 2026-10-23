@@ -29,6 +29,10 @@ class ScopedConfig(BaseModel):
     proactive_meme_probability: float = Field(default=0.02, ge=0.0, le=1.0)
     proactive_private_message: bool = True
     continuous_conversation_minutes: float = 5.0
+    group_style_learning_enabled: bool = True
+    meme_visual_selection_enabled: bool = True
+    group_message_debounce_seconds: float = Field(default=1.2, ge=0, le=5)
+    group_message_debounce_max_seconds: float = Field(default=4.0, ge=0, le=10)
     usage_webui_enabled: bool = True
     usage_webui_path: str = "/ai-groupmate/usage"
     usage_webui_token: str = ""
