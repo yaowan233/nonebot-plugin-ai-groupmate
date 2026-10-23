@@ -285,13 +285,15 @@ async def run_docker(request: dict, *, image: str, timeout: float = 20) -> dict:
         status, _, _ = await _command("docker", "start", container)
         if status:
             raise ExecutionError("执行容器无法启动。")
-        status, _, _ = await _command("docker", "cp", "-", container + ":/workspace", stdin=archive)
+        # docker cp cannot access tmpfs mounts. Extract inside the running container;
+        # -o skips ownership restoration because CAP_CHOWN is dropped.
+        status, _, transfer_stderr = await _command("docker", "exec", "-i", container, "tar", "-xof", "-", "-C", "/workspace", stdin=archive)
         if status:
-            raise ExecutionError("无法传入执行文件。")
+            raise ExecutionError("无法传入执行文件。" + transfer_stderr.decode("utf-8", "replace")[:200])
         exit_code, stdout, stderr = await _command("docker", "exec", container, "timeout", "--signal=KILL", str(timeout), *command)
-        status, output, _ = await _command("docker", "cp", container + ":/workspace/out/.", "-", limit=MAX_OUTPUT_BYTES + 1024 * 1024, strict=True)
+        status, output, transfer_stderr = await _command("docker", "exec", container, "tar", "-cf", "-", "-C", "/workspace/out", ".", limit=MAX_OUTPUT_BYTES + 1024 * 1024, strict=True)
         if status:
-            raise ExecutionError("无法收集输出文件，请勿删除 out 目录。")
+            raise ExecutionError("无法收集输出文件，请勿删除 out 目录。" + transfer_stderr.decode("utf-8", "replace")[:200])
         return {"exit_code": exit_code, "stdout": stdout.decode("utf-8", "replace"), "stderr": stderr.decode("utf-8", "replace"), "files": output_files(output)}
 
     try:
