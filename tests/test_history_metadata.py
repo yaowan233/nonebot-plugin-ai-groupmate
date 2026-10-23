@@ -80,6 +80,123 @@ def test_formatter_does_not_reintroduce_bot_image_echo_as_human_inline_image(tmp
     assert "[图片]" in formatted[0].content
 
 
+@pytest.mark.parametrize("echo_first", [None, False, True])
+@pytest.mark.parametrize("image_limit", [0, 3])
+def test_sent_meme_meaning_survives_history_rebuild_without_image_bytes(tmp_path, echo_first, image_limit):
+    from nonebot_plugin_ai_groupmate.agent.history_format import format_chat_history
+
+    bot = _history(1, "bot", "id: 1222234946\n发送了图片，图片描述是: 黄色卡通角色，配文‘切换为奶龙模式’，表示进入轻松装傻的状态。\n图片文件: sent-meme.jpg", media_id=1056353)
+    echo = _history(2, "image", "id: 1222234946\nsent-meme.jpg", media_id=1056353)
+    followup = _history(3, "text", "id: 1222234947\n你刚才发的那张是什么意思")
+    history = [bot] if echo_first is None else [echo, bot] if echo_first else [bot, echo]
+
+    messages = format_chat_history([*history, followup], pic_dir=tmp_path, bot_name="miyuki", max_inline_images=image_limit)
+
+    assert len(messages) == 2
+    assert isinstance(messages[0], AIMessage)
+    assert "切换为奶龙模式" in messages[0].content
+    assert "轻松装傻" in messages[0].content
+    assert "sent-meme.jpg" not in messages[0].content
+    assert "图片文件:" not in messages[0].content
+    assert isinstance(messages[1], HumanMessage)
+
+
+@pytest.mark.parametrize("echo_first", [False, True])
+def test_sent_meme_original_is_attached_once_in_provider_compatible_role(tmp_path, echo_first):
+    import base64
+    from io import BytesIO
+
+    from PIL import Image
+
+    from nonebot_plugin_ai_groupmate.agent.history_format import format_chat_history
+
+    Image.new("RGB", (11, 7), "red").save(tmp_path / "sent-meme.png")
+    bot = _history(1, "bot", "id: 1222234946\n图片文件: sent-meme.png", media_id=1056353)
+    echo = _history(2, "image", "id: 1222234946\nsent-meme.png", media_id=1056353)
+    followup = _history(3, "text", "id: 1222234947\n你刚才发的那张是什么意思")
+
+    history = [echo, bot, followup] if echo_first else [bot, echo, followup]
+    messages = format_chat_history(history, pic_dir=tmp_path, bot_name="miyuki")
+
+    assert len(messages) == 3
+    assert isinstance(messages[0], AIMessage)
+    assert isinstance(messages[1], HumanMessage)
+    blocks = messages[1].content
+    assert isinstance(blocks, list)
+    assert isinstance(blocks[0], dict)
+    assert "miyuki" in blocks[0]["text"]
+    assert "历史" in blocks[0]["text"]
+    image_blocks = [part for part in blocks if isinstance(part, dict) and part["type"] == "image_url"]
+    assert len(image_blocks) == 1
+    raw = base64.b64decode(image_blocks[0]["image_url"]["url"].split(",", 1)[1])
+    with Image.open(BytesIO(raw)) as original:
+        assert original.size == (11, 7)
+    assert "刚才发的" in messages[2].content
+
+
+@pytest.mark.asyncio
+async def test_sent_meme_original_survives_active_thread_update(tmp_path):
+    from uuid import uuid4
+
+    from PIL import Image
+    from nonebot_plugin_orm import get_session
+
+    from nonebot_plugin_ai_groupmate.model import ChatHistory
+    from nonebot_plugin_ai_groupmate.agent.conversation import update_active_thread, active_conversation_threads
+    from nonebot_plugin_ai_groupmate.agent.history_format import format_chat_history
+
+    Image.new("RGB", (11, 7), "red").save(tmp_path / "sent-meme.png")
+    session_id = f"cache-sent-meme-{uuid4()}"
+
+    def format_history(history, max_images, roles, extra):
+        return format_chat_history(history, pic_dir=tmp_path, bot_name="miyuki", max_inline_images=max_images, extra_inline_images=extra)
+
+    try:
+        async with get_session() as db:
+            trigger = ChatHistory(session_id=session_id, user_id="user", user_name="user", content_type="text", content="id: 1200\n发个表情包")
+            db.add(trigger)
+            await db.flush()
+            boundary = trigger.msg_id
+            db.add(ChatHistory(session_id=session_id, user_id="miyuki", user_name="miyuki", content_type="bot", content="id: 1201\n图片文件: sent-meme.png", media_id=1056353))
+            await db.commit()
+            await update_active_thread(db, session_id, [HumanMessage("发个表情包")], boundary, format_history=format_history)
+
+        thread = active_conversation_threads[session_id]
+        assert any(isinstance(m.content, list) and any(p.get("type") == "image_url" for p in m.content if isinstance(p, dict)) for m in thread.messages)
+        assert any(isinstance(m, AIMessage) for m in thread.messages)
+    finally:
+        active_conversation_threads.pop(session_id, None)
+
+
+def test_sent_and_received_images_share_the_recent_inline_budget(tmp_path):
+    import base64
+    from io import BytesIO
+
+    from PIL import Image
+
+    from nonebot_plugin_ai_groupmate.agent.history_format import format_chat_history
+
+    history = []
+    for index, kind in enumerate(("bot", "image", "bot", "image"), start=1):
+        filename = f"image-{index}.png"
+        Image.new("RGB", (10 + index, 7), "red").save(tmp_path / filename)
+        body = f"图片文件: {filename}" if kind == "bot" else filename
+        history.append(_history(index, kind, f"id: {index}\n{body}", media_id=index))
+
+    messages = format_chat_history(history, pic_dir=tmp_path, bot_name="miyuki", max_inline_images=2)
+    sizes = []
+    for message in messages:
+        if not isinstance(message.content, list):
+            continue
+        for part in message.content:
+            if isinstance(part, dict) and part.get("type") == "image_url":
+                assert isinstance(message, HumanMessage)
+                raw = base64.b64decode(part["image_url"]["url"].split(",", 1)[1])
+                with Image.open(BytesIO(raw)) as original:
+                    sizes.append(original.size)
+    assert sizes == [(13, 7), (14, 7)]
+
+
 def test_append_only_history_drops_delayed_echo_of_previous_bot_turn(tmp_path):
     from nonebot_plugin_ai_groupmate.agent.conversation import (
         ActiveConversationThread,

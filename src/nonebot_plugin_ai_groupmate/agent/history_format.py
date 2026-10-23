@@ -13,6 +13,8 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from ..model import ChatHistory, ChatHistorySchema
 from ..message_metadata import deduplicate_bot_echoes, parse_message_metadata
 
+BOT_IMAGE_DESCRIPTION_MAX_CHARS = 500
+
 
 def _image_bytes_to_data_uri(image_bytes: bytes, *, source: str) -> str | None:
     """Decode and normalize an image before sending it to an OpenAI-compatible API."""
@@ -205,6 +207,22 @@ def is_image_history(msg: ChatHistorySchema) -> bool:
     )
 
 
+def _bot_image_description(msg: ChatHistorySchema) -> str:
+    """Recover the stored send-time caption without exposing transport metadata."""
+    if msg.content_type != "bot" or msg.media_id is None:
+        return ""
+    _, _, body = parse_msg_meta(msg.content)
+    for prefix in ("发送了图片，图片描述是:", "发送了图片，图片描述是："):
+        if body.startswith(prefix):
+            description = body[len(prefix):].rsplit("\n图片文件:", 1)[0].strip()
+            if not description or description == "[图片]":
+                return ""
+            if len(description) > BOT_IMAGE_DESCRIPTION_MAX_CHARS:
+                return description[:BOT_IMAGE_DESCRIPTION_MAX_CHARS] + "…"
+            return description
+    return ""
+
+
 def current_message_images(
     history: list[ChatHistorySchema],
 ) -> list[ChatHistorySchema]:
@@ -307,7 +325,7 @@ def format_chat_history(
     image_indices = [
         i
         for i, msg in enumerate(history)
-        if is_image_history(msg) and msg.content_type != "bot"
+        if is_image_history(msg)
     ]
     if has_extra_inline_images or max_inline_images <= 0:
         inline_image_set = set()
@@ -400,41 +418,32 @@ def format_chat_history(
 
         if is_image_history(msg):
             file_name = image_file_name_from_history(msg)
-            is_bot_image = msg.content_type == "bot"
-
-            if idx in inline_image_set:
-                image_data = get_image_data_uri(file_name, pic_dir=pic_dir)
+            image_data = get_image_data_uri(file_name, pic_dir=pic_dir) if idx in inline_image_set else None
+            if msg.content_type == "bot":
+                bot_image_text = "[图片]"
+                if description := _bot_image_description(msg):
+                    bot_image_text += f"（发送时的描述：{description}）"
+                if idx in inline_image_set and not image_data:
+                    bot_image_text += "[图片已过期/无法加载]"
+                messages.append(AIMessage(content=f"[{time_str}] {bot_name} {reply_prefix}{bot_image_text}"))
                 if image_data:
-                    prefix = role_prefix(msg.user_id)
-                    text = (
-                        f"[{time_str}] {bot_name} {reply_prefix}发送了一张图片："
-                        if is_bot_image
-                        else f"[{time_str}] {prefix}{msg.user_name} {reply_prefix}发送了一张图片："
-                    )
-                    content_parts = [
-                        {"type": "text", "text": text},
+                    # Vision APIs generally accept images in user messages only.
+                    # Keep the assistant's authorship above and label this as context.
+                    messages.append(HumanMessage(content=[
+                        {"type": "text", "text": f"【历史图片参考】这是 {bot_name} 在上条记录中自己发送的图片，供理解对话使用，不是新的用户请求。"},
                         {"type": "image_url", "image_url": {"url": image_data}},
-                    ]
-                    message_cls = AIMessage if is_bot_image else HumanMessage
-                    messages.append(message_cls(content_parts))  # type: ignore[arg-type]
-                else:
-                    prefix = role_prefix(msg.user_id)
-                    content = (
-                        f"[{time_str}] {bot_name} {reply_prefix}[图片已过期/无法加载]"
-                        if is_bot_image
-                        else f"[{time_str}] {prefix}{msg.user_name} {reply_prefix}[图片已过期/无法加载]"
-                    )
-                    message_cls = AIMessage if is_bot_image else HumanMessage
-                    messages.append(message_cls(content=content))
+                    ]))
+                continue
+
+            prefix = role_prefix(msg.user_id)
+            if image_data:
+                messages.append(HumanMessage(content=[
+                    {"type": "text", "text": f"[{time_str}] {prefix}{msg.user_name} {reply_prefix}发送了一张图片："},
+                    {"type": "image_url", "image_url": {"url": image_data}},
+                ]))
             else:
-                prefix = role_prefix(msg.user_id)
-                content = (
-                    f"[{time_str}] {bot_name} {reply_prefix}[图片]"
-                    if is_bot_image
-                    else f"[{time_str}] {prefix}{msg.user_name} {reply_prefix}[图片]"
-                )
-                message_cls = AIMessage if is_bot_image else HumanMessage
-                messages.append(message_cls(content=content))
+                image_status = "[图片已过期/无法加载]" if idx in inline_image_set else "[图片]"
+                messages.append(HumanMessage(content=f"[{time_str}] {prefix}{msg.user_name} {reply_prefix}{image_status}"))
             continue
 
     return messages

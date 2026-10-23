@@ -132,7 +132,7 @@ async def update_active_thread(
                 for msg in deduplicate_bot_echoes([*earlier_bots, *new_history])
                 if msg.msg_id > input_max_msg_id
             ]
-        base_messages = base_messages + format_history(new_history, 0, None, None)
+        base_messages = base_messages + format_history(new_history, 3, None, None)
     else:
         last_msg_id = input_max_msg_id
 
