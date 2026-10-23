@@ -21,7 +21,9 @@ from ..message_metadata import deduplicate_bot_echoes, parse_message_metadata
 STYLE_HISTORY_DAYS = 7
 STYLE_ROWS_PER_DAY = 100
 STYLE_CACHE_SECONDS = 300
+PAIR_HISTORY_LIMIT = 400
 _style_cache: OrderedDict[tuple[str, tuple[str, ...], tuple[str, ...]], tuple[float, list[ChatHistorySchema]]] = OrderedDict()
+_pair_history_cache: OrderedDict[tuple[str, tuple[str, ...], tuple[str, ...]], tuple[float, list[ChatHistorySchema]]] = OrderedDict()
 
 
 def _human_expressions(
@@ -30,6 +32,10 @@ def _human_expressions(
     bot_user_ids: Sequence[str] = (),
     *,
     bot_names: Sequence[str] = (),
+    max_per_speaker: int | None = 20,
+    preserve_occurrences: bool = False,
+    max_length: int = 100,
+    max_lines: int = 3,
 ) -> list[tuple[ChatHistorySchema, str]]:
     excluded = set(bot_user_ids)
     excluded.update(m.user_id for m in history if m.content_type == "bot")
@@ -49,12 +55,12 @@ def _human_expressions(
         own_id, _, body = parse_message_metadata(message.content)
         if (
             own_id == "system"
-            or not 2 <= len(body) <= 100
-            or len(body.splitlines()) > 3
+            or not 2 <= len(body) <= max_length
+            or len(body.splitlines()) > max_lines
             or body.startswith(("/", "!", "！", "#"))
             or any(marker in body for marker in ("http://", "https://", "[CQ:", "```"))
-            or (message.user_id, body) in seen
-            or counts[message.user_id] >= 20
+            or (not preserve_occurrences and (message.user_id, body) in seen)
+            or (max_per_speaker is not None and counts[message.user_id] >= max_per_speaker)
             or (addressed is not None and addressed.search(body))
             or re.match(r"^(?:请(?:帮|给|查|搜|画|写|生成)|帮我|帮忙|麻烦|修改一下|生成一个)", body)
             or any(marker in body for marker in ("【合并转发", "【视频消息", "【用户上传文件", "attachment_message_id:", "forward_id:"))
@@ -170,6 +176,24 @@ async def load_group_style_context(
                 _style_cache.popitem(last=False)
     context = build_group_style_context(history, session_id, bot_user_ids, bot_names=bot_names)
     if model_factory is not None and store_root is not None:
+        # Pair reconstruction needs an unbroken recent timeline, not the
+        # daily sampled/deduplicated corpus used for single-message style.
+        pair_cached = _pair_history_cache.get(key) if now is None else None
+        if pair_cached is not None and time.monotonic() - pair_cached[0] < STYLE_CACHE_SECONDS:
+            pair_history = pair_cached[1]
+            _pair_history_cache.move_to_end(key)
+        else:
+            result = await db_session.execute(Select(ChatHistory).where(
+                ChatHistory.session_id == session_id,
+                ChatHistory.created_at > (now or datetime.now()) - timedelta(days=STYLE_HISTORY_DAYS),
+                ChatHistory.created_at <= (now or datetime.now()),
+            ).order_by(ChatHistory.created_at.desc(), ChatHistory.msg_id.desc()).limit(PAIR_HISTORY_LIMIT))
+            pair_history = [ChatHistorySchema.model_validate(row) for row in reversed(result.scalars().all())]
+            if now is None:
+                _pair_history_cache[key] = (time.monotonic(), pair_history)
+                _pair_history_cache.move_to_end(key)
+                while len(_pair_history_cache) > 128:
+                    _pair_history_cache.popitem(last=False)
         await db_session.commit()  # Do not hold a pooled connection during model I/O.
         recent = []
         for row in current_history[-12:]:
@@ -181,6 +205,9 @@ async def load_group_style_context(
             sources=_human_expressions(history, session_id, bot_user_ids, bot_names=bot_names),
             recent_chat=json.dumps(recent, ensure_ascii=False) if recent else "",
             model_factory=model_factory, excluded_users=bot_user_ids,
+            learning_history=pair_history,
+            pair_sources=_human_expressions(pair_history, session_id, bot_user_ids, bot_names=bot_names,
+                                           max_per_speaker=None, preserve_occurrences=True, max_length=240, max_lines=6),
         )
         if selected is not None:
             # Keep aggregate observations; never refill an intentional empty choice
