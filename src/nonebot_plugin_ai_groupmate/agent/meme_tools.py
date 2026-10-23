@@ -19,6 +19,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from ..model import ChatHistory, MediaStorage, ChatHistorySchema
 from ..memory import DB, expand_meme_search_terms
+from .reply_tools import resolve_reply_target
 from ..reply_guard import is_request_active
 from .tool_results import tool_failure, tool_skipped, tool_success
 from ..participation import record_group_delivery
@@ -851,6 +852,8 @@ def create_send_meme_tool(
     bot_name: str,
     approved_meme_ids: set[int] | None = None,
     max_sends: int = 1,
+    current_message_id: str | None = None,
+    replied_message_id: str | None = None,
 ):
     """
     创建一个带上下文的表情包发送工具
@@ -862,13 +865,15 @@ def create_send_meme_tool(
     sent_perceptual_hashes: list[int] = []
 
     @tool("send_meme_image")
-    async def send_meme_image(pic_id: str) -> str:
+    async def send_meme_image(pic_id: str, reply_to: str | None = None) -> str:
         """
         发送表情包图片到聊天中。
 
         你需要先使用当前可用的表情包搜索工具获取候选图片，
         然后从本轮审核通过的候选中决定是否发送。工具每次发送一张；只有用户明确
         要求多张时才可用不同 pic_id 多次调用，且必须服从本轮发送上限。
+        reply_to 可选：填 current 引用用户现在发出的这条消息；
+        引用其他消息则传当前会话的已知平台消息ID；省略则普通发送，不要编造ID。
         """
         nonlocal sent_count
         if sent_count >= max_sends:
@@ -889,6 +894,10 @@ def create_send_meme_tool(
 
         send_started = False
         try:
+            try:
+                quoted_id = await resolve_reply_target(db_session, session_id, reply_to, current_message_id=current_message_id, replied_message_id=replied_message_id)
+            except ValueError as error:
+                return tool_failure("invalid_reply_target", str(error), delivery_state="not_attempted")
             match = re.search(r"\d+", pic_id)
             if not match:
                 return tool_failure(
@@ -993,6 +1002,8 @@ def create_send_meme_tool(
             # Release the read transaction before waiting on the adapter.
             await db_session.commit()
             message = UniMessage.image(raw=pic_data)
+            if quoted_id is not None:
+                message = UniMessage.reply(quoted_id) + message
             send_started = True
             res = await (
                 message.send(target=send_target)
@@ -1013,7 +1024,8 @@ def create_send_meme_tool(
                 content_type="bot",
                 content=(
                     f"id: {msg_id}\n"
-                    f"发送了图片，图片描述是: {description}\n"
+                    + (f"回复id: {quoted_id}\n" if quoted_id is not None else "")
+                    + f"发送了图片，图片描述是: {description}\n"
                     f"图片文件: {media_file_path}"
                 ),
                 user_name=bot_name,
@@ -1033,6 +1045,7 @@ def create_send_meme_tool(
                 data={
                     "pic_id": selected_pic_id,
                     "message_id": msg_id,
+                    "reply_to_message_id": quoted_id,
                     "description": description,
                     "sent_count": sent_count,
                     "max_sends": max_sends,

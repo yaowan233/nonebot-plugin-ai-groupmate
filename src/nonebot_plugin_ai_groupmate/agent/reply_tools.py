@@ -5,7 +5,7 @@ from typing import Any, Literal
 from collections.abc import Callable
 
 import jieba
-from sqlalchemy import Select
+from sqlalchemy import Select, or_
 from nonebot.log import logger
 from langchain.tools import tool
 from nonebot_plugin_uninfo import SceneType, QryItrface
@@ -15,6 +15,32 @@ from ..model import ChatHistory
 from ..reply_guard import is_request_active
 from .tool_results import tool_failure, tool_skipped, tool_success
 from ..participation import record_group_delivery
+from ..message_metadata import platform_message_ids, is_reliable_platform_id
+
+
+async def resolve_reply_target(db_session, session_id: str, reply_to: str | None, *, current_message_id: str | None = None, replied_message_id: str | None = None) -> str | None:
+    """Resolve a quote to a transport ID belonging to the bound conversation."""
+    if reply_to is None:
+        return None
+    requested = reply_to.strip()
+    target = current_message_id if requested == "current" else requested
+    if not is_reliable_platform_id(target):
+        raise ValueError("没有可引用的目标消息，请使用当前消息或当前会话中的有效消息ID。")
+    target = str(target).strip()
+    if target in {current_message_id, replied_message_id}:
+        return target
+    rows = await db_session.execute(
+        Select(ChatHistory.content).where(
+            ChatHistory.session_id == session_id,
+            or_(
+                ChatHistory.content.contains(f"id: {target}\n", autoescape=True),
+                ChatHistory.content.contains(f"id:{target}\n", autoescape=True),
+            ),
+        ).order_by(ChatHistory.msg_id.asc()).limit(50)
+    )
+    if any(target in platform_message_ids(content) for content in rows.scalars().all()):
+        return target
+    raise ValueError("当前会话中找不到该消息，未执行引用回复。请核对平台消息ID，不要使用数据库记录ID。")
 
 
 def create_reply_tool(
@@ -28,6 +54,8 @@ def create_reply_tool(
     parse_msg_meta: Callable[[str], tuple[str | None, str | None, str]],
     group_members: list[Any] | None = None,
     repeat_text: str | None = None,
+    current_message_id: str | None = None,
+    replied_message_id: str | None = None,
 ):
     """
     核心工具：用于发送消息。
@@ -70,12 +98,15 @@ def create_reply_tool(
     async def reply_user(
         content: str,
         next_step: Literal["end", "continue"],
+        reply_to: str | None = None,
     ) -> str:
         """
         向当前群聊发送文本回复。
         注意：如果你想对用户说话，必须调用这个工具。不要直接返回文本。
         Args:
             content: 你想发送的内容。
+            reply_to: 可选引用回复。填 current 引用用户现在发出的这条消息；
+                引用其他消息则传当前会话的已知平台消息ID。省略则普通发送，不要编造ID。
             next_step: 当前请求已处理并交付结果或明确说明阻塞后填 end；
                 只有下一条会提供新信息时填 continue，最后一条必须填 end。
                 end 表示本轮任务结束。不要发送“还在推/等下再回你”等空承诺；
@@ -110,6 +141,10 @@ def create_reply_tool(
             content = repeat_text
 
         try:
+            try:
+                quoted_id = await resolve_reply_target(db_session, session_id, reply_to, current_message_id=current_message_id, replied_message_id=replied_message_id)
+            except ValueError as error:
+                return tool_failure("invalid_reply_target", str(error), delivery_state="not_attempted")
             content = _dedupe_consecutive_lines(content.strip())
             normalized_content = _normalize_text(content)
 
@@ -129,7 +164,7 @@ def create_reply_tool(
                 .first()
             )
             if latest_bot_msg:
-                _, _, latest_body = parse_msg_meta(latest_bot_msg.content)
+                _, latest_reply_id, latest_body = parse_msg_meta(latest_bot_msg.content)
                 latest_normalized = _normalize_text(
                     latest_body or latest_bot_msg.content
                 )
@@ -138,7 +173,7 @@ def create_reply_tool(
                     <= datetime.timedelta(seconds=90)
                 )
                 similarity = _semantic_similarity(latest_normalized, normalized_content)
-                if recent and similarity >= 0.9:
+                if recent and similarity >= 0.9 and latest_reply_id == quoted_id:
                     logger.info(
                         f"检测到近义重复回复(相似度={similarity:.2f})，已自动跳过"
                     )
@@ -229,6 +264,8 @@ def create_reply_tool(
                 )
 
             outgoing = message or UniMessage.text(content)
+            if quoted_id is not None:
+                outgoing = UniMessage.reply(quoted_id) + outgoing
             res = await (
                 outgoing.send(target=send_target)
                 if send_target is not None
@@ -240,7 +277,7 @@ def create_reply_tool(
                 session_id=session_id,
                 user_id=bot_name,
                 content_type="bot",
-                content=f"id: {msg_id}\n" + content,
+                content=f"id: {msg_id}\n" + (f"回复id: {quoted_id}\n" if quoted_id is not None else "") + content,
                 user_name=bot_name,
             )
             db_session.add(chat_history)
@@ -248,7 +285,7 @@ def create_reply_tool(
             return tool_success(
                 "message_sent",
                 "消息已发送。",
-                data={"message_id": str(msg_id)},
+                data={"message_id": str(msg_id), "reply_to_message_id": quoted_id},
                 delivery_state="completed",
             )
         except Exception as error:

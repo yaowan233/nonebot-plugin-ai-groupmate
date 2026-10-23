@@ -413,7 +413,7 @@ def format_chat_history(
             continue
 
         if msg.content_type == "bot" and not is_image_history(msg):
-            messages.append(AIMessage(content=body or msg.content))
+            messages.append(AIMessage(content=reply_prefix + (body or msg.content)))
             continue
 
         if is_image_history(msg):
