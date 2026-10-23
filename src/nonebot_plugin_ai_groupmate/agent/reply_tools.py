@@ -43,6 +43,20 @@ async def resolve_reply_target(db_session, session_id: str, reply_to: str | None
     raise ValueError("当前会话中找不到该消息，未执行引用回复。请核对平台消息ID，不要使用数据库记录ID。")
 
 
+def compose_image_reply(image: UniMessage, text: str = "", quoted_id: str | None = None) -> UniMessage:
+    """Build one native message chain for an image, optional text, and a quote."""
+    message = UniMessage.text(text) + image if text else image
+    return UniMessage.reply(quoted_id) + message if quoted_id is not None else message
+
+
+def record_image_reply(db_session, *, session_id: str, bot_name: str, message_id: str, image_content: str, text: str = "", quoted_id: str | None = None, media_id: int | None = None) -> None:
+    """Store multipart content under the single platform message's transport ID."""
+    header = f"id: {message_id}\n" + (f"回复id: {quoted_id}\n" if quoted_id is not None else "")
+    if text:
+        db_session.add(ChatHistory(session_id=session_id, user_id=bot_name, user_name=bot_name, content_type="bot", content=header + text))
+    db_session.add(ChatHistory(session_id=session_id, user_id=bot_name, user_name=bot_name, content_type="bot", content=header + image_content, media_id=media_id))
+
+
 def create_reply_tool(
     db_session,
     session_id: str,
@@ -101,8 +115,8 @@ def create_reply_tool(
         reply_to: str | None = None,
     ) -> str:
         """
-        向当前群聊发送文本回复。
-        注意：如果你想对用户说话，必须调用这个工具。不要直接返回文本。
+        向当前会话单独发送文字回复，不要直接返回正文。
+        文字要和图片在同一条消息中时，使用发图工具的 text 参数，不要拆成两次发送。
         Args:
             content: 你想发送的内容。
             reply_to: 可选引用回复。填 current 引用用户现在发出的这条消息；

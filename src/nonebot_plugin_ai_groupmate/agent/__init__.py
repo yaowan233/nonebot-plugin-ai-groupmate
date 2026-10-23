@@ -1542,6 +1542,8 @@ async def create_chat_graph(
             send_target=send_target,
             supports_images=_chat_supports_images(chat_config),
             image_summarizer=summarize_web_image if plugin_config.vision_model else None,
+            current_message_id=str(getattr(event, "message_id", "") or "") or None,
+            replied_message_id=reply_to_id,
         )
         if not proactive_meme_only and not proactive_reaction_only and repeat_text is None
         else []
@@ -1563,6 +1565,8 @@ async def create_chat_graph(
             user_id=str(user_id), bot_id=str(bot_id or plugin_config.bot_name),
             is_private=is_private, bot_name=plugin_config.bot_name, send_target=send_target,
             bot=bot, event=event,
+            current_message_id=str(getattr(event, "message_id", "") or "") or None,
+            replied_message_id=reply_to_id,
         )
         if plugin_config.agent_file_tools_enabled
         and not proactive_meme_only and not proactive_reaction_only and repeat_text is None

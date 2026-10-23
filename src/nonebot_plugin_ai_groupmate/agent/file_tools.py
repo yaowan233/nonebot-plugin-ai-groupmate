@@ -9,11 +9,11 @@ from collections.abc import Callable
 from nonebot.log import logger
 from nonebot.adapters import Bot, Event
 from langchain_core.tools import tool
-from nonebot_plugin_alconna import File, Target
+from nonebot_plugin_alconna import File, Target, UniMessage
 
-from ..model import ChatHistory
 from .web_fetch import download_public_url
 from .chat_files import import_chat_file, wait_for_chat_files
+from .reply_tools import record_image_reply, compose_image_reply, resolve_reply_target
 from ..reply_guard import is_request_active
 from .file_content import SOURCE_SUFFIXES, read_table, decode_text, bounded_text, extract_html, image_preview, create_document, summarize_table, extract_document
 from .tool_results import tool_failure, tool_skipped, tool_success
@@ -69,6 +69,8 @@ def create_file_tools(
     send_target: Target | None,
     bot: Bot | None = None,
     event: Event | None = None,
+    current_message_id: str | None = None,
+    replied_message_id: str | None = None,
 ):
     workspace = FileWorkspace(root, session_id=session_id, user_id=user_id, bot_id=bot_id, is_private=is_private)
     attempted_sends: set[str] = set()
@@ -255,8 +257,11 @@ def create_file_tools(
         return await run(lambda: workspace.save(create_document(filename, content), filename).public(), "file_created", "已生成文件，需要发送时调用 send_file。")
 
     @tool("send_file")
-    async def send_file(file_id: str) -> str:
-        """把当前用户已保存的文件实际发送到当前会话。只能使用已有 file_id；成功后才能确认送达。"""
+    async def send_file(file_id: str, text: str = "", reply_to: str | None = None, as_image: bool = False, next_step: Literal["end", "continue"] = "end") -> str:
+        """实际发送已有 file_id。位图可设置 as_image=true 按图片发送；有 text 配文或 reply_to 时也按图片发送，图文共用一条消息。
+        reply_to=current 引用当前消息，或填当前会话的已知平台消息ID。有配文时本轮已完成填 next_step=end，仍有交付填 continue。
+        普通文件保留文件发送方式；成功后才能确认送达。
+        """
         if not await active():
             return tool_skipped("request_expired", "请求已过期，已取消发送。", delivery_state="not_attempted")
         if file_id in attempted_sends:
@@ -270,19 +275,33 @@ def create_file_tools(
                 return tool_skipped("duplicate_file", "本轮已尝试发送此文件，请勿重复发送。", delivery_state="not_attempted")
             artifact = workspace.get(file_id)
             path = workspace.path(file_id)
+            text = text.strip()
+            image_mode = as_image or bool(text) or reply_to is not None
+            quoted_id = None
+            if image_mode:
+                try:
+                    quoted_id = await resolve_reply_target(db_session, session_id, reply_to, current_message_id=current_message_id, replied_message_id=replied_message_id)
+                except ValueError as error:
+                    return tool_failure("invalid_reply_target", str(error), delivery_state="not_attempted")
+                data = await asyncio.to_thread(workspace.read, file_id)
+                async with _parse_gate:
+                    await asyncio.to_thread(image_preview, data, 0)
+                message = compose_image_reply(UniMessage.image(raw=data), text, quoted_id)
+            else:
+                message = file_message(path, artifact.name)
             await db_session.commit()
             if not await active():
                 return tool_skipped("request_expired", "请求已过期，已取消发送。", delivery_state="not_attempted")
-            message = file_message(path, artifact.name)
             attempted_sends.add(file_id)
             started = True
             receipt = await message.send(target=send_target, fallback=False)
             record_group_delivery(session_id)
             ids = getattr(receipt, "msg_ids", None) or []
             message_id = str(ids[-1].get("message_id") or ids[-1].get("msg_id") or "unknown") if ids and isinstance(ids[-1], dict) else "unknown"
-            db_session.add(ChatHistory(session_id=session_id, user_id=bot_name, user_name=bot_name, content_type="bot",
-                                       content=f"id: {message_id}\n[文件] {artifact.name} file_id={file_id}"))
-            return tool_success("file_sent", "文件已发送。", data={"file_id": file_id, "name": artifact.name}, delivery_state="completed")
+            record_image_reply(db_session, session_id=session_id, bot_name=bot_name, message_id=message_id, text=text, quoted_id=quoted_id,
+                               image_content=f"[{'图片文件' if image_mode else '文件'}] {artifact.name} file_id={file_id}")
+            return tool_success("file_sent", "图文已在同一条消息中发送。" if text else "图片已发送。" if image_mode else "文件已发送。",
+                                data={"file_id": file_id, "name": artifact.name, "message_id": message_id, "text": text, "reply_to_message_id": quoted_id, "as_image": image_mode}, delivery_state="completed")
         except FileTaskError as error:
             return tool_failure(error.code, str(error), delivery_state="not_attempted")
         except Exception as error:

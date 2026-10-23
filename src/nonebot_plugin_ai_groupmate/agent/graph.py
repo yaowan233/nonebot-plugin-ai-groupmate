@@ -18,9 +18,9 @@ from langgraph.graph.message import add_messages
 from langchain_core.runnables import RunnableConfig
 from langchain_core.utils.function_calling import convert_to_openai_tool
 
+from .prompts import DELIVERED_FILE_REPLY_RULE
 from ..reply_guard import is_request_active
 from .prompt_cache import normalize_system_messages
-from .prompts import DELIVERED_FILE_REPLY_RULE
 from .tool_results import (
     tool_failure,
     tool_skipped,
@@ -790,7 +790,10 @@ def _make_agent_node(
             bound_models[tool_names] = bound_model
         full: list[BaseMessage] = system_messages + [HumanMessage(content=COMPLETION_RULE)] + list(state["messages"])
         if image_search_tools is not None:
-            full.append(HumanMessage(content="请按用户当前问题结合原图和原始搜图证据回答：查出处时优先匹配链接；辨认虚构角色时，cartoon/anime 等泛化标签和视觉相似图不能证明角色身份，没有图源匹配也不能推出是原创或没有对应角色。不要根据画风猜作者，不要为圆候选而编造改发色、换校服。当前已收紧工具范围，不能继续搜索时请说明证据与不确定之处，并以 reply_user(next_step='end') 完成本轮。"))
+            full.append(HumanMessage(content=(
+                "请按用户当前问题结合原图和原始搜图证据回答：查出处时优先匹配链接；辨认虚构角色时，cartoon/anime 等泛化标签和视觉相似图不能证明角色身份，没有图源匹配也不能推出是原创或没有对应角色。"
+                "不要根据画风猜作者，不要为圆候选而编造改发色、换校服。当前已收紧工具范围，不能继续搜索时请说明证据与不确定之处，并以 reply_user(next_step='end') 完成本轮。"
+            )))
         delivery_context = _file_delivery_reply_context(state["messages"])
         if delivery_context:
             full.append(HumanMessage(content=delivery_context))
@@ -1221,6 +1224,8 @@ def _make_tool_node(
                 metadata_value = args.pop(terminal_metadata.argument_name, None)
             if name == "reply_user" and isinstance(args.get("content"), str):
                 args = {**args, "content": _safe_reply_text(args["content"])}
+            if name in {"send_meme_image", "send_web_image", "send_file"} and isinstance(args.get("text"), str):
+                args = {**args, "text": _safe_reply_text(args["text"])}
 
             await _recover_db_session(db_session)
 
@@ -1596,6 +1601,21 @@ def _make_tool_node(
                     if required_side_effect_completed:
                         # 必需动作已经达到目标次数，不再让模型补发解释文字。
                         called_finish += 1
+                delivery_data = parsed_tool_result.get("data") if isinstance(parsed_tool_result, dict) else None
+                if (
+                    name in {"send_meme_image", "send_web_image", "send_file"}
+                    and tool_status == "succeeded"
+                    and isinstance(parsed_tool_result, dict)
+                    and parsed_tool_result.get("delivery_state") == "completed"
+                    and isinstance(delivery_data, dict)
+                    and isinstance(delivery_data.get("text"), str)
+                    and delivery_data["text"].strip()
+                ):
+                    reply_count += 1
+                    reply_this_round += 1
+                    reply_requires_continuation = args.get("next_step", "end") == "continue" or (
+                        required_side_effect_tool is not None and not required_side_effect_completed and not required_side_effect_unavailable
+                    )
                 if effect_key is not None and (
                     tool_status == "succeeded" or delivery_unknown
                 ):

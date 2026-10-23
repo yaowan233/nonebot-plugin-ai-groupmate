@@ -2,7 +2,7 @@ import base64
 import socket
 import asyncio
 import ipaddress
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlsplit
 from collections.abc import Callable, Awaitable
 
@@ -12,7 +12,7 @@ from langchain_tavily import TavilySearch
 from langchain_core.tools import tool
 from nonebot_plugin_alconna import Target, UniMessage
 
-from ..model import ChatHistory
+from .reply_tools import record_image_reply, compose_image_reply, resolve_reply_target
 from ..reply_guard import is_request_active
 from .common_tools import _web_search_failure
 from .tool_results import tool_failure, tool_skipped, tool_success
@@ -64,6 +64,8 @@ def create_web_image_tools(
     send_target: Target | None = None,
     supports_images: bool = False,
     image_summarizer: Callable[[list[Any]], Awaitable[str]] | None = None,
+    current_message_id: str | None = None,
+    replied_message_id: str | None = None,
 ):
     """Search and send only images returned in this agent request."""
     search = TavilySearch(
@@ -161,8 +163,10 @@ def create_web_image_tools(
         return [{"type": "text", "text": result}, *blocks] if blocks else result
 
     @tool("send_web_image")
-    async def send_web_image(image_id: str, allow_unverified: bool = False) -> str:
-        """把本轮 search_web_images 返回的图片发送到当前群聊或私聊。只能传候选 image_id，每轮最多 3 张。"""
+    async def send_web_image(image_id: str, allow_unverified: bool = False, text: str = "", reply_to: str | None = None, next_step: Literal["end", "continue"] = "end") -> str:
+        """发送本轮搜图候选，每轮最多3张。text 可将文字与图放在同一条消息中；reply_to=current 引用当前消息，或填会话内已知平台消息ID。
+        有配文时本轮已完成填 next_step=end，仍需交付其他内容填 continue；不要另发同一文字。
+        """
         if not await active():
             return tool_skipped("request_expired", "请求已过期，已取消发送。", delivery_state="not_attempted")
         candidate = candidates.get(image_id.strip())
@@ -181,11 +185,17 @@ def create_web_image_tools(
             return tool_skipped("image_send_limit", "本轮已达到 3 张图片的发送上限。", delivery_state="not_attempted")
         send_started = False
         try:
+            try:
+                quoted_id = await resolve_reply_target(db_session, session_id, reply_to, current_message_id=current_message_id, replied_message_id=replied_message_id)
+            except ValueError as error:
+                return tool_failure("invalid_reply_target", str(error), delivery_state="not_attempted")
             await db_session.commit()
             if not await active():
                 return tool_skipped("request_expired", "请求已过期，已取消发送。", delivery_state="not_attempted")
             uri = previews.get(image_id)
             message = UniMessage.image(raw=base64.b64decode(uri.partition(",")[2])) if uri else UniMessage.image(url=url)
+            text = text.strip()
+            message = compose_image_reply(message, text, quoted_id)
             attempted_urls.add(url)
             send_started = True
             receipt = await (message.send(target=send_target) if send_target is not None else message.send())
@@ -194,13 +204,14 @@ def create_web_image_tools(
             if receipt.msg_ids:
                 raw_id = receipt.msg_ids[-1]
                 message_id = str(raw_id.get("message_id") or raw_id.get("msg_id") or "unknown")
-            db_session.add(ChatHistory(
-                session_id=session_id, user_id=bot_name, user_name=bot_name, content_type="bot",
-                content=f"id: {message_id}\n发送了网络图片，搜索描述: {candidate['description']}\n看图状态: {status}\n图片来源: {url}",
-            ))
+            record_image_reply(db_session, session_id=session_id, bot_name=bot_name, message_id=message_id, text=text, quoted_id=quoted_id,
+                               image_content=f"发送了网络图片，搜索描述: {candidate['description']}\n看图状态: {status}\n图片来源: {url}")
         except Exception as error:
             logger.warning(f"网络图片发送失败 error_type={type(error).__name__} send_started={send_started}")
             return tool_failure("image_send_failed", "图片发送失败，可能是图片链接失效或站点防盗链；投递结果不确定时不要重复发送。", delivery_state="unknown" if send_started else "not_attempted")
-        return tool_success("image_sent", "已发送网络图片。" if status != "description_only" else "已按搜索描述发送图片，未核实画面，请向用户说明。", data={"image_id": image_id, "message_id": message_id, "url": url, "inspection_status": status}, delivery_state="completed")
+        note = "图文已在同一条消息中发送。" if text else "已发送网络图片。"
+        if status == "description_only":
+            note += "未核实画面，请向用户说明。"
+        return tool_success("image_sent", note, data={"image_id": image_id, "message_id": message_id, "url": url, "inspection_status": status, "text": text, "reply_to_message_id": quoted_id}, delivery_state="completed")
 
     return [search_web_images, send_web_image, preview_web_images]

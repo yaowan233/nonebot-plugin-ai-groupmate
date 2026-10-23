@@ -19,7 +19,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from ..model import ChatHistory, MediaStorage, ChatHistorySchema
 from ..memory import DB, expand_meme_search_terms
-from .reply_tools import resolve_reply_target
+from .reply_tools import record_image_reply, compose_image_reply, resolve_reply_target
 from ..reply_guard import is_request_active
 from .tool_results import tool_failure, tool_skipped, tool_success
 from ..participation import record_group_delivery
@@ -865,7 +865,7 @@ def create_send_meme_tool(
     sent_perceptual_hashes: list[int] = []
 
     @tool("send_meme_image")
-    async def send_meme_image(pic_id: str, reply_to: str | None = None) -> str:
+    async def send_meme_image(pic_id: str, reply_to: str | None = None, text: str = "", next_step: Literal["end", "continue"] = "end") -> str:
         """
         发送表情包图片到聊天中。
 
@@ -874,6 +874,8 @@ def create_send_meme_tool(
         要求多张时才可用不同 pic_id 多次调用，且必须服从本轮发送上限。
         reply_to 可选：填 current 引用用户现在发出的这条消息；
         引用其他消息则传当前会话的已知平台消息ID；省略则普通发送，不要编造ID。
+        text 可选，填写后文字与图片在同一条消息中发送，不要再单独重复发文字。
+        图文已完成本轮请求时 next_step=end；仍需交付其他内容时填 continue。
         """
         nonlocal sent_count
         if sent_count >= max_sends:
@@ -1001,9 +1003,8 @@ def create_send_meme_tool(
             # All ORM values needed after the send have been copied above.
             # Release the read transaction before waiting on the adapter.
             await db_session.commit()
-            message = UniMessage.image(raw=pic_data)
-            if quoted_id is not None:
-                message = UniMessage.reply(quoted_id) + message
+            text = text.strip()
+            message = compose_image_reply(UniMessage.image(raw=pic_data), text, quoted_id)
             send_started = True
             res = await (
                 message.send(target=send_target)
@@ -1018,20 +1019,8 @@ def create_send_meme_tool(
                 )
                 if raw_msg_id is not None:
                     msg_id = str(raw_msg_id)
-            chat_history = ChatHistory(
-                session_id=session_id,
-                user_id=bot_name,
-                content_type="bot",
-                content=(
-                    f"id: {msg_id}\n"
-                    + (f"回复id: {quoted_id}\n" if quoted_id is not None else "")
-                    + f"发送了图片，图片描述是: {description}\n"
-                    f"图片文件: {media_file_path}"
-                ),
-                user_name=bot_name,
-                media_id=media_id,
-            )
-            db_session.add(chat_history)
+            record_image_reply(db_session, session_id=session_id, bot_name=bot_name, message_id=msg_id, text=text, quoted_id=quoted_id,
+                               image_content=f"发送了图片，图片描述是: {description}\n图片文件: {media_file_path}", media_id=media_id)
             if approved_meme_ids is not None:
                 approved_meme_ids.discard(selected_pic_id)
             sent_meme_ids.add(selected_pic_id)
@@ -1041,11 +1030,12 @@ def create_send_meme_tool(
             logger.info(f"id:{res.msg_ids}\n发送表情包: {description}")
             return tool_success(
                 "meme_sent",
-                "已成功发送表情包。",
+                "文字和表情包已在同一条消息中发送。" if text else "已成功发送表情包。",
                 data={
                     "pic_id": selected_pic_id,
                     "message_id": msg_id,
                     "reply_to_message_id": quoted_id,
+                    "text": text,
                     "description": description,
                     "sent_count": sent_count,
                     "max_sends": max_sends,
