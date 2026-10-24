@@ -82,6 +82,7 @@ from .custom_tools import (
     create_agent_skill_loader_tool,
     build_registered_agent_extensions,
 )
+from .member_tools import create_group_member_tool
 from .prompt_cache import (
     build_system_messages,
     add_ephemeral_cache_marker,
@@ -1593,6 +1594,10 @@ async def create_chat_graph(
     if file_tools:
         system_prompt += FILE_TOOLS_PROMPT
     history_tools = [] if is_private else [
+        create_group_member_tool(
+            session_id, request_id, interface, group_members=member_snapshot,
+            bot_user_ids=tuple({str(uid) for uid in get_bots()} | ({str(bot_id)} if bot_id else set())),
+        ),
         search_history_context,
         *create_interaction_history_tools(
             session_id, request_id, bot_user_ids=tuple({str(uid) for uid in get_bots()} | ({str(bot_id)} if bot_id else set())),

@@ -13,6 +13,7 @@ from nonebot_plugin_alconna import Target, UniMessage
 
 from ..model import ChatHistory
 from ..reply_guard import is_request_active
+from .member_tools import member_aliases
 from .tool_results import tool_failure, tool_skipped, tool_success
 from ..participation import record_group_delivery
 from ..message_metadata import platform_message_ids, is_reliable_platform_id
@@ -118,7 +119,8 @@ def create_reply_tool(
         向当前会话单独发送文字回复，不要直接返回正文。
         文字要和图片在同一条消息中时，使用发图工具的 text 参数，不要拆成两次发送。
         Args:
-            content: 你想发送的内容。
+            content: 你想发送的内容。群内提及成员用@用户ID，ID后用空白或标点分隔；
+                会生成平台原生@。未知ID或重名时先用get_group_members查询，也支持唯一昵称。
             reply_to: 可选引用回复。填 current 引用用户现在发出的这条消息；
                 引用其他消息则传当前会话的已知平台消息ID。省略则普通发送，不要编造ID。
             next_step: 当前请求已处理并交付结果或明确说明阻塞后填 end；
@@ -210,20 +212,16 @@ def create_reply_tool(
                     logger.warning(f"获取群成员失败，降级为纯文本发送: {e}")
                     members = None
             if members is not None:
+                aliases_to_ids: dict[str, set[str]] = {}
                 for member in members:
                     target_id = str(member.id)
-                    aliases = {
-                        getattr(member, "name", None),
-                        getattr(member, "nick", None),
-                        getattr(getattr(member, "user", None), "name", None),
-                        getattr(getattr(member, "user", None), "nick", None),
-                    }
-                    for alias in aliases:
-                        if alias:
-                            name_to_id[str(alias)] = target_id
+                    for alias in member_aliases(member):
+                        aliases_to_ids.setdefault(alias, set()).add(target_id)
+                name_to_id.update({alias: next(iter(ids)) for alias, ids in aliases_to_ids.items() if len(ids) == 1})
+                name_to_id.update({str(member.id): str(member.id) for member in members})
 
-            at_pattern = re.compile(r"@([^\s@]+)")
             punctuation = "，。,.!！?？:：;；、)）]\"'”’"
+            at_pattern = re.compile(rf"@(\d+(?=$|[\s{re.escape(punctuation)}])|[^\s@]+)")
             message: UniMessage | None = None
 
             def append_text(text: str):
@@ -235,16 +233,12 @@ def create_reply_tool(
                 else:
                     message = message.text(text)
 
-            def append_at(target_id: str) -> bool:
+            def append_at(target_id: str):
                 nonlocal message
-                try:
-                    if message is None:
-                        message = UniMessage.at(target_id)
-                    else:
-                        message = message.at(target_id)
-                    return True
-                except Exception:
-                    return False
+                if message is None:
+                    message = UniMessage.at(target_id)
+                else:
+                    message = message.at(target_id)
 
             cursor = 0
             for match in at_pattern.finditer(content):
@@ -258,11 +252,12 @@ def create_reply_tool(
 
                 target_id = name_to_id.get(mention_name)
                 if not target_id:
+                    if mention_name.isdigit():
+                        return tool_failure("invalid_mention_target", "当前群成员名单中无法确认该用户ID，未发送；请先用get_group_members核对。", delivery_state="not_attempted")
                     continue
 
                 append_text(content[cursor:start])
-                if not append_at(target_id):
-                    append_text("@" + mention_name)
+                append_at(target_id)
                 append_text(suffix)
                 cursor = end
 
