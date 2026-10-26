@@ -96,6 +96,7 @@ from .group_daily_quota import (
     get_private_user_daily_quota_status,
     build_private_quota_exhausted_message,
 )
+from .agent.turn_context import bind_turn_history, build_turn_context
 from .group_model_config import (
     LOCAL_ENCRYPTION_KEY_FILENAME,
     LocalSecretCipher,
@@ -1716,6 +1717,22 @@ async def handle_reply_logic(
         if not recent_msgs:
             return
 
+        trigger_message_id = str(getattr(event, "message_id", "") or "") or None
+        if not is_reliable_platform_id(trigger_message_id) and current_input_batch.get():
+            trigger_message_id = current_input_batch.get()[-1][0]
+        if proactive_observation:
+            latest_human = next((m for m in reversed(recent_msgs) if m.content_type != "bot"), None)
+        else:
+            recent_msgs, latest_human = bind_turn_history(recent_msgs, user_id, trigger_message_id)
+        event_text = ""
+        if not proactive_observation:
+            try:
+                event_text = event.get_plaintext().strip()
+            except Exception:
+                pass
+        if latest_human is None and not event_text:
+            return
+
         # 简单的文本摘要用于 Gatekeeper
         history_summary = ""
         for m in recent_msgs:
@@ -1725,12 +1742,12 @@ async def handle_reply_logic(
             else:
                 history_summary += f"[{role}] {m.user_name}: {m.content[:1200]}\n"
 
-        latest_human = next((m for m in reversed(recent_msgs) if m.content_type != "bot"), None)
-        if latest_human is None:
+        if proactive_observation and latest_human is not None and latest_human.created_at < datetime.datetime.now() - datetime.timedelta(minutes=15):
             return
-        if proactive_observation and latest_human.created_at < datetime.datetime.now() - datetime.timedelta(minutes=15):
-            return
-        current_msg_text = latest_human.content[:1200] if latest_human.content_type == "text" else "[图片/表情包。除非用户明确在问这张图、@bot、回复bot或正在延续图片话题，否则通常不需要回应]"
+        current_msg_text = event_text or (
+            _parse_msg_meta(latest_human.content)[2][:1200] if latest_human is not None and latest_human.content_type == "text"
+            else "[图片/表情包。除非用户明确在问这张图、@bot、回复bot或正在延续图片话题，否则通常不需要回应]"
+        )
         gatekeeper_msg_text = current_msg_text
         if is_continuous:
             gatekeeper_msg_text = f"这是用户在刚才主动呼叫 bot 后的连续对话消息。如果像追问、补充、回应 bot 或继续话题，应倾向回复；如果只是“嗯”“哈哈”“行”等无需回应的短反馈，可以不回复。\n{current_msg_text}"
@@ -1740,7 +1757,7 @@ async def handle_reply_logic(
             gatekeeper_msg_text = f"这条群消息命中了低概率主动表情包采样。只要一张表情包能大致作为群友式接梗、吐槽或情绪反应就可以回复，允许轻微偏题，不要求完全精确；认真求助、事实问题、敏感/沉重话题、真实冲突、他人之间的定向对话，以及普通到没有反应价值的消息都应保持沉默。\n{current_msg_text}"
 
         # === Gatekeeper 判断 ===
-        if not is_tome and repeat_text is None and not proactive_observation:
+        if not is_tome and repeat_text is None:
             observed_sent = participation.state(participation_key).last_sent
             should_reply = await check_if_should_reply(
                 history_summary,
@@ -1752,7 +1769,16 @@ async def handle_reply_logic(
                 participation_context=participation.context(participation_key) if autonomous else "",
                 on_continuation=(
                     lambda: participation.engaged(participation_key, expected_sent=observed_sent)
-                ) if autonomous else None,
+                ) if autonomous and not proactive_observation else None,
+                turn_context=build_turn_context(
+                    recent_msgs,
+                    user_id=latest_human.user_id if proactive_observation and latest_human is not None else user_id,
+                    user_name=latest_human.user_name if proactive_observation and latest_human is not None else user_name,
+                    current_text=current_msg_text,
+                    message_id=None if proactive_observation else trigger_message_id,
+                    continuous=is_continuous, observation=proactive_observation,
+                ) if not is_private else "",
+                is_continuous=is_continuous,
             )
             if not should_reply:
                 return
@@ -1773,6 +1799,9 @@ async def handle_reply_logic(
         if not last_msg:
             logger.info("没有历史消息，跳过回复")
             return
+
+        if not proactive_observation:
+            last_msg, _ = bind_turn_history(last_msg, user_id, trigger_message_id)
 
         if proactive_observation and not _observation_allowed(participation_key):
             return

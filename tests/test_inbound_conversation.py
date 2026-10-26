@@ -251,7 +251,7 @@ async def test_observation_uses_only_bounded_recent_text_and_can_be_disabled_inf
     monkeypatch.setattr(plugin.plugin_config, "proactive_observation_enabled", True)
     monkeypatch.setattr(plugin.plugin_config, "global_model_daily_group_limit_enabled", False)
     monkeypatch.setattr(plugin, "resolve_group_reply_probability", lambda *_: 0.01)
-    gatekeeper, history_loader = AsyncMock(), AsyncMock()
+    gatekeeper, history_loader = AsyncMock(return_value=True), AsyncMock()
     monkeypatch.setattr(plugin, "check_if_should_reply", gatekeeper)
     monkeypatch.setattr(plugin, "_load_agent_history", history_loader)
 
@@ -272,7 +272,8 @@ async def test_observation_uses_only_bounded_recent_text_and_can_be_disabled_inf
         cast(Event, SimpleNamespace()), "咕咕", "member-1", "Alice", False, False, None, proactive_observation=True,
     )
     agent.assert_awaited_once()
-    gatekeeper.assert_not_awaited()
+    gatekeeper.assert_awaited_once()
+    assert '"candidate_reason": "observation"' in gatekeeper.call_args.kwargs["turn_context"]
     history_loader.assert_not_awaited()
     assert observation_guard.get() is None
     assert plugin.delivery_context.get() is None
