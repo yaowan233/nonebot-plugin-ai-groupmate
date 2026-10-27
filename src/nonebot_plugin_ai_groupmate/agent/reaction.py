@@ -134,7 +134,7 @@ def create_reaction_tool(
         return message_id or None
 
     def _is_supported_onebot_reaction_message_id(message_id: str | None) -> bool:
-        return bool(message_id and message_id.isdigit())
+        return bool(message_id and re.fullmatch(r"-?[0-9]+", message_id))
 
     @tool("add_message_reaction")
     async def add_message_reaction(
@@ -145,7 +145,7 @@ def create_reaction_tool(
         count: int = 1,
     ) -> str:
         """
-        给某条消息添加或取消表情回复。
+        给群聊消息添加或取消表情回复。
 
         当只需要用一个表情表达态度时使用这个工具，不要再调用 reply_user 发送重复文本。
 
@@ -197,6 +197,13 @@ def create_reaction_tool(
             return tool_failure(
                 "adapter_unsupported",
                 "当前适配器不是 OneBot，不支持消息表情回复。",
+                delivery_state="not_attempted",
+            )
+
+        if getattr(event, "message_type", None) == "private":
+            return tool_skipped(
+                "private_reaction_unsupported",
+                "当前消息表情工具仅支持群聊；私聊请用文字或表情包回应。",
                 delivery_state="not_attempted",
             )
 

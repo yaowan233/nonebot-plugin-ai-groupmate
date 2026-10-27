@@ -141,7 +141,8 @@ async def test_proactive_reaction_graph_only_exposes_reaction_or_finish(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_normal_onebot_graph_exposes_reaction_without_loading_skill(monkeypatch):
+@pytest.mark.parametrize("is_private", [False, True])
+async def test_onebot_graph_only_exposes_group_reaction(monkeypatch, is_private):
     from nonebot_plugin_ai_groupmate import agent
 
     captured_base_tools: list[str] = []
@@ -175,14 +176,15 @@ async def test_normal_onebot_graph_exposes_reaction_without_loading_skill(monkey
         "user-1",
         "Alice",
         history=[],
-        is_private=False,
+        is_private=is_private,
     )
 
-    assert "add_message_reaction" in captured_base_tools
+    assert ("add_message_reaction" in captured_base_tools) is (not is_private)
 
 
 @pytest.mark.asyncio
-async def test_reaction_tool_applies_to_the_current_numeric_message(monkeypatch):
+@pytest.mark.parametrize("message_id", [123, -123])
+async def test_reaction_tool_applies_to_the_current_numeric_message(monkeypatch, message_id):
     from nonebot.adapters import Bot, Event
 
     from nonebot_plugin_ai_groupmate.agent import reaction
@@ -197,7 +199,7 @@ async def test_reaction_tool_applies_to_the_current_numeric_message(monkeypatch)
     monkeypatch.setattr(reaction, "message_reaction", fake_message_reaction)
 
     db_session = SimpleNamespace(add=added.append)
-    event = SimpleNamespace(message_id=123)
+    event = SimpleNamespace(message_id=message_id, message_type="group")
     tool = reaction.create_reaction_tool(
         db_session,
         "group-1",
@@ -215,3 +217,44 @@ async def test_reaction_tool_applies_to_the_current_numeric_message(monkeypatch)
     assert calls[0]["message_id"] is None
     assert calls[0]["event"] is event
     assert len(added) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target_id", ["-456", "id: -456"])
+async def test_reaction_tool_accepts_explicit_signed_transport_id(monkeypatch, target_id):
+    from nonebot.adapters import Bot, Event
+
+    from nonebot_plugin_ai_groupmate.agent import reaction
+
+    calls = []
+
+    async def apply(_emoji, **kwargs):
+        calls.append(kwargs)
+
+    monkeypatch.setattr(reaction, "is_onebot_context", lambda *_: True)
+    monkeypatch.setattr(reaction, "message_reaction", apply)
+    tool = reaction.create_reaction_tool(SimpleNamespace(add=lambda _: None), "group", None, "bot", cast(Bot, SimpleNamespace()), cast(Event, SimpleNamespace(message_id=123, message_type="group")))
+    result = json.loads(await tool.ainvoke({"mood": "like", "target_msg_id": target_id}))
+    assert result["status"] == "succeeded"
+    assert calls[0]["message_id"] == "-456"
+
+
+@pytest.mark.asyncio
+async def test_private_reaction_is_rejected_before_calling_group_only_api(monkeypatch):
+    from nonebot.adapters import Bot, Event
+
+    from nonebot_plugin_ai_groupmate.agent import reaction
+
+    calls = []
+
+    async def reject_private(_emoji, **kwargs):
+        calls.append(kwargs)
+        raise RuntimeError("只支持群聊消息")
+
+    monkeypatch.setattr(reaction, "is_onebot_context", lambda *_: True)
+    monkeypatch.setattr(reaction, "message_reaction", reject_private)
+    tool = reaction.create_reaction_tool(SimpleNamespace(add=lambda _: None), "private-user", None, "bot", cast(Bot, SimpleNamespace()), cast(Event, SimpleNamespace(message_id=123, message_type="private")))
+    result = json.loads(await tool.ainvoke({"mood": "like"}))
+    assert result["delivery_state"] == "not_attempted"
+    assert result["reason_code"] == "private_reaction_unsupported"
+    assert not calls

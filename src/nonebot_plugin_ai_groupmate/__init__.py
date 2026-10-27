@@ -1228,7 +1228,7 @@ async def handle_message(
         )
     meme_required = (to_me or continuous_to_me) and _is_explicit_meme_request(stripped_plain_text)
     meme_send_count = _get_explicit_meme_send_count(stripped_plain_text) if meme_required else 1
-    reaction_required = not meme_required and (to_me or continuous_to_me) and is_onebot_context(bot, event) and _is_explicit_reaction_request(stripped_plain_text)
+    reaction_required = is_group and not meme_required and (to_me or continuous_to_me) and is_onebot_context(bot, event) and _is_explicit_reaction_request(stripped_plain_text)
     if meme_required:
         random_reply_sample = False
         proactive_reaction_only = False
