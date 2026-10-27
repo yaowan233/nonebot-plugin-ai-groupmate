@@ -11,6 +11,7 @@ from nonebot.log import logger
 from nonebot.adapters import Bot
 from nonebot_plugin_alconna.uniseg import Reference, CustomNode
 
+from .shared_cards import parse_shared_segment
 from .media_message import MediaKind
 
 MAX_FORWARD_DEPTH = 2
@@ -98,8 +99,6 @@ def _format_segments(
         "mface": "[表情]",
         "face": "[表情]",
         "file": "[文件]",
-        "json": "[JSON 卡片]",
-        "xml": "[XML 卡片]",
     }
     for segment in segments:
         segment_type = _segment_type(segment)
@@ -136,6 +135,10 @@ def _format_segments(
                 )
         elif segment_type == "image" and register_image is not None:
             parts.append(register_image(data))
+        elif (card := parse_shared_segment(segment)) is not None:
+            parts.append(card.text)
+            if card.urls:
+                parts.append("\n备用链接：" + " ".join(card.urls))
         elif segment_type in placeholders:
             parts.append(placeholders[segment_type])
         elif segment_type:

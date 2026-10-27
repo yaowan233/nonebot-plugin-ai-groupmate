@@ -7,6 +7,37 @@ from unittest.mock import AsyncMock
 import pytest
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("format_name", ["json", "xml"])
+@pytest.mark.parametrize("addressed", [False, True])
+async def test_share_card_is_stored_as_visible_text_without_forcing_reply(deliver_message, monkeypatch, tmp_path, format_name, addressed):
+    from uuid import uuid4
+
+    from sqlalchemy import select
+    from nonebot_plugin_orm import get_session
+    from nonebot_plugin_alconna import UniMessage
+    from nonebot_plugin_alconna.uniseg import Hyper
+
+    import nonebot_plugin_ai_groupmate as plugin
+    from nonebot_plugin_ai_groupmate.model import ChatHistory
+
+    monkeypatch.setattr(plugin, "plugin_data_dir", tmp_path)
+    monkeypatch.setattr(plugin, "_sample_proactive_reply_modes", lambda **_: (True, False, False))
+    group = f"share-card-{uuid4()}"
+    payload = '{"title":"卡片标题","desc":"短摘要","url":"https://example.com/story"}' if format_name == "json" else '<msg url="https://example.com/story"><title>卡片标题</title><summary>短摘要</summary></msg>'
+    deliver, queued, images = deliver_message
+    await deliver(group, "card-100", "", addressed=addressed, message=UniMessage([Hyper(format_name, payload)]))
+    async with get_session() as db:
+        rows = (await db.scalars(select(ChatHistory).where(ChatHistory.session_id == group))).all()
+    assert len(rows) == 1
+    assert rows[0].content_type == "text"
+    assert "卡片标题" in rows[0].content
+    assert "短摘要" in rows[0].content
+    assert "https://" not in rows[0].content
+    assert queued.await_count == int(addressed)
+    assert not images
+
+
 async def test_real_inbound_burst_commits_both_messages_before_one_queue_admission(deliver_message, monkeypatch):
     from uuid import uuid4
 

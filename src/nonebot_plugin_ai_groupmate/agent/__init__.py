@@ -125,6 +125,7 @@ from .web_image_search import (
 )
 from ..message_batching import current_input_batch
 from .interaction_tools import create_interaction_history_tools
+from .shared_card_tools import create_shared_card_tools
 from .group_memory_tools import create_group_memory_tool
 from .image_search_tools import create_web_image_tools
 from ..group_model_config import (
@@ -1679,6 +1680,10 @@ async def create_chat_graph(
         ),
         *([last_image_search_tool] if last_image_search_tool is not None else []),
         *web_image_tools,
+        *create_shared_card_tools(
+            plugin_data_dir / "shared_card_links", f"{'private' if is_private else 'group'}:{session_id}",
+            history or [], reply_to_id,
+        ),
         *file_tools,
         *history_tools,
         *create_explicit_memory_tools(

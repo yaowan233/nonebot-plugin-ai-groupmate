@@ -70,6 +70,7 @@ from .reply_guard import (
     deactivate_request_id,
     set_latest_request_id,
 )
+from .shared_cards import MAX_CARD_TEXT, save_card_links, parse_shared_segment
 from .media_message import format_media_markers
 from .participation import participation, delivery_context, observation_guard
 from .agent.reaction import is_onebot_context, requested_reaction_emoji
@@ -1015,7 +1016,11 @@ async def handle_message(
     reply_id: str | None = None  # 记录回复 ID，稍后单独成行插入
     body = ""  # 正文部分单独拼接
     has_at_mention = False
+    shared_cards = []
     for i in msg:
+        if len(shared_cards) < 3 and (card := parse_shared_segment(i)) is not None:
+            shared_cards.append(card)
+            is_text = True
         if i.type == "at":
             has_at_mention = True
             name = ""
@@ -1041,6 +1046,16 @@ async def handle_message(
             body += "[图片]"
         if i.type == "mface":
             body += "[表情]"
+
+    card_text = "\n".join(card.text for card in shared_cards)[:MAX_CARD_TEXT]
+    if card_text:
+        body += ("\n" if body and not body.endswith("\n") else "") + card_text
+        try:
+            scope = f"{'private' if session.scene.type == SceneType.PRIVATE else 'group'}:{session.scene.id}"
+            await asyncio.to_thread(save_card_links, plugin_data_dir / "shared_card_links", scope, incoming_message_id,
+                                    (url for card in shared_cards for url in card.urls))
+        except OSError as error:
+            logger.warning(f"保存分享卡片备用链接失败: error_type={type(error).__name__}")
 
     if forward_references:
         forward_text = format_forward_reference_markers(forward_references)
@@ -1081,7 +1096,7 @@ async def handle_message(
             except Exception:
                 pass
         if not reply_to_bot:
-            separator = "\n" if forward_references or audios or videos or files else " "
+            separator = "\n" if shared_cards or forward_references or audios or videos or files else " "
             body = f"{plugin_config.bot_name}{separator}{body}"
 
     if not reply_id:
@@ -1175,6 +1190,8 @@ async def handle_message(
 
     # ========== 步骤2: 决定是否回复（在图片处理前判断） ==========
     plain_text = event.get_plaintext()
+    if card_text:
+        plain_text = (plain_text + "\n" + card_text).strip()
     stripped_plain_text = msg.extract_plain_text().strip()
     command_like = plain_text.startswith(("!", "！", "/", "#", "?", "\\"))
     if stripped_plain_text.lower().startswith(plugin_config.bot_name):
@@ -1248,8 +1265,11 @@ async def handle_message(
         _refresh_continuous_conversation(session.scene.id, session.user.id, bot_id)
     if not plain_text and not imgs and not forward_references and not audios and not videos and not files:
         should_reply = False
-    if files and not stripped_plain_text and not imgs and not forward_references and not audios and not videos:
+    if files and not stripped_plain_text and not shared_cards and not imgs and not forward_references and not audios and not videos:
         # Receiving a file is not a request to analyze it or download it.
+        should_reply = False
+    if shared_cards and not stripped_plain_text and not (to_me or continuous_to_me):
+        # A standalone share supplies context, not a request to inspect a page.
         should_reply = False
     if command_like:
         should_reply = False

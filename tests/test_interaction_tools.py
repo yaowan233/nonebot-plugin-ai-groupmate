@@ -173,6 +173,7 @@ def test_history_tools_visible_on_first_group_turn_without_loading_a_skill(mode)
         session_id="group-1", request_id=None, bot_id="bot-id", plugin_config=SimpleNamespace(bot_name="miyuki"),
         get_bots=lambda: {"bot-id": object()}, str=str, tuple=tuple, set=set,
         user_id="1", history=[],
+        plugin_data_dir=Path("unused-card-cache"), create_shared_card_tools=lambda *_: [],
     )
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), env)
     names = {tool.name for tool in _active_tools(env["base_agent_tools"], {}, [])}

@@ -59,6 +59,7 @@ def _human_expressions(
             or len(body.splitlines()) > max_lines
             or body.startswith(("/", "!", "！", "#"))
             or any(marker in body for marker in ("http://", "https://", "[CQ:", "```"))
+            or "【分享卡片文字】" in body
             or (not preserve_occurrences and (message.user_id, body) in seen)
             or (max_per_speaker is not None and counts[message.user_id] >= max_per_speaker)
             or (addressed is not None and addressed.search(body))
