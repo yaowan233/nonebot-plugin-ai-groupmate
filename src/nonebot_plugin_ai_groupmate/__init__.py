@@ -72,7 +72,7 @@ from .reply_guard import (
 )
 from .media_message import format_media_markers
 from .participation import participation, delivery_context, observation_guard
-from .agent.reaction import is_onebot_context
+from .agent.reaction import is_onebot_context, requested_reaction_emoji
 from .group_affinity import note_group_activity, load_group_affinities
 from .runtime_config import (
     RESTART_REQUIRED_FIELDS,
@@ -502,10 +502,14 @@ def _is_explicit_reaction_request(text: str) -> bool:
         return False
     if _is_explicit_meme_request(normalized):
         return False
+    if re.search(r"(?:不要|别|不用|停止)[^，。！？?\n]*(?:表情|reaction)", normalized):
+        return False
+    if requested_reaction_emoji(normalized) is not None:
+        return True
     return bool(
         re.search(
-            r"(?:回应|回复|点|加|来|贴|上)(?:一个|个|一下|点)?(?:表情|reaction)"
-            r"|(?:表情|reaction)(?:回应|回复|一下)"
+            r"(?:回应|回复|回|点|加|来|贴|上|给)(?:一个|个|一下|点)?(?:(?:消息)?小?表情(?!包)|reaction)"
+            r"|(?:(?:消息)?小?表情(?!包)|reaction)(?:回应|回复|一下)"
             r"|点(?:个|一下)?(?:赞|爱心)",
             normalized,
         )
@@ -515,6 +519,8 @@ def _is_explicit_reaction_request(text: str) -> bool:
 def _is_explicit_meme_request(text: str) -> bool:
     normalized = " ".join((text or "").strip().lower().split())
     if not normalized:
+        return False
+    if re.search(r"(?:小|消息)表情(?!包)|reaction", normalized):
         return False
     # A generic image request leaves the image source to the agent. Only an
     # explicit meme request may force delivery from the local meme collection.

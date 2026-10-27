@@ -1095,11 +1095,14 @@ async def create_chat_graph(
     repeat_text: str | None = None,
     reply_to_id: str | None = None,
     proactive_observation: bool = False,
+    reaction_required: bool = False,
 ) -> tuple[Any, list[Any], str]:
     """创建 LangGraph 聊天图"""
     if meme_required:
         # An explicit user request may need clarification or failure feedback.
         proactive_meme_only = False
+    if reaction_required:
+        proactive_reaction_only = False
     chat_config = resolve_session_chat_config(
         session_id=session_id,
         user_id=str(user_id),
@@ -1788,7 +1791,10 @@ async def create_chat_graph(
         db_session=db_session,
         supports_images=supports_images,
         image_summarizer=summarize_image_content if not supports_images else None,
-        required_side_effect_tool=("send_meme_image" if meme_required else None),
+        required_side_effect_tool=(
+            "send_meme_image" if meme_required else
+            "add_message_reaction" if reaction_required and reaction_enabled else None
+        ),
         required_side_effect_count=meme_send_count if meme_required else 1,
         request_kwargs_factory=(
             lambda current_session_id: (
@@ -1875,6 +1881,7 @@ async def choice_response_strategy(
             repeat_text=repeat_text,
             reply_to_id=reply_to_id,
             proactive_observation=proactive_observation,
+            reaction_required=reaction_required,
         )
 
         # 1. 获取多模态格式的历史消息列表 (List[BaseMessage])
@@ -1954,16 +1961,10 @@ async def choice_response_strategy(
 2. 不加入：调用 `finish` 保持沉默。
 禁止回复“复读是吧”“又开始了”“你们搁这复读”等任何评价复读行为的话。
 """.strip()
+        elif reaction_required and not is_private:
+            task_instruction = """实际调用 `add_message_reaction`：指定符号原样传emoji，否则按语境选符号或mood，默认1个；不以文字代替。通常省略target_msg_id，指定引用目标时用其平台ID。成功后结束。"""
         elif proactive_reaction_only:
-            if reaction_required:
-                task_instruction = """
-【用户明确要求消息表情回应】
-用户明确要求你添加 reaction。本轮必须调用 `add_message_reaction`，不要改成文字确认，也不要调用 `finish` 逃避执行。
-通常不要传 target_msg_id，让工具作用于当前触发消息；若用户通过引用或正文明确指定另一条历史消息，传该消息的数字 id。
-根据语气选择最贴切的 mood，默认 count=1；工具执行后结束，不要再发同义文字或图片。
-""".strip()
-            else:
-                task_instruction = """
+            task_instruction = """
 【本轮主动消息表情回应机会】
 本轮由低概率 reaction 采样触发，只能选择以下两种结果：
 1. 当前消息有明确、自然的轻量情绪反应价值：调用 `add_message_reaction`，通常不要传 target_msg_id，然后结束。

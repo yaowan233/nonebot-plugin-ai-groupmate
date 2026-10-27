@@ -1,5 +1,6 @@
 import re
 import random
+import unicodedata
 from typing import Literal
 
 from nonebot.log import logger
@@ -57,6 +58,38 @@ REACTION_EMOJI_MAP: dict[str, tuple[str, ...]] = {
 }
 
 
+def requested_reaction_emoji(text: str) -> str | None:
+    """Keep an explicitly requested symbol, including presentation selectors."""
+    for match in re.finditer(r"(?=(?:回应|回复|回|点|贴|加|上|给|用)(?:一个|个|一下|点)?\s*(\S+))", text):
+        tail = match.group(1)
+        if ord(tail[0]) <= 127 or not unicodedata.category(tail[0]).startswith("S"):
+            continue
+        clause = re.split(r"[，。！？?\n]", text[:match.start(1)])[-1]
+        if re.search(r"不要|别|不用|停止", clause):
+            continue
+        end = 1
+        while end < len(tail):
+            char = tail[end]
+            if char in "\ufe0e\ufe0f\u200d\u20e3" or (ord(char) > 127 and unicodedata.category(char).startswith("S")):
+                end += 1
+            else:
+                break
+        return tail[:end]
+    return None
+
+
+def _reaction_emoji_id(value: str) -> str:
+    value = value.strip()
+    if re.fullmatch(r"[0-9]+", value):
+        return value
+    symbol = value.replace("\ufe0e", "").replace("\ufe0f", "")
+    # Current QQ adapters infer Unicode reactions from a decimal ID longer
+    # than three digits. Never truncate a sequence or reinterpret it as a face.
+    if len(symbol) == 1 and ord(symbol) >= 1000 and unicodedata.category(symbol).startswith("S"):
+        return str(ord(symbol))
+    raise ValueError("需要QQ表情ID或接口可表示的单个Unicode表情；当前不支持组合表情编码。")
+
+
 def is_onebot_context(bot: Bot | None, event: Event | None) -> bool:
     candidates: list[str] = []
     for obj in (bot, event):
@@ -94,6 +127,12 @@ def create_reaction_tool(
     """
     创建 OneBot 消息表情回复工具，底层使用 nonebot_plugin_alconna.message_reaction。
     """
+    requested_emoji = None
+    if event is not None:
+        try:
+            requested_emoji = requested_reaction_emoji(event.get_plaintext())
+        except Exception:
+            pass
 
     def _normalize_reaction_message_id(raw_message_id: str | None) -> str | None:
         if not raw_message_id:
@@ -138,7 +177,7 @@ def create_reaction_tool(
 
     @tool("add_message_reaction")
     async def add_message_reaction(
-        mood: ReactionMood,
+        mood: ReactionMood = "like",
         target_msg_id: str | None = None,
         delete: bool = False,
         emoji: str | None = None,
@@ -153,7 +192,7 @@ def create_reaction_tool(
             mood: 表情回复表达的态度。基础 mood: like/laugh/surprise/sad/angry/ok。扩展 mood: love/question/awkward/clap/plead/thanks/good_job/shock/smirk/tease/proud/excited/unhappy。
             target_msg_id: 目标消息 id，来自聊天记录里的 "id: xxxxx"。通常不要传；不传时默认给当前触发 bot 回复的这条消息添加。
             delete: 是否取消这个表情回复，默认 False。
-            emoji: 可选的适配器原始表情 ID/名称覆盖值。通常不要传，除非明确知道平台支持的表情 ID。
+            emoji: 单个Unicode符号或QQ表情ID，优先于mood；可自主选择，用户指定时须保留原符号。
             count: 同一 mood 下连续添加几个不同表情，范围 1-3。传了 emoji 时只添加该 emoji。
         """
         if request_id is not None and not await is_request_active(
@@ -168,8 +207,15 @@ def create_reaction_tool(
         mood_key = str(mood).strip()
         mood_emojis = REACTION_EMOJI_MAP.get(mood_key)
         reaction_count = max(1, min(int(count or 1), 3))
-        if emoji:
-            reaction_emojis = [str(emoji).strip()]
+        chosen_emoji = requested_emoji if requested_emoji is not None else emoji
+        if chosen_emoji is not None:
+            try:
+                reaction_emojis = [_reaction_emoji_id(str(chosen_emoji))]
+            except ValueError as error:
+                return tool_failure(
+                    "unsupported_emoji_encoding", str(error),
+                    retryable=requested_emoji is None, delivery_state="not_attempted",
+                )
         elif mood_emojis:
             reaction_emojis = random.sample(
                 list(mood_emojis), k=min(reaction_count, len(mood_emojis))
@@ -287,6 +333,7 @@ def create_reaction_tool(
                     "target_message_id": message_id,
                     "mood": mood_key,
                     "emojis": reaction_emojis,
+                    "requested_emoji": requested_emoji,
                     "deleted": delete,
                 },
                 delivery_state="completed",

@@ -142,10 +142,12 @@ async def test_proactive_reaction_graph_only_exposes_reaction_or_finish(monkeypa
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("is_private", [False, True])
-async def test_onebot_graph_only_exposes_group_reaction(monkeypatch, is_private):
+@pytest.mark.parametrize("reaction_required", [False, True])
+async def test_onebot_graph_only_exposes_group_reaction(monkeypatch, is_private, reaction_required):
     from nonebot_plugin_ai_groupmate import agent
 
     captured_base_tools: list[str] = []
+    required_tools = []
 
     class FakeSession:
         async def commit(self):
@@ -159,6 +161,7 @@ async def test_onebot_graph_only_exposes_group_reaction(monkeypatch, is_private)
 
     def fake_build_chat_graph(model, tools, system_prompt, **kwargs):
         captured_base_tools.extend(tool.name for tool in kwargs["base_tools"])
+        required_tools.append(kwargs["required_side_effect_tool"])
         return object()
 
     monkeypatch.setattr(agent, "get_user_relation_context", empty_context)
@@ -177,9 +180,11 @@ async def test_onebot_graph_only_exposes_group_reaction(monkeypatch, is_private)
         "Alice",
         history=[],
         is_private=is_private,
+        reaction_required=reaction_required,
     )
 
     assert ("add_message_reaction" in captured_base_tools) is (not is_private)
+    assert required_tools == (["add_message_reaction"] if reaction_required and not is_private else [None])
 
 
 @pytest.mark.asyncio

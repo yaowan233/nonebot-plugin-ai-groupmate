@@ -1170,9 +1170,9 @@ def _make_tool_node(
                 )
                 results.append(HumanMessage(content=(
                     f"当前任务必须实际完成 `{required_side_effect_tool}`，不能用文字回复、"
-                    "道歉或承诺代替。请继续调用搜索/发送工具；"
+                    "道歉或承诺代替。请继续调用所需工具；"
                     f"还需成功执行 {required_side_effect_target_count - required_side_effect_success_count} 次。"
-                    "只有搜索明确返回候选池为空时才能结束。"
+                    "无法执行时依据工具结果说明具体限制。"
                 )))
             elif direct_reply:
                 await _recover_db_session(db_session)
@@ -1279,7 +1279,7 @@ def _make_tool_node(
                         content=(
                             f"当前任务必须实际完成 {required_side_effect_tool}，不能提前结束。"
                             f"还需成功执行 {required_side_effect_target_count - required_side_effect_success_count} 次。"
-                            "请继续搜索并发送；只有搜索明确返回候选池为空时才能结束。"
+                            "请继续执行所需工具；无法执行时依据工具结果说明具体限制。"
                         ),
                         tool_call_id=tool_call_id,
                     ))
@@ -1588,6 +1588,14 @@ def _make_tool_node(
                                 required_side_effect_target_count,
                                 required_side_effect_success_count + available_count,
                             )
+                if (
+                    name == required_side_effect_tool
+                    and tool_status in {"failed", "skipped"}
+                    and isinstance(parsed_tool_result, dict)
+                    and parsed_tool_result.get("delivery_state") == "not_attempted"
+                    and parsed_tool_result.get("retryable") is False
+                ):
+                    required_side_effect_unavailable = True
                 if (
                     name == required_side_effect_tool
                     and tool_status == "succeeded"
