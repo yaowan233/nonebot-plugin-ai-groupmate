@@ -209,6 +209,68 @@ class _ToolSpyModel:
         return next(self.responses)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("caption", ["", "这张给你"])
+@pytest.mark.parametrize("delivery_tool", ["send_web_image", "send_meme_image"])
+async def test_completed_image_ends_turn_before_unsolicited_followup(caption, delivery_tool):
+    from nonebot_plugin_ai_groupmate.agent.graph import build_chat_graph
+    from nonebot_plugin_ai_groupmate.agent.tool_results import tool_success
+
+    sent = []
+
+    @tool("send_web_image")
+    async def send_web_image(image_id: str, text: str = "", next_step: str = "end") -> str:
+        """Send the requested image."""
+        sent.append(image_id)
+        return tool_success("image_sent", "sent", data={"text": text}, delivery_state="completed")
+
+    send_web_image.name = delivery_tool
+
+    @tool("reply_user")
+    async def reply_user(content: str, next_step: str) -> str:
+        """Send an extra message."""
+        sent.append(content)
+        return "sent"
+
+    @tool("finish")
+    def finish() -> str:
+        """End the turn."""
+        return ""
+
+    model = _ToolSpyModel([
+        AIMessage(content="", tool_calls=[{"name": delivery_tool, "args": {"image_id": "requested", "text": caption}, "id": "image"}]),
+        AIMessage(content="", tool_calls=[{"name": "reply_user", "args": {"content": "unrequested", "next_step": "end"}, "id": "extra"}]),
+        AIMessage(content="", tool_calls=[{"name": "finish", "args": {}, "id": "end"}]),
+    ])
+    result = await build_chat_graph(model, [send_web_image, reply_user, finish], "system").ainvoke(_state(AIMessage(content="给张参考图")))
+    assert sent == ["requested"]
+    assert result["reply_count"] == 1
+    assert model.invoke_count == 1
+
+
+@pytest.mark.asyncio
+async def test_image_continuation_delivers_remaining_requested_content():
+    from nonebot_plugin_ai_groupmate.agent.graph import build_chat_graph
+    from nonebot_plugin_ai_groupmate.agent.tool_results import tool_success
+
+    sent = []
+
+    @tool("send_web_image")
+    async def send_web_image(image_id: str, next_step: str = "end") -> str:
+        """Deliver an image."""
+        sent.append(image_id)
+        return tool_success("image_sent", "sent", delivery_state="completed")
+
+    model = _ToolSpyModel([
+        AIMessage(content="", tool_calls=[{"name": "send_web_image", "args": {"image_id": "first", "next_step": "continue"}, "id": "one"}]),
+        AIMessage(content="", tool_calls=[{"name": "send_web_image", "args": {"image_id": "second", "next_step": "end"}, "id": "two"}]),
+    ])
+    result = await build_chat_graph(model, [send_web_image], "system").ainvoke(_state(AIMessage(content="发两张图")))
+    assert sent == ["first", "second"]
+    assert result["reply_count"] == 2
+    assert model.invoke_count == 2
+
+
 @pytest.mark.parametrize("first_tool", ["search_web", "search_web_images"])
 @pytest.mark.asyncio
 async def test_tavily_quota_failure_blocks_further_searches_and_hides_tools(first_tool):
@@ -2174,6 +2236,7 @@ async def test_sixteen_model_calls_fit_graph_recursion_budget():
 @pytest.mark.parametrize("requested", ["unknown_file", "run_code"])
 async def test_delivery_finalizer_rejects_new_work_and_unknown_files(requested):
     from langchain_core.messages import ToolMessage
+
     from nonebot_plugin_ai_groupmate.agent import graph as module
     from nonebot_plugin_ai_groupmate.agent.tool_results import tool_success
 
@@ -2194,8 +2257,9 @@ async def test_delivery_finalizer_rejects_new_work_and_unknown_files(requested):
 
 def test_delivery_finalizer_never_retries_a_previously_attempted_file():
     from langchain_core.messages import ToolMessage
+
     from nonebot_plugin_ai_groupmate.agent.graph import _pending_generated_file_ids
-    from nonebot_plugin_ai_groupmate.agent.tool_results import tool_success, tool_failure
+    from nonebot_plugin_ai_groupmate.agent.tool_results import tool_failure, tool_success
 
     file_id = "b" * 32
     messages = [
@@ -2210,7 +2274,8 @@ def test_delivery_finalizer_never_retries_a_previously_attempted_file():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("outcome", ["completed", "unknown", "failed", "previous_request"])
 async def test_delivery_reply_guidance_only_follows_confirmed_current_file_delivery(outcome):
-    from langchain_core.messages import HumanMessage, ToolMessage
+    from langchain_core.messages import ToolMessage, HumanMessage
+
     from nonebot_plugin_ai_groupmate.agent import graph as module
     from nonebot_plugin_ai_groupmate.agent.tool_results import tool_failure, tool_success
 

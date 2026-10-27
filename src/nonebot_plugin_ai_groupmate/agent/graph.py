@@ -1607,9 +1607,11 @@ def _make_tool_node(
                     and tool_status == "succeeded"
                     and isinstance(parsed_tool_result, dict)
                     and parsed_tool_result.get("delivery_state") == "completed"
-                    and isinstance(delivery_data, dict)
-                    and isinstance(delivery_data.get("text"), str)
-                    and delivery_data["text"].strip()
+                    and (name != "send_file" or (
+                        isinstance(delivery_data, dict)
+                        and isinstance(delivery_data.get("text"), str)
+                        and delivery_data["text"].strip()
+                    ))
                 ):
                     reply_count += 1
                     reply_this_round += 1

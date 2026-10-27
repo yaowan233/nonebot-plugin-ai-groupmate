@@ -516,6 +516,10 @@ def _is_explicit_meme_request(text: str) -> bool:
     normalized = " ".join((text or "").strip().lower().split())
     if not normalized:
         return False
+    # A generic image request leaves the image source to the agent. Only an
+    # explicit meme request may force delivery from the local meme collection.
+    if not re.search(r"表情|梗图|斗图", normalized):
+        return False
     if is_explicit_web_image_search_request(normalized):
         return False
     # Online image requests must retain web search/send tools instead of

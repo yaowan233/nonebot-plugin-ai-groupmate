@@ -41,6 +41,31 @@ def test_missing_trigger_does_not_fall_back_to_someone_elses_message():
     assert data["latest_message"]["text"] == "实际触发内容"
 
 
+@pytest.mark.parametrize("continuous", [False, True])
+def test_uninterrupted_followup_focuses_on_its_own_exchange(continuous):
+    from nonebot_plugin_ai_groupmate.agent.turn_context import build_turn_context
+
+    rows = [row(1, "bob", "id: 101\n无关的旧话题"),
+            row(2, "alice", "id: 102\nmiyuki 看看这个"),
+            row(3, "alice", "id: 102\n头像.png", kind="image"),
+            row(4, "miyuki", "id: 103\n挺可爱的", kind="bot"),
+            row(5, "alice", "id: 104\n我原本的不可爱吗？")]
+    data = json.loads(build_turn_context(rows, user_id="alice", user_name="Alice", current_text="我原本的不可爱吗？", message_id="104", continuous=continuous))
+    assert [m["message_id"] for m in data["recent_messages"]] == (["102", "102", "103", "104"] if continuous else ["101", "102", "102", "103", "104"])
+    assert data["participants"] == {"bob": "bob", "alice": "alice"}
+
+
+def test_followup_keeps_intervening_peer_conversation_visible():
+    from nonebot_plugin_ai_groupmate.agent.turn_context import build_turn_context
+
+    rows = [row(1, "alice", "id: 101\nmiyuki 帮我看看"),
+            row(2, "miyuki", "id: 102\n我看看", kind="bot"),
+            row(3, "bob", "id: 103\n阿明，你看见了吗"),
+            row(4, "alice", "id: 104\n没看见")]
+    data = json.loads(build_turn_context(rows, user_id="alice", user_name="Alice", current_text="没看见", message_id="104", continuous=True))
+    assert any(m["speaker_id"] == "bob" for m in data["recent_messages"])
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("recipient", "continuous", "allowed", "engaged"), [
     ("other", False, False, False), ("other", True, False, False),
@@ -57,10 +82,26 @@ async def test_recipient_decision_controls_admission_and_continuation(monkeypatc
     }))))
     monkeypatch.setattr(agent, "get_flash_model", lambda: model)
     callback = Mock()
-    context = build_turn_context([row(1, "alice", "id: 100\n小鲸鱼能做什么")], user_id="alice", user_name="Alice", current_text="小鲸鱼能做什么", continuous=continuous)
-    assert await agent.check_if_should_reply("history", "小鲸鱼能做什么", "miyuki", turn_context=context, is_continuous=continuous, on_continuation=callback) is allowed
+    context = build_turn_context([row(1, "miyuki", "id: 99\n先确认目标再拆任务", kind="bot"), row(2, "alice", "id: 100\n第二步怎么拆")], user_id="alice", user_name="Alice", current_text="第二步怎么拆", continuous=continuous)
+    assert await agent.check_if_should_reply("history", "第二步怎么拆", "miyuki", turn_context=context, is_continuous=continuous, on_continuation=callback) is allowed
     assert callback.called is engaged
     assert model.ainvoke.call_args.kwargs["max_tokens"] >= 160
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("recipient", "allowed"), [("bot", False), ("group", True)])
+async def test_non_addressed_peer_chat_cannot_be_claimed_as_bot_followup(monkeypatch, recipient, allowed):
+    from nonebot_plugin_ai_groupmate import agent
+    from nonebot_plugin_ai_groupmate.agent.turn_context import build_turn_context
+
+    model = SimpleNamespace(ainvoke=AsyncMock(return_value=AIMessage(content=json.dumps({
+        "recipient": recipient, "should_reply": True, "continues_bot_conversation": True,
+    }))))
+    monkeypatch.setattr(agent, "get_flash_model", lambda: model)
+    callback = Mock()
+    context = build_turn_context([row(1, "alice", "id: 100\n你能听一下吗"), row(2, "bob", "id: 101\n能"), row(3, "alice", "id: 102\n然后打字回我")], user_id="alice", user_name="Alice", current_text="然后打字回我")
+    assert await agent.check_if_should_reply("", "然后打字回我", "miyuki", turn_context=context, on_continuation=callback) is allowed
+    callback.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -127,6 +168,7 @@ async def test_queued_pipeline_does_not_promote_newer_users_input_to_current_req
     group = f"queued-recipient-{uuid4()}"
     async with get_session() as db:
         db.add_all([
+            ChatHistory(session_id=group, user_id="miyuki", user_name="miyuki", content_type="bot", content="id: 99\n先确认目标，第二步拆任务"),
             ChatHistory(session_id=group, user_id="alice", user_name="Alice", content_type="text", content="id: 100\nalias_id: first-alias\n你刚才第二步怎么做"),
             ChatHistory(session_id=group, user_id="bob", user_name="Bob", content_type="text", content="id: 200\n小鲸鱼介绍一下自己"),
         ])
@@ -156,7 +198,7 @@ async def test_queued_pipeline_does_not_promote_newer_users_input_to_current_req
             current_input_batch.reset(token)
     model.ainvoke.assert_awaited_once()
     choose.assert_awaited_once()
-    assert [m.user_id for m in choose.call_args.args[3]] == ["alice"]
+    assert [m.user_id for m in choose.call_args.args[3]] == ["miyuki", "alice"]
 
 
 def test_group_boundary_does_not_turn_third_party_speech_into_a_self_request():
