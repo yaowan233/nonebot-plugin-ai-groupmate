@@ -138,6 +138,7 @@ class ScopedConfig(BaseModel):
     google_web_detection_max_results: int = Field(default=5, ge=1, le=10)
 
     # === 快速决策模型（Gatekeeper） ===
+    gatekeeper_provider: Literal["flash", "decisions"] = "flash"
     flash_model: str = "qwen-flash"
     flash_api_key: str = ""
     flash_base_url: str = ""

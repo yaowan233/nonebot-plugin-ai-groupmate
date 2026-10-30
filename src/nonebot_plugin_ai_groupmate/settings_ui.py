@@ -108,6 +108,7 @@ SETTING_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         "快速决策模型",
         "用于 Gatekeeper 判断消息是否值得回复。",
         (
+            "gatekeeper_provider",
             "flash_model",
             "flash_api_key",
             "flash_base_url",
@@ -196,6 +197,7 @@ SETTING_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
 )
 
 _DIRECT_LABELS = {
+    "gatekeeper_provider": "接话判断接口",
     "bot_name": "Bot 名称",
     "reply_probability": "主动接话抽样概率（0 关闭）",
     "proactive_observation_enabled": "偶尔主动查看群聊",
@@ -269,6 +271,7 @@ _DIRECT_LABELS = {
     "qwen_token": "旧版 Qwen Token",
 }
 _FIELD_HINTS = {
+    "gatekeeper_provider": "Decisions 使用 gpt-6-luna 和已配置的 OpenAI 官方主模型凭据；Flash 用于原有快速判断。",
     "chat_reasoning_effort": "用于 OpenAI 兼容接口，留空保持供应商默认（DeepSeek 默认 low）；须选择当前模型支持的档位。",
     "chat_max_tokens": "主模型输出 Token 上限，留空使用供应商默认（DeepSeek 默认 8192）；推理是否计入由供应商决定。",
     "google_web_detection_enabled": (

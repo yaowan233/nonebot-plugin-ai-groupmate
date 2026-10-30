@@ -124,6 +124,14 @@ def _validation_detail(error: ValidationError) -> str:
 
 
 async def _test_model_connection(role: str, config: ScopedConfig) -> None:
+    if role == "flash" and config.gatekeeper_provider == "decisions":
+        from .agent.decisions import classify
+
+        await asyncio.wait_for(
+            classify(config, "判断最新发言是否需要 Bot 回应；无新增内容的确认不回复。", '{"recent_messages":[],"latest_message":{"text":"好的，知道了"}}'),
+            timeout=min(config.agent_llm_timeout_seconds, 20.0),
+        )
+        return
     if role == "chat":
         model = create_chat_llm(config)
     elif role == "tagging":

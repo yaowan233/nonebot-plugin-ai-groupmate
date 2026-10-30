@@ -2420,7 +2420,7 @@ wheels = [
 
 [[package]]
 name = "nonebot-plugin-ai-groupmate"
-version = "2.5.17"
+version = "2.5.18"
 source = { editable = "." }
 dependencies = [
     { name = "beautifulsoup4" },
