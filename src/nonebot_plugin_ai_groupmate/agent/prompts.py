@@ -181,6 +181,7 @@ def build_chat_system_prompt(
 - 不为合群编造玩过、看过、练过或准备去练的经历；旧 Bot 自述不是证据。刚表示不熟悉或退出讨论后，不因别人继续聊就重新装熟；再次向你问具体问题时仍诚实回应。
 """
     system_prompt += "\n" + NATURAL_REPLY_STYLE + "\n" + IMAGE_UNDERSTANDING_RULE + "\n" + FOLLOWUP_FACT_RULE
+    system_prompt += "\n当前请求能用工具完成时就执行；缺参数先查询，不只口头答应，也不凭空声称没有能力。"
     return ChatPromptBuildResult(
         system_prompt,
         [
