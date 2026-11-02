@@ -564,6 +564,11 @@ def _message_text_content(message: AIMessage) -> str:
     return ""
 
 
+def _is_bare_finish_control(text: str) -> bool:
+    """Recognize a standalone terminal marker, not prose mentioning the tool."""
+    return text.strip().strip("`").strip().casefold() in {"finish", "finish()"}
+
+
 def is_multimodal_unsupported_error(error: Exception) -> bool:
     error_text = str(error).lower()
     is_supported_status = (
@@ -871,6 +876,20 @@ def _make_agent_node(
                 f"finish_reason={response.response_metadata.get('finish_reason', response.response_metadata.get('stop_reason', 'unknown'))}"
             )
 
+            if (
+                not response.tool_calls
+                and not response.invalid_tool_calls
+                and any(tool.name == "finish" for tool in visible_tools)
+                and _is_bare_finish_control(_message_text_content(response))
+            ):
+                # Recover the intended control operation before history is
+                # committed, so normal tool guards and call IDs still apply.
+                response = response.model_copy(update={
+                    "content": "",
+                    "tool_calls": [{"name": "finish", "args": {}, "id": f"call_finish_text_{call_number}", "type": "tool_call"}],
+                })
+                logger.info(f"[AgentTrace] recovered_finish_control session={state['session_id']}")
+
             if _has_unfinished_reply(response, full):
                 rejected_progress_replies += 1
                 logger.warning(
@@ -965,6 +984,8 @@ def _pending_generated_file_ids(messages: Sequence[BaseMessage]) -> set[str]:
 
 def _budget_final_reply_text(response: AIMessage) -> str:
     text = _message_text_content(response)
+    if not response.tool_calls and _is_bare_finish_control(text):
+        return BUDGET_FINALIZATION_FALLBACK
     if text:
         return _safe_reply_text(text)
     for tool_call in response.tool_calls or []:

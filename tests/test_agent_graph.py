@@ -10,6 +10,76 @@ if TYPE_CHECKING:
     from nonebot_plugin_ai_groupmate.agent.graph import AgentState
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("content", ["finish", "finish()", "`finish`", [{"type": "text", "text": "finish"}]])
+@pytest.mark.parametrize("finalize", [False, True])
+async def test_bare_finish_control_is_not_sent_as_text(content, finalize):
+    from nonebot_plugin_ai_groupmate.agent.graph import AgentRunLimits, build_chat_graph
+
+    replies = []
+
+    @tool("reply_user")
+    async def reply_user(content: str, next_step: str = "end") -> str:
+        """Capture messages sent to the conversation."""
+        replies.append(content)
+        return "sent"
+
+    @tool("finish")
+    def finish() -> str:
+        """End without sending a message."""
+        return ""
+
+    @tool("search_web")
+    async def search_web() -> str:
+        """Return evidence."""
+        return "found"
+
+    responses = [AIMessage(content=content)]
+    if finalize:
+        responses.insert(0, AIMessage(content="", tool_calls=[{"name": "search_web", "args": {}, "id": "search"}]))
+    model = _ToolSpyModel(responses)
+    graph = build_chat_graph(model, [reply_user, finish, search_web], "system", limits=AgentRunLimits(max_llm_calls=1))
+    result = await graph.ainvoke(_state(AIMessage(content="普通闲聊")))
+    assert all(reply.strip("` ()").casefold() != "finish" for reply in replies)
+    assert result["called_finish"] == 1
+    if finalize:
+        assert len(replies) == 1
+    else:
+        assert replies == []
+        assert result["reply_count"] == 0
+        calls = [call for msg in result["messages"] if isinstance(msg, AIMessage) for call in msg.tool_calls]
+        assert len(calls) == 1 and calls[0]["name"] == "finish"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("content", "explicit_reply", "expose_finish"), [
+    ("finish", True, True),
+    ("finish", False, False),
+    ("finish 这个词表示结束。", False, True),
+])
+async def test_finish_word_remains_valid_conversation_text(content, explicit_reply, expose_finish):
+    from nonebot_plugin_ai_groupmate.agent.graph import build_chat_graph
+
+    replies = []
+
+    @tool("reply_user")
+    async def reply_user(content: str, next_step: str = "end") -> str:
+        """Capture requested conversation text."""
+        replies.append(content)
+        return "sent"
+
+    @tool("finish")
+    def finish() -> str:
+        """End the task."""
+        return ""
+
+    response = AIMessage(content="", tool_calls=[{"name": "reply_user", "args": {"content": content, "next_step": "end"}, "id": "reply"}]) if explicit_reply else AIMessage(content=content)
+    tools = [reply_user, finish] if expose_finish else [reply_user]
+    graph = build_chat_graph(_ToolSpyModel([response]), tools, "system")
+    await graph.ainvoke(_state(AIMessage(content="解释这个单词")))
+    assert replies == [content]
+
+
 def test_image_search_policy_keeps_reply_and_limits_followup_searches():
     from langchain_core.messages import ToolMessage
 
@@ -1294,7 +1364,8 @@ async def test_failed_side_effect_can_be_retried():
 
 
 @pytest.mark.asyncio
-async def test_required_meme_send_blocks_text_and_finish_until_image_is_sent():
+@pytest.mark.parametrize("plain_finish", [False, True])
+async def test_required_meme_send_blocks_text_and_finish_until_image_is_sent(plain_finish):
     from nonebot_plugin_ai_groupmate.agent.graph import build_chat_graph
 
     events: list[str] = []
@@ -1322,7 +1393,7 @@ async def test_required_meme_send_blocks_text_and_finish_until_image_is_sent():
     model = _ToolSpyModel(
         [
             AIMessage(content="没找到，下次补上"),
-            AIMessage(
+            AIMessage(content="finish") if plain_finish else AIMessage(
                 content="",
                 tool_calls=[{"name": "finish", "args": {}, "id": "finish-early"}],
             ),
@@ -1357,6 +1428,11 @@ async def test_required_meme_send_blocks_text_and_finish_until_image_is_sent():
     assert result["required_side_effect_completed"] is True
     assert result["called_finish"] == 1
     assert model.invoke_count == 4
+    if plain_finish:
+        from langchain_core.messages import ToolMessage
+
+        recovered = [call for message in result["messages"] if isinstance(message, AIMessage) for call in message.tool_calls if call["name"] == "finish"]
+        assert recovered and any(isinstance(message, ToolMessage) and message.tool_call_id == recovered[0]["id"] for message in result["messages"])
 
 
 @pytest.mark.asyncio
