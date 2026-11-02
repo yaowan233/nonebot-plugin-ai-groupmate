@@ -48,7 +48,8 @@ async def test_bare_finish_control_is_not_sent_as_text(content, finalize):
         assert replies == []
         assert result["reply_count"] == 0
         calls = [call for msg in result["messages"] if isinstance(msg, AIMessage) for call in msg.tool_calls]
-        assert len(calls) == 1 and calls[0]["name"] == "finish"
+        assert len(calls) == 1
+        assert calls[0]["name"] == "finish"
 
 
 @pytest.mark.asyncio
@@ -93,6 +94,36 @@ def test_image_search_policy_keeps_reply_and_limits_followup_searches():
         messages.extend([AIMessage(content="", tool_calls=[{"name": "search_web", "args": {}, "id": str(i)}]), ToolMessage(content="found", tool_call_id=str(i))])
     assert _image_search_allowed_tools(messages) == {"reply_user", "finish"}
     assert _image_search_allowed_tools([]) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("search_count", [0, 2])
+async def test_image_search_guidance_matches_actual_verification_tool_availability(search_count):
+    from langchain_core.messages import ToolMessage
+
+    from nonebot_plugin_ai_groupmate.agent import graph as module
+    from nonebot_plugin_ai_groupmate.agent.tool_results import tool_success
+
+    @tool("search_web")
+    async def search_web(query: str) -> str:
+        """Verify candidate character information."""
+        return "found"
+
+    state = _state(AIMessage(content="", tool_calls=[{"name": "reverse_image_search", "args": {}, "id": "image"}]))
+    state["messages"].append(ToolMessage(content=tool_success("matches", "candidate found"), tool_call_id="image"))
+    for i in range(search_count):
+        state["messages"].extend([
+            AIMessage(content="", tool_calls=[{"name": "search_web", "args": {"query": "candidate"}, "id": str(i)}]),
+            ToolMessage(content=tool_success("found", "evidence"), tool_call_id=str(i)),
+        ])
+    model = _ToolSpyModel([AIMessage(content="reply")])
+    node = module._make_agent_node(model, [search_web], "system", {}, module.AgentRunLimits())
+    await node(state)
+    can_verify = "search_web" in model.bound_tool_names[-1]
+    guidance = model.invoke_messages[-1][-1].content
+    assert can_verify is (search_count == 0)
+    assert ("仍可调用 search_web" in guidance) is can_verify
+    assert ("没有可用的补查工具" in guidance) is not can_verify
 
 
 def test_image_search_followup_answers_from_record_and_budget_finalizes():
@@ -1432,7 +1463,8 @@ async def test_required_meme_send_blocks_text_and_finish_until_image_is_sent(pla
         from langchain_core.messages import ToolMessage
 
         recovered = [call for message in result["messages"] if isinstance(message, AIMessage) for call in message.tool_calls if call["name"] == "finish"]
-        assert recovered and any(isinstance(message, ToolMessage) and message.tool_call_id == recovered[0]["id"] for message in result["messages"])
+        assert recovered
+        assert any(isinstance(message, ToolMessage) and message.tool_call_id == recovered[0]["id"] for message in result["messages"])
 
 
 @pytest.mark.asyncio

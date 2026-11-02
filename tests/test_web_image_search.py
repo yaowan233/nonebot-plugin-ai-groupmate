@@ -14,6 +14,7 @@ from nonebot.adapters import Bot, Event
 async def test_reverse_search_does_not_promote_generic_labels_or_similar_images_to_matches(monkeypatch, tmp_path, matching_key):
     import json
     from types import SimpleNamespace
+
     from nonebot_plugin_ai_groupmate.agent import web_image_search as module
     from nonebot_plugin_ai_groupmate.config import ScopedConfig
 
@@ -392,6 +393,7 @@ def test_settings_page_exposes_google_web_detection_fields():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("explicit_meme", [False, True])
+@pytest.mark.parametrize("provider", ["google", "serpapi"])
 @pytest.mark.parametrize(
     ("request_text", "expected_visible"),
     [
@@ -400,6 +402,7 @@ def test_settings_page_exposes_google_web_detection_fields():
         ("miyuki你用搜图试试这张图", True),
         ("给我找一张猫图", True),
         ("你搜图搜到了什么", True),
+        ("这是谁", True),
     ],
 )
 async def test_agent_exposes_search_and_evidence_tools_without_keyword_gate(
@@ -407,6 +410,7 @@ async def test_agent_exposes_search_and_evidence_tools_without_keyword_gate(
     request_text: str,
     expected_visible: bool,
     explicit_meme: bool,
+    provider: str,
 ):
     from nonebot_plugin_ai_groupmate import agent
 
@@ -447,7 +451,8 @@ async def test_agent_exposes_search_and_evidence_tools_without_keyword_gate(
     monkeypatch.setattr(agent, "get_flash_model", lambda: object())
     monkeypatch.setattr(agent, "build_chat_graph", fake_build_chat_graph)
     monkeypatch.setattr(agent, "create_reverse_image_search_tool", fake_reverse_tool)
-    monkeypatch.setattr(agent.plugin_config, "google_web_detection_enabled", True)
+    monkeypatch.setattr(agent.plugin_config, "google_web_detection_enabled", provider == "google")
+    monkeypatch.setattr(agent.plugin_config, "serpapi_api_key", "secret" if provider == "serpapi" else "")
 
     await agent.create_chat_graph(
         FakeSession(),

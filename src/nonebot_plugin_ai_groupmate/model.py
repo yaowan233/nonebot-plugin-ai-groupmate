@@ -343,6 +343,23 @@ class GoogleWebDetectionUsage(NulSafeModel):
     )
 
 
+class SerpApiImageCache(NulSafeModel):
+    """Google Lens evidence, isolated from the older Vision provider cache."""
+
+    image_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    result: Mapped[dict[str, object]] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(default=datetime.now, index=True)
+    updated_at: Mapped[datetime] = mapped_column(default=datetime.now, onupdate=datetime.now)
+
+
+class SerpApiImageUsage(NulSafeModel):
+    """Local monthly search attempts; independent of the SerpApi account quota."""
+
+    usage_month: Mapped[str] = mapped_column(String(7), primary_key=True)
+    used_count: Mapped[int] = mapped_column(Integer, default=0)
+    updated_at: Mapped[datetime] = mapped_column(default=datetime.now, onupdate=datetime.now)
+
+
 class ChatHistorySchema(BaseModel):
     msg_id: int
     session_id: str

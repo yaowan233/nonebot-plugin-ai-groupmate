@@ -126,6 +126,13 @@ class ScopedConfig(BaseModel):
     vertex_api_key: str = ""
     vertex_credentials_path: str = ""
 
+    # === SerpApi Google Lens（配置密钥后优先用于以图搜图） ===
+    serpapi_api_key: str = ""
+    serpapi_monthly_limit: int = Field(default=100, ge=1, le=100000)
+    serpapi_cache_days: int = Field(default=30, ge=1, le=365)
+    serpapi_timeout_seconds: float = Field(default=30.0, gt=0, le=60)
+    serpapi_max_results: int = Field(default=5, ge=1, le=10)
+
     # === Google Cloud Vision Web Detection（反向搜图） ===
     # 凭据留空时回退复用 Vertex 凭据，再回退 ADC。默认关闭，且把本地
     # 月用量硬限制在免费额度以内，避免 Agent 误调用产生意外费用。

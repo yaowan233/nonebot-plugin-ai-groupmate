@@ -92,8 +92,19 @@ SETTING_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         ),
     ),
     (
+        "SerpApi 以图搜图",
+        "配置密钥后优先使用 Google Lens 查找角色和图源线索；原图会压缩后上传，缓存命中不联网。月限额是本地请求次数上限，并非账户剩余额度。",
+        (
+            "serpapi_api_key",
+            "serpapi_monthly_limit",
+            "serpapi_cache_days",
+            "serpapi_timeout_seconds",
+            "serpapi_max_results",
+        ),
+    ),
+    (
         "Google 反向搜图",
-        "仅在用户明确要求找原图、图源或图片出处时使用；缓存命中不消耗月额度。",
+        "未配置 SerpApi 时使用此服务查找图片来源线索；泛化标签不代表角色身份，缓存命中不消耗月额度。",
         (
             "google_web_detection_enabled",
             "google_web_detection_credentials_path",
@@ -248,6 +259,11 @@ _DIRECT_LABELS = {
     "vertex_location": "Vertex 区域",
     "vertex_api_key": "Vertex API Key",
     "vertex_credentials_path": "服务账号 JSON 路径",
+    "serpapi_api_key": "SerpApi API Key",
+    "serpapi_monthly_limit": "每月本地请求上限",
+    "serpapi_cache_days": "结果缓存天数",
+    "serpapi_timeout_seconds": "上传和搜索总超时（秒）",
+    "serpapi_max_results": "每类最大结果数",
     "google_web_detection_enabled": "启用 Google 反向搜图",
     "google_web_detection_credentials_path": "反向搜图服务账号 JSON 路径",
     "google_web_detection_project_id": "反向搜图计费项目 ID",
