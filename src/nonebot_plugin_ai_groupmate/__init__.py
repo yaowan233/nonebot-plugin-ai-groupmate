@@ -45,6 +45,7 @@ from nonebot_plugin_alconna.uniseg import Audio, Video, UniMsg, Reference
 
 from .agent import (
     _parse_msg_meta,
+    get_flash_model,
     _detect_repeat_chain,
     check_if_should_reply,
     choice_response_strategy,
@@ -381,8 +382,10 @@ MAX_GROUP_ADDRESSED_REQUESTS = 3
 @get_driver().on_shutdown
 async def _stop_input_learning_tasks() -> None:
     from .agent.style_learning import stop_style_learning
+    from .agent.jargon_learning import stop_jargon_learning
 
     await _input_batcher.close()
+    await stop_jargon_learning()
     await stop_style_learning()
 
 
@@ -1199,6 +1202,13 @@ async def handle_message(
     explicit_to_me = to_me
     is_group = session.scene.type == SceneType.GROUP
     bot_id = str(bot.self_id)
+    if (is_group and is_text and is_new_text_message and not sender_is_connected_bot and not command_like
+            and plugin_config.group_jargon_learning_enabled
+            and (plugin_config.flash_api_key or plugin_config.llm_api_key or plugin_config.qwen_token)):
+        from .agent.jargon_learning import schedule_jargon_learning
+
+        schedule_jargon_learning(plugin_data_dir / "group_jargon", session.scene.id, get_flash_model,
+                                excluded_users=tuple(connected_bot_ids | {bot_id}))
     active_followup = is_group and _is_continuous_conversation(session.scene.id, session.user.id, bot_id)
     group_followup = is_group and time.monotonic() - participation.state((bot_id, session.scene.id)).last_sent < 300
     disengaged = is_group and (explicit_to_me or ((active_followup or group_followup) and not has_at_mention and not reply_id)) and _is_explicit_disengagement(stripped_plain_text, plugin_config.bot_name)

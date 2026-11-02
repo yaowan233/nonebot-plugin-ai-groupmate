@@ -30,6 +30,7 @@ class ScopedConfig(BaseModel):
     proactive_private_message: bool = True
     continuous_conversation_minutes: float = 5.0
     group_style_learning_enabled: bool = True
+    group_jargon_learning_enabled: bool = True
     meme_visual_selection_enabled: bool = True
     group_message_debounce_seconds: float = Field(default=1.2, ge=0, le=5)
     group_message_debounce_max_seconds: float = Field(default=4.0, ge=0, le=10)

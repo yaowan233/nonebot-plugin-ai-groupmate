@@ -161,6 +161,32 @@ def deliver_message(monkeypatch):
     plugin._observation_schedule.clear()
 
 
+@pytest.mark.parametrize("enabled", [True, False])
+async def test_jargon_learning_observes_silent_group_text_but_not_private_bots_or_duplicates(deliver_message, monkeypatch, tmp_path, enabled):
+    from uuid import uuid4
+    from unittest.mock import Mock
+
+    import nonebot_plugin_ai_groupmate as plugin
+    from nonebot_plugin_ai_groupmate.agent import jargon_learning
+
+    schedule = Mock(return_value=True)
+    monkeypatch.setattr(jargon_learning, "schedule_jargon_learning", schedule)
+    monkeypatch.setattr(plugin, "plugin_data_dir", tmp_path)
+    monkeypatch.setattr(plugin.plugin_config, "group_jargon_learning_enabled", enabled)
+    monkeypatch.setattr(plugin.plugin_config, "flash_api_key", "test-only")
+    deliver, queued, _ = deliver_message
+    group = f"jargon-{uuid4()}"
+    await deliver(group, "term-1", "蓝票又没了")
+    await deliver(group, "term-1", "蓝票又没了")
+    await deliver(f"private-{uuid4()}", "private", "蓝票是什么", is_private=True)
+    await deliver(group, "bot-msg", "蓝票是错的", user_id="bot-2")
+    assert schedule.call_count == int(enabled)
+    queued.assert_not_awaited()
+    if enabled:
+        assert schedule.call_args.args[:2] == (tmp_path / "group_jargon", group)
+        assert set(schedule.call_args.kwargs["excluded_users"]) == {"bot-1", "bot-2"}
+
+
 @pytest.mark.asyncio
 async def test_only_new_group_text_feeds_affinity_with_public_api(deliver_message, monkeypatch):
     from uuid import uuid4

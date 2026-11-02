@@ -117,6 +117,7 @@ from ..group_affinity import group_feeling_context
 from ..runtime_config import get_runtime_config
 from .execution_tools import execution_prompt, create_execution_tool
 from .explicit_memory import MEMORY_PROMPT, get_explicit_memory_context, create_explicit_memory_tools
+from .jargon_learning import create_jargon_tool, get_jargon_context
 from ..forward_message import extract_forward_message_ids
 from .moderation_tools import create_mute_tool
 from .web_image_search import (
@@ -1140,6 +1141,7 @@ async def create_chat_graph(
     group_context = ""
     recent_relations_context = ""
     group_style_context = ""
+    style_bot_ids: tuple[str, ...] = ()
     if not is_private:
         group_context = await get_group_context(db_session, session_id)
         group_context += "\n" + group_feeling_context((str(bot_id or plugin_config.bot_name), session_id))
@@ -1353,6 +1355,22 @@ async def create_chat_graph(
     explicit_web_image_search = is_explicit_web_image_search_request(
         current_request_text, has_image_context=bool(reply_to_id)
     )
+    jargon_context = ""
+    jargon_tool = None
+    if (not is_private and plugin_config.group_jargon_learning_enabled
+            and not proactive_meme_only and not proactive_reaction_only and repeat_text is None):
+        from ..message_metadata import platform_message_ids, parse_message_metadata
+
+        jargon_query = current_request_text[-4000:]
+        if reply_to_id:
+            quoted = next((row for row in reversed(history or []) if row.session_id == session_id and reply_to_id in platform_message_ids(row.content)), None)
+            if quoted is not None:
+                jargon_query += "\n" + parse_message_metadata(quoted.content)[2][:500]
+        try:
+            jargon_context = await get_jargon_context(plugin_data_dir / "group_jargon", session_id, jargon_query, excluded_users=style_bot_ids)
+        except Exception as error:
+            logger.warning(f"读取群词义失败 error_type={type(error).__name__}")
+        jargon_tool = create_jargon_tool(plugin_data_dir / "group_jargon", session_id, str(user_id), current_request_text, request_id)
     reverse_image_search_tool = None
     last_image_search_tool = None
     if (
@@ -1689,6 +1707,7 @@ async def create_chat_graph(
             else []
         ),
         *([last_image_search_tool] if last_image_search_tool is not None else []),
+        *([jargon_tool] if jargon_tool is not None else []),
         *web_image_tools,
         *create_shared_card_tools(
             plugin_data_dir / "shared_card_links", f"{'private' if is_private else 'group'}:{session_id}",
@@ -1778,7 +1797,7 @@ async def create_chat_graph(
         kept_dynamic_context_parts.append(context_part.strip())
 
     dynamic_context = "\n\n".join(kept_dynamic_context_parts)
-    dynamic_context = "\n\n".join(part for part in (dynamic_context, memory_context, review_context) if part)
+    dynamic_context = "\n\n".join(part for part in (dynamic_context, memory_context, review_context, jargon_context) if part)
     system_messages = build_system_messages(
         stable_system_prompt,
         use_cache_control=_use_explicit_prompt_cache(chat_config),

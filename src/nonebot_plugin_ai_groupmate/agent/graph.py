@@ -70,6 +70,7 @@ SIDE_EFFECT_TOOL_NAMES = frozenset({
     "send_file",
     "send_private_message",
     "update_group_memory",
+    "update_group_jargon",
     "update_scheduled_task",
     "update_user_impression",
     "save_explicit_memory",
