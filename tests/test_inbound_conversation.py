@@ -82,9 +82,10 @@ async def test_real_inbound_burst_commits_both_messages_before_one_queue_admissi
     from nonebot_plugin_ai_groupmate.message_batching import InputBatcher
 
     deliver, _, _ = deliver_message
-    batcher = InputBatcher()
+    now = [0.0]
+    batcher = InputBatcher(clock=lambda: now[0])
     monkeypatch.setattr(plugin, "_input_batcher", batcher)
-    monkeypatch.setattr(plugin.plugin_config, "group_message_debounce_seconds", 0.02)
+    monkeypatch.setattr(plugin.plugin_config, "group_message_debounce_seconds", 0.5)
     group = f"batched-inbound-{uuid4()}"
     captured = []
 
@@ -98,6 +99,9 @@ async def test_real_inbound_burst_commits_both_messages_before_one_queue_admissi
     try:
         await deliver(group, "10001", "这个是什么厂的", addressed=True)
         await deliver(group, "10002", "我说右边那个")
+        now[0] = 2.0
+        for pending in batcher.pending.values():
+            pending.changed.set()
         await asyncio.gather(*list(batcher.tasks))
         assert len(captured) == 1
         assert captured[0].is_tome
@@ -111,9 +115,10 @@ async def test_inbound_stop_cancels_waiting_burst(deliver_message, monkeypatch):
     from nonebot_plugin_ai_groupmate.message_batching import InputBatcher
 
     deliver, queued, _ = deliver_message
-    batcher = InputBatcher()
+    now = [0.0]
+    batcher = InputBatcher(clock=lambda: now[0])
     monkeypatch.setattr(plugin, "_input_batcher", batcher)
-    monkeypatch.setattr(plugin.plugin_config, "group_message_debounce_seconds", 0.02)
+    monkeypatch.setattr(plugin.plugin_config, "group_message_debounce_seconds", 0.5)
     try:
         await deliver("batch-stop", "10001", "说点什么", addressed=True)
         await deliver("batch-stop", "10002", "别插话")
