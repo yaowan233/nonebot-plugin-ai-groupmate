@@ -1298,9 +1298,10 @@ class VectorDBOperator:
     # ================= 聊天记录功能 (RAG) =================
 
     @staticmethod
-    async def _read_chat_sources(session_id: str, msg_ids: list[int]) -> list[Any]:
+    async def _read_chat_sources(session_id: str, msg_ids: list[int], *, platform: str = "") -> list[Any]:
         from sqlalchemy import select
         from nonebot_plugin_orm import get_session
+        from types import SimpleNamespace
 
         from .model import ChatHistory, ChatHistorySchema
 
@@ -1310,13 +1311,27 @@ class VectorDBOperator:
                 ChatHistory.msg_id.in_(msg_ids),
                 ChatHistory.content_type.in_(("text", "bot")),
             ))).all()
-            return [ChatHistorySchema.model_validate(row) for row in rows]
+            records = [ChatHistorySchema.model_validate(row) for row in rows]
+            if not platform or not records:
+                return records
+            from .agent.structured_context import load_structured_context_safely
+            from .agent.turn_context import TurnHistoryResolver
+
+            snapshots = await load_structured_context_safely(
+                session, records, session_id=session_id, scope="group", platform=platform, include_media=False,
+            )
+            if not snapshots:
+                return records
+            resolver = TurnHistoryResolver(snapshots)
+            return [SimpleNamespace(**row.model_dump(), resolved_body=resolver.metadata(row)[2]) for row in records]
 
     @staticmethod
     def _format_chat_source(query: str, message: Any) -> str:
         from .message_metadata import parse_message_metadata
 
-        body = parse_message_metadata(message.content)[2]
+        body = getattr(message, "resolved_body", None)
+        if body is None:
+            body = parse_message_metadata(message.content)[2]
         # Keep a long source's matching passage and its owner together. Escaping
         # newlines prevents trimming a continuation away from the source header.
         terms = sorted(_chat_search_terms(query), key=len, reverse=True)
@@ -1339,6 +1354,7 @@ class VectorDBOperator:
 
     async def _hydrate_chat_sources(
         self, query: str, session_id: str, texts: list[str], points: Sequence[Any],
+        *, platform: str = "",
     ) -> list[tuple[str, str]]:
         """Resolve retained hits through SQL IDs, including existing v2 indexes.
 
@@ -1363,7 +1379,7 @@ class VectorDBOperator:
         if not needed:
             return [(text, unverified) for text in texts]
         try:
-            rows = await self._read_chat_sources(session_id, needed)
+            rows = await self._read_chat_sources(session_id, needed, **({"platform": platform} if platform else {}))
         except Exception as error:
             logger.warning(f"RAG 来源回查失败，返回未核实片段: {type(error).__name__}")
             return [(text, unverified) for text in texts]
@@ -1449,7 +1465,7 @@ class VectorDBOperator:
             ]
         )
 
-    async def search_chat(self, query: str, session_id: str) -> str:
+    async def search_chat(self, query: str, session_id: str, *, platform: str = "") -> str:
         """在当前会话中召回并融合排序相关历史片段。"""
         if not self.enabled:
             return "未找到相关历史记录"
@@ -1514,7 +1530,8 @@ class VectorDBOperator:
             return "未找到相关历史记录"
         fragments: list[str] = []
         total_chars = 0
-        sources = await self._hydrate_chat_sources(normalized_query, session_id, best_texts, search_result.points)
+        sources = await self._hydrate_chat_sources(normalized_query, session_id, best_texts, search_result.points,
+                                                    **({"platform": platform} if platform else {}))
         for text, source_notice in sources:
             fragment = self._trim_chat_fragment(normalized_query, text)
             if not fragment:

@@ -10,6 +10,7 @@ from nonebot_plugin_alconna import message_reaction
 
 from ..model import ChatHistory
 from ..reply_guard import is_request_active
+from ..reply_request import resolve_current_message_id
 from .tool_results import tool_failure, tool_skipped, tool_success
 from ..participation import record_group_delivery
 
@@ -164,13 +165,7 @@ def create_reaction_tool(
         return None
 
     def _get_event_message_id() -> str | None:
-        if event is None:
-            return None
-        message_id = getattr(event, "message_id", None)
-        if message_id is None:
-            return None
-        message_id = str(message_id).strip()
-        return message_id or None
+        return resolve_current_message_id(event)
 
     def _is_supported_onebot_reaction_message_id(message_id: str | None) -> bool:
         return bool(message_id and re.fullmatch(r"-?[0-9]+", message_id))
@@ -289,6 +284,11 @@ def create_reaction_tool(
         async def _apply_reaction(
             reaction_emoji: str, target_message_id: str | None
         ) -> None:
+            if target_message_id is None:
+                captured = resolve_current_message_id(event)
+                native_id = str(getattr(event, "message_id", "") or "")
+                if captured and captured != native_id:
+                    target_message_id = captured
             await message_reaction(
                 reaction_emoji,
                 message_id=target_message_id,

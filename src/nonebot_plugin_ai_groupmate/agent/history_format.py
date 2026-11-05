@@ -1,17 +1,25 @@
 import io
 import base64
+import json
 from typing import Any
 from pathlib import Path
 
 from PIL import Image, ImageOps
-from sqlalchemy import Select
 from nonebot.log import logger
 from nonebot_plugin_uninfo import SceneType, QryItrface
 from sqlalchemy.ext.asyncio import AsyncSession
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 
-from ..model import ChatHistory, ChatHistorySchema
-from ..message_metadata import deduplicate_bot_echoes, parse_message_metadata
+from ..model import ChatHistorySchema
+from .file_workspace import FileWorkspace
+from .image_resources import ImageResources, ImageResourceError, is_image_history as is_image_history, published_image_file_id as published_image_file_id, image_file_name_from_history as image_file_name_from_history
+from ..message_mentions import format_member_mention
+from ..message_metadata import platform_message_ids, deduplicate_bot_echoes, parse_message_metadata
+from .structured_context import StructuredSnapshot, visible_quote_text
+from .turn_context import TurnHistoryResolver
+from ..message_repository import find_by_platform_id
+from ..media_message import format_media_markers
+from ..forward_message import format_forward_marker
 
 BOT_IMAGE_DESCRIPTION_MAX_CHARS = 500
 
@@ -47,15 +55,20 @@ def _image_bytes_to_data_uri(image_bytes: bytes, *, source: str) -> str | None:
 
 
 def get_image_data_uri(file_name: str, *, pic_dir: Path) -> str | None:
-    file_path = pic_dir / file_name
-    if not file_path.exists():
+    try:
+        data = ImageResources(pic_dir).read_media(file_name)
+        return _image_bytes_to_data_uri(data, source=file_name)
+    except ImageResourceError:
         return None
 
+
+def get_history_image_data_uri(msg: ChatHistorySchema, *, pic_dir: Path, workspace: FileWorkspace | None = None) -> str | None:
+    """Read either an ordinary media image or a confirmed, scoped bot publication."""
     try:
-        return _image_bytes_to_data_uri(file_path.read_bytes(), source=file_name)
-    except Exception as e:
-        logger.error(f"读取图片失败 {file_name}: {e}")
+        image_bytes = ImageResources(pic_dir, workspace).read_history(msg)
+    except ImageResourceError:
         return None
+    return _image_bytes_to_data_uri(image_bytes, source="history_image")
 
 
 def fallback_qq_avatar_url(user_id: str | None) -> str | None:
@@ -193,25 +206,18 @@ def parse_msg_meta(content: str) -> tuple[str | None, str | None, str]:
     return parse_message_metadata(content)
 
 
-def image_file_name_from_history(msg: ChatHistorySchema) -> str:
-    for line in reversed(msg.content.strip().splitlines()):
-        line = line.strip()
-        if line.startswith("图片文件:"):
-            return line.split(":", 1)[1].strip()
-    return msg.content.strip().split("\n")[-1].strip()
-
-
-def is_image_history(msg: ChatHistorySchema) -> bool:
-    return msg.content_type == "image" or (
-        msg.content_type == "bot" and msg.media_id is not None
-    )
-
-
 def _bot_image_description(msg: ChatHistorySchema) -> str:
     """Recover the stored send-time caption without exposing transport metadata."""
-    if msg.content_type != "bot" or msg.media_id is None:
+    if msg.content_type != "bot":
         return ""
     _, _, body = parse_msg_meta(msg.content)
+    if msg.media_id is None and published_image_file_id(msg) is not None:
+        for line in body.splitlines():
+            if line.startswith("搜索描述:") and (description := line.partition(":")[2].strip()):
+                return "搜索描述（未必准确）：" + description[:BOT_IMAGE_DESCRIPTION_MAX_CHARS]
+        return ""
+    if msg.media_id is None:
+        return ""
     for prefix in ("发送了图片，图片描述是:", "发送了图片，图片描述是："):
         if body.startswith(prefix):
             description = body[len(prefix):].rsplit("\n图片文件:", 1)[0].strip()
@@ -249,36 +255,32 @@ async def load_replied_message_histories(
     session_id: str,
     reply_to_id: str | None,
 ) -> list[ChatHistorySchema]:
-    if not reply_to_id:
-        return []
+    rows = await find_by_platform_id(db_session, session_id, reply_to_id)
+    return [ChatHistorySchema.model_validate(msg) for msg in rows]
 
-    normalized_reply_id = str(reply_to_id).strip()
-    if not normalized_reply_id:
-        return []
 
-    for marker in (f"id: {normalized_reply_id}\n", f"id:{normalized_reply_id}\n"):
-        rows = (
-            (
-                await db_session.execute(
-                    Select(ChatHistory)
-                    .where(
-                        ChatHistory.session_id == session_id,
-                        ChatHistory.content.contains(marker),
-                    )
-                    .order_by(ChatHistory.msg_id.asc())
-                )
-            )
-            .scalars()
-            .all()
-        )
-        if rows:
-            history_msg_ids = ", ".join(str(msg.msg_id) for msg in rows)
-            logger.info(
-                f"命中被回复消息记录 reply_id={normalized_reply_id} history_msg_ids={history_msg_ids}"
-            )
-            return [ChatHistorySchema.model_validate(msg) for msg in rows]
-
-    return []
+def _match_bot_image_rows(snapshot: StructuredSnapshot, indices: list[int], history: list[ChatHistorySchema]) -> list[int] | None:
+    """Match each structured image to its exact legacy row before reading it."""
+    parts = [part for part in snapshot.parts if part.get("type") == "image"]
+    available = [index for index in indices if is_image_history(history[index])]
+    if len(parts) != len(available):
+        return None
+    matched = []
+    for part in parts:
+        file_id = part.get("file_id", "")
+        media_id = part.get("media_id", "")
+        if not file_id and not media_id:
+            return None
+        if media_id and not media_id.isdigit():
+            return None
+        index = next((i for i in available if
+                      (not file_id or published_image_file_id(history[i]) == file_id) and
+                      (not media_id or history[i].media_id == int(media_id))), None)
+        if index is None:
+            return None
+        available.remove(index)
+        matched.append(index)
+    return matched
 
 
 def format_chat_history(
@@ -289,16 +291,41 @@ def format_chat_history(
     max_inline_images: int = 3,
     user_roles: dict[str, str] | None = None,
     extra_inline_images: list[ChatHistorySchema] | None = None,
+    workspace: FileWorkspace | None = None,
+    structured_messages: dict[tuple[str, str], StructuredSnapshot] | None = None,
+    exclude_inline_message_ids: frozenset[str] = frozenset(),
 ) -> list[BaseMessage]:
     messages = []
+    snapshots = structured_messages or {}
+    resolver = TurnHistoryResolver(snapshots)
     # Reply-image records may contain another copy of a bot's adapter echo.
-    combined = deduplicate_bot_echoes([*history, *(extra_inline_images or [])])
+    combined = deduplicate_bot_echoes([*history, *(extra_inline_images or [])], ids_for=resolver.ids)
     retained = {id(message) for message in combined}
     history = [message for message in history if id(message) in retained]
     user_roles = user_roles or {}
     extra_inline_images = [
         message for message in (extra_inline_images or []) if id(message) in retained
     ]
+    structured_keys_by_history: dict[int, list[tuple[str, str]]] = {}
+    for key, snapshot in snapshots.items():
+        for history_id in snapshot.history_ids:
+            structured_keys_by_history.setdefault(history_id, []).append(key)
+
+    def row_platform_ids(message: ChatHistorySchema) -> set[str]:
+        indexed_keys = structured_keys_by_history.get(message.msg_id)
+        if indexed_keys is not None:
+            ids: set[str] = set()
+            for key in indexed_keys:
+                if key[1] == message.user_id:
+                    ids.update(snapshots[key].history_platform_ids.get(message.msg_id, (key[0],)))
+            return ids
+        return platform_message_ids(message.content)
+
+    def row_own_id(message: ChatHistorySchema) -> str | None:
+        indexed_keys = structured_keys_by_history.get(message.msg_id)
+        if indexed_keys is not None:
+            return next((key[0] for key in sorted(indexed_keys) if key[1] == message.user_id), None)
+        return parse_msg_meta(message.content)[0]
 
     def role_prefix(uid: str) -> str:
         role = user_roles.get(uid)
@@ -310,13 +337,15 @@ def format_chat_history(
 
     id_to_summary: dict[str, str] = {}
     for msg in [*history, *extra_inline_images]:
-        own_id, _, body = parse_msg_meta(msg.content)
-        if own_id:
+        own_id, _, body = resolver.metadata(msg)
+        summary_ids = resolver.ids(msg) or ({own_id} if own_id else set())
+        if summary_ids:
             if is_image_history(msg):
                 snippet = "[图片]"
             else:
                 snippet = body[:30] + ("…" if len(body) > 30 else "")
-            id_to_summary[own_id] = f'{msg.user_name} "{snippet}"'
+            for summary_id in summary_ids:
+                id_to_summary[summary_id] = f'{msg.user_name} "{snippet}"'
 
     has_extra_inline_images = any(
         is_image_history(msg) for msg in extra_inline_images
@@ -325,7 +354,7 @@ def format_chat_history(
     image_indices = [
         i
         for i, msg in enumerate(history)
-        if is_image_history(msg)
+        if is_image_history(msg) and not (row_platform_ids(msg) & exclude_inline_message_ids)
     ]
     if has_extra_inline_images or max_inline_images <= 0:
         inline_image_set = set()
@@ -334,13 +363,13 @@ def format_chat_history(
 
     text_to_images: dict[str, tuple[int, list[int]]] = {}
     for i in range(len(history)):
-        own_id, _, _ = parse_msg_meta(history[i].content)
+        own_id = row_own_id(history[i])
         if not own_id:
             continue
         if history[i].content_type == "text":
             img_idxs: list[int] = []
             for j in range(i + 1, len(history)):
-                next_own_id, _, _ = parse_msg_meta(history[j].content)
+                next_own_id = row_own_id(history[j])
                 if (
                     next_own_id == own_id
                     and is_image_history(history[j])
@@ -356,12 +385,66 @@ def format_chat_history(
     for _tid, (_, img_idxs) in text_to_images.items():
         merged_image_indices.update(img_idxs)
 
+    # Image downloads can finish after later messages. Anchor a structured
+    # message at its first compatibility row, even when its rows are separated.
+    structured_anchors: dict[int, tuple[StructuredSnapshot, list[int]]] = {}
+    structured_bot_images: dict[int, list[int]] = {}
+    structured_skip: set[int] = set()
+    grouped: dict[tuple[str, str], list[int]] = {}
+    if structured_messages:
+        for i, msg in enumerate(history):
+            indexed_keys = structured_keys_by_history.get(msg.msg_id)
+            keys = (sorted(indexed_keys) if indexed_keys is not None else
+                    [(message_id, msg.user_id) for message_id in sorted(platform_message_ids(msg.content))])
+            for key in keys:
+                if key[1] != msg.user_id:
+                    continue
+                if key not in structured_messages:
+                    continue
+                if msg.content_type == "bot":
+                    if structured_messages[key].parts and all(part.get("type") in {"text", "mention", "image"}
+                                                              for part in structured_messages[key].parts):
+                        grouped.setdefault(key, []).append(i)
+                        break
+                    continue
+                if (structured_messages[key].parts and visible_quote_text(structured_messages[key]) is not None and all(
+                    part.get("type") in {"text", "mention", "image", "face", "mface", "card", "file", "audio", "record", "video", "forward"} and
+                    (part.get("type") != "file" or (part.get("file_id") and part.get("name"))) and
+                    (part.get("type") != "image" or (part.get("media_id", "").isdigit() and
+                     int(part["media_id"]) in structured_messages[key].media_paths))
+                    for part in structured_messages[key].parts
+                )):
+                    grouped.setdefault(key, []).append(i)
+                    break
+        for key, indices in grouped.items():
+            snapshot = structured_messages[key]
+            contains_text = any((part.get("type") in {"text", "mention", "card", "file"} and
+                                 (part.get("text") or part.get("target") or part.get("name"))) or
+                                part.get("type") in {"audio", "record", "video", "forward"} for part in snapshot.parts)
+            is_bot = history[indices[0]].content_type == "bot"
+            if is_bot:
+                bot_images = _match_bot_image_rows(snapshot, indices, history)
+                has_text_row = any(not is_image_history(history[i]) for i in indices)
+                if bot_images is None or contains_text != has_text_row:
+                    continue
+                structured_bot_images[indices[0]] = bot_images
+            elif contains_text and not any(history[i].content_type == "text" for i in indices):
+                # An image can arrive after this message was already cached in
+                # an append-only thread. Do not replay its old text as new.
+                continue
+            structured_anchors[indices[0]] = (snapshot, indices)
+            structured_skip.update(indices[1:])
+
     for idx, msg in enumerate(history):
-        if idx in merged_image_indices:
+        if idx in structured_skip or (idx in merged_image_indices and idx not in structured_anchors):
             continue
 
         time_str = msg.created_at.strftime("%Y-%m-%d %H:%M:%S")
-        own_id, reply_to_id, body = parse_msg_meta(msg.content)
+        if idx in structured_anchors:
+            snapshot = structured_anchors[idx][0]
+            own_id, reply_to_id, body = snapshot.platform_id, snapshot.reply_to_id, ""
+        else:
+            own_id, reply_to_id, body = parse_msg_meta(msg.content)
 
         if reply_to_id and reply_to_id in id_to_summary:
             reply_prefix = f"(回复 {id_to_summary[reply_to_id]}) "
@@ -369,6 +452,88 @@ def format_chat_history(
             reply_prefix = "(回复了一条消息) "
         else:
             reply_prefix = ""
+
+        if idx in structured_anchors:
+            snapshot, indices = structured_anchors[idx]
+            if msg.content_type == "bot":
+                bot_image_iter = iter(structured_bot_images[idx])
+                text_parts: list[str] = []
+                image_blocks: list[dict[str, Any]] = []
+                for part in snapshot.parts:
+                    kind = part.get("type", "")
+                    if kind == "text":
+                        text_parts.append(part.get("text", ""))
+                    elif kind == "mention":
+                        text_parts.append(format_member_mention(part.get("target", ""), part.get("name", "")))
+                    elif kind == "image":
+                        image_idx = next(bot_image_iter)
+                        image_row = history[image_idx]
+                        label = "[图片]"
+                        if description := _bot_image_description(image_row):
+                            label += f"（发送时的描述：{description}）"
+                        if image_idx in inline_image_set:
+                            uri = get_history_image_data_uri(image_row, pic_dir=pic_dir, workspace=workspace)
+                            if uri:
+                                image_blocks.append({"type": "image_url", "image_url": {"url": uri}})
+                            else:
+                                label += "[图片已过期/无法加载]"
+                        text_parts.append(label)
+                messages.append(AIMessage(content=reply_prefix + "".join(text_parts)))
+                if image_blocks:
+                    messages.append(HumanMessage(content=[
+                        {"type": "text", "text": f"【历史图片参考】这些是 {bot_name} 在上条记录中自己发送的图片，供理解对话使用，不是新的用户请求。"},
+                        *image_blocks,
+                    ]))
+                continue
+            prefix = role_prefix(msg.user_id)
+            chunks: list[Any] = [{"type": "text", "text": f"[{time_str}] {prefix}{msg.user_name}: {reply_prefix}"}]
+            image_rows: dict[int, list[int]] = {}
+            audio_count = video_count = 0
+            for image_idx in indices:
+                image_row = history[image_idx]
+                if is_image_history(image_row) and image_row.media_id is not None:
+                    image_rows.setdefault(image_row.media_id, []).append(image_idx)
+            for part in snapshot.parts:
+                kind = part.get("type", "")
+                if kind in {"text", "card"}:
+                    chunks[-1]["text"] += part.get("text", "")
+                elif kind == "mention":
+                    chunks[-1]["text"] += format_member_mention(part.get("target", ""), part.get("name", ""))
+                elif kind == "image":
+                    raw_media_id = part.get("media_id", "")
+                    media_id = int(raw_media_id) if raw_media_id.isdigit() else None
+                    matching = image_rows.get(media_id, []) if media_id is not None else []
+                    image_idx = matching.pop(0) if matching else None
+                    if image_idx in inline_image_set and media_id in snapshot.media_paths:
+                        uri = get_image_data_uri(snapshot.media_paths[media_id], pic_dir=pic_dir)
+                        if uri:
+                            chunks.append({"type": "image_url", "image_url": {"url": uri}})
+                            chunks.append({"type": "text", "text": ""})
+                        else:
+                            chunks[-1]["text"] += "[图片已过期/无法加载]"
+                    else:
+                        chunks[-1]["text"] += "[图片]"
+                elif kind in {"mface", "face"}:
+                    chunks[-1]["text"] += "[表情]"
+                elif kind == "file":
+                    chunks[-1]["text"] += "[文件：" + json.dumps(part["name"], ensure_ascii=False) + "]"
+                elif kind == "forward":
+                    chunks[-1]["text"] += "\n" + format_forward_marker(part.get("forward_id"))
+                elif kind in {"record", "audio"}:
+                    audio_count += 1
+                    chunks[-1]["text"] += "[语音]"
+                elif kind == "video":
+                    video_count += 1
+                    chunks[-1]["text"] += "[视频]"
+            if audio_count or video_count:
+                chunks[-1]["text"] += "\n" + format_media_markers(
+                    snapshot.platform_id, audio_count=audio_count, video_count=video_count,
+                )
+            if any(chunk.get("type") == "image_url" for chunk in chunks):
+                messages.append(HumanMessage(chunks))
+            else:
+                messages.append(HumanMessage(chunks[0]["text"]))
+            continue
 
         if msg.content_type == "text" and own_id and own_id in text_to_images:
             prefix = role_prefix(msg.user_id)
@@ -390,8 +555,7 @@ def format_chat_history(
             content_parts: list[Any] = [{"type": "text", "text": text_line}]
             for img_idx in merged_inline_images:
                 img_msg = history[img_idx]
-                file_name = image_file_name_from_history(img_msg)
-                image_data = get_image_data_uri(file_name, pic_dir=pic_dir)
+                image_data = get_history_image_data_uri(img_msg, pic_dir=pic_dir, workspace=workspace)
                 if image_data:
                     content_parts.append(
                         {"type": "image_url", "image_url": {"url": image_data}}
@@ -417,8 +581,7 @@ def format_chat_history(
             continue
 
         if is_image_history(msg):
-            file_name = image_file_name_from_history(msg)
-            image_data = get_image_data_uri(file_name, pic_dir=pic_dir) if idx in inline_image_set else None
+            image_data = get_history_image_data_uri(msg, pic_dir=pic_dir, workspace=workspace) if idx in inline_image_set else None
             if msg.content_type == "bot":
                 bot_image_text = "[图片]"
                 if description := _bot_image_description(msg):

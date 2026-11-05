@@ -38,6 +38,39 @@ async def test_share_card_is_stored_as_visible_text_without_forcing_reply(delive
     assert not images
 
 
+async def test_inbound_stores_native_order_and_keeps_legacy_history(deliver_message, monkeypatch):
+    from uuid import uuid4
+
+    from sqlalchemy import select
+    from nonebot_plugin_orm import get_session
+    from nonebot_plugin_alconna import UniMessage
+    from nonebot.adapters.onebot.v11 import Message, MessageSegment
+
+    import nonebot_plugin_ai_groupmate as plugin
+    from nonebot_plugin_ai_groupmate.model import ChatHistory, StructuredMessage
+
+    deliver, _, _ = deliver_message
+    group = f"structured-inbound-{uuid4()}"
+    monkeypatch.setattr(plugin.plugin_config, "message_refactor_pilot_groups", [group])
+    native = Message([MessageSegment.text("帮"), MessageSegment.at("123"),
+                      MessageSegment.text("看"), MessageSegment.image("https://example.test/a.png"),
+                      MessageSegment.text("这个")])
+    unified = UniMessage.text("帮").at("123").text("看").image(raw=b"not-downloaded").text("这个")
+    await deliver(group, "id-1", "帮看这个", message=unified, original_message=native)
+    other_group = group + "-other"
+    await deliver(other_group, "id-2", "非试运行群")
+    async with get_session() as db:
+        row = await db.scalar(select(StructuredMessage).where(StructuredMessage.session_id == group))
+        legacy = (await db.scalars(select(ChatHistory).where(ChatHistory.session_id == group))).all()
+        assert await db.scalar(select(StructuredMessage).where(StructuredMessage.session_id == other_group)) is None
+        assert row is not None
+        assert [part["type"] for part in row.parts] == ["text", "mention", "text", "image", "text"]
+        assert row.parts[1]["target"] == "123"
+        assert row.sender_id == "member-1"
+        assert len(legacy) == 1
+        assert "id: id-1" in legacy[0].content
+
+
 async def test_real_inbound_burst_commits_both_messages_before_one_queue_admission(deliver_message, monkeypatch):
     from uuid import uuid4
 
@@ -107,14 +140,16 @@ def deliver_message(monkeypatch):
     monkeypatch.setattr(plugin, "_load_repeat_chain_text", AsyncMock(return_value=None))
     monkeypatch.setattr(plugin, "_sample_proactive_reply_modes", lambda **_: (False, False, False))
     monkeypatch.setattr(plugin, "is_onebot_context", lambda *_: False)
-    monkeypatch.setattr(plugin, "_start_background_image_task", lambda *args: images.append(args))
+    monkeypatch.setattr(plugin, "_start_background_image_task", lambda *args, **kwargs: images.append(args))
     monkeypatch.setattr(plugin.plugin_config, "bot_name", "咕咕")
     monkeypatch.setattr(plugin.plugin_config, "continuous_conversation_minutes", 5)
     # These tests assert admission policy; burst collection has separate coverage.
     monkeypatch.setattr(plugin.plugin_config, "group_message_debounce_seconds", 0)
     plugin._continuous_conversation_until.clear()
+    plugin._explicit_conversation_until.clear()
     plugin.participation.states.clear()
     plugin._observation_schedule.clear()
+
 
     async def deliver(
         session_id,
@@ -157,8 +192,50 @@ def deliver_message(monkeypatch):
 
     yield deliver, queued, images
     plugin._continuous_conversation_until.clear()
+    plugin._explicit_conversation_until.clear()
     plugin.participation.states.clear()
     plugin._observation_schedule.clear()
+
+
+@pytest.mark.asyncio
+async def test_continuation_survives_bot_switch_for_same_user(deliver_message, monkeypatch):
+    import nonebot_plugin_ai_groupmate as plugin
+
+    monkeypatch.setattr(plugin, "_shared_balancer_enabled", lambda: True, raising=False)
+    deliver, queued, _ = deliver_message
+    await deliver("continuation-switch", "1", "接下来我们连续聊天", addressed=True, bot_id="bot-1")
+    queued.reset_mock()
+    await deliver("continuation-switch", "2", "2+2=", bot_id="bot-2")
+    queued.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_balanced_continuation_is_scoped_and_exit_clears_it(deliver_message, monkeypatch):
+    import nonebot_plugin_ai_groupmate as plugin
+
+    monkeypatch.setattr(plugin, "_shared_balancer_enabled", lambda: True)
+    deliver, queued, _ = deliver_message
+    await deliver("balanced-scope", "1", "你好", addressed=True, bot_id="bot-1")
+    queued.reset_mock()
+    await deliver("balanced-scope", "2", "2+2=", bot_id="bot-2", user_id="another-user")
+    await deliver("another-group", "3", "2+2=", bot_id="bot-2")
+    queued.assert_not_awaited()
+    await deliver("balanced-scope", "4", "别插话", bot_id="bot-2")
+    await deliver("balanced-scope", "5", "继续刚才的话", bot_id="bot-1")
+    queued.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_explicit_conversation_mode_follows_pooled_bot_and_ends_on_request(deliver_message, monkeypatch):
+    import nonebot_plugin_ai_groupmate as plugin
+
+    monkeypatch.setattr(plugin, "_shared_balancer_enabled", lambda: True)
+    deliver, _, _ = deliver_message
+    await deliver("explicit-pool", "1", "接下来我们连续聊天", addressed=True, bot_id="bot-1")
+    assert plugin._is_explicit_conversation("explicit-pool", "member-1", "bot-2")
+    assert not plugin._is_explicit_conversation("explicit-pool", "other", "bot-2")
+    await deliver("explicit-pool", "2", "别插话", bot_id="bot-2")
+    assert not plugin._is_explicit_conversation("explicit-pool", "member-1", "bot-1")
 
 
 @pytest.mark.parametrize("enabled", [True, False])
@@ -173,7 +250,7 @@ async def test_jargon_learning_observes_silent_group_text_but_not_private_bots_o
     monkeypatch.setattr(jargon_learning, "schedule_jargon_learning", schedule)
     monkeypatch.setattr(plugin, "plugin_data_dir", tmp_path)
     monkeypatch.setattr(plugin.plugin_config, "group_jargon_learning_enabled", enabled)
-    monkeypatch.setattr(plugin.plugin_config, "flash_api_key", "test-only")
+    monkeypatch.setattr(plugin.plugin_config, "chat_api_key", "test-only")
     deliver, queued, _ = deliver_message
     group = f"jargon-{uuid4()}"
     await deliver(group, "term-1", "蓝票又没了")
@@ -185,6 +262,8 @@ async def test_jargon_learning_observes_silent_group_text_but_not_private_bots_o
     if enabled:
         assert schedule.call_args.args[:2] == (tmp_path / "group_jargon", group)
         assert set(schedule.call_args.kwargs["excluded_users"]) == {"bot-1", "bot-2"}
+        assert schedule.call_args.args[2] is plugin.get_jargon_discovery_model
+        assert schedule.call_args.kwargs["review_model_factory"] is plugin.get_jargon_review_model
 
 
 @pytest.mark.asyncio

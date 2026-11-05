@@ -644,7 +644,7 @@ async def test_send_meme_honors_multi_send_limit_and_uses_distinct_ids(
     assert sends == [b"image-1", b"image-2"]
     assert approved == {3}
     assert len(session.added) == 2
-    assert session.commit_count == 2
+    assert session.commit_count == 4  # Release before each send, persist each confirmed delivery.
 
 
 @pytest.mark.asyncio

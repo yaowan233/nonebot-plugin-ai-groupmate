@@ -1,25 +1,23 @@
 import re
-import difflib
-import datetime
 from typing import Any, Literal
 from collections.abc import Callable
 
-import jieba
-from sqlalchemy import Select, or_
 from nonebot.log import logger
 from langchain.tools import tool
 from nonebot_plugin_uninfo import SceneType, QryItrface
 from nonebot_plugin_alconna import Target, UniMessage
 
 from ..model import ChatHistory
+from .delivery import OutboundIdentity, send_and_finalize
+from .outbound_plan import compose_segments
 from ..reply_guard import is_request_active
 from .member_tools import member_aliases
 from .tool_results import tool_failure, tool_skipped, tool_success
-from ..participation import record_group_delivery
-from ..message_metadata import platform_message_ids, is_reliable_platform_id
+from ..message_metadata import is_reliable_platform_id
+from ..message_repository import find_by_platform_id, structured_id_in_scope
 
 
-async def resolve_reply_target(db_session, session_id: str, reply_to: str | None, *, current_message_id: str | None = None, replied_message_id: str | None = None) -> str | None:
+async def resolve_reply_target(db_session, session_id: str, reply_to: str | None, *, current_message_id: str | None = None, replied_message_id: str | None = None, outbound_identity: OutboundIdentity | None = None) -> str | None:
     """Resolve a quote to a transport ID belonging to the bound conversation."""
     if reply_to is None:
         return None
@@ -30,32 +28,36 @@ async def resolve_reply_target(db_session, session_id: str, reply_to: str | None
     target = str(target).strip()
     if target in {current_message_id, replied_message_id}:
         return target
-    rows = await db_session.execute(
-        Select(ChatHistory.content).where(
-            ChatHistory.session_id == session_id,
-            or_(
-                ChatHistory.content.contains(f"id: {target}\n", autoescape=True),
-                ChatHistory.content.contains(f"id:{target}\n", autoescape=True),
-            ),
-        ).order_by(ChatHistory.msg_id.asc()).limit(50)
-    )
-    if any(target in platform_message_ids(content) for content in rows.scalars().all()):
+    if outbound_identity is not None:
+        found = await structured_id_in_scope(db_session, session_id=session_id, message_id=target,
+                                             platform=outbound_identity.platform, scope=outbound_identity.scope)
+        if found is True:
+            return target
+        if found is False:
+            raise ValueError("当前会话中找不到该消息，未执行引用回复。请核对平台消息ID，不要使用数据库记录ID。")
+    if await find_by_platform_id(db_session, session_id, target):
         return target
     raise ValueError("当前会话中找不到该消息，未执行引用回复。请核对平台消息ID，不要使用数据库记录ID。")
 
 
 def compose_image_reply(image: UniMessage, text: str = "", quoted_id: str | None = None) -> UniMessage:
     """Build one native message chain for an image, optional text, and a quote."""
-    message = UniMessage.text(text) + image if text else image
-    return UniMessage.reply(quoted_id) + message if quoted_id is not None else message
+    return compose_segments(([UniMessage.text(text)] if text else []) + [image], quoted_id)
 
 
-def record_image_reply(db_session, *, session_id: str, bot_name: str, message_id: str, image_content: str, text: str = "", quoted_id: str | None = None, media_id: int | None = None) -> None:
-    """Store multipart content under the single platform message's transport ID."""
+def image_reply_rows(*, session_id: str, bot_name: str, message_id: str, image_content: str, text: str = "", quoted_id: str | None = None, media_id: int | None = None) -> list[ChatHistory]:
     header = f"id: {message_id}\n" + (f"回复id: {quoted_id}\n" if quoted_id is not None else "")
+    rows = []
     if text:
-        db_session.add(ChatHistory(session_id=session_id, user_id=bot_name, user_name=bot_name, content_type="bot", content=header + text))
-    db_session.add(ChatHistory(session_id=session_id, user_id=bot_name, user_name=bot_name, content_type="bot", content=header + image_content, media_id=media_id))
+        rows.append(ChatHistory(session_id=session_id, user_id=bot_name, user_name=bot_name, content_type="bot", content=header + text))
+    rows.append(ChatHistory(session_id=session_id, user_id=bot_name, user_name=bot_name, content_type="bot", content=header + image_content, media_id=media_id))
+    return rows
+
+
+def record_image_reply(db_session, **kwargs) -> None:
+    """Compatibility writer for callers that manage their own transaction."""
+    for row in image_reply_rows(**kwargs):
+        db_session.add(row)
 
 
 def create_reply_tool(
@@ -71,32 +73,17 @@ def create_reply_tool(
     repeat_text: str | None = None,
     current_message_id: str | None = None,
     replied_message_id: str | None = None,
+    recovery_enabled: bool = True,
+    outbound_identity: OutboundIdentity | None = None,
 ):
     """
     核心工具：用于发送消息。
     """
+    attempted_sends: set[tuple[str, str | None]] = set()
 
     def _normalize_text(text: str) -> str:
         text = re.sub(r"\s+", " ", text).strip()
         return text
-
-    def _semantic_similarity(a: str, b: str) -> float:
-        if not a or not b:
-            return 0.0
-        if a == b:
-            return 1.0
-
-        seq_ratio = difflib.SequenceMatcher(None, a, b).ratio()
-
-        a_tokens = {t for t in jieba.lcut(a) if t.strip()}
-        b_tokens = {t for t in jieba.lcut(b) if t.strip()}
-        if not a_tokens or not b_tokens:
-            return seq_ratio
-
-        inter = len(a_tokens & b_tokens)
-        union = len(a_tokens | b_tokens)
-        jaccard = inter / union if union else 0.0
-        return max(seq_ratio, jaccard)
 
     def _dedupe_consecutive_lines(text: str) -> str:
         lines = [line.strip() for line in text.splitlines() if line.strip()]
@@ -156,51 +143,18 @@ def create_reply_tool(
             # 使用识别到的原文，避免模型添加不可见空白或改变换行。
             content = repeat_text
 
+        send_started = False
         try:
             try:
-                quoted_id = await resolve_reply_target(db_session, session_id, reply_to, current_message_id=current_message_id, replied_message_id=replied_message_id)
+                quoted_id = await resolve_reply_target(db_session, session_id, reply_to, current_message_id=current_message_id, replied_message_id=replied_message_id, outbound_identity=outbound_identity)
             except ValueError as error:
                 return tool_failure("invalid_reply_target", str(error), delivery_state="not_attempted")
             content = _dedupe_consecutive_lines(content.strip())
             normalized_content = _normalize_text(content)
+            if (normalized_content, quoted_id) in attempted_sends:
+                return tool_skipped("duplicate_reply", "本轮已尝试发送该消息，请勿重复发送。", delivery_state="not_attempted")
 
-            latest_bot_msg = (
-                (
-                    await db_session.execute(
-                        Select(ChatHistory)
-                        .where(
-                            ChatHistory.session_id == session_id,
-                            ChatHistory.content_type == "bot",
-                        )
-                        .order_by(ChatHistory.msg_id.desc())
-                        .limit(1)
-                    )
-                )
-                .scalars()
-                .first()
-            )
-            if latest_bot_msg:
-                _, latest_reply_id, latest_body = parse_msg_meta(latest_bot_msg.content)
-                latest_normalized = _normalize_text(
-                    latest_body or latest_bot_msg.content
-                )
-                recent = (
-                    datetime.datetime.now() - latest_bot_msg.created_at
-                    <= datetime.timedelta(seconds=90)
-                )
-                similarity = _semantic_similarity(latest_normalized, normalized_content)
-                if recent and similarity >= 0.9 and latest_reply_id == quoted_id:
-                    logger.info(
-                        f"检测到近义重复回复(相似度={similarity:.2f})，已自动跳过"
-                    )
-                    return tool_skipped(
-                        "duplicate_reply",
-                        "检测到重复回复，已跳过发送。",
-                        delivery_state="not_attempted",
-                    )
-
-            # The duplicate-check query has finished.  Sending through the
-            # adapter can block, so release its pooled connection first.
+            # Sending can block; release the pooled connection first.
             await db_session.commit()
 
             name_to_id: dict[str, str] = {}
@@ -273,37 +227,36 @@ def create_reply_tool(
                 )
 
             outgoing = message or UniMessage.text(content)
-            if quoted_id is not None:
-                outgoing = UniMessage.reply(quoted_id) + outgoing
-            res = await (
-                outgoing.send(target=send_target)
-                if send_target is not None
-                else outgoing.send()
-            )
-            record_group_delivery(session_id)
-            msg_id = res.msg_ids[-1]["message_id"] if res.msg_ids else "unknown"
-            chat_history = ChatHistory(
-                session_id=session_id,
-                user_id=bot_name,
-                content_type="bot",
-                content=f"id: {msg_id}\n" + (f"回复id: {quoted_id}\n" if quoted_id is not None else "") + content,
-                user_name=bot_name,
-            )
-            db_session.add(chat_history)
+            outgoing = compose_segments([outgoing], quoted_id)
+            def record(msg_id: str) -> list[ChatHistory]:
+                return [ChatHistory(
+                    session_id=session_id, user_id=bot_name, content_type="bot",
+                    content=f"id: {msg_id}\n" + (f"回复id: {quoted_id}\n" if quoted_id is not None else "") + content,
+                    user_name=bot_name,
+                )]
+            attempted_sends.add((normalized_content, quoted_id))
+            send_started = True
+            options = {"target": send_target} if send_target is not None else {}
+            delivery = await send_and_finalize(db_session, session_id, outgoing, send_options=options, record=record,
+                                               recovery_enabled=recovery_enabled, outbound_identity=outbound_identity,
+                                               reply_to_id=quoted_id)
             logger.info(f"Bot已回复: {content}")
             return tool_success(
                 "message_sent",
-                "消息已发送。",
-                data={"message_id": str(msg_id), "reply_to_message_id": quoted_id},
+                delivery.note or "消息已发送。",
+                data={"message_id": delivery.message_id, "reply_to_message_id": quoted_id, "history_saved": delivery.history_saved},
                 delivery_state="completed",
             )
         except Exception as error:
             logger.warning(f"发送消息异常: error_type={type(error).__name__}")
-            await db_session.rollback()
+            try:
+                await db_session.rollback()
+            except Exception as rollback_error:
+                logger.warning(f"发送事务回滚失败 error_type={type(rollback_error).__name__}")
             return tool_failure(
                 "send_failed",
-                "消息发送失败；投递结果可能未知，请勿立即重试。",
-                delivery_state="unknown",
+                "消息发送失败；投递结果可能未知，请勿立即重试。" if send_started else "消息尚未发送。",
+                delivery_state="unknown" if send_started else "not_attempted",
             )
 
     return reply_user

@@ -206,6 +206,48 @@ async def test_web_image_send_waits_for_model_to_read_preview():
     assert sent == [True]
 
 
+@pytest.mark.asyncio
+async def test_image_generation_has_own_deadline_without_extending_other_tools():
+    from nonebot_plugin_ai_groupmate.agent import graph as module
+    from nonebot_plugin_ai_groupmate.agent.tool_results import tool_success
+
+    @tool("generate_image")
+    async def generate_image() -> str:
+        """Slow image call."""
+        await asyncio.sleep(0.04)
+        return tool_success("image_generated", "generated", data={"file_id": "test"})
+
+    @tool("slow_other_tool")
+    async def slow_other_tool() -> str:
+        """Ordinary tool retains the general deadline."""
+        await asyncio.sleep(0.04)
+        return "done"
+
+    generate_image.metadata = slow_other_tool.metadata = {"image_generation_timeout_seconds": 0.5}
+    tools = [generate_image, slow_other_tool]
+    node = module._make_tool_node({item.name: item for item in tools}, tools, {}, module.AgentRunLimits(tool_timeout_seconds=0.01))
+    state = _state(AIMessage(content="", tool_calls=[{"name": "generate_image", "args": {}, "id": "image"}, {"name": "slow_other_tool", "args": {}, "id": "ordinary"}]))
+    result = await node(state)
+    assert result["tool_timeout_names"] == ["slow_other_tool"]
+    assert json.loads(result["messages"][0].content)["reason_code"] == "image_generated"
+
+
+@pytest.mark.asyncio
+async def test_native_image_file_without_caption_counts_as_reply():
+    from nonebot_plugin_ai_groupmate.agent import graph as module
+    from nonebot_plugin_ai_groupmate.agent.tool_results import tool_success
+
+    @tool("send_file")
+    async def send_file() -> str:
+        """Deliver a generated image without a caption."""
+        return tool_success("file_sent", "sent", data={"as_image": True, "text": ""}, delivery_state="completed")
+
+    node = module._make_tool_node({"send_file": send_file}, [send_file], {}, module.AgentRunLimits())
+    result = await node(_state(AIMessage(content="", tool_calls=[{"name": "send_file", "args": {}, "id": "send"}])))
+    assert result["reply_count"] == 1
+    assert result["reply_this_round"] == 1
+
+
 def _state(message: AIMessage, *, tool_count: int = 0) -> "AgentState":
     return {
         "messages": [message],
@@ -236,6 +278,69 @@ def _state(message: AIMessage, *, tool_count: int = 0) -> "AgentState":
         "required_side_effect_target_count": 1,
         "image_input_disabled": False,
     }
+
+
+@pytest.mark.asyncio
+async def test_model_and_tool_logs_share_request_trace(monkeypatch):
+    from nonebot_plugin_ai_groupmate.agent import graph as module
+    from nonebot_plugin_ai_groupmate.message_trace import trace_id
+
+    @tool("lookup")
+    async def lookup() -> str:
+        """Return a test result."""
+        return "ok"
+
+    async def active(*args):
+        return True
+
+    monkeypatch.setattr(module, "is_request_active", active)
+    response = AIMessage(content="", tool_calls=[{"name": "lookup", "args": {}, "id": "call"}])
+    state = _state(AIMessage(content="private content"))
+    state["request_id"] = "private-request"
+    messages = []
+    sink = module.logger.add(lambda message: messages.append(message.record["message"]))
+    try:
+        agent = module._make_agent_node(_ToolSpyModel([response]), [lookup], "system", {}, module.AgentRunLimits())
+        output = await agent(state)
+        state["messages"] += output["messages"]
+        node = module._make_tool_node({"lookup": lookup}, [lookup], {}, module.AgentRunLimits())
+        await node(state)
+    finally:
+        module.logger.remove(sink)
+    marker = f"trace={trace_id('group-1', 'private-request')}"
+    assert any("[AgentTrace] LLM " in line and marker in line for line in messages)
+    assert any("[AgentTrace] 工具 " in line and marker in line for line in messages)
+    assert all("private-request" not in line and "private content" not in line for line in messages if marker in line)
+
+
+@pytest.mark.asyncio
+async def test_direct_text_fallback_logs_correlated_tool_stage(monkeypatch):
+    from nonebot_plugin_ai_groupmate.agent import graph as module
+    from nonebot_plugin_ai_groupmate.message_trace import trace_id
+
+    @tool("reply_user")
+    async def reply_user(content: str, next_step: str) -> str:
+        """Record a reply."""
+        return "sent"
+
+    async def active(*args):
+        return True
+
+    monkeypatch.setattr(module, "is_request_active", active)
+    state = _state(AIMessage(content="private text"))
+    state["request_id"] = "private-request"
+    messages = []
+    sink = module.logger.add(lambda message: messages.append(message.record["message"]))
+    try:
+        node = module._make_tool_node({"reply_user": reply_user}, [reply_user], {}, module.AgentRunLimits())
+        await node(state)
+    finally:
+        module.logger.remove(sink)
+    lines = [line for line in messages if "[AgentTrace]" in line and "fallback=True" in line]
+    assert len(lines) == 1
+    assert f"trace={trace_id('group-1', 'private-request')}" in lines[0]
+    assert "tool=reply_user" in lines[0]
+    assert "private text" not in lines[0]
 
 
 @pytest.mark.asyncio
@@ -1076,6 +1181,60 @@ async def test_reply_with_end_stops_without_an_extra_model_call():
     assert sent == ["one message"]
     assert model.invoke_count == 1
     assert result["reply_requires_continuation"] is False
+
+
+@pytest.mark.asyncio
+async def test_ordered_message_counts_images_and_stops_after_confirmed_delivery():
+    from nonebot_plugin_ai_groupmate.agent.graph import build_chat_graph
+    from nonebot_plugin_ai_groupmate.agent.tool_results import tool_success
+
+    calls = []
+
+    @tool("send_ordered_message")
+    async def send_ordered_message(parts: list[dict[str, str]], next_step: str = "end") -> str:
+        """Send one composed message."""
+        calls.append(parts)
+        return tool_success("message_sent", "sent", data={"meme_count": 2}, delivery_state="completed")
+
+    model = _ToolSpyModel([AIMessage(content="", tool_calls=[{
+        "name": "send_ordered_message", "args": {"parts": [{"type": "text", "text": "hello"}]}, "id": "ordered",
+    }])])
+    graph = build_chat_graph(model, [send_ordered_message], "system", required_side_effect_tool="send_meme_image", required_side_effect_count=2)
+    result = await graph.ainvoke(_state(AIMessage(content="placeholder")))
+    assert len(calls) == 1
+    assert result["reply_count"] == 1
+    assert result["required_side_effect_completed"] is True
+    assert model.invoke_count == 1
+
+
+@pytest.mark.asyncio
+async def test_ordered_background_submission_stops_further_replies():
+    from nonebot_plugin_ai_groupmate.agent.graph import build_chat_graph
+    from nonebot_plugin_ai_groupmate.agent.tool_results import tool_success
+
+    calls = []
+
+    @tool("send_ordered_message")
+    async def send_ordered_message(parts: list[dict[str, str]]) -> str:
+        """Enqueue one composed message."""
+        calls.append("queue")
+        return tool_success("ordered_delivery_queued", "queued", data={"job_id": "job"})
+
+    @tool("reply_user")
+    async def reply_user(content: str, next_step: str) -> str:
+        """Send a text message."""
+        calls.append("text")
+        return "sent"
+
+    model = _ToolSpyModel([AIMessage(content="", tool_calls=[
+        {"name": "send_ordered_message", "args": {"parts": [{"type": "text", "text": "hello"}]}, "id": "ordered"},
+        {"name": "reply_user", "args": {"content": "duplicate", "next_step": "end"}, "id": "text"},
+    ])])
+    graph = build_chat_graph(model, [send_ordered_message, reply_user], "system")
+    result = await graph.ainvoke(_state(AIMessage(content="placeholder")))
+    assert calls == ["queue"]
+    assert result["called_finish"] == 1
+    assert model.invoke_count == 1
 
 
 @pytest.mark.asyncio

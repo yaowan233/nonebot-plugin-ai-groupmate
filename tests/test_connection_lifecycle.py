@@ -184,7 +184,7 @@ async def test_reply_releases_database_connection_before_adapter_send(monkeypatc
 
     assert result["status"] == "succeeded"
     assert result["delivery_state"] == "completed"
-    assert events == ["query", "commit", "send", "add"]
+    assert events == ["query", "commit", "send", "add", "commit"]
 
 
 @pytest.mark.asyncio
@@ -233,6 +233,34 @@ async def test_agent_error_notice_uses_guarded_reply_tool(monkeypatch):
         "next_step": "end",
     }
     assert calls[2] == "commit"
+
+
+async def test_error_notice_obeys_message_rollout(monkeypatch):
+    from nonebot_plugin_uninfo import Uninfo, SceneType, QryItrface
+
+    import nonebot_plugin_ai_groupmate as plugin
+
+    calls = []
+    class ReplyTool:
+        async def ainvoke(self, _args):
+            return json.dumps({"ok": True})
+    class Session:
+        async def commit(self):
+            pass
+    def create(*_args, **kwargs):
+        calls.append(kwargs)
+        return ReplyTool()
+    monkeypatch.setattr(plugin, "create_reply_tool", create)
+    monkeypatch.setattr(plugin, "get_bots", lambda: {})
+    monkeypatch.setattr(plugin.plugin_config, "message_refactor_pilot_groups", ["pilot"])
+    for group in ("pilot", "other"):
+        context = SimpleNamespace(scene=SimpleNamespace(id=group, type=SceneType.GROUP), self_id="bot-1")
+        await plugin._send_agent_error_notice(Session(), content="错误", request_id="r", session=cast(Uninfo, context),
+                                              interface=cast(QryItrface, SimpleNamespace()), bot_name="bot", is_private=False, group_members=[])
+    assert calls[0]["recovery_enabled"] is True
+    assert calls[0]["outbound_identity"] is not None
+    assert calls[1]["recovery_enabled"] is False
+    assert calls[1]["outbound_identity"] is None
 
 
 @pytest.mark.asyncio

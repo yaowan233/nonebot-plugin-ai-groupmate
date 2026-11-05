@@ -1,4 +1,5 @@
 import datetime
+from dataclasses import dataclass
 from typing import Literal
 
 from sqlalchemy import Select
@@ -7,12 +8,22 @@ from langchain.tools import tool
 from nonebot.adapters import Bot, Event
 from nonebot_plugin_alconna import message_recall
 
-from ..model import ChatHistory
+from ..model import ChatHistory, StructuredMessage
 from ..reply_guard import is_request_active
 from .tool_results import tool_failure, tool_skipped, tool_success
 from .history_format import parse_msg_meta
+from .structured_context import StructuredSnapshot, visible_text
 
 SELF_RECALL_WINDOW = datetime.timedelta(minutes=5)
+
+
+@dataclass(frozen=True)
+class RecallCandidate:
+    message_id: str
+    sender_name: str
+    body: str
+    is_self: bool
+    created_at: datetime.datetime
 
 
 def _extract_stored_message_id(content: str) -> str | None:
@@ -35,6 +46,9 @@ def create_recall_message_tool(
     bot: Bot | None,
     event: Event | None,
     reply_to_id: str | None = None,
+    structured_platform: str | None = None,
+    is_private: bool = False,
+    bot_id: str | None = None,
 ):
     async def _recent_history() -> list[ChatHistory]:
         return list(
@@ -49,6 +63,53 @@ def create_recall_message_tool(
             .scalars()
             .all()
         )
+
+    async def _recent_candidates() -> list[RecallCandidate]:
+        history = await _recent_history()
+        if structured_platform is None:
+            return [RecallCandidate(mid, getattr(row, "user_name", ""), parse_msg_meta(row.content)[2],
+                                    row.content_type == "bot" and str(row.user_id) == str(bot_name), row.created_at)
+                    for row in history if (mid := _extract_stored_message_id(row.content))]
+
+        scope = "private" if is_private else "group"
+        legacy_ids = {mid for row in history if (mid := _extract_stored_message_id(row.content))}
+        # Resolve every legacy ID in both scopes so a record from another scope
+        # can never authorize a recall through the compatibility path.
+        async with db_session.begin_nested():
+            scoped = list((await db_session.scalars(Select(StructuredMessage).where(
+                StructuredMessage.platform == structured_platform, StructuredMessage.scope == scope,
+                StructuredMessage.session_id == session_id,
+            ).order_by(StructuredMessage.created_at.desc(), StructuredMessage.id.desc()).limit(300))).all())
+            known = list((await db_session.scalars(Select(StructuredMessage).where(
+                StructuredMessage.platform == structured_platform,
+                StructuredMessage.scope.in_(("group", "private")),
+                StructuredMessage.session_id == session_id, StructuredMessage.platform_id.in_(legacy_ids),
+            ))).all()) if legacy_ids else []
+
+        by_id = {row.platform_id: row for row in [*scoped, *known] if row.scope == scope}
+        known_ids = {row.platform_id for row in known}
+        candidates = []
+        for row in by_id.values():
+            if row.sender_kind not in {"user", "bot"} or not isinstance(row.parts, list):
+                continue
+            parts = tuple(dict(part) for part in row.parts if isinstance(part, dict))
+            body = visible_text(StructuredSnapshot(row.platform_id, row.sender_id, row.reply_to_id, parts, {}))
+            if body is None:
+                # A video/file/unknown segment must not hide accompanying text.
+                body = "".join(str(part.get("text", "")) for part in parts if part.get("type") in {"text", "card"})
+            candidates.append(RecallCandidate(
+                row.platform_id, row.sender_name, body,
+                row.sender_kind == "bot" and bool(bot_id) and row.sender_id == str(bot_id), row.created_at,
+            ))
+        for row in history:
+            mid = _extract_stored_message_id(row.content)
+            if not mid or mid in by_id or mid in known_ids:
+                continue
+            candidates.append(RecallCandidate(
+                mid, row.user_name, parse_msg_meta(row.content)[2],
+                row.content_type == "bot" and str(row.user_id) == str(bot_name), row.created_at,
+            ))
+        return sorted(candidates, key=lambda row: row.created_at, reverse=True)
 
     @tool("recall_message")
     async def recall_message(
@@ -96,19 +157,23 @@ def create_recall_message_tool(
                 "missing_target_text", "请提供要撤回的消息正文或独特片段。",
                 delivery_state="not_attempted",
             )
-        candidates: dict[str, ChatHistory] = {}
-        for row in await _recent_history():
-            message_id = _extract_stored_message_id(row.content)
-            if message_id is None:
-                continue
+        try:
+            recent = await _recent_candidates()
+        except Exception as error:
+            logger.warning(f"读取撤回目标失败 error_type={type(error).__name__}")
+            return tool_failure("history_unavailable", "撤回失败：暂时无法读取当前会话记录。", retryable=True,
+                                delivery_state="not_attempted")
+        candidates: dict[str, RecallCandidate] = {}
+        for row in recent:
+            message_id = row.message_id
             if target == "latest_self":
-                matches = row.content_type == "bot" and str(row.user_id) == str(bot_name)
+                matches = row.is_self
             elif target == "reply":
                 matches = message_id == str(reply_to_id)
             else:
-                matches = target_text in parse_msg_meta(row.content)[2]
+                matches = target_text in row.body
                 if sender_name:
-                    matches = matches and row.user_name == sender_name
+                    matches = matches and row.sender_name == sender_name
             if matches:
                 candidates.setdefault(message_id, row)
                 if target == "latest_self":
@@ -127,9 +192,7 @@ def create_recall_message_tool(
                 delivery_state="not_attempted",
             )
 
-        is_bot_message = (
-            history.content_type == "bot" and str(history.user_id) == str(bot_name)
-        )
+        is_bot_message = history.is_self
         if not has_admin_permission:
             if not is_bot_message:
                 return tool_failure(

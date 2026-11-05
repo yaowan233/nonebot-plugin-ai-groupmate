@@ -27,6 +27,7 @@ from .tool_results import (
     parse_tool_result,
     tool_result_status,
 )
+from ..message_trace import trace_id
 
 MAX_REPLY_COUNT = 5
 MAX_TOOL_COUNT = 30
@@ -60,9 +61,13 @@ TOOL_MARKUP_FALLBACK = "本轮未能完成操作，请让我继续处理。"
 SIDE_EFFECT_TOOL_NAMES = frozenset({
     "add_message_reaction",
     "cancel_scheduled_task",
+    "cancel_drawing_job",
+    "revise_drawing_job",
+    "generate_image",
     "mute_user",
     "recall_message",
     "reply_user",
+    "send_ordered_message",
     "schedule_agent_task",
     "schedule_message",
     "send_meme_image",
@@ -255,6 +260,7 @@ class AgentState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
     session_id: str
     request_id: str | None
+    platform: NotRequired[str]
     reply_count: int
     tool_count: int
     reply_this_round: int
@@ -286,6 +292,7 @@ class AgentState(TypedDict):
 class _AgentContext:
     session_id: str
     request_id: str | None
+    platform: str = ""
 
 
 def _deep_get(data: Any, *path: str) -> Any:
@@ -875,7 +882,7 @@ def _make_agent_node(
             cached_tokens += usage["cached_tokens"]
             cache_creation_tokens += usage["cache_creation_tokens"]
             logger.info(
-                f"[AgentTrace] LLM session={state['session_id']} call={call_number} "
+                f"[AgentTrace] LLM session={state['session_id']} trace={trace_id(str(state['session_id']), state.get('request_id'))} call={call_number} "
                 f"duration_ms={elapsed_ms:.0f} visible_tools={len(visible_tools)} "
                 f"builtin_tools={len(builtin_tools)} "
                 f"tokens={budget_tokens}{' (估算)' if not usage['total_tokens'] else ''} "
@@ -1177,9 +1184,9 @@ def _make_tool_node(
         session_id = state["session_id"]
         request_id = state["request_id"]
 
-        agent_ctx = _AgentContext(session_id=session_id, request_id=request_id)
+        agent_ctx = _AgentContext(session_id=session_id, request_id=request_id, platform=state.get("platform", ""))
         has_pending_tool_work = any(
-            tc.get("name") not in {"reply_user", "finish"}
+            tc.get("name") not in {"reply_user", "send_ordered_message", "finish"}
             for tc in tool_calls
         )
 
@@ -1209,15 +1216,23 @@ def _make_tool_node(
                 elif request_id and not await is_request_active(session_id, request_id):
                     logger.info("[Agent] 模型直接返回文本，但请求已过期，跳过发送")
                 else:
+                    started_at = time.perf_counter()
                     try:
                         result = await reply_tool.ainvoke(
                             {"content": direct_reply, "next_step": "end"}
                         )
                         logger.info(f"[Agent] 已兜底发送模型直接回复: {result}")
-                        reply_count += 1
-                        if _tool_result_status(_normalize_tool_result(result)[0]) in {None, "succeeded"}:
+                        status = _tool_result_status(_normalize_tool_result(result)[0])
+                        logger.info(f"[AgentTrace] 工具 session={session_id} trace={trace_id(str(session_id), request_id)} "
+                                    f"tool=reply_user duration_ms={(time.perf_counter() - started_at) * 1000:.0f} "
+                                    f"status={status or 'unknown'} fallback=True")
+                        if status in {None, "succeeded"}:
+                            reply_count += 1
                             await observe_terminal(None)
                     except Exception as e:
+                        logger.info(f"[AgentTrace] 工具 session={session_id} trace={trace_id(str(session_id), request_id)} "
+                                    f"tool=reply_user duration_ms={(time.perf_counter() - started_at) * 1000:.0f} "
+                                    "status=exception fallback=True")
                         logger.error(f"[Agent] 兜底发送模型直接回复失败: {e}")
             return {
                 "messages": results,
@@ -1253,6 +1268,13 @@ def _make_tool_node(
                 args = {**args, "content": _safe_reply_text(args["content"])}
             if name in {"send_meme_image", "send_web_image", "send_file"} and isinstance(args.get("text"), str):
                 args = {**args, "text": _safe_reply_text(args["text"])}
+            if name == "send_ordered_message" and isinstance(args.get("parts"), list):
+                if any(isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str)
+                       and _safe_reply_text(part["text"]) != part["text"] for part in args["parts"]):
+                    results.append(ToolMessage(content=tool_failure(
+                        "invalid_message", "消息包含工具控制文本，未发送。", delivery_state="not_attempted"),
+                        tool_call_id=tool_call_id))
+                    continue
 
             await _recover_db_session(db_session)
 
@@ -1351,7 +1373,7 @@ def _make_tool_node(
                 ))
                 continue
 
-            if name == "reply_user":
+            if name in {"reply_user", "send_ordered_message"}:
                 if has_pending_tool_work:
                     results.append(ToolMessage(
                         content=tool_skipped(
@@ -1376,11 +1398,16 @@ def _make_tool_node(
                         tool_call_id=tool_call_id,
                     ))
                     continue
-                reply_this_round += 1
-                reply_count += 1
                 # Let malformed or failed reply calls return to the model for repair.
                 # A successful call below overwrites this with the explicit decision.
                 reply_requires_continuation = True
+
+            if name in {"send_meme_image", "send_web_image", "send_file"} and reply_this_round >= MAX_REPLY_PER_ROUND:
+                results.append(ToolMessage(
+                    content=tool_skipped("reply_limit_reached", "本轮已经发送过消息，请下一轮继续。", delivery_state="not_attempted"),
+                    tool_call_id=tool_call_id,
+                ))
+                continue
 
             if name == "add_message_reaction":
                 if reaction_this_round >= MAX_REACTION_PER_ROUND:
@@ -1521,7 +1548,10 @@ def _make_tool_node(
                         )
                         result = await asyncio.wait_for(
                             tool.ainvoke(tool_input, runtime=runtime),
-                            timeout=limits.tool_timeout_seconds,
+                            timeout=(
+                                min(605.0, max(limits.tool_timeout_seconds, float((getattr(tool, "metadata", None) or {}).get("image_generation_timeout_seconds", limits.tool_timeout_seconds))))
+                                if name == "generate_image" else limits.tool_timeout_seconds
+                            ),
                         )
                     # A tool may have started a transaction.  The following
                     # model call can take minutes, so do not keep that
@@ -1637,16 +1667,27 @@ def _make_tool_node(
                         # 必需动作已经达到目标次数，不再让模型补发解释文字。
                         called_finish += 1
                 delivery_data = parsed_tool_result.get("data") if isinstance(parsed_tool_result, dict) else None
+                if (name == "reply_user" and tool_status in {None, "succeeded"}
+                        and not delivery_unknown):
+                    reply_count += 1
+                    reply_this_round += 1
+                if (name == "send_ordered_message" and tool_status == "succeeded"
+                        and isinstance(parsed_tool_result, dict)
+                        and parsed_tool_result.get("reason_code") == "ordered_delivery_queued"):
+                    # A durable batch owns the eventual delivery, not this agent run.
+                    called_finish += 1
+                if (name == "send_ordered_message" and required_side_effect_tool == "send_meme_image"
+                        and tool_status == "succeeded" and not delivery_unknown and isinstance(delivery_data, dict)
+                        and parsed_tool_result.get("delivery_state") == "completed"):
+                    required_side_effect_success_count += int(delivery_data.get("meme_count", 0))
+                    required_side_effect_completed = required_side_effect_success_count >= required_side_effect_target_count
+                    if required_side_effect_completed:
+                        called_finish += 1
                 if (
-                    name in {"send_meme_image", "send_web_image", "send_file"}
+                    name in {"send_meme_image", "send_web_image", "send_file", "send_ordered_message"}
                     and tool_status == "succeeded"
                     and isinstance(parsed_tool_result, dict)
                     and parsed_tool_result.get("delivery_state") == "completed"
-                    and (name != "send_file" or (
-                        isinstance(delivery_data, dict)
-                        and isinstance(delivery_data.get("text"), str)
-                        and delivery_data["text"].strip()
-                    ))
                 ):
                     reply_count += 1
                     reply_this_round += 1
@@ -1696,10 +1737,14 @@ def _make_tool_node(
                         )
                     )
                 logger.info(
-                    f"[AgentTrace] 工具 session={session_id} tool={name} "
+                    f"[AgentTrace] 工具 session={session_id} trace={trace_id(str(session_id), state.get('request_id'))} tool={name} "
                     f"duration_ms={elapsed_ms:.0f} status={tool_status or 'unknown'} "
                     f"truncated={truncated}"
                 )
+                if (name == "send_ordered_message" and tool_status == "succeeded"
+                        and isinstance(parsed_tool_result, dict)
+                        and parsed_tool_result.get("reason_code") == "ordered_delivery_queued"):
+                    break
                 if delivery_unknown:
                     logger.warning(
                         f"[AgentTrace] 副作用投递结果未知，结束本轮 "

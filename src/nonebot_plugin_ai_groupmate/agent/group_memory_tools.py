@@ -18,6 +18,7 @@ async def _run_group_memory_update(
     bot_name: str,
     reason: str,
     timeout_seconds: float,
+    platform: str | None = None,
 ) -> None:
     try:
         # Wait for the shared maintenance slot before opening a session.  The
@@ -30,6 +31,7 @@ async def _run_group_memory_update(
                         db_session,
                         session_id,
                         bot_name=bot_name,
+                        **({"platform": platform} if platform else {}),
                     ),
                     timeout=timeout_seconds,
                 )
@@ -58,6 +60,7 @@ def start_group_memory_update(
     bot_name: str,
     reason: str,
     timeout_seconds: float,
+    platform: str | None = None,
 ) -> bool:
     existing_task = _background_update_tasks.get(session_id)
     if existing_task is not None and not existing_task.done():
@@ -70,6 +73,7 @@ def start_group_memory_update(
             bot_name=bot_name,
             reason=reason,
             timeout_seconds=timeout_seconds,
+            **({"platform": platform} if platform else {}),
         ),
         name=f"group-memory-update:{session_id}",
     )
@@ -86,6 +90,7 @@ def create_group_memory_tool(
     *,
     bot_name: str,
     timeout_seconds: float,
+    platform: str | None = None,
 ):
     @tool("update_group_memory")
     async def update_group_memory(reason: str) -> str:
@@ -109,6 +114,7 @@ def create_group_memory_tool(
             bot_name=bot_name,
             reason=normalized_reason,
             timeout_seconds=timeout_seconds,
+            **({"platform": platform} if platform else {}),
         )
         if not started:
             return tool_skipped(

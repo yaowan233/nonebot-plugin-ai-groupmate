@@ -11,11 +11,12 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 async def source_db(tmp_path, monkeypatch):
     import nonebot_plugin_orm
 
-    from nonebot_plugin_ai_groupmate.model import ChatHistory
+    from nonebot_plugin_ai_groupmate.model import ChatHistory, HistoryMessageIndex
 
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'sources.sqlite3'}")
     async with engine.begin() as connection:
         await connection.run_sync(ChatHistory.__table__.create)
+        await connection.run_sync(HistoryMessageIndex.__table__.create)
     sessions = async_sessionmaker(engine, expire_on_commit=False)
     monkeypatch.setattr(nonebot_plugin_orm, "get_session", sessions)
     async with sessions() as session:

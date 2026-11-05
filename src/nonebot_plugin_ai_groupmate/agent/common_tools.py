@@ -20,6 +20,7 @@ from .deepseek_search import DeepSeekSearch, SearchFilterError
 class Context:
     session_id: str
     request_id: str | None = None
+    platform: str = ""
 
 
 WEB_SEARCH_MAX_QUERY_CHARS = 1500
@@ -392,6 +393,7 @@ async def search_history_context(query: str, runtime: ToolRuntime[Context]) -> s
         similar_msgs = await DB.search_chat(
             normalized_query,
             runtime.context.session_id,
+            **({"platform": runtime.context.platform} if getattr(runtime.context, "platform", "") else {}),
         )
         if not similar_msgs or similar_msgs == "未找到相关历史记录":
             return tool_failure(

@@ -9,9 +9,10 @@ from langchain_core.messages import BaseMessage
 from ..model import ChatHistory, ChatHistorySchema
 from ..message_metadata import (
     BOT_ECHO_LOOKBACK,
-    platform_message_ids,
     deduplicate_bot_echoes,
 )
+from .structured_context import StructuredSnapshot, load_structured_context_safely, merge_snapshots
+from .turn_context import TurnHistoryResolver
 
 ACTIVE_THREAD_TTL = datetime.timedelta(minutes=10)
 ACTIVE_THREAD_MAX_MESSAGES = 24
@@ -22,6 +23,7 @@ class ActiveConversationThread:
     messages: list[BaseMessage]
     last_msg_id: int
     updated_at: datetime.datetime
+    history_variant: str = "legacy"
 
 
 active_conversation_threads: dict[str, ActiveConversationThread] = {}
@@ -55,11 +57,16 @@ def build_append_only_history(
     format_history: FormatHistory,
     user_roles: dict[str, str] | None = None,
     extra_inline_images: list[ChatHistorySchema] | None = None,
+    history_variant: str = "legacy",
+    structured_messages: dict[tuple[str, str], StructuredSnapshot] | None = None,
 ) -> tuple[list[BaseMessage], list[ChatHistorySchema], bool]:
     thread = get_active_thread(session_id)
+    if thread is not None and thread.history_variant != history_variant:
+        thread = None
     # Compare the full supplied window before slicing at last_msg_id, otherwise
     # an echo arriving after the previous bot turn loses its canonical evidence.
-    history = deduplicate_bot_echoes(history)
+    resolver = TurnHistoryResolver(structured_messages if history_variant == "structured" else None)
+    history = deduplicate_bot_echoes(history, ids_for=resolver.ids)
     if not history:
         return [], [], False
 
@@ -85,6 +92,10 @@ async def update_active_thread(
     input_max_msg_id: int,
     *,
     format_history: FormatHistory,
+    history_variant: str = "legacy",
+    structured_messages: dict[tuple[str, str], StructuredSnapshot] | None = None,
+    platform: str | None = None,
+    scope: str | None = None,
 ) -> None:
     await db_session.flush()
     new_rows = (
@@ -102,8 +113,17 @@ async def update_active_thread(
     if new_rows:
         new_history = [ChatHistorySchema.model_validate(row) for row in new_rows]
         last_msg_id = max(msg.msg_id for msg in new_history)
+        if history_variant == "structured" and structured_messages is not None and platform and scope:
+            snapshots = await load_structured_context_safely(
+                db_session, new_history, session_id=session_id, scope=scope, platform=platform,
+            )
+            if snapshots is None:
+                active_conversation_threads.pop(session_id, None)
+                return
+            merge_snapshots(structured_messages, snapshots)
+        resolver = TurnHistoryResolver(structured_messages if history_variant == "structured" else None)
         if any(
-            msg.content_type != "bot" and platform_message_ids(msg.content)
+            msg.content_type != "bot" and resolver.ids(msg)
             for msg in new_history
         ):
             # A delayed echo can sit beyond the input boundary while its bot
@@ -129,7 +149,7 @@ async def update_active_thread(
             earlier_bots = [ChatHistorySchema.model_validate(row) for row in earlier_bot_rows]
             new_history = [
                 msg
-                for msg in deduplicate_bot_echoes([*earlier_bots, *new_history])
+                for msg in deduplicate_bot_echoes([*earlier_bots, *new_history], ids_for=resolver.ids)
                 if msg.msg_id > input_max_msg_id
             ]
         base_messages = base_messages + format_history(new_history, 3, None, None)
@@ -140,4 +160,5 @@ async def update_active_thread(
         messages=trim_thread_messages(base_messages),
         last_msg_id=last_msg_id,
         updated_at=datetime.datetime.now(),
+        history_variant=history_variant,
     )

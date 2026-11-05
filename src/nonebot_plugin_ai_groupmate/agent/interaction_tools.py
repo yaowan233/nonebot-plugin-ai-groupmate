@@ -2,6 +2,7 @@
 
 from typing import Annotated
 from datetime import datetime, timedelta
+from dataclasses import replace
 
 from pydantic import Field
 from sqlalchemy import or_, and_, select
@@ -12,8 +13,9 @@ from nonebot_plugin_orm import get_session
 from ..model import ChatHistory
 from ..reply_guard import is_request_active
 from .tool_results import tool_failure, tool_skipped, tool_success
-from ..message_metadata import parse_message_metadata
-from ..interaction_history import HistoryMessage, prepare_history, message_evidence, find_repeat_interactions
+from ..interaction_history import HistoryMessage, prepare_history, message_evidence, find_repeat_interactions, history_metadata
+from .structured_context import load_structured_context_safely
+from .turn_context import TurnHistoryResolver
 
 SCAN_LIMIT = 120_000
 RESULT_MAX_CHARS = 5_600
@@ -66,6 +68,7 @@ def create_interaction_history_tools(
     request_id: str | None,
     *,
     bot_user_ids: tuple[str, ...] = (),
+    platform: str = "",
 ):
     # This cache lives for one Agent request, never as a background index. A
     # second call can filter/page the same evidence without another large scan.
@@ -76,6 +79,17 @@ def create_interaction_history_tools(
 
     async def expired() -> bool:
         return request_id is not None and not await is_request_active(session_id, request_id)
+
+    async def resolve_rows(session, rows: list[HistoryMessage]) -> list[HistoryMessage]:
+        if not platform or not rows:
+            return rows
+        snapshots = await load_structured_context_safely(
+            session, rows, session_id=session_id, scope="group", platform=platform, include_media=False,
+        )
+        if not snapshots:
+            return rows
+        resolver = TurnHistoryResolver(snapshots)
+        return [replace(row, structured_ids=resolver.ids(row), structured_metadata=resolver.metadata(row)) for row in rows]
 
     async def resolve_member(session, member: str) -> tuple[str | None, list[dict]]:
         member = member.strip()
@@ -244,7 +258,9 @@ def create_interaction_history_tools(
                     later = or_(ChatHistory.created_at > anchor.created_at, and_(ChatHistory.created_at == anchor.created_at, ChatHistory.msg_id > anchor.msg_id))
                     left = await _rows(session, select(*_COLUMNS).where(scope, earlier).order_by(ChatHistory.created_at.desc(), ChatHistory.msg_id.desc()).limit(3))
                     right = await _rows(session, select(*_COLUMNS).where(scope, later).order_by(ChatHistory.created_at, ChatHistory.msg_id).limit(3))
-                    rows, bot_ids = prepare_history([*left, anchor, *right], known_bot_ids)
+                    resolved = await resolve_rows(session, [*left, anchor, *right])
+                    anchor = next(row for row in resolved if row.msg_id == anchor_msg_id)
+                    rows, bot_ids = prepare_history(resolved, known_bot_ids)
                     evidence = [message_evidence(row, bot_ids, max_chars=300) for row in rows]
                     # Place the anchor first so a result budget cannot drop it.
                     evidence.sort(key=lambda item: (item["msg_id"] != anchor_msg_id, abs((datetime.fromisoformat(item["created_at"]) - anchor.created_at).total_seconds()), item["msg_id"]))
@@ -261,8 +277,9 @@ def create_interaction_history_tools(
                     if keyword.strip():
                         filters.append(ChatHistory.content.contains(keyword.strip(), autoescape=True))
                     raw = await _rows(session, select(*_COLUMNS).where(*filters).order_by(ChatHistory.msg_id.desc()).limit(limit + 1))
+                    raw = await resolve_rows(session, raw)
                     rows, bot_ids = prepare_history(raw, known_bot_ids)
-                    rows = [row for row in rows if str(row.user_id) not in bot_ids and (not keyword.strip() or keyword.strip() in parse_message_metadata(row.content)[2])]
+                    rows = [row for row in rows if str(row.user_id) not in bot_ids and (not keyword.strip() or keyword.strip() in history_metadata(row)[2])]
                     # Keep latest-first for a stable ID cursor even when timestamps differ.
                     rows.sort(key=lambda row: row.msg_id, reverse=True)
                     page = rows[:limit]

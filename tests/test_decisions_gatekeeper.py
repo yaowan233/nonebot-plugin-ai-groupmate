@@ -55,6 +55,25 @@ async def test_decisions_does_not_reuse_a_different_providers_token():
         await decisions.classify(ScopedConfig(chat_api_key="different-provider", chat_base_url="https://other.invalid/v1"), "policy", "evidence")
 
 
+async def test_decisions_uses_its_own_key_when_main_chat_is_deepseek(monkeypatch):
+    from nonebot_plugin_ai_groupmate.agent import decisions
+    from nonebot_plugin_ai_groupmate.config import ScopedConfig
+    from nonebot_plugin_ai_groupmate.runtime_config import SECRET_FIELDS
+
+    assert "decisions_api_key" in SECRET_FIELDS
+
+    def respond(request):
+        assert str(request.url) == "https://api.openai.com/v1/decisions"
+        assert request.headers["authorization"] == "Bearer openai-only"
+        assert "deepseek-only" not in request.headers["authorization"]
+        return httpx.Response(200, json={"answers": [{"type": "choice", "name": "admission", "choice": "bot_new_request"}]})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        monkeypatch.setattr(decisions, "get_client", lambda: client)
+        result = await decisions.classify(ScopedConfig(chat_api_key="deepseek-only", chat_base_url="https://api.deepseek.com", decisions_api_key="openai-only"), "policy", "evidence")
+    assert result["should_reply"] is True
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("recipient", "allowed"), [("bot", True), ("other", False)])
 async def test_decisions_runs_through_the_existing_recipient_guards(monkeypatch, recipient, allowed):

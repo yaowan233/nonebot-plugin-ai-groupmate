@@ -35,6 +35,11 @@ from ..model import (
 from ..config import ScopedConfig
 from ..reply_guard import is_request_active
 from .tool_results import tool_failure, tool_skipped, tool_success
+from .file_workspace import FileWorkspace
+from .image_resources import ImageResources, ImageResourceError
+from ..message_rollout import message_pilot_enabled
+from ..message_metadata import platform_message_ids
+from .structured_image_resources import find_recent_scoped_user_image, read_scoped_message_images
 
 GOOGLE_VISION_ANNOTATE_URL = "https://vision.googleapis.com/v1/images:annotate"
 GOOGLE_CLOUD_PLATFORM_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
@@ -523,7 +528,7 @@ async def _find_source_media(
     user_id: str | None,
     target_msg_id: str | None,
     reply_to_id: str | None,
-) -> tuple[ChatHistory, MediaStorage] | None:
+) -> tuple[ChatHistory, MediaStorage | None] | None:
     base_stmt = (
         Select(ChatHistory)
         .where(
@@ -532,24 +537,16 @@ async def _find_source_media(
         )
         .order_by(desc(ChatHistory.created_at))
     )
-    if target_msg_id:
-        statement = base_stmt.where(
-            ChatHistory.content.contains(f"id: {target_msg_id}\n")
-        ).limit(1)
-        message = (await db_session.execute(statement)).scalar_one_or_none()
+    if target_msg_id or reply_to_id:
+        from .image_resources import is_image_history
+        from ..message_repository import find_by_platform_id
+
+        matches = await find_by_platform_id(db_session, session_id, target_msg_id or reply_to_id)
+        message = next((row for row in reversed(matches) if is_image_history(row)), None)
         if message is None:
             return None
     else:
         message = None
-        if reply_to_id:
-            reply_statement = base_stmt.where(
-                ChatHistory.content.contains(f"id: {reply_to_id}\n")
-            ).limit(1)
-            message = (
-                await db_session.execute(reply_statement)
-            ).scalar_one_or_none()
-            if message is None:
-                return None
         if message is None and user_id:
             user_statement = base_stmt.where(
                 ChatHistory.user_id == user_id
@@ -561,7 +558,9 @@ async def _find_source_media(
             return None
 
     if message.media_id is None:
-        return None
+        from .image_resources import published_image_file_id
+
+        return (message, None) if published_image_file_id(message) else None
     media = await db_session.get(MediaStorage, message.media_id)
     if media is None:
         return None
@@ -569,32 +568,22 @@ async def _find_source_media(
 
 
 def _read_source_image(pic_dir: Path, media_file_path: str) -> bytes:
-    base_dir = pic_dir.resolve()
-    source_path = (base_dir / media_file_path).resolve()
     try:
-        source_path.relative_to(base_dir)
-    except ValueError as error:
-        raise WebDetectionError(
-            "source_file_not_found",
-            "原图文件路径无效，无法进行反向搜图。",
-        ) from error
-    if not source_path.is_file():
-        raise WebDetectionError(
-            "source_file_not_found",
-            "找不到原图文件，无法进行反向搜图。",
-        )
-    source_size = source_path.stat().st_size
-    if source_size == 0:
-        raise WebDetectionError(
-            "source_image_invalid",
-            "原图文件为空，无法进行反向搜图。",
-        )
-    if source_size > MAX_SOURCE_IMAGE_BYTES:
-        raise WebDetectionError(
-            "source_image_too_large",
-            "原图超过 10 MiB，无法进行反向搜图。",
-        )
-    return source_path.read_bytes()
+        return ImageResources(pic_dir).read_media(media_file_path, max_bytes=MAX_SOURCE_IMAGE_BYTES)
+    except ImageResourceError as error:
+        raise _source_resource_error(error) from None
+
+
+def _source_resource_error(error: ImageResourceError) -> WebDetectionError:
+    if error.code == "unavailable":
+        return WebDetectionError("source_image_unavailable", "暂时无法读取图片记录，请稍后再试。")
+    if error.code == "expired":
+        return WebDetectionError("source_image_expired", "原图已过期，请重新发送后再搜图。")
+    if error.code == "too_large":
+        return WebDetectionError("source_image_too_large", "原图超过 10 MiB，无法进行反向搜图。")
+    if error.code == "empty":
+        return WebDetectionError("source_image_invalid", "原图文件为空，无法进行反向搜图。")
+    return WebDetectionError("source_file_not_found", "找不到原图文件或无权访问，无法进行反向搜图。")
 
 
 def _has_web_detection_evidence(result: Mapping[str, object]) -> bool:
@@ -645,6 +634,9 @@ def create_reverse_image_search_tool(
     reply_to_id: str | None,
     pic_dir: Path,
     config: ScopedConfig,
+    workspace: FileWorkspace | None = None,
+    platform: str = "",
+    is_private: bool = False,
 ):
     async def run_search(target_msg_id: str | None = None) -> str:
         """
@@ -666,41 +658,69 @@ def create_reverse_image_search_tool(
                 "反向搜图尚未配置。",
             )
         try:
-            source = await _find_source_media(
-                db_session,
-                session_id,
-                user_id,
-                target_msg_id,
-                reply_to_id,
-            )
-            if source is None:
-                return tool_failure(
-                    "source_image_not_found",
-                    "没有找到对应图片；请发送或回复一张图片后再试。",
-                )
-            message, media = source
-            # Provider cache/quota commits can expire ORM objects in this session.
-            source_message_id = message.msg_id
-            source_media_id = media.media_id
-            source_platform_message_ids = [
-                line.split(":", 1)[1].strip() for line in message.content.splitlines()
-                if line.startswith(("id:", "alias_id:"))
-            ]
-            logger.info(
-                f"[ReverseImageSearch] source session={session_id} "
-                f"target_msg_id={target_msg_id} reply_to_id={reply_to_id} "
-                f"history_msg_id={message.msg_id} media_id={media.media_id}"
-            )
-            if not media.file_path:
-                return tool_failure(
-                    "source_file_not_found",
-                    "找不到原图文件，无法进行反向搜图。",
-                )
-            image_bytes = await asyncio.to_thread(
-                _read_source_image,
-                pic_dir,
-                media.file_path,
-            )
+            selected_id = target_msg_id or reply_to_id
+            legacy_source = None
+            structured = None
+            pilot = message_pilot_enabled(config, session_id, is_private=is_private)
+            if not selected_id and pilot and user_id:
+                legacy_source = await _find_source_media(db_session, session_id, user_id, None, None)
+                try:
+                    recent = await find_recent_scoped_user_image(
+                        db_session, session_id=session_id, platform=platform, is_private=is_private, user_id=user_id,
+                    )
+                except ImageResourceError as error:
+                    raise _source_resource_error(error) from None
+                legacy_row = legacy_source[0] if legacy_source else None
+                if recent and legacy_row is None:
+                    # A newer legacy image may exist even if its media file was
+                    # cleaned up; never replace it with an older structured one.
+                    legacy_row = await db_session.scalar(Select(ChatHistory).where(
+                        ChatHistory.session_id == session_id, ChatHistory.user_id == user_id,
+                        ChatHistory.content_type == "image",
+                    ).order_by(ChatHistory.created_at.desc(), ChatHistory.msg_id.desc()).limit(1))
+                if recent and (legacy_row is None or recent[0] in platform_message_ids(legacy_row.content)
+                               or recent[1] >= legacy_row.created_at):
+                    selected_id = recent[0]
+            if selected_id and pilot:
+                try:
+                    structured = await read_scoped_message_images(
+                        db_session, ImageResources(pic_dir, workspace), session_id=session_id,
+                        platform=platform, is_private=is_private, message_id=selected_id,
+                        max_bytes=MAX_SOURCE_IMAGE_BYTES, max_images=1, last_only=True,
+                    )
+                except ImageResourceError as error:
+                    raise _source_resource_error(error) from None
+            if structured is not None:
+                if not structured:
+                    return tool_failure("source_image_not_found", "没有找到对应图片；请发送或回复一张图片后再试。")
+                image_bytes = structured[0]
+                source_message_id = None
+                source_media_id = None
+                source_platform_message_ids = [str(selected_id)]
+            else:
+                source = legacy_source or await _find_source_media(db_session, session_id, user_id, target_msg_id, reply_to_id)
+                if source is None:
+                    return tool_failure("source_image_not_found", "没有找到对应图片；请发送或回复一张图片后再试。")
+                message, media = source
+                # Provider cache/quota commits can expire ORM objects in this session.
+                source_message_id = message.msg_id
+                source_media_id = media.media_id if media is not None else None
+                source_platform_message_ids = [
+                    line.split(":", 1)[1].strip() for line in message.content.splitlines()
+                    if line.startswith(("id:", "alias_id:"))
+                ]
+                logger.info(f"[ReverseImageSearch] source session={session_id} target_msg_id={target_msg_id} "
+                            f"reply_to_id={reply_to_id} history_msg_id={message.msg_id} media_id={source_media_id}")
+                if media is not None and not media.file_path:
+                    return tool_failure("source_file_not_found", "找不到原图文件，无法进行反向搜图。")
+                if media is None:
+                    try:
+                        image_bytes = await asyncio.to_thread(ImageResources(pic_dir, workspace).read_history, message,
+                                                              max_bytes=MAX_SOURCE_IMAGE_BYTES)
+                    except ImageResourceError as error:
+                        raise _source_resource_error(error) from None
+                else:
+                    image_bytes = await asyncio.to_thread(_read_source_image, pic_dir, media.file_path)
             image_hash = hashlib.sha256(image_bytes).hexdigest()
             search_result = await perform_web_detection(
                 db_session,

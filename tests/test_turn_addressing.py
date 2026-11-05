@@ -67,6 +67,110 @@ def test_followup_keeps_intervening_peer_conversation_visible():
 
 
 @pytest.mark.asyncio
+async def test_explicit_conversation_does_not_override_addressed_other(monkeypatch):
+    from nonebot_plugin_ai_groupmate import agent
+
+    monkeypatch.setattr(agent.plugin_config, "gatekeeper_provider", "decisions")
+    monkeypatch.setattr(agent, "classify_decisions", AsyncMock(return_value={
+        "recipient": "other", "should_reply": False, "continues_bot_conversation": False,
+    }))
+    context = json.dumps({"conversation_mode": "explicit", "recent_messages": [{"role": "self_bot", "text": "3"}]})
+    assert not await agent.check_if_should_reply("history", "小明你怎么看", "miyuki", turn_context=context, is_continuous=True)
+
+
+@pytest.mark.asyncio
+async def test_one_to_one_explicit_conversation_does_not_depend_on_recipient_guess(monkeypatch):
+    from nonebot_plugin_orm import get_session
+    from nonebot_plugin_uninfo import SceneType
+
+    import nonebot_plugin_ai_groupmate as plugin
+    from nonebot_plugin_ai_groupmate import agent
+    from nonebot_plugin_ai_groupmate.model import ChatHistory
+
+    group = f"direct-chat-{uuid4()}"
+    async with get_session() as db:
+        db.add_all([
+            ChatHistory(session_id=group, user_id="alice", user_name="Alice", content_type="text", content="id: 98\n4*23"),
+            ChatHistory(session_id=group, user_id="miyuki", user_name="miyuki", content_type="bot", content="id: 99\n92"),
+            ChatHistory(session_id=group, user_id="alice", user_name="Alice", content_type="text", content="id: 100\n输出一个很大的素数"),
+        ])
+        await db.commit()
+    monkeypatch.setattr(plugin.plugin_config, "global_model_daily_group_limit_enabled", False)
+    monkeypatch.setattr(plugin.plugin_config, "gatekeeper_provider", "decisions")
+    monkeypatch.setattr(plugin, "_shared_balancer_enabled", lambda: False)
+    plugin._refresh_continuous_conversation(group, "alice", "bot")
+    key = plugin._continuous_key(group, "alice", "bot")
+    plugin._explicit_conversation_until[key] = plugin._continuous_conversation_until[key]
+    judge = AsyncMock(return_value={"recipient": "group", "should_reply": False, "continues_bot_conversation": False})
+    monkeypatch.setattr(agent, "classify_decisions", judge)
+    choose = AsyncMock(return_value=SimpleNamespace(need_reply=False, text=None))
+    monkeypatch.setattr(plugin, "choice_response_strategy", choose)
+    try:
+        await plugin.handle_reply_logic("request", SimpleNamespace(scene=SimpleNamespace(id=group, type=SceneType.GROUP), self_id="bot"),
+            SimpleNamespace(get_members=AsyncMock(return_value=[])), SimpleNamespace(self_id="bot"),
+            SimpleNamespace(message_id="100", get_plaintext=lambda: "输出一个很大的素数"),
+            "miyuki", "alice", "Alice", False, True, None)
+        judge.assert_not_awaited()
+        choose.assert_awaited_once()
+        assert choose.call_args.kwargs["direct_conversation"] is True
+    finally:
+        plugin._continuous_conversation_until.pop(key, None)
+        plugin._explicit_conversation_until.pop(key, None)
+
+
+@pytest.mark.asyncio
+async def test_one_to_one_followup_survives_decisions_connect_timeout(monkeypatch):
+    import httpx
+    from nonebot_plugin_orm import get_session
+    from nonebot_plugin_uninfo import SceneType
+
+    import nonebot_plugin_ai_groupmate as plugin
+    from nonebot_plugin_ai_groupmate import agent
+    from nonebot_plugin_ai_groupmate.model import ChatHistory
+
+    group = f"decision-timeout-{uuid4()}"
+    async with get_session() as db:
+        db.add_all([
+            ChatHistory(session_id=group, user_id="alice", user_name="Alice", content_type="text", content="id: 98\nmiyuki 你好"),
+            ChatHistory(session_id=group, user_id="miyuki", user_name="miyuki", content_type="bot", content="id: 99\n继续算题吗？"),
+            ChatHistory(session_id=group, user_id="alice", user_name="Alice", content_type="text", content="id: 100\n输出一个很大的素数"),
+        ])
+        await db.commit()
+    monkeypatch.setattr(plugin.plugin_config, "global_model_daily_group_limit_enabled", False)
+    monkeypatch.setattr(plugin.plugin_config, "gatekeeper_provider", "decisions")
+    monkeypatch.setattr(plugin, "_shared_balancer_enabled", lambda: False)
+    plugin._refresh_continuous_conversation(group, "alice", "bot")
+    judge = AsyncMock(side_effect=httpx.ConnectTimeout(""))
+    monkeypatch.setattr(agent, "classify_decisions", judge)
+    choose = AsyncMock(return_value=SimpleNamespace(need_reply=False, text=None))
+    monkeypatch.setattr(plugin, "choice_response_strategy", choose)
+    try:
+        await plugin.handle_reply_logic("request", SimpleNamespace(scene=SimpleNamespace(id=group, type=SceneType.GROUP), self_id="bot"),
+            SimpleNamespace(get_members=AsyncMock(return_value=[])), SimpleNamespace(self_id="bot"),
+            SimpleNamespace(message_id="100", get_plaintext=lambda: "输出一个很大的素数"),
+            "miyuki", "alice", "Alice", False, True, None)
+        judge.assert_awaited_once()
+        choose.assert_awaited_once()
+        assert choose.call_args.kwargs["direct_conversation"] is True
+    finally:
+        plugin._continuous_conversation_until.pop(plugin._continuous_key(group, "alice", "bot"), None)
+
+
+@pytest.mark.parametrize(("roles", "allowed"), [
+    (["alice", "bot", "alice"], True),
+    (["alice", "bot", "bob", "alice"], False),
+    (["bob", "bot", "alice"], False),
+    (["alice"], False),
+])
+def test_direct_conversation_requires_uninterrupted_exchange(roles, allowed):
+    from nonebot_plugin_ai_groupmate.agent.turn_context import is_one_to_one_exchange
+
+    history = [row(index, name, f"id: {index}\ntext", kind="bot" if name == "bot" else "text")
+               for index, name in enumerate(roles, 1)]
+    assert is_one_to_one_exchange(history, "alice") is allowed
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(("recipient", "continuous", "allowed", "engaged"), [
     ("other", False, False, False), ("other", True, False, False),
     ("unclear", False, False, False), ("group", False, True, False),
@@ -211,3 +315,6 @@ def test_group_boundary_does_not_turn_third_party_speech_into_a_self_request():
     assert "<latest_message>" in boundary
     assert "<current_request>" not in boundary
     assert "【发言对象】" not in _build_current_request_boundary(history, "alice", "Alice", None, is_private=True)
+    direct = _build_current_request_boundary(history, "alice", "Alice", None, direct_conversation=True)
+    assert "当前发言是对你说的" in direct
+    assert "不自动构成给你的请求" not in direct

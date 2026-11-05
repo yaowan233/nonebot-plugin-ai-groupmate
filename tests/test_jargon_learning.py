@@ -83,12 +83,12 @@ async def test_single_character_jargon_can_be_learned_from_supported_group_usage
 
     rows = [message(1, "a", "寄在我们群指的是提前休息"), message(2, "b", "我要寄就是打算提前休息了")]
     bank = module.merge_extraction(module.JargonBank(session_id="group"), extraction(term="寄", meaning="提前休息"),
-                                   module.collect_sources(rows, "group"), now=datetime.now())
+                                   module.collect_sources(rows, "group"), now=datetime.now(), reviewed=True)
     module._write_bank(module.bank_path(tmp_path, "group"), bank)
     assert "提前休息" in await module.get_jargon_context(tmp_path, "group", "我先寄一会儿")
 
 
-async def test_learning_is_one_batch_call_and_lookup_is_group_local_without_model_calls(tmp_path):
+async def test_learning_batches_discovery_and_review_without_lookup_model_calls(tmp_path):
     from nonebot_plugin_ai_groupmate.agent import jargon_learning as module
     model = Model()
     now = datetime.now()
@@ -99,7 +99,7 @@ async def test_learning_is_one_batch_call_and_lookup_is_group_local_without_mode
     assert await module.get_jargon_context(tmp_path, "other", "蓝票还能领吗") == ""
     assert await module.get_jargon_context(tmp_path, "group", "晚上吃什么") == ""
     assert not await module.learn_jargon(tmp_path, "group", corpus(), lambda: model, now=now + timedelta(hours=1))
-    assert model.calls == 1
+    assert model.calls == 2
     bank = module._read_bank(module.bank_path(tmp_path, "group"), "group")
     assert bank.last_source_id == 12
     assert [source.msg_id for source in bank.entries[0].sources] == [1, 2]
@@ -118,7 +118,7 @@ async def test_failed_learning_keeps_material_for_retry_and_persists_cooldown(tm
     assert not await module.learn_jargon(tmp_path, "group", corpus(), lambda: good, now=now + timedelta(minutes=1))
     assert good.calls == 0
     assert await module.learn_jargon(tmp_path, "group", corpus(), lambda: good, now=now + timedelta(minutes=31))
-    assert good.calls == 1
+    assert good.calls == 2
 
 
 async def test_new_material_accumulates_until_threshold(tmp_path):
@@ -192,10 +192,10 @@ async def test_stale_correction_cannot_write(monkeypatch, tmp_path):
 async def test_matching_is_bounded_expiring_and_does_not_include_all_terms(tmp_path):
     from nonebot_plugin_ai_groupmate.agent import jargon_learning as module
     now = datetime.now()
-    entries = [module.JargonEntry(term=f"词语{i}", meaning=f"含义{i}", status="inferred", updated_at=now) for i in range(8)]
-    entries.extend([module.JargonEntry(term="旧词", meaning="旧意思", status="inferred", updated_at=now - timedelta(days=91)),
-                    module.JargonEntry(term="蓝票", meaning="普通词条", status="inferred", updated_at=now),
-                    module.JargonEntry(term="蓝票机", meaning="更长词条", status="inferred", updated_at=now)])
+    entries = [module.JargonEntry(term=f"词语{i}", meaning=f"含义{i}", status="inferred", validation_version=module.AUTO_VALIDATION_VERSION, updated_at=now) for i in range(8)]
+    entries.extend([module.JargonEntry(term="旧词", meaning="旧意思", status="inferred", validation_version=module.AUTO_VALIDATION_VERSION, updated_at=now - timedelta(days=91)),
+                    module.JargonEntry(term="蓝票", meaning="普通词条", status="inferred", validation_version=module.AUTO_VALIDATION_VERSION, updated_at=now),
+                    module.JargonEntry(term="蓝票机", meaning="更长词条", status="inferred", validation_version=module.AUTO_VALIDATION_VERSION, updated_at=now)])
     module._write_bank(module.bank_path(tmp_path, "group"), module.JargonBank(session_id="group", entries=entries))
     assert await module.get_jargon_context(tmp_path, "group", "旧词") == ""
     context = await module.get_jargon_context(tmp_path, "group", "蓝票机")

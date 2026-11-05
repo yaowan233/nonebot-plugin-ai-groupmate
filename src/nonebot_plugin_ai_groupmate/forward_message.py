@@ -247,20 +247,16 @@ async def _expand_forward_id(
     return lines
 
 
+def format_forward_marker(forward_id: str | None) -> str:
+    if not forward_id:
+        return "【合并转发消息（缺少可读取的 forward_id）】"
+    encoded_id = json.dumps(str(forward_id), ensure_ascii=False)
+    return f"{FORWARD_MARKER_HEADER}\n{FORWARD_ID_PREFIX}{encoded_id}\n需要查看聊天记录时调用 read_forward_message。"
+
+
 def format_forward_reference_markers(references: Iterable[Reference]) -> str:
     """Keep forward messages lazy while exposing stable IDs to the agent."""
-    markers: list[str] = []
-    for reference in references:
-        if reference.id:
-            encoded_id = json.dumps(str(reference.id), ensure_ascii=False)
-            markers.append(
-                f"{FORWARD_MARKER_HEADER}\n"
-                f"{FORWARD_ID_PREFIX}{encoded_id}\n"
-                "需要查看聊天记录时调用 read_forward_message。"
-            )
-        else:
-            markers.append("【合并转发消息（缺少可读取的 forward_id）】")
-    return "\n".join(markers)
+    return "\n".join(format_forward_marker(reference.id) for reference in references)
 
 
 def extract_forward_message_ids(contents: Iterable[str]) -> set[str]:

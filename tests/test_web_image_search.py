@@ -311,8 +311,10 @@ async def test_source_image_prefers_reply_then_current_user():
         invalid_reply = await _find_source_media(db_session, session_id, "bob", None, "missing-reply")
 
     assert replied is not None
+    assert replied[1] is not None
     assert replied[1].media_id == alice_media.media_id
     assert own_latest is not None
+    assert own_latest[1] is not None
     assert own_latest[1].media_id == alice_media.media_id
     assert invalid_explicit is None
     assert invalid_reply is None
@@ -350,6 +352,8 @@ async def test_duplicate_image_preserves_both_bot_message_ids(monkeypatch, tmp_p
         second = await _find_source_media(db, group, "alice", None, "bot-two-id")
         assert first is not None
         assert second is not None
+        assert first[1] is not None
+        assert second[1] is not None
         assert first[1].media_id == second[1].media_id
         assert rows[0].content.splitlines()[-1] == first[1].file_path
 

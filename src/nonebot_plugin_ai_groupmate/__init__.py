@@ -9,15 +9,15 @@ import traceback
 from io import BytesIO
 from typing import Any
 from pathlib import Path
+from urllib.parse import urlsplit
 from functools import lru_cache
-from collections import deque
-from dataclasses import field, replace, dataclass
+from dataclasses import replace
 
 import jieba
-from nonebot import logger, require, get_bots, on_notice, get_driver, on_command, on_message
+from nonebot import logger, require, get_bots, on_notice, get_driver, on_command, on_message, get_plugin_config
 from wordcloud import WordCloud
 from nonebot.params import CommandArg
-from nonebot.plugin import PluginMetadata, inherit_supported_adapters
+from nonebot.plugin import PluginMetadata, get_plugin, inherit_supported_adapters
 from nonebot.typing import T_State
 from nonebot.adapters import Bot, Event, Message
 from nonebot.permission import SUPERUSER
@@ -43,12 +43,14 @@ from nonebot_plugin_alconna import (
 from nonebot_plugin_apscheduler import scheduler
 from nonebot_plugin_alconna.uniseg import Audio, Video, UniMsg, Reference
 
+from . import message_index as _message_index  # noqa: F401 - registers ORM listeners
 from .agent import (
     _parse_msg_meta,
-    get_flash_model,
     _detect_repeat_chain,
     check_if_should_reply,
+    get_jargon_review_model,
     choice_response_strategy,
+    get_jargon_discovery_model,
 )
 from .model import ChatHistory, MediaStorage, ChatHistorySchema
 from .utils import (
@@ -57,7 +59,7 @@ from .utils import (
     process_and_vectorize_session_chats,
 )
 from .webui import register_usage_webui
-from .config import Config, create_tagging_llm
+from .config import Config, create_tagging_llm, agent_run_timeout_seconds
 from .memory import (
     DB,
     MEDIA_EMBEDDING_VERSION as MEDIA_EMBEDDING_VERSION,
@@ -66,14 +68,13 @@ from .memory import (
 )
 from .concurrency import agent_run_gate, maintenance_gate, background_image_gate
 from .observation import RECENT_PARTICIPATION_SECONDS, ObservationSchedule
-from .reply_guard import (
-    activate_request_id,
-    deactivate_request_id,
-    set_latest_request_id,
-)
+from .drawing_poll import poll_drawing_jobs, stop_drawing_jobs, start_drawing_jobs
 from .shared_cards import MAX_CARD_TEXT, save_card_links, parse_shared_segment
 from .media_message import format_media_markers
+from .message_trace import trace_id
 from .participation import participation, delivery_context, observation_guard
+from .reply_request import ReplyRequest, GroupReplyState, merge_reply_requests, current_transport_message_id
+from .agent.delivery import OutboundIdentity
 from .agent.reaction import is_onebot_context, requested_reaction_emoji
 from .group_affinity import note_group_activity, load_group_affinities
 from .runtime_config import (
@@ -84,11 +85,16 @@ from .runtime_config import (
 )
 from .forward_message import format_forward_reference_markers
 from .group_api_relay import delete_expired_pending_group_configs
+from .message_rollout import message_pilot_enabled
 from .scheduled_tasks import poll_scheduled_tasks, stop_scheduled_tasks
 from .agent.chat_files import chat_file_source_key
 from .message_batching import InputBatcher, current_input_batch
-from .message_metadata import BOT_ECHO_LOOKBACK, is_reliable_platform_id
+from .message_mentions import (format_member_mention, event_mentioned_user_ids, mentioned_user_ids,
+                               current_mentioned_user_ids, current_normalized_message)
+from .message_metadata import BOT_ECHO_LOOKBACK, is_reliable_platform_id, platform_message_ids
 from .agent.reply_tools import create_reply_tool
+from .agent.turn_context import is_one_to_one_exchange
+from .delivery_recovery import prune_receipts, recover_pending
 from .group_daily_quota import (
     GroupDailyQuotaStatus,
     consume_group_daily_quota,
@@ -98,7 +104,8 @@ from .group_daily_quota import (
     get_private_user_daily_quota_status,
     build_private_quota_exhausted_message,
 )
-from .agent.turn_context import bind_turn_history, build_turn_context
+from .agent.turn_context import bind_turn_history, build_turn_context, TurnHistoryResolver
+from .agent.structured_context import load_structured_context_safely
 from .group_model_config import (
     LOCAL_ENCRYPTION_KEY_FILENAME,
     LocalSecretCipher,
@@ -110,11 +117,15 @@ from .group_model_config import (
     resolve_group_reply_probability,
     load_or_create_local_encryption_key,
 )
-from .agent.file_workspace import FileWorkspace
+from .structured_message import adapter_name, image_source_id, normalize_parts, record_inbound_safely, bind_image_resource_safely
+from .agent.file_workspace import FileWorkspace, clean_filename
 from .relation_maintenance import count_negative_relations, reset_negative_relations
-from .agent.chat_file_inbox import cleanup_chat_file_inbox, register_chat_file_markers
+from .agent.chat_file_inbox import cleanup_chat_file_inbox, register_chat_file_markers, register_chat_file_resources
 from .agent.explicit_memory import cleanup_explicit_memories
+from .group_reply_scheduler import GroupReplyScheduler
+from .agent.command_delivery import send_command_image
 from .agent.web_image_search import is_explicit_web_image_search_request
+from .history_index_backfill import backfill_one, has_pending_backfill
 
 
 async def _safe_rollback(db_session) -> None:
@@ -259,6 +270,56 @@ async def _poll_scheduled_tasks() -> None:
         logger.exception("扫描数据库定时任务失败，将在下次扫描重试；请确认已执行 nb orm upgrade")
 
 
+@get_driver().on_startup
+async def _start_drawing_jobs() -> None:
+    start_drawing_jobs()
+
+
+@scheduler.scheduled_job("interval", seconds=2, max_instances=1, coalesce=True, id="ai_groupmate_poll_drawing_jobs")
+async def _poll_drawing_jobs() -> None:
+    try:
+        await poll_drawing_jobs(plugin_data_dir / "agent_files", get_runtime_config())
+    except Exception:
+        logger.exception("扫描绘图任务失败，将在下次扫描重试")
+
+
+@scheduler.scheduled_job("interval", seconds=30, max_instances=1, coalesce=True, id="ai_groupmate_recover_deliveries")
+async def _recover_deliveries() -> None:
+    try:
+        await recover_pending(plugin_data_dir / "delivery_recovery", plugin_data_dir / "agent_files")
+    except Exception:
+        logger.exception("恢复发送记录失败，将在下次扫描重试")
+
+
+@scheduler.scheduled_job("interval", hours=24, max_instances=1, coalesce=True, id="ai_groupmate_prune_delivery_receipts")
+async def _prune_delivery_receipts() -> None:
+    try:
+        await prune_receipts(plugin_data_dir / "delivery_recovery")
+    except Exception:
+        logger.exception("清理发送记录恢复标记失败")
+
+
+@scheduler.scheduled_job("interval", seconds=5, max_instances=1, coalesce=True, id="ai_groupmate_backfill_history_index")
+async def _backfill_history_index() -> None:
+    try:
+        groups = plugin_config.message_refactor_pilot_groups
+        if not groups and not plugin_config.message_refactor_pilot_private:
+            return
+        allowed = None if "*" in groups or plugin_config.message_refactor_pilot_private else list(groups)
+        # Do not occupy the shared maintenance slot when there is no work.
+        async with get_session() as db_session:
+            pending = await has_pending_backfill(db_session, allowed_sessions=allowed)
+        if not pending:
+            return
+        async with maintenance_gate.slot(wait=False) as granted:
+            if granted:
+                async with get_session() as db_session:
+                    await backfill_one(db_session, allowed_sessions=allowed)
+                    await db_session.commit()
+    except Exception:
+        logger.exception("历史消息索引回填失败，将稍后继续")
+
+
 @scheduler.scheduled_job("interval", minutes=5, max_instances=1, coalesce=True, id="ai_groupmate_expire_explicit_memories")
 async def _expire_explicit_memories() -> None:
     try:
@@ -283,6 +344,7 @@ async def _expire_agent_files() -> None:
 @get_driver().on_shutdown
 async def _close_scheduled_tasks() -> None:
     await stop_scheduled_tasks()
+    await stop_drawing_jobs()
 
 
 @get_driver().on_shutdown
@@ -295,29 +357,6 @@ async def _close_vector_resources() -> None:
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
     await DB.close()
-
-
-@dataclass
-class ReplyRequest:
-    request_id: str
-    session: Uninfo
-    interface: QryItrface
-    bot: Bot
-    event: Event
-    bot_name: str
-    user_id: str
-    user_name: str | None
-    is_tome: bool
-    is_continuous: bool
-    reply_to_id: str | None
-    proactive_meme_only: bool = False
-    meme_required: bool = False
-    meme_send_count: int = 1
-    proactive_reaction_only: bool = False
-    reaction_required: bool = False
-    repeat_text: str | None = None
-    proactive_observation: bool = False
-    input_batch: tuple[tuple[str, str], ...] = ()
 
 
 _observation_schedule: ObservationSchedule[ReplyRequest] = ObservationSchedule()
@@ -355,28 +394,20 @@ async def _occasionally_observe_groups() -> None:
                 is_tome=False, is_continuous=False, reply_to_id=None,
                 proactive_meme_only=False, meme_required=False, meme_send_count=1,
                 proactive_reaction_only=False, reaction_required=False, repeat_text=None,
-                proactive_observation=True,
+                proactive_observation=True, created_monotonic=time.monotonic(),
+                message_id=None, input_batch=(), mentioned_user_ids=(), normalized_parts=None,
             ))
         except Exception:
             logger.exception("主动查看群聊未能入队，等待下次机会")
 
 
-@dataclass
-class GroupReplyState:
-    running: bool = False
-    latest: ReplyRequest | None = None
-    addressed: deque[ReplyRequest] = field(default_factory=deque)
-    addressed_tasks: dict[str, asyncio.Task[None]] = field(default_factory=dict)
-    active: ReplyRequest | None = None
-    task: asyncio.Task | None = None
-
-
 # 每个群有限并发处理明确 @；非定向回复只保留最新一条，避免高峰期刷屏。
-_group_reply_states: dict[str, GroupReplyState] = {}
-_group_reply_state_lock = asyncio.Lock()
+_reply_scheduler = GroupReplyScheduler(lambda request: _execute_reply_request(request),
+                                       lambda: plugin_config.agent_max_concurrency_per_group)
+_group_reply_states: dict[str, GroupReplyState] = _reply_scheduler.states
 _input_batcher: InputBatcher[ReplyRequest] = InputBatcher()
 _continuous_conversation_until: dict[tuple[str, str, str], datetime.datetime] = {}
-MAX_GROUP_ADDRESSED_REQUESTS = 3
+_explicit_conversation_until: dict[tuple[str, str, str], datetime.datetime] = {}
 
 
 @get_driver().on_shutdown
@@ -404,23 +435,14 @@ async def _submit_reply_input(group_id: str, request: ReplyRequest, message_id: 
         await _queue_group_reply_request(group_id, request)
         return
 
-    def merge(previous: ReplyRequest, latest: ReplyRequest) -> ReplyRequest:
-        return replace(latest, is_tome=previous.is_tome or latest.is_tome,
-                       is_continuous=previous.is_continuous or latest.is_continuous,
-                       meme_required=previous.meme_required or latest.meme_required,
-                       meme_send_count=max(previous.meme_send_count, latest.meme_send_count),
-                       reply_to_id=latest.reply_to_id or previous.reply_to_id,
-                       reaction_required=previous.reaction_required or latest.reaction_required)
-
-    async def deliver(ready: ReplyRequest) -> None:
-        messages = current_input_batch.get()
+    async def deliver(ready: ReplyRequest, messages: tuple[tuple[str, str], ...]) -> None:
         logger.info(f"[InputBatch] group={group_id} messages={len(messages)} ids={[mid for mid, _ in messages]}")
         await _queue_group_reply_request(group_id, replace(ready, input_batch=messages))
 
     await _input_batcher.submit(
         _input_batch_key(str(request.bot.self_id), group_id, request.user_id, request.reply_to_id), request,
         message_id=message_id if is_reliable_platform_id(message_id) else "", text=text, delay=plugin_config.group_message_debounce_seconds,
-        max_wait=plugin_config.group_message_debounce_max_seconds, merge=merge, deliver=deliver,
+        max_wait=plugin_config.group_message_debounce_max_seconds, merge=merge_reply_requests, deliver=deliver,
     )
 
 # 多bot去重锁: 每个群串行化消息记录,防止并发SELECT查不到对方未提交数据
@@ -438,13 +460,29 @@ def _continuous_conversation_ttl() -> datetime.timedelta:
     return datetime.timedelta(minutes=minutes)
 
 
+def _shared_balancer_enabled() -> bool:
+    """Only share a conversation when the optional bot pool actually routes sends."""
+    balancer = get_plugin("nonebot_plugin_bot_load_balancer")
+    if balancer is None:
+        return False
+    try:
+        return bool(get_plugin_config(balancer.module.Config).bot_load_balancer.enabled)
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
+def _continuous_key(session_id: str, user_id: str, bot_id: str) -> tuple[str, str, str]:
+    return (session_id, user_id, "__balanced_pool__" if _shared_balancer_enabled() else bot_id)
+
+
 def _is_continuous_conversation(session_id: str, user_id: str, bot_id: str) -> bool:
-    key = (session_id, user_id, bot_id)
+    key = _continuous_key(session_id, user_id, bot_id)
     expires_at = _continuous_conversation_until.get(key)
     if not expires_at:
         return False
     if datetime.datetime.now() > expires_at:
         _continuous_conversation_until.pop(key, None)
+        _explicit_conversation_until.pop(key, None)
         return False
     return True
 
@@ -453,7 +491,26 @@ def _refresh_continuous_conversation(session_id: str, user_id: str, bot_id: str)
     ttl = _continuous_conversation_ttl()
     if ttl <= datetime.timedelta(0):
         return
-    _continuous_conversation_until[(session_id, user_id, bot_id)] = datetime.datetime.now() + ttl
+    key = _continuous_key(session_id, user_id, bot_id)
+    expires_at = datetime.datetime.now() + ttl
+    _continuous_conversation_until[key] = expires_at
+    if key in _explicit_conversation_until:
+        _explicit_conversation_until[key] = expires_at
+
+
+def _is_explicit_conversation_request(text: str) -> bool:
+    return bool(re.search(r"(?:连续|一直|持续|接下来).{0,16}(?:聊|对话)", text))
+
+
+def _is_explicit_conversation(session_id: str, user_id: str, bot_id: str) -> bool:
+    key = _continuous_key(session_id, user_id, bot_id)
+    until = _explicit_conversation_until.get(key)
+    if until is None:
+        return False
+    if datetime.datetime.now() > until:
+        _explicit_conversation_until.pop(key, None)
+        return False
+    return True
 
 
 def _is_explicit_disengagement(text: str, bot_name: str) -> bool:
@@ -750,178 +807,47 @@ def _extract_reply_message_id_from_event(event: Event) -> str | None:
     return None
 
 
-def _start_group_reply_worker_locked(group_id: str, state: GroupReplyState):
-    """在已持有状态锁时启动 latest-only 后台回复 worker。"""
-    state.running = True
-    state.task = asyncio.create_task(_run_group_reply_worker(group_id))
-
-
-def _is_addressed_reply_request(request: ReplyRequest) -> bool:
-    return request.is_tome or request.is_continuous
-
-
 async def _execute_reply_request(request: ReplyRequest) -> None:
     # Wait for a global Agent slot before opening a database session. This
     # bounds cross-group concurrency without consuming pool capacity while queued.
+    slot_started = time.monotonic()
     async with agent_run_gate.slot():
-        token = current_input_batch.set(getattr(request, "input_batch", ()))
+        created = getattr(request, "created_monotonic", None)
+        scene = getattr(getattr(request, "session", None), "scene", None)
+        scene_id = getattr(scene, "id", None)
+        if created is not None and scene_id is not None and message_pilot_enabled(
+            plugin_config, str(scene_id),
+            is_private=getattr(scene, "type", None) == SceneType.PRIVATE,
+        ):
+            logger.info(f"[MessageTrace] trace={trace_id(str(scene_id), request.request_id)} "
+                        f"stage=worker_admitted wait_ms={(time.monotonic() - created) * 1000:.0f} "
+                        f"global_slot_wait_ms={(time.monotonic() - slot_started) * 1000:.0f}")
+        is_observation = bool(getattr(request, "proactive_observation", False))
+        token = current_input_batch.set(() if is_observation else getattr(request, "input_batch", ()))
+        message_token = current_transport_message_id.set(None if is_observation else getattr(request, "message_id", None))
+        normalized = getattr(request, "normalized_parts", None)
+        normalized_token = current_normalized_message.set(
+            (request.event, normalized) if not is_observation and normalized is not None else None
+        )
         try:
-            await _handle_batched_reply_request(request)
+            mentions = () if is_observation else (getattr(request, "mentioned_user_ids", ()) or event_mentioned_user_ids(request.event))
+            mentions_token = current_mentioned_user_ids.set(mentions)
+            try:
+                await handle_reply_request(request)
+            finally:
+                current_mentioned_user_ids.reset(mentions_token)
         finally:
             current_input_batch.reset(token)
+            current_transport_message_id.reset(message_token)
+            current_normalized_message.reset(normalized_token)
 
 
-async def _handle_batched_reply_request(request: ReplyRequest) -> None:
-    await handle_reply_logic(
-        request.request_id,
-        request.session,
-        request.interface,
-        request.bot,
-        request.event,
-        request.bot_name,
-        request.user_id,
-        request.user_name,
-        request.is_tome,
-        request.is_continuous,
-        request.reply_to_id,
-        getattr(request, "proactive_meme_only", False),
-        getattr(request, "meme_required", False),
-        getattr(request, "meme_send_count", 1),
-        getattr(request, "proactive_reaction_only", False),
-        getattr(request, "reaction_required", False),
-        getattr(request, "repeat_text", None),
-        getattr(request, "proactive_observation", False),
-    )
+async def _queue_group_reply_request(group_id: str, request: ReplyRequest) -> bool:
+    return await _reply_scheduler.enqueue(group_id, request)
 
 
-def _start_addressed_workers_locked(
-    group_id: str,
-    state: GroupReplyState,
-) -> None:
-    limit = max(int(plugin_config.agent_max_concurrency_per_group), 1)
-    while state.addressed and len(state.addressed_tasks) < limit:
-        request = state.addressed.popleft()
-        task = asyncio.create_task(
-            _run_addressed_reply_request(group_id, request),
-            name=f"ai-groupmate-addressed:{group_id}:{request.request_id}",
-        )
-        state.addressed_tasks[request.request_id] = task
-
-
-async def _run_addressed_reply_request(
-    group_id: str,
-    request: ReplyRequest,
-) -> None:
-    """Run one independently deliverable addressed request."""
-    try:
-        await activate_request_id(group_id, request.request_id)
-        await _execute_reply_request(request)
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        logger.exception(
-            f"群 {group_id} 明确提问处理失败 request={request.request_id}"
-        )
-    finally:
-        await deactivate_request_id(group_id, request.request_id)
-        async with _group_reply_state_lock:
-            state = _group_reply_states.get(group_id)
-            if state is None:
-                return
-            state.addressed_tasks.pop(request.request_id, None)
-            _start_addressed_workers_locked(group_id, state)
-            if (
-                not state.addressed
-                and not state.addressed_tasks
-                and state.latest is not None
-                and (not state.running or state.task is None or state.task.done())
-            ):
-                _start_group_reply_worker_locked(group_id, state)
-
-
-async def _queue_group_reply_request(
-    group_id: str,
-    request: ReplyRequest,
-) -> bool:
-    """明确 @ 有限并发；非定向消息不能打断或挤占定向请求。"""
-    async with _group_reply_state_lock:
-        reply_state = _group_reply_states.setdefault(group_id, GroupReplyState())
-        active_is_addressed = bool(reply_state.addressed_tasks)
-
-        if getattr(request, "proactive_observation", False) and (
-            active_is_addressed or reply_state.addressed or reply_state.running or reply_state.latest is not None
-        ):
-            return False
-
-        if _is_addressed_reply_request(request):
-            addressed_count = len(reply_state.addressed) + len(
-                reply_state.addressed_tasks
-            )
-            if addressed_count >= MAX_GROUP_ADDRESSED_REQUESTS:
-                logger.warning(f"群 {group_id} 待处理的定向请求已达上限，忽略额外请求")
-                return False
-            reply_state.addressed.append(request)
-            # 明确 @ 到来时丢弃尚未开始的随机/表情/复读请求。
-            reply_state.latest = None
-            if reply_state.active is not None and reply_state.task is not None:
-                # 抢占正在运行的低优先级 Agent，并提前使其发送工具失效。
-                await set_latest_request_id(group_id, request.request_id)
-                reply_state.task.cancel()
-                logger.info(f"群 {group_id} 收到明确 @，已取消后台回复")
-            _start_addressed_workers_locked(group_id, reply_state)
-            return True
-
-        if active_is_addressed or reply_state.addressed:
-            logger.debug(f"群 {group_id} 存在待处理的定向请求，忽略后台回复采样")
-            return False
-
-        # 非定向请求仍只保留最新一个，避免随机插话、主动表情或复读积压刷屏。
-        reply_state.latest = request
-        if not reply_state.running:
-            _start_group_reply_worker_locked(group_id, reply_state)
-        elif not reply_state.task or reply_state.task.done():
-            logger.warning(f"群 {group_id} 回复 worker 不可用，已重新启动")
-            _start_group_reply_worker_locked(group_id, reply_state)
-        elif reply_state.active is not None:
-            await set_latest_request_id(group_id, request.request_id)
-            reply_state.task.cancel()
-            logger.info(f"群 {group_id} 已将后台回复切换到最新消息")
-        return True
-
-
-async def _run_group_reply_worker(group_id: str):
-    """消费同群 latest-only 后台请求；明确提问由独立 worker 处理。"""
-    try:
-        while True:
-            async with _group_reply_state_lock:
-                state = _group_reply_states.get(group_id)
-                if not state:
-                    return
-                if state.addressed or state.addressed_tasks:
-                    return
-                request = state.latest
-                state.latest = None
-                state.active = request
-
-            if request is None:
-                break
-
-            await set_latest_request_id(group_id, request.request_id)
-            await _execute_reply_request(request)
-    finally:
-        async with _group_reply_state_lock:
-            state = _group_reply_states.get(group_id)
-            if state:
-                state.running = False
-                state.active = None
-                state.task = None
-                _start_addressed_workers_locked(group_id, state)
-                if (
-                    not state.addressed
-                    and not state.addressed_tasks
-                    and state.latest is not None
-                ):
-                    _start_group_reply_worker_locked(group_id, state)
+async def _run_group_reply_worker(group_id: str) -> None:
+    await _reply_scheduler.run_background(group_id)
 
 
 def _is_file_upload_notice(bot: Bot, event: Event) -> bool:
@@ -1004,6 +930,20 @@ async def handle_message(
         logger.debug(f"消息明确发给其他 Bot {addressed_bot_id}，当前 Bot {bot.self_id} 跳过处理")
         return
 
+    try:
+        try:
+            native_segments = event.get_message()
+        except Exception:
+            native_segments = msg
+        if not native_segments or not any(getattr(segment, "type", "") not in {"reply", ""}
+                                          for segment in native_segments):
+            native_segments = msg
+        normalized_parts = tuple(normalize_parts(event, native_segments))
+    except Exception as error:
+        logger.warning(f"解析结构化消息失败，继续使用适配器事件 error_type={type(error).__name__}")
+        normalized_parts = None
+        native_segments = msg
+
     bot_name = plugin_config.bot_name
     imgs = msg.include(Image)
     audios = list(msg.include(Audio))
@@ -1019,6 +959,7 @@ async def handle_message(
     reply_id: str | None = None  # 记录回复 ID，稍后单独成行插入
     body = ""  # 正文部分单独拼接
     has_at_mention = False
+    mention_names: dict[str, str] = {}
     shared_cards = []
     for i in msg:
         if len(shared_cards) < 3 and (card := parse_shared_segment(i)) is not None:
@@ -1038,7 +979,9 @@ async def handle_message(
                     pass
             if not name:
                 name = i.target or ""
-            body += "@" + name + " "
+            if name and str(i.target or "") and name != str(i.target):
+                mention_names[str(i.target)] = str(name)
+            body += format_member_mention(str(i.target or ""), name)
             is_text = True
         if i.type == "reply":
             reply_id = i.id
@@ -1047,8 +990,17 @@ async def handle_message(
             is_text = True
         if i.type == "image":
             body += "[图片]"
-        if i.type == "mface":
+        if i.type in {"mface", "face"}:
             body += "[表情]"
+            is_text = True
+
+    # Some adapters retain native faces only on the original event, not in the
+    # unified message. Keep a history anchor even when the message is face-only.
+    if not is_text and not imgs:
+        original_segments = getattr(event, "original_message", None) or ()
+        if any(getattr(segment, "type", "") in {"face", "mface"} for segment in original_segments):
+            body += "[表情]"
+            is_text = True
 
     card_text = "\n".join(card.text for card in shared_cards)[:MAX_CARD_TEXT]
     if card_text:
@@ -1078,13 +1030,14 @@ async def handle_message(
         body += media_text
         is_text = True
 
+    file_resource_ids: tuple[str | None, ...] = ()
     if files:
         workspace = FileWorkspace(plugin_data_dir / "agent_files", session_id=session.scene.id,
                                   user_id=session.user.id, bot_id=str(bot.self_id),
                                   is_private=session.scene.type == SceneType.PRIVATE)
-        marker = await asyncio.to_thread(register_chat_file_markers, files, workspace,
-                                         message_id=incoming_message_id,
-                                         group_id=session.scene.id if session.scene.type == SceneType.GROUP else None)
+        marker, file_resource_ids = await asyncio.to_thread(register_chat_file_resources, files, workspace,
+                                                            message_id=incoming_message_id,
+                                                            group_id=session.scene.id if session.scene.type == SceneType.GROUP else None)
         body += ("\n" if body and not body.endswith("\n") else "") + marker
         is_text = True
 
@@ -1159,7 +1112,9 @@ async def handle_message(
                     history.content,
                     content_prefix,
                     body,
-                    exact_id_only=sender_is_connected_bot,
+                    # Distinct platform IDs are distinct messages even when a
+                    # user repeats the exact same text within a few seconds.
+                    exact_id_only=sender_is_connected_bot or is_reliable_platform_id(incoming_message_id),
                 )
                 for history in existing.scalars().all()
             ):
@@ -1180,6 +1135,29 @@ async def handle_message(
 
         # 在锁内提交,确保第二个bot的SELECT能看到第一个bot的写入
         try:
+            if (is_new_text_message and (is_text or imgs) and message_pilot_enabled(
+                plugin_config, str(session.scene.id), is_private=session.scene.type == SceneType.PRIVATE
+            )):
+                await record_inbound_safely(
+                    db_session,
+                    event=event,
+                    fallback_segments=native_segments,
+                    normalized_parts=normalized_parts,
+                    mention_names=mention_names,
+                    file_ids=file_resource_ids,
+                    file_source_ids=tuple(str(file.id or "") for file in files),
+                    file_names=tuple(clean_filename(str(file.name or "")) for file in files),
+                    image_source_ids=tuple(image_source_id(image) for image in imgs),
+                    platform=adapter_name(bot),
+                    scope="private" if session.scene.type == SceneType.PRIVATE else "group",
+                    session_id=str(session.scene.id),
+                    platform_id=incoming_message_id,
+                    sender_id=str(session.user.id),
+                    sender_name=str(user_name),
+                    sender_kind="bot" if sender_is_connected_bot else "user",
+                    bot_id=str(bot.self_id),
+                    reply_to_id=reply_id,
+                )
             await db_session.commit()
         except Exception as e:
             logger.error(f"保存文本消息失败: {e}")
@@ -1203,18 +1181,24 @@ async def handle_message(
     is_group = session.scene.type == SceneType.GROUP
     bot_id = str(bot.self_id)
     if (is_group and is_text and is_new_text_message and not sender_is_connected_bot and not command_like
+            and (bool(stripped_plain_text) or "[表情]" not in body)
             and plugin_config.group_jargon_learning_enabled
-            and (plugin_config.flash_api_key or plugin_config.llm_api_key or plugin_config.qwen_token)):
+            and (plugin_config.chat_api_key or plugin_config.llm_api_key or plugin_config.qwen_token
+                 or plugin_config.vertex_credentials_path or plugin_config.vertex_api_key or plugin_config.chat_api_format == "vertex")):
         from .agent.jargon_learning import schedule_jargon_learning
 
-        schedule_jargon_learning(plugin_data_dir / "group_jargon", session.scene.id, get_flash_model,
-                                excluded_users=tuple(connected_bot_ids | {bot_id}))
+        schedule_jargon_learning(plugin_data_dir / "group_jargon", session.scene.id, get_jargon_discovery_model,
+                                review_model_factory=get_jargon_review_model, excluded_terms=(plugin_config.bot_name,),
+                                excluded_users=tuple(connected_bot_ids | {bot_id}),
+                                structured_platform=adapter_name(bot) if message_pilot_enabled(
+                                    plugin_config, str(session.scene.id), is_private=False) else None)
     active_followup = is_group and _is_continuous_conversation(session.scene.id, session.user.id, bot_id)
     group_followup = is_group and time.monotonic() - participation.state((bot_id, session.scene.id)).last_sent < 300
     disengaged = is_group and (explicit_to_me or ((active_followup or group_followup) and not has_at_mention and not reply_id)) and _is_explicit_disengagement(stripped_plain_text, plugin_config.bot_name)
     if disengaged:
         _input_batcher.discard_speaker((bot_id, session.scene.id, session.user.id))
-        _continuous_conversation_until.pop((session.scene.id, session.user.id, bot_id), None)
+        _continuous_conversation_until.pop(_continuous_key(session.scene.id, session.user.id, bot_id), None)
+        _explicit_conversation_until.pop(_continuous_key(session.scene.id, session.user.id, bot_id), None)
         logger.debug("用户明确退出当前 bot 对话，本条保持沉默并结束跟进窗口")
     continuous_to_me = not disengaged and not explicit_to_me and not command_like and not has_at_mention and not reply_id and bool(stripped_plain_text) and active_followup
     if continuous_to_me:
@@ -1273,6 +1257,10 @@ async def handle_message(
     should_reply = not disengaged and (to_me or continuous_to_me or random_reply_sample or proactive_reaction_only or proactive_meme_only or repeat_reply_sample)
     if explicit_to_me and not disengaged:
         _refresh_continuous_conversation(session.scene.id, session.user.id, bot_id)
+        if _is_explicit_conversation_request(stripped_plain_text):
+            key = _continuous_key(session.scene.id, session.user.id, bot_id)
+            if key in _continuous_conversation_until:
+                _explicit_conversation_until[key] = _continuous_conversation_until[key]
     if not plain_text and not imgs and not forward_references and not audios and not videos and not files:
         should_reply = False
     if files and not stripped_plain_text and not shared_cards and not imgs and not forward_references and not audios and not videos:
@@ -1297,7 +1285,7 @@ async def handle_message(
     # 如果要回复则同步等待图片处理完成,否则后台异步
     if imgs:
         if should_reply:
-            for img in imgs:
+            for image_index, img in enumerate(imgs):
                 await process_image_message(
                     db_session,
                     img,
@@ -1307,9 +1295,11 @@ async def handle_message(
                     session,
                     user_name,
                     content_prefix,
+                    image_index=image_index,
+                    image_count=len(imgs),
                 )
         else:
-            for img in imgs:
+            for image_index, img in enumerate(imgs):
                 _start_background_image_task(
                     img,
                     event,
@@ -1318,6 +1308,8 @@ async def handle_message(
                     session,
                     user_name,
                     content_prefix,
+                    image_index=image_index,
+                    image_count=len(imgs),
                 )
 
     # ========== 步骤4: 处理回复 ==========
@@ -1347,19 +1339,23 @@ async def handle_message(
             is_tome=to_me,
             is_continuous=continuous_to_me,
             reply_to_id=reply_id,
+            message_id=incoming_message_id if is_reliable_platform_id(incoming_message_id) else None,
             proactive_meme_only=proactive_meme_only,
             meme_required=meme_required,
             meme_send_count=meme_send_count,
             proactive_reaction_only=proactive_reaction_only,
             reaction_required=reaction_required,
             repeat_text=repeat_text if repeat_reply_sample else None,
+            mentioned_user_ids=(mentioned_user_ids(normalized_parts) if normalized_parts is not None
+                                else event_mentioned_user_ids(event)),
+            normalized_parts=normalized_parts,
         )
         if track_observation:
             _observation_schedule.note((bot_id, group_id), request, addressed=explicit_to_me, disengaged=disengaged)
         # Commit all text/image rows before the batch can wake a reader.
         await db_session.commit()
         if should_reply or pending_input:
-            await _submit_reply_input(group_id, request, str(incoming_message_id), plain_text)
+            await _submit_reply_input(group_id, request, str(incoming_message_id), (body or plain_text) if has_at_mention else plain_text)
     else:
         await db_session.commit()
 
@@ -1373,20 +1369,35 @@ async def process_image_message(
     session: Uninfo,
     user_name: str | None,
     content_prefix: str,
+    *,
+    image_index: int | None = None,
+    image_count: int | None = None,
 ):
     """处理单张图片消息 (修复并发插入报错)"""
     try:
         content_type = "image"
-        if not img.id:
+        raw = getattr(img, "raw", None)
+        url = getattr(img, "url", None)
+        if not img.id and not (raw or url):
             return
-        # 简单判断后缀，默认为 jpg
-        image_format = img.id.split(".")[-1] if "." in img.id else "jpg"
+        if not img.id and not raw and getattr(img, "path", None):
+            # An inbound path is not a local file authorization.
+            return
+        source_name = str(img.id or url or getattr(img, "name", ""))
+        try:
+            suffix = Path(urlsplit(source_name).path).suffix.lower().lstrip(".")
+        except ValueError:
+            suffix = ""
+        image_format = suffix if suffix in {"jpg", "jpeg", "png", "gif", "webp", "bmp"} else "jpg"
 
         # 1. 获取和压缩图片
         try:
             pic = await asyncio.wait_for(image_fetch(event, bot, state, img), timeout=15.0)
         except asyncio.TimeoutError:
             logger.warning("下载图片超时，跳过")
+            return
+        if not pic:
+            logger.warning("图片来源未返回数据，跳过保存")
             return
 
         pic = await asyncio.to_thread(check_and_compress_image_bytes, pic, image_format=image_format.upper())
@@ -1448,10 +1459,15 @@ async def process_image_message(
                         ChatHistory.created_at >= time_window,
                     )
                 )
-                existing_image = existing_img.scalar_one_or_none()
+                candidates = existing_img.scalars().all()
+                incoming_id = content_prefix.removeprefix("id: ").splitlines()[0]
+                if image_index is not None and image_count is not None and is_reliable_platform_id(incoming_id):
+                    existing_image = next((row for row in candidates if incoming_id in platform_message_ids(row.content)), None)
+                else:
+                    existing_image = candidates[0] if candidates else None
                 if existing_image:
-                    # Different bot accounts assign different IDs to the same
-                    # message. Retain aliases while keeping the filename last.
+                    # Preserve aliases used by the legacy no-index path while
+                    # keeping the filename as the last line.
                     message_marker = content_prefix.splitlines()[0]
                     if message_marker.startswith("id: ") and f"{message_marker}\n" not in existing_image.content:
                         header, separator, filename = existing_image.content.rpartition("\n")
@@ -1468,6 +1484,23 @@ async def process_image_message(
                     )
                     db_session.add(chat_history)
 
+                if (image_index is not None and image_count is not None and message_pilot_enabled(
+                    plugin_config, str(session.scene.id), is_private=session.scene.type == SceneType.PRIVATE
+                )):
+                    await bind_image_resource_safely(
+                        db_session,
+                        platform=adapter_name(bot),
+                        scope="private" if session.scene.type == SceneType.PRIVATE else "group",
+                        session_id=str(session.scene.id),
+                        platform_id=content_prefix.removeprefix("id: ").splitlines()[0],
+                        image_index=image_index,
+                        image_count=image_count,
+                        media_id=media_obj.media_id,
+                        sender_id=str(session.user.id),
+                        source_id=image_source_id(img),
+                        require_source_for_multi=event is not None,
+                    )
+
                 # 5. 在锁内提交
                 await db_session.commit()
 
@@ -1476,13 +1509,14 @@ async def process_image_message(
         await db_session.rollback()
 
 
-async def _process_image_task(img, event, bot, state, session, user_name, content_prefix):
+async def _process_image_task(img, event, bot, state, session, user_name, content_prefix, *, image_index=None, image_count=None):
     """后台图片处理任务，使用独立的数据库会话，不阻塞主消息流程"""
     # Queueing happens before a session is opened, so an image burst cannot
     # reserve every pooled connection while waiting for CPU/network work.
     async with background_image_gate.slot():
         async with get_session() as db_session:
-            await process_image_message(db_session, img, event, bot, state, session, user_name, content_prefix)
+            await process_image_message(db_session, img, event, bot, state, session, user_name, content_prefix,
+                                        image_index=image_index, image_count=image_count)
 
 
 def _consume_background_image_task(task: asyncio.Task[None]) -> None:
@@ -1501,13 +1535,17 @@ def _start_background_image_task(
     session: Uninfo,
     user_name: str | None,
     content_prefix: str,
+    *,
+    image_index: int | None = None,
+    image_count: int | None = None,
 ) -> bool:
     if len(_background_image_tasks) >= plugin_config.background_image_max_pending:
         logger.warning(f"后台图片任务已达上限 {plugin_config.background_image_max_pending}，跳过本张图片")
         return False
 
     task = asyncio.create_task(
-        _process_image_task(img, event, bot, state, session, user_name, content_prefix),
+        _process_image_task(img, event, bot, state, session, user_name, content_prefix,
+                            image_index=image_index, image_count=image_count),
         name=f"ai-groupmate-image:{session.scene.id}",
     )
     _background_image_tasks.add(task)
@@ -1542,6 +1580,9 @@ async def _send_quota_notice(
             self_id=session.self_id,
         )
         log_label = "公共模型额度提示未发送"
+    pilot = message_pilot_enabled(plugin_config, str(session.scene.id), is_private=is_private)
+    identity = (OutboundIdentity(adapter_name(get_bots().get(str(session.self_id))), "private" if is_private else "group",
+                                 str(session.self_id), bot_name) if pilot else None)
     reply_tool = create_reply_tool(
         db_session,
         session.scene.id,
@@ -1551,6 +1592,8 @@ async def _send_quota_notice(
         bot_name=bot_name,
         parse_msg_meta=_parse_msg_meta,
         group_members=[],
+        recovery_enabled=pilot,
+        outbound_identity=identity,
     )
     raw_result = await reply_tool.ainvoke(
         {"content": message, "next_step": "end"}
@@ -1572,6 +1615,9 @@ async def _send_agent_error_notice(
     is_private: bool,
     group_members: list[Any] | None,
 ) -> None:
+    pilot = message_pilot_enabled(plugin_config, str(session.scene.id), is_private=is_private)
+    identity = (OutboundIdentity(adapter_name(get_bots().get(str(session.self_id))), "private" if is_private else "group",
+                                 str(session.self_id), bot_name) if pilot else None)
     reply_tool = create_reply_tool(
         db_session,
         session.scene.id,
@@ -1585,6 +1631,8 @@ async def _send_agent_error_notice(
         bot_name=bot_name,
         parse_msg_meta=_parse_msg_meta,
         group_members=group_members or [],
+        recovery_enabled=pilot,
+        outbound_identity=identity,
     )
     raw_result = await reply_tool.ainvoke(
         {"content": content, "next_step": "end"}
@@ -1615,7 +1663,25 @@ async def handle_reply_logic(
     repeat_text: str | None = None,
     proactive_observation: bool = False,
 ):
-    """处理回复逻辑"""
+    """Compatibility entry point for callers still using individual arguments."""
+    await handle_reply_request(ReplyRequest(
+        request_id=request_id, session=session, interface=interface, bot=bot, event=event,
+        bot_name=bot_name, user_id=user_id, user_name=user_name, is_tome=is_tome,
+        is_continuous=is_continuous, reply_to_id=reply_to_id, proactive_meme_only=proactive_meme_only,
+        meme_required=meme_required, meme_send_count=meme_send_count, proactive_reaction_only=proactive_reaction_only,
+        reaction_required=reaction_required, repeat_text=repeat_text, proactive_observation=proactive_observation,
+        input_batch=current_input_batch.get(), mentioned_user_ids=current_mentioned_user_ids.get() or (),
+    ))
+
+
+async def handle_reply_request(request: ReplyRequest) -> None:
+    """Handle one admitted request with its conversation context intact."""
+    request_id, session, interface, bot, event = request.request_id, request.session, request.interface, request.bot, request.event
+    bot_name, user_id, user_name = request.bot_name, request.user_id, request.user_name
+    is_tome, is_continuous, reply_to_id = request.is_tome, request.is_continuous, request.reply_to_id
+    proactive_meme_only, meme_required, meme_send_count = request.proactive_meme_only, request.meme_required, request.meme_send_count
+    proactive_reaction_only, reaction_required = request.proactive_reaction_only, request.reaction_required
+    repeat_text, proactive_observation = request.repeat_text, request.proactive_observation
     is_private = session.scene.type == SceneType.PRIVATE
     participation_key = (str(session.self_id), session.scene.id)
     autonomous = not is_private and not is_tome and not is_continuous and repeat_text is None
@@ -1664,6 +1730,7 @@ async def handle_reply_logic(
                 # 跟随执行时最新一条的原始格式，检测比较仍使用标准化文本。
                 assert current_repeat_text is not None
                 repeat_text = current_repeat_text
+                pilot = message_pilot_enabled(plugin_config, str(session.scene.id), is_private=False)
                 reply_tool = create_reply_tool(
                     repeat_session,
                     session.scene.id,
@@ -1678,10 +1745,13 @@ async def handle_reply_logic(
                     parse_msg_meta=_parse_msg_meta,
                     group_members=[],
                     repeat_text=repeat_text,
+                    recovery_enabled=pilot,
+                    outbound_identity=(OutboundIdentity(adapter_name(bot), "group", str(session.self_id),
+                                                        bot_name, request_id) if pilot else None),
                 )
                 raw_result = await reply_tool.ainvoke({"content": repeat_text, "next_step": "end"})
                 result = json.loads(raw_result)
-                if result.get("status") != "sent":
+                if not result.get("ok"):
                     logger.info(f"复读消息未发送: {result.get('message', raw_result)}")
                 await repeat_session.commit()
             return
@@ -1727,7 +1797,13 @@ async def handle_reply_logic(
             recent_msgs = [ChatHistorySchema.model_validate(row) for row in recent_msgs[::-1]]
             if proactive_observation:
                 recent_msgs = [row.model_copy(update={"content": row.content[:600]}) for row in recent_msgs]
+            recent_snapshots = (await load_structured_context_safely(
+                history_session, recent_msgs, session_id=str(session.scene.id),
+                scope="private" if is_private else "group", platform=adapter_name(bot), include_media=False,
+            )) if message_pilot_enabled(plugin_config, str(session.scene.id), is_private=is_private) else None
             await history_session.commit()
+
+        recent_resolver = TurnHistoryResolver(recent_snapshots)
 
         if quota_status is not None and not quota_status.allowed:
             if uses_private_model_quota:
@@ -1757,13 +1833,21 @@ async def handle_reply_logic(
         if not recent_msgs:
             return
 
-        trigger_message_id = str(getattr(event, "message_id", "") or "") or None
-        if not is_reliable_platform_id(trigger_message_id) and current_input_batch.get():
-            trigger_message_id = current_input_batch.get()[-1][0]
+        trigger_message_id = None if proactive_observation else (
+            request.message_id if is_reliable_platform_id(request.message_id) else
+            str(getattr(event, "message_id", "") or "") or None
+        )
+        if not proactive_observation and not is_reliable_platform_id(trigger_message_id) and request.input_batch:
+            trigger_message_id = request.input_batch[-1][0]
+        pilot_trace = (trace_id(str(session.scene.id), request_id)
+                       if message_pilot_enabled(plugin_config, str(session.scene.id), is_private=is_private) else None)
+        if pilot_trace:
+            logger.info(f"[MessageTrace] trace={pilot_trace} stage=turn_started "
+                        f"source={trace_id(str(session.scene.id), trigger_message_id)}")
         if proactive_observation:
             latest_human = next((m for m in reversed(recent_msgs) if m.content_type != "bot"), None)
         else:
-            recent_msgs, latest_human = bind_turn_history(recent_msgs, user_id, trigger_message_id)
+            recent_msgs, latest_human = bind_turn_history(recent_msgs, user_id, trigger_message_id, recent_resolver)
         event_text = ""
         if not proactive_observation:
             try:
@@ -1773,6 +1857,10 @@ async def handle_reply_logic(
         if latest_human is None and not event_text:
             return
 
+        one_to_one = bool(is_continuous and latest_human is not None and not proactive_observation
+                          and is_one_to_one_exchange(recent_msgs, user_id, bot_ids={str(item) for item in get_bots()}))
+        direct_conversation = bool(one_to_one and _is_explicit_conversation(session.scene.id, user_id, str(bot.self_id)))
+
         # 简单的文本摘要用于 Gatekeeper
         history_summary = ""
         for m in recent_msgs:
@@ -1780,12 +1868,12 @@ async def handle_reply_logic(
             if m.content_type == "image":
                 history_summary += f"[{role}] {m.user_name}: [发送了一张图片/表情包，可能只是随手发的]\n"
             else:
-                history_summary += f"[{role}] {m.user_name}: {m.content[:1200]}\n"
+                history_summary += f"[{role}] {m.user_name}: {recent_resolver.gate_content(m)[:1200]}\n"
 
         if proactive_observation and latest_human is not None and latest_human.created_at < datetime.datetime.now() - datetime.timedelta(minutes=15):
             return
         current_msg_text = event_text or (
-            _parse_msg_meta(latest_human.content)[2][:1200] if latest_human is not None and latest_human.content_type == "text"
+            recent_resolver.metadata(latest_human)[2][:1200] if latest_human is not None and latest_human.content_type == "text"
             else "[图片/表情包。除非用户明确在问这张图、@bot、回复bot或正在延续图片话题，否则通常不需要回应]"
         )
         gatekeeper_msg_text = current_msg_text
@@ -1797,8 +1885,10 @@ async def handle_reply_logic(
             gatekeeper_msg_text = f"这条群消息命中了低概率主动表情包采样。只要一张表情包能大致作为群友式接梗、吐槽或情绪反应就可以回复，允许轻微偏题，不要求完全精确；认真求助、事实问题、敏感/沉重话题、真实冲突、他人之间的定向对话，以及普通到没有反应价值的消息都应保持沉默。\n{current_msg_text}"
 
         # === Gatekeeper 判断 ===
-        if not is_tome and repeat_text is None:
+        if not is_tome and repeat_text is None and not direct_conversation:
             observed_sent = participation.state(participation_key).last_sent
+            gate_started = time.perf_counter()
+            gate_failure: list[tuple[str, int | None]] = []
             should_reply = await check_if_should_reply(
                 history_summary,
                 gatekeeper_msg_text,
@@ -1817,31 +1907,50 @@ async def handle_reply_logic(
                     current_text=current_msg_text,
                     message_id=None if proactive_observation else trigger_message_id,
                     continuous=is_continuous, observation=proactive_observation,
+                    resolver=recent_resolver,
                 ) if not is_private else "",
                 is_continuous=is_continuous,
+                on_failure=lambda error_type, status: gate_failure.append((error_type, status)),
             )
+            if pilot_trace:
+                logger.info(f"[MessageTrace] trace={pilot_trace} stage=gatekeeper_decided reply={should_reply} "
+                            f"duration_ms={(time.perf_counter() - gate_started) * 1000:.0f}")
             if not should_reply:
-                return
+                transient_types = {"ConnectTimeout", "ReadTimeout", "WriteTimeout", "PoolTimeout", "ConnectError", "ReadError", "RemoteProtocolError", "TimeoutError"}
+                transient = bool(gate_failure and (gate_failure[0][0] in transient_types or
+                                 gate_failure[0][1] == 429 or (gate_failure[0][1] is not None and gate_failure[0][1] >= 500)))
+                if not (one_to_one and transient):
+                    return
+                direct_conversation = True
+                logger.info("[TurnAddress] decision_unavailable fallback=one_to_one")
             if autonomous and (
                 resolve_group_reply_probability(session.scene.id) <= 0
                 or not participation.can_reply(participation_key)
             ):
                 return
+        elif pilot_trace:
+            logger.info(f"[MessageTrace] trace={pilot_trace} stage=gatekeeper_bypassed")
 
         # === 获取详细历史给 Agent ===
         if proactive_observation:
             last_msg = recent_msgs
+            last_resolver = recent_resolver
         else:
             async with get_session() as history_session:
                 last_msg = await _load_agent_history(history_session, session.scene.id)
+                last_snapshots = (await load_structured_context_safely(
+                    history_session, last_msg, session_id=str(session.scene.id),
+                    scope="private" if is_private else "group", platform=adapter_name(bot), include_media=False,
+                )) if message_pilot_enabled(plugin_config, str(session.scene.id), is_private=is_private) else None
                 await history_session.commit()
+            last_resolver = TurnHistoryResolver(last_snapshots)
 
         if not last_msg:
             logger.info("没有历史消息，跳过回复")
             return
 
         if not proactive_observation:
-            last_msg, _ = bind_turn_history(last_msg, user_id, trigger_message_id)
+            last_msg, _ = bind_turn_history(last_msg, user_id, trigger_message_id, last_resolver)
 
         if proactive_observation and not _observation_allowed(participation_key):
             return
@@ -1943,8 +2052,9 @@ async def handle_reply_logic(
                         reaction_required=reaction_required,
                         repeat_text=repeat_text,
                         proactive_observation=proactive_observation,
+                        direct_conversation=direct_conversation,
                     ),
-                    timeout=plugin_config.agent_timeout_seconds,
+                    timeout=agent_run_timeout_seconds(plugin_config),
                 )
         except asyncio.TimeoutError:
             logger.warning(f"Agent 思考超时 - session: {session.scene.id}")
@@ -2074,6 +2184,18 @@ async def _(db_session: async_scoped_session, arg: Message = CommandArg()):
 frequency = on_command("词频")
 
 
+async def _send_wordcloud_image(db_session, session: Uninfo, image_bytes: bytes) -> None:
+    session_id = str(session.scene.id)
+    is_private = session.scene.type == SceneType.PRIVATE
+    pilot = message_pilot_enabled(plugin_config, session_id, is_private=is_private)
+    bot_id = str(session.self_id)
+    workspace = FileWorkspace(plugin_data_dir / "agent_files", session_id=session_id, user_id=str(session.user.id),
+                              bot_id=bot_id, is_private=is_private)
+    identity = OutboundIdentity(adapter_name(get_bots().get(bot_id)), "private" if is_private else "group", bot_id, plugin_config.bot_name)
+    await send_command_image(db_session, image_bytes, workspace=workspace, identity=identity,
+                             reply_to_id=str(get_message_id()), name="词云.png", recovery_enabled=pilot)
+
+
 @frequency.handle()
 async def _(db_session: async_scoped_session, session: Uninfo, arg: Message = CommandArg()):
     session_id = session.scene.id
@@ -2088,8 +2210,8 @@ async def _(db_session: async_scoped_session, session: Uninfo, arg: Message = Co
     if not words:
         await frequency.finish("在指定时间内，没有说过话呢")
 
-    image_bytes = await asyncio.to_thread(_build_wordcloud_image, words)
-    await UniMessage.image(raw=image_bytes).send(reply_to=True)
+    image_bytes = (await asyncio.to_thread(_build_wordcloud_image, words)).getvalue()
+    await _send_wordcloud_image(db_session, session, image_bytes)
 
 
 group_frequency = on_command("群词频")
@@ -2110,8 +2232,8 @@ async def _(db_session: async_scoped_session, session: Uninfo, arg: Message = Co
     if not words:
         await group_frequency.finish("在指定时间内，没有消息可统计")
 
-    image_bytes = await asyncio.to_thread(_build_wordcloud_image, words)
-    await UniMessage.image(raw=image_bytes).send(reply_to=True)
+    image_bytes = (await asyncio.to_thread(_build_wordcloud_image, words)).getvalue()
+    await _send_wordcloud_image(db_session, session, image_bytes)
 
 
 def _consume_rag_task(session_id: str, task: asyncio.Task[None]) -> None:

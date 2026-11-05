@@ -83,6 +83,22 @@ SETTING_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         ),
     ),
     (
+        "GPT 绘图",
+        "创作或修改图片，生成后通过文件工具发图。专用密钥留空时复用全局 OpenAI 兼容主模型配置；填写专用密钥但未填地址时使用 OpenAI 官方地址。",
+        (
+            "image_generation_enabled",
+            "image_generation_model",
+            "image_generation_api_key",
+            "image_generation_base_url",
+            "image_generation_quality",
+            "image_generation_timeout_seconds",
+            "image_generation_background_groups",
+            "image_generation_background_private",
+            "message_refactor_pilot_groups",
+            "message_refactor_pilot_private",
+        ),
+    ),
+    (
         "Google Vertex AI",
         "chat/tagging/vision 选择 Vertex 时共用；API Key 使用无需项目 ID 的 Express Mode，服务账号或 ADC 使用标准模式。",
         (
@@ -121,6 +137,7 @@ SETTING_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         "用于 Gatekeeper 判断消息是否值得回复。",
         (
             "gatekeeper_provider",
+            "decisions_api_key",
             "flash_model",
             "flash_api_key",
             "flash_base_url",
@@ -210,6 +227,7 @@ SETTING_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
 
 _DIRECT_LABELS = {
     "gatekeeper_provider": "接话判断接口",
+    "decisions_api_key": "Decisions API Key",
     "bot_name": "Bot 名称",
     "reply_probability": "主动接话抽样概率（0 关闭）",
     "proactive_observation_enabled": "偶尔主动查看群聊",
@@ -262,6 +280,16 @@ _DIRECT_LABELS = {
     "vertex_api_key": "Vertex API Key",
     "vertex_credentials_path": "服务账号 JSON 路径",
     "serpapi_api_key": "SerpApi API Key",
+    "image_generation_enabled": "启用 GPT 绘图（需要启用文件工具）",
+    "image_generation_model": "绘图模型",
+    "image_generation_api_key": "绘图 API Key",
+    "image_generation_base_url": "绘图 API 地址",
+    "image_generation_quality": "绘图质量",
+    "image_generation_timeout_seconds": "绘图等待上限（秒）",
+    "image_generation_background_groups": "独立绘图群号（* 为全部群）",
+    "image_generation_background_private": "私聊启用独立绘图任务",
+    "message_refactor_pilot_groups": "结构化消息群号（* 为全部群）",
+    "message_refactor_pilot_private": "私聊启用结构化消息",
     "serpapi_monthly_limit": "每月本地请求上限",
     "serpapi_cache_days": "结果缓存天数",
     "serpapi_timeout_seconds": "上传和搜索总超时（秒）",
@@ -289,7 +317,8 @@ _DIRECT_LABELS = {
     "qwen_token": "旧版 Qwen Token",
 }
 _FIELD_HINTS = {
-    "gatekeeper_provider": "Decisions 使用 gpt-6-luna 和已配置的 OpenAI 官方主模型凭据；Flash 用于原有快速判断。",
+    "gatekeeper_provider": "Decisions 使用 gpt-6-luna；Flash 用于原有快速判断。",
+    "decisions_api_key": "留空时复用 OpenAI 官方主模型密钥；主聊天使用其他供应商时需单独配置。",
     "chat_reasoning_effort": "用于 OpenAI 兼容接口，留空保持供应商默认（DeepSeek 默认 low）；须选择当前模型支持的档位。",
     "chat_max_tokens": "主模型输出 Token 上限，留空使用供应商默认（DeepSeek 默认 8192）；推理是否计入由供应商决定。",
     "google_web_detection_enabled": (
@@ -421,6 +450,9 @@ def _render_field(
             f'<textarea data-setting="{key}" rows="5">'
             f'{escape(str(value))}</textarea>'
         )
+    elif field_name in {"image_generation_background_groups", "message_refactor_pilot_groups"}:
+        control = (f'<input type="text" data-setting="{key}" '
+                   f'value="{escape(",".join(value))}" placeholder="群号，多个用逗号分隔" />')
     elif field_name == "chat_responses_builtin_tools":
         tool_options = (
             ("code_interpreter", "代码解释器（限时免工具费）"),
