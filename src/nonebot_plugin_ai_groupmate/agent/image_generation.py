@@ -117,9 +117,10 @@ def decode_generated_image(payload: object, output_format: str = "png") -> Gener
     elif output_format == "gif":
         try:
             with Image.open(io.BytesIO(data)) as image:
-                if image.format != "GIF" or not 2 <= getattr(image, "n_frames", 1) <= 16 or image.width * image.height * image.n_frames > MAX_IMAGE_PIXELS:
+                frame_count = getattr(image, "n_frames", 1)
+                if image.format != "GIF" or not 2 <= frame_count <= 16 or image.width * image.height * frame_count > MAX_IMAGE_PIXELS:
                     raise ValueError("invalid GIF")
-                for frame in range(image.n_frames):
+                for frame in range(frame_count):
                     image.seek(frame)
                     image.load()
         except Exception:

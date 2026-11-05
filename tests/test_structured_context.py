@@ -151,7 +151,7 @@ def test_structured_bot_mixed_images_preserve_order_and_scoped_visibility(tmp_pa
     blocks = cast(list[dict[str, Any]], messages[1].content)
     urls = [part["image_url"]["url"] for part in blocks if part["type"] == "image_url"]
     assert len(urls) == 2
-    pixels = [Image.open(BytesIO(base64.b64decode(url.split(",", 1)[1]))).getpixel((0, 0)) for url in urls]
+    pixels = [cast(tuple[int, ...], Image.open(BytesIO(base64.b64decode(url.split(",", 1)[1]))).convert("RGB").getpixel((0, 0))) for url in urls]
     assert pixels[0][0] > 240
     assert pixels[0][2] < 10
     assert pixels[1][2] > 240

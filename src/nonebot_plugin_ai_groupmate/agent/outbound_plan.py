@@ -41,7 +41,7 @@ class ReplyPlan(BaseModel):
 
     @model_validator(mode="after")
     def bounded(self):
-        if not any(part.type != "text" or part.text.strip() for part in self.parts):
+        if not any(part.type != "text" or (part.text or "").strip() for part in self.parts):
             raise ValueError("message is empty")
         if sum(part.type == "image" for part in self.parts) > 10:
             raise ValueError("at most 10 images per message")
@@ -65,10 +65,13 @@ def compose_reply(plan: ReplyPlan, images: dict[str, bytes], quoted_id: str | No
     segments = []
     for part in plan.parts:
         if part.type == "text":
+            assert part.text is not None
             segments.append(UniMessage.text(part.text))
         elif part.type == "mention":
+            assert part.user_id is not None
             segments.append(UniMessage.at(part.user_id))
         else:
+            assert part.resource_id is not None
             data = images.get(part.resource_id)
             if not data:
                 raise ValueError("image resource unavailable")

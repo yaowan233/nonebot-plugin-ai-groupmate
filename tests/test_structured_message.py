@@ -45,7 +45,7 @@ async def test_registered_files_bind_only_when_native_order_matches(tmp_path):
     marker, ids = register_chat_file_resources(files, workspace, message_id="message", group_id=session)
     assert "a.csv" in marker
     assert len(ids) == 2
-    assert all(ids)
+    assert all(ids) and ids[0] is not None
     assert ChatFileInbox(workspace).get(ids[0]).name == "a.csv"
     other = FileWorkspace(tmp_path, session_id=session, user_id="bob", bot_id="bot", is_private=False)
     with pytest.raises(FileTaskError):

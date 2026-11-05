@@ -1,5 +1,6 @@
 import json
 from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 from langchain_core.messages import AIMessage
@@ -168,7 +169,7 @@ async def test_structured_only_quote_supplies_images_to_actual_agent(monkeypatch
                                    ([{"type": "image", "file_id": artifact.file_id}] if include_image else []))
         await db.commit()
         await agent.choice_response_strategy(db, group, None, [current], "bob", "Bob", bot_id="bot-b",
-                                             bot=bot, group_members=[], reply_to_id="quote-me")
+                                             bot=cast(Any, bot), group_members=[], reply_to_id="quote-me")
     assert "prompt" in captured
     assert "这是一幅小画" in str(captured["prompt"])
     if multimodal and include_image:
@@ -178,6 +179,7 @@ async def test_structured_only_quote_supplies_images_to_actual_agent(monkeypatch
         summary.assert_not_awaited()
     elif include_image:
         assert "蓝色小猫" in captured["prompt"]
+        assert summary.await_args is not None
         assert len(summary.await_args.args[0]) == 1
     else:
         assert isinstance(captured["prompt"], str)

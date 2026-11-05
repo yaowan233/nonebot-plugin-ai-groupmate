@@ -33,6 +33,7 @@ async def test_published_image_search_uses_scoped_publication(monkeypatch, tmp_p
         assert response["status"] == "succeeded"
         assert provider.await_count == 1
         assert provider.await_args is not None
+        assert provider.await_args is not None
         assert provider.await_args.args[2] == png("red")
         bad = search.create_reverse_image_search_tool(db, group, None, None, reply_to_id="sent-123",
               pic_dir=tmp_path, config=ScopedConfig(google_web_detection_enabled=True), workspace=other)
@@ -73,6 +74,7 @@ async def test_structured_only_bot_image_is_shared_by_drawing_and_search(monkeyp
                     platform="qq", is_private=False)
         edited = json.loads(await generate.ainvoke({"prompt": "改成蓝色", "reference_message_ids": ["replied"]}))
         assert edited["reason_code"] == "image_generated"
+        assert provider.await_args is not None
         assert provider.await_args.args[2][0][0] == png("red")
         reverse = search.create_reverse_image_search_tool(db, group, None, None, reply_to_id="sent", pic_dir=tmp_path,
                     config=ScopedConfig(google_web_detection_enabled=True, message_refactor_pilot_groups=[group]),
@@ -80,6 +82,7 @@ async def test_structured_only_bot_image_is_shared_by_drawing_and_search(monkeyp
         found = json.loads(await reverse.ainvoke({}))
         assert found["status"] == "succeeded"
         assert found["data"]["source_platform_message_ids"] == ["sent"]
+        assert search_provider.await_args is not None
         assert search_provider.await_args.args[2] == png("red")
 
 
@@ -145,6 +148,7 @@ async def test_structured_user_images_keep_original_order_without_legacy_rows(mo
                     platform="qq", is_private=False)
         result = json.loads(await tool.ainvoke({"prompt": "合起来", "reference_message_ids": ["current"]}))
         assert result["reason_code"] == "image_generated"
+        assert provider.await_args is not None
         assert [item[0] for item in provider.await_args.args[2]] == [png("red"), png("blue")]
 
 
@@ -176,6 +180,7 @@ async def test_pilot_reads_old_image_when_no_structured_record_exists(monkeypatc
                     platform="qq", is_private=False)
         result = json.loads(await tool.ainvoke({"prompt": "edit", "reference_message_ids": ["replied"]}))
         assert result["reason_code"] == "image_generated"
+        assert provider.await_args is not None
         assert provider.await_args.args[2][0][0] == png("red")
 
 

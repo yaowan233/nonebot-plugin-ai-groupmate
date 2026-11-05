@@ -184,7 +184,7 @@ async def test_reply_releases_database_connection_before_adapter_send(monkeypatc
 
     assert result["status"] == "succeeded"
     assert result["delivery_state"] == "completed"
-    assert events == ["query", "commit", "send", "add", "commit"]
+    assert events == ["commit", "send", "add", "commit"]
 
 
 @pytest.mark.asyncio

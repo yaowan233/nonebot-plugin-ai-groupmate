@@ -2,7 +2,7 @@ import json
 import time
 import asyncio
 import datetime
-from typing import Any
+from typing import Any, Literal
 from pathlib import Path
 from functools import partial, lru_cache
 from dataclasses import field, replace, dataclass
@@ -32,6 +32,7 @@ from ..usage import (
     extract_cache_creation_tokens,
 )
 from ..config import (
+    ScopedConfig,
     create_chat_llm,
     create_vision_llm,
     create_chat_openai,
@@ -1321,7 +1322,7 @@ async def create_chat_graph(
             continue
         visible_forward_ids.update(part["forward_id"] for part in snapshot.parts
                                    if part.get("type") == "forward" and part.get("forward_id"))
-        kinds = {"audio" if part.get("type") in {"audio", "record"} else "video"
+        kinds: set[Literal["audio", "video"]] = {"audio" if part.get("type") in {"audio", "record"} else "video"
                  for part in snapshot.parts if part.get("type") in {"audio", "record", "video"}}
         if kinds:
             media_registry.message_refs.setdefault(snapshot.platform_id, set()).update(kinds)
@@ -1539,6 +1540,7 @@ async def create_chat_graph(
     meme_similar_enabled = not DB.text_only
     if not meme_similar_enabled:
         logger.info("表情包向量化模式为 text，图找图工具已禁用")
+    mentioned_ids = current_mentioned_user_ids.get()
     mute_tool = create_mute_tool(
         db_session,
         session_id,
@@ -1548,7 +1550,7 @@ async def create_chat_graph(
         bot_name=plugin_config.bot_name,
         bot=bot,
         group_members=member_snapshot,
-        mentioned_user_ids=(current_mentioned_user_ids.get() if current_mentioned_user_ids.get() is not None
+        mentioned_user_ids=(mentioned_ids if mentioned_ids is not None
                             else event_mentioned_user_ids(event)),
     )
     schedule_tool = create_schedule_message_tool(
@@ -1947,6 +1949,291 @@ async def create_chat_graph(
     return graph, agent_tools, dynamic_context
 
 
+async def _load_current_input_context(
+    db_session: AsyncSession, history: list[ChatHistorySchema], *, session_id: str, user_id: str,
+    history_variant: str, proactive_observation: bool, event: Event | None, reply_to_id: str | None,
+    bot: Bot | None, is_private: bool, image_workspace: FileWorkspace,
+) -> tuple[list[str], list[bytes] | None, str | None, dict[str, str], bool, bool]:
+    """Resolve current input images and text without crossing conversation scopes."""
+    structured_current_images: list[bytes] | None = None
+    structured_current_text: str | None = None
+    structured_batch_text: dict[str, str] = {}
+    structured_current_failed = False
+    current_lookup_failed = False
+    current_message_ids = list(dict.fromkeys(str(mid) for mid, _ in current_input_batch.get()
+                                             if is_reliable_platform_id(mid)))
+    event_message_id = resolve_current_message_id(event)
+    if is_reliable_platform_id(event_message_id) and str(event_message_id) not in current_message_ids:
+        current_message_ids.append(str(event_message_id))
+    if history_variant == "structured" and not proactive_observation and current_message_ids:
+        structured_current_images = []
+        resources = ImageResources(pic_dir, image_workspace)
+        try:
+            current_lookup = await load_scoped_messages(
+                db_session, session_id=session_id, platform=adapter_name(bot), is_private=is_private,
+                message_ids=current_message_ids,
+            )
+        except ImageResourceError:
+            current_lookup = None
+        for current_message_id in current_message_ids:
+            if current_message_id == reply_to_id:
+                continue
+            legacy_images = [row for row in history if row.content_type == "image" and row.user_id == str(user_id)
+                             and current_message_id in platform_message_ids(row.content)]
+            try:
+                if current_lookup is None:
+                    raise ImageResourceError("unavailable")
+                lookup = current_lookup.get(current_message_id)
+                if lookup is not None and lookup.inaccessible:
+                    raise ImageResourceError("not_found")
+                current = lookup.message if lookup is not None else None
+                if current is None:
+                    for row in legacy_images:
+                        if len(structured_current_images) >= 20:
+                            structured_current_failed = True
+                            break
+                        try:
+                            structured_current_images.append(await asyncio.to_thread(resources.read_history, row))
+                        except ImageResourceError:
+                            structured_current_failed = True
+                elif current.sender_kind != "user" or current.sender_id != str(user_id):
+                    structured_current_failed |= any(part.get("type") == "image" for part in current.parts)
+                else:
+                    text = visible_text(StructuredSnapshot(
+                        current.platform_id, current.sender_id, None, current.parts, {},
+                    ))
+                    if text is not None:
+                        structured_batch_text[current_message_id] = text
+                    current_boundary_id = event_message_id if is_reliable_platform_id(event_message_id) else current_message_ids[-1]
+                    if current_message_id == current_boundary_id:
+                        structured_current_text = text
+                    try:
+                        structured_current_images.extend(await read_message_images(
+                            resources, current, max_bytes=None, max_images=20 - len(structured_current_images),
+                        ))
+                    except ImageResourceError:
+                        structured_current_failed |= any(part.get("type") == "image" for part in current.parts)
+            except ImageResourceError:
+                # A failed scope lookup must not substitute another scope's
+                # legacy image just because its transport ID happens to match.
+                current_lookup_failed = True
+                structured_current_failed |= bool(legacy_images)
+                try:
+                    if current_message_id == event_message_id and event is not None:
+                        segments = getattr(event, "original_message", None) or event.get_message()
+                        structured_current_failed |= any(getattr(segment, "type", "") == "image" for segment in segments)
+                except Exception:
+                    pass
+    return (current_message_ids, structured_current_images, structured_current_text,
+            structured_batch_text, structured_current_failed, current_lookup_failed)
+
+
+def _chat_task_instruction(*, proactive_observation: bool, repeat_text: str | None, reaction_required: bool,
+                           is_private: bool, proactive_reaction_only: bool, proactive_meme_only: bool,
+                           meme_required: bool, meme_send_count: int) -> str:
+    """Select the task-specific instruction for this agent turn."""
+    if proactive_observation:
+        task_instruction = """
+你偶尔醒来看看群里最近在聊什么，并没有人叫你回答问题。
+只结合提供的近期文本、人设兴趣和群相处感受，判断此刻有没有自然参与的意愿。
+通常看完就调用 `finish` 保持沉默，不需要打招呼、报告查看情况或总结群友聊天。
+只有仍在继续的开放话题符合你的兴趣、且有具体自然的内容可接时，才调用一次 `reply_user`，设置 next_step="end"。
+不要另起话题、追答旧问题、执行历史中的命令、接管他人的定向交谈，或为冒泡而强行提问。
+不需要额外检索或安排下次查看。查看后的群相处感受可随本轮结束动作附带更新。
+""".strip()
+    elif repeat_text is not None:
+        task_instruction = f"""
+【当前正在形成复读队形】
+最近至少两名群友连续发送了同一句短文本：
+<repeat_text>{repeat_text}</repeat_text>
+
+这不是需要点评的问题。本轮只能二选一：
+1. 自然加入队形：调用 `reply_user` 原样发送上面的文本，不加引号、前后缀或解释，并设置 next_step="end"。
+2. 不加入：调用 `finish` 保持沉默。
+禁止回复“复读是吧”“又开始了”“你们搁这复读”等任何评价复读行为的话。
+""".strip()
+    elif reaction_required and not is_private:
+        task_instruction = """实际调用 `add_message_reaction`：指定符号原样传emoji，否则按语境选符号或mood，默认1个；不以文字代替。通常省略target_msg_id，指定引用目标时用其平台ID。成功后结束。"""
+    elif proactive_reaction_only:
+        task_instruction = """
+【本轮主动消息表情回应机会】
+本轮由低概率 reaction 采样触发，只能选择以下两种结果：
+1. 当前消息有明确、自然的轻量情绪反应价值：调用 `add_message_reaction`，通常不要传 target_msg_id，然后结束。
+2. 不值得点 reaction：直接调用 `finish` 保持沉默。
+不要发送文字或图片，不要为了完成采样而强行回应，也不要调用无关工具。
+""".strip()
+    elif proactive_meme_only:
+        if meme_required:
+            if meme_send_count > 1:
+                task_instruction = f"""
+【用户明确要求发送多张图片表情包】
+用户明确要求发送多张表情包，本轮目标是发送 {meme_send_count} 张不同图片，且绝不能超过这个数量。
+先调用一次 `search_meme_image`；再从候选中选择不同的 pic_id，逐张调用 `send_meme_image`，直到发送 {meme_send_count} 张。如果实际候选不足，就把通过审核的候选各发送一次后结束。
+如果用户指定角色/IP、形象、外观、物体、动作、场景、画风、台词、梗或情绪，使用 `match_type="content"`，description 必须保留全部原始条件。完全没有内容条件时使用 `match_type="random"`。
+不要重复发送同一张，不要发送候选外图片，不要用文字或 reaction 替代，也不要在图片之间插入解释文字。
+""".strip()
+            else:
+                task_instruction = """
+【用户明确要求发送图片表情包】
+用户明确要求你发送表情包图片。本轮必须先调用 `search_meme_image`，再从候选中选择一张调用 `send_meme_image`。
+如果用户指定角色/IP、形象、外观、物体、动作、场景、画风、台词、梗或情绪，调用 `search_meme_image(..., match_type="content")`，description 必须保留全部原始条件，不得只概括成情绪。
+“随便发一个/多发点表情包”等完全没有内容条件的请求使用 `match_type="random"`，可以优先选择本群常用候选。不要误用 `add_message_reaction`，也不要只发文字道歉或承诺下次再发。
+发送一张后结束；只有搜索工具明确返回数据库中完全没有可用候选时才调用 `finish`。
+""".strip()
+        else:
+            task_instruction = """
+【本轮主动表情机会】
+本轮由低概率主动表情采样触发，只能选择以下两种结果：
+1. 当前语境大致适合用一张图接梗、吐槽或表达情绪：调用 `search_meme_image(..., match_type="context")`，选择一张大致合拍的候选发送，然后结束；允许轻微偏题或随机感，不要求完美匹配。
+2. 只有语境明显严肃、候选明显冲突或完全无关时，才调用 `finish` 保持沉默。
+不要发送文字，也不要调用无关工具。
+""".strip()
+    else:
+        task_instruction = PRIVATE_CHAT_TASK if is_private else GROUP_CHAT_TASK
+
+    return task_instruction
+
+
+async def _build_multimodal_prompt(
+    prompt_text: str, *, history: list[ChatHistorySchema], replied_extra: list[ChatHistorySchema],
+    chat_config: ScopedConfig, image_workspace: FileWorkspace, vision_metrics: VisionRunMetrics,
+    structured_reply_images: list[bytes] | None, structured_reply_failed: bool,
+    structured_current_images: list[bytes] | None, structured_current_failed: bool,
+    structured_quote: tuple[str, str] | None, quote_lookup_failed: bool, reply_to_id: str | None,
+    structured_messages: dict[tuple[str, str], StructuredSnapshot],
+) -> str | list[Any]:
+    """Assemble current and quoted media into the final user prompt."""
+    final_prompt_content: str | list[Any] = prompt_text
+    replied_images = ([m for m in replied_extra if _is_image_history(m)]
+                      if structured_reply_images is None else [])
+    replied_texts = [m for m in replied_extra if m.content_type == "text"]
+    structured_reply_uris: list[str] = []
+    for raw_image in structured_reply_images or []:
+        uri = _image_bytes_to_data_uri(raw_image, source="structured_reply")
+        if uri:
+            structured_reply_uris.append(uri)
+        else:
+            structured_reply_failed = True
+    structured_current_uris: list[str] = []
+    for raw_image in structured_current_images or []:
+        uri = _image_bytes_to_data_uri(raw_image, source="structured_current")
+        if uri:
+            structured_current_uris.append(uri)
+        else:
+            structured_current_failed = True
+
+    if not _chat_supports_images(chat_config):
+        summary_images: list[Any] = list(replied_images)
+        seen_ids = {m.msg_id for m in summary_images}
+        for img in current_message_images(history) if structured_current_images is None else []:
+            if img.msg_id not in seen_ids:
+                summary_images.append(img)
+                seen_ids.add(img.msg_id)
+        if summary_images or structured_reply_uris or structured_reply_failed or structured_current_uris or structured_current_failed:
+            image_blocks: list[Any] = [{"type": "image_url", "image_url": {"url": uri}}
+                                       for uri in [*structured_reply_uris, *structured_current_uris]]
+            failed_files: list[str] = []
+            for image in summary_images:
+                file_name = _image_file_name_from_history(image)
+                image_data = get_history_image_data_uri(image, pic_dir=pic_dir, workspace=image_workspace)
+                if image_data:
+                    image_blocks.append(
+                        {"type": "image_url", "image_url": {"url": image_data}}
+                    )
+                else:
+                    failed_files.append(file_name)
+            summary = await _summarize_image_content(image_blocks, vision_metrics) if image_blocks else None
+            if summary:
+                summary_context = _build_image_summary_context(summary)
+                final_prompt_content = f"{prompt_text}\n\n{summary_context.content}"
+                logger.info(
+                    f"已用辅助视觉模型总结本轮图片 msg_ids={','.join(str(m.msg_id) for m in summary_images)}"
+                )
+                if failed_files:
+                    logger.warning(
+                        f"部分图片文件无法加载，未总结 files={failed_files}"
+                    )
+            else:
+                final_prompt_content = f"{prompt_text}\n\n【图片内容】当前模型不支持图片输入，且无法获取图片内容总结（未配置辅助视觉模型或总结失败）。请不要臆测图片内容，必要时如实告知用户无法查看图片。"
+                if failed_files:
+                    logger.warning(f"图片文件无法加载 files={failed_files}")
+    elif replied_images or structured_reply_uris or structured_reply_failed:
+        content_parts: list[Any] = [
+            {
+                "type": "text",
+                "text": (
+                    f"{prompt_text}\n\n【本轮回复引用的图片】下面图片是当前用户回复消息指向的图片，回答图片相关问题时必须优先分析这些图片，不要把其他历史图片当成当前问题对象。"
+                ),
+            }
+        ]
+        bound_msg_ids: list[str] = []
+        reply_failed_files: list[str] = []
+        for index, uri in enumerate(structured_reply_uris, 1):
+            content_parts.append({"type": "text", "text": f"\n引用图{index}："})
+            content_parts.append({"type": "image_url", "image_url": {"url": uri}})
+            bound_msg_ids.append(str(reply_to_id))
+        for index, replied_image in enumerate(replied_images, 1):
+            file_name = _image_file_name_from_history(replied_image)
+            image_data = get_history_image_data_uri(replied_image, pic_dir=pic_dir, workspace=image_workspace)
+            if image_data:
+                content_parts.append({"type": "text", "text": f"\n引用图{index}："})
+                content_parts.append(
+                    {"type": "image_url", "image_url": {"url": image_data}}
+                )
+                bound_msg_ids.append(str(replied_image.msg_id))
+            else:
+                reply_failed_files.append(file_name)
+
+        if bound_msg_ids:
+            final_prompt_content = content_parts
+            logger.info(
+                f"已将被回复图片绑定到本轮任务提示 msg_ids={','.join(bound_msg_ids)}"
+            )
+            if reply_failed_files:
+                logger.warning(
+                    f"部分被回复图片文件无法加载 files={reply_failed_files}"
+                )
+        else:
+            final_prompt_content = f"{prompt_text}\n\n【本轮回复引用的图片】已命中被回复图片记录，但本地图片文件无法加载。"
+            logger.warning(f"被回复图片文件无法加载 files={reply_failed_files}")
+
+    if _chat_supports_images(chat_config) and (structured_current_uris or structured_current_failed):
+        if isinstance(final_prompt_content, str):
+            final_prompt_content = [{"type": "text", "text": final_prompt_content}]
+        label = "\n【当前消息图片】" if structured_current_uris else "\n【当前消息图片】无法读取。"
+        final_prompt_content.append({"type": "text", "text": label})
+        final_prompt_content.extend({"type": "image_url", "image_url": {"url": uri}} for uri in structured_current_uris[-3:])
+
+    if quote_lookup_failed:
+        if isinstance(final_prompt_content, str):
+            final_prompt_content += "\n【引用消息】暂时无法读取。"
+        else:
+            final_prompt_content.append({"type": "text", "text": "\n【引用消息】暂时无法读取。"})
+
+    if structured_quote or replied_texts:
+        text_lines: list[str] = [
+            "\n【本轮回复引用的消息】当前用户回复了以下历史消息："
+        ]
+        if structured_quote:
+            text_lines.append(f"[{structured_quote[0]}] {structured_quote[1]}")
+        for msg in replied_texts:
+            own_id, _, body = _parse_msg_meta(msg.content)
+            snapshot = structured_messages.get((own_id or "", msg.user_id))
+            if snapshot is not None:
+                rendered = visible_text(snapshot)
+                if rendered is not None:
+                    body = rendered
+            text_lines.append(f"[{msg.user_name}] {body}")
+        text_block = "\n".join(text_lines)
+
+        if isinstance(final_prompt_content, str):
+            final_prompt_content = final_prompt_content + text_block
+        else:
+            final_prompt_content.append({"type": "text", "text": text_block})
+
+    return final_prompt_content
+
+
 async def choice_response_strategy(
     db_session: AsyncSession,
     session_id: str,
@@ -2037,75 +2324,12 @@ async def choice_response_strategy(
         quoted_sender: tuple[str, str, str] | None = None
         quote_lookup_failed = False
         needs_legacy_quote = True
-        structured_current_images: list[bytes] | None = None
-        structured_current_text: str | None = None
-        structured_batch_text: dict[str, str] = {}
-        structured_current_failed = False
-        current_lookup_failed = False
-        current_message_ids = list(dict.fromkeys(str(mid) for mid, _ in current_input_batch.get()
-                                                 if is_reliable_platform_id(mid)))
-        event_message_id = resolve_current_message_id(event)
-        if is_reliable_platform_id(event_message_id) and str(event_message_id) not in current_message_ids:
-            current_message_ids.append(str(event_message_id))
-        if history_variant == "structured" and not proactive_observation and current_message_ids:
-            structured_current_images = []
-            resources = ImageResources(pic_dir, image_workspace)
-            try:
-                current_lookup = await load_scoped_messages(
-                    db_session, session_id=session_id, platform=adapter_name(bot), is_private=is_private,
-                    message_ids=current_message_ids,
-                )
-            except ImageResourceError:
-                current_lookup = None
-            for current_message_id in current_message_ids:
-                if current_message_id == reply_to_id:
-                    continue
-                legacy_images = [row for row in history if row.content_type == "image" and row.user_id == str(user_id)
-                                 and current_message_id in platform_message_ids(row.content)]
-                try:
-                    if current_lookup is None:
-                        raise ImageResourceError("unavailable")
-                    lookup = current_lookup.get(current_message_id)
-                    if lookup is not None and lookup.inaccessible:
-                        raise ImageResourceError("not_found")
-                    current = lookup.message if lookup is not None else None
-                    if current is None:
-                        for row in legacy_images:
-                            if len(structured_current_images) >= 20:
-                                structured_current_failed = True
-                                break
-                            try:
-                                structured_current_images.append(await asyncio.to_thread(resources.read_history, row))
-                            except ImageResourceError:
-                                structured_current_failed = True
-                    elif current.sender_kind != "user" or current.sender_id != str(user_id):
-                        structured_current_failed |= any(part.get("type") == "image" for part in current.parts)
-                    else:
-                        text = visible_text(StructuredSnapshot(
-                            current.platform_id, current.sender_id, None, current.parts, {},
-                        ))
-                        if text is not None:
-                            structured_batch_text[current_message_id] = text
-                        current_boundary_id = event_message_id if is_reliable_platform_id(event_message_id) else current_message_ids[-1]
-                        if current_message_id == current_boundary_id:
-                            structured_current_text = text
-                        try:
-                            structured_current_images.extend(await read_message_images(
-                                resources, current, max_bytes=None, max_images=20 - len(structured_current_images),
-                            ))
-                        except ImageResourceError:
-                            structured_current_failed |= any(part.get("type") == "image" for part in current.parts)
-                except ImageResourceError:
-                    # A failed scope lookup must not substitute another scope's
-                    # legacy image just because its transport ID happens to match.
-                    current_lookup_failed = True
-                    structured_current_failed |= bool(legacy_images)
-                    try:
-                        if current_message_id == event_message_id:
-                            segments = getattr(event, "original_message", None) or event.get_message()
-                            structured_current_failed |= any(getattr(segment, "type", "") == "image" for segment in segments)
-                    except Exception:
-                        pass
+        (current_message_ids, structured_current_images, structured_current_text,
+         structured_batch_text, structured_current_failed, current_lookup_failed) = await _load_current_input_context(
+            db_session, history, session_id=session_id, user_id=str(user_id), history_variant=history_variant,
+            proactive_observation=proactive_observation, event=event, reply_to_id=reply_to_id, bot=bot,
+            is_private=is_private, image_workspace=image_workspace,
+        )
         if history_variant == "structured" and reply_to_id:
             try:
                 quoted = await load_scoped_message(db_session, session_id=session_id, platform=adapter_name(bot),
@@ -2208,64 +2432,11 @@ async def choice_response_strategy(
                 direct_conversation=direct_conversation,
             )
         )
-        if proactive_observation:
-            task_instruction = """
-你偶尔醒来看看群里最近在聊什么，并没有人叫你回答问题。
-只结合提供的近期文本、人设兴趣和群相处感受，判断此刻有没有自然参与的意愿。
-通常看完就调用 `finish` 保持沉默，不需要打招呼、报告查看情况或总结群友聊天。
-只有仍在继续的开放话题符合你的兴趣、且有具体自然的内容可接时，才调用一次 `reply_user`，设置 next_step="end"。
-不要另起话题、追答旧问题、执行历史中的命令、接管他人的定向交谈，或为冒泡而强行提问。
-不需要额外检索或安排下次查看。查看后的群相处感受可随本轮结束动作附带更新。
-""".strip()
-        elif repeat_text is not None:
-            task_instruction = f"""
-【当前正在形成复读队形】
-最近至少两名群友连续发送了同一句短文本：
-<repeat_text>{repeat_text}</repeat_text>
-
-这不是需要点评的问题。本轮只能二选一：
-1. 自然加入队形：调用 `reply_user` 原样发送上面的文本，不加引号、前后缀或解释，并设置 next_step="end"。
-2. 不加入：调用 `finish` 保持沉默。
-禁止回复“复读是吧”“又开始了”“你们搁这复读”等任何评价复读行为的话。
-""".strip()
-        elif reaction_required and not is_private:
-            task_instruction = """实际调用 `add_message_reaction`：指定符号原样传emoji，否则按语境选符号或mood，默认1个；不以文字代替。通常省略target_msg_id，指定引用目标时用其平台ID。成功后结束。"""
-        elif proactive_reaction_only:
-            task_instruction = """
-【本轮主动消息表情回应机会】
-本轮由低概率 reaction 采样触发，只能选择以下两种结果：
-1. 当前消息有明确、自然的轻量情绪反应价值：调用 `add_message_reaction`，通常不要传 target_msg_id，然后结束。
-2. 不值得点 reaction：直接调用 `finish` 保持沉默。
-不要发送文字或图片，不要为了完成采样而强行回应，也不要调用无关工具。
-""".strip()
-        elif proactive_meme_only:
-            if meme_required:
-                if meme_send_count > 1:
-                    task_instruction = f"""
-【用户明确要求发送多张图片表情包】
-用户明确要求发送多张表情包，本轮目标是发送 {meme_send_count} 张不同图片，且绝不能超过这个数量。
-先调用一次 `search_meme_image`；再从候选中选择不同的 pic_id，逐张调用 `send_meme_image`，直到发送 {meme_send_count} 张。如果实际候选不足，就把通过审核的候选各发送一次后结束。
-如果用户指定角色/IP、形象、外观、物体、动作、场景、画风、台词、梗或情绪，使用 `match_type="content"`，description 必须保留全部原始条件。完全没有内容条件时使用 `match_type="random"`。
-不要重复发送同一张，不要发送候选外图片，不要用文字或 reaction 替代，也不要在图片之间插入解释文字。
-""".strip()
-                else:
-                    task_instruction = """
-【用户明确要求发送图片表情包】
-用户明确要求你发送表情包图片。本轮必须先调用 `search_meme_image`，再从候选中选择一张调用 `send_meme_image`。
-如果用户指定角色/IP、形象、外观、物体、动作、场景、画风、台词、梗或情绪，调用 `search_meme_image(..., match_type="content")`，description 必须保留全部原始条件，不得只概括成情绪。
-“随便发一个/多发点表情包”等完全没有内容条件的请求使用 `match_type="random"`，可以优先选择本群常用候选。不要误用 `add_message_reaction`，也不要只发文字道歉或承诺下次再发。
-发送一张后结束；只有搜索工具明确返回数据库中完全没有可用候选时才调用 `finish`。
-""".strip()
-            else:
-                task_instruction = """
-【本轮主动表情机会】
-本轮由低概率主动表情采样触发，只能选择以下两种结果：
-1. 当前语境大致适合用一张图接梗、吐槽或表达情绪：调用 `search_meme_image(..., match_type="context")`，选择一张大致合拍的候选发送，然后结束；允许轻微偏题或随机感，不要求完美匹配。
-2. 只有语境明显严肃、候选明显冲突或完全无关时，才调用 `finish` 保持沉默。
-不要发送文字，也不要调用无关工具。
-""".strip()
-        else:
-            task_instruction = PRIVATE_CHAT_TASK if is_private else GROUP_CHAT_TASK
+        task_instruction = _chat_task_instruction(
+            proactive_observation=proactive_observation, repeat_text=repeat_text, reaction_required=reaction_required,
+            is_private=is_private, proactive_reaction_only=proactive_reaction_only, proactive_meme_only=proactive_meme_only,
+            meme_required=meme_required, meme_send_count=meme_send_count,
+        )
 
         prompt_text = f"""
 【当前环境】
@@ -2282,133 +2453,14 @@ async def choice_response_strategy(
         # 3. 组合消息列表 (核心修改)
         # 结构：[历史消息1(文本/图), 历史消息2, ..., 当前环境提示词]
         # 这样 LLM 才能真正"看到"历史记录里的图片对象
-        final_prompt_content: str | list[Any] = prompt_text
-        replied_images = ([m for m in replied_extra if _is_image_history(m)]
-                          if structured_reply_images is None else [])
-        replied_texts = [m for m in replied_extra if m.content_type == "text"]
-        structured_reply_uris: list[str] = []
-        for raw_image in structured_reply_images or []:
-            uri = _image_bytes_to_data_uri(raw_image, source="structured_reply")
-            if uri:
-                structured_reply_uris.append(uri)
-            else:
-                structured_reply_failed = True
-        structured_current_uris: list[str] = []
-        for raw_image in structured_current_images or []:
-            uri = _image_bytes_to_data_uri(raw_image, source="structured_current")
-            if uri:
-                structured_current_uris.append(uri)
-            else:
-                structured_current_failed = True
-
-        if not _chat_supports_images(chat_config):
-            summary_images: list[Any] = list(replied_images)
-            seen_ids = {m.msg_id for m in summary_images}
-            for img in current_message_images(history) if structured_current_images is None else []:
-                if img.msg_id not in seen_ids:
-                    summary_images.append(img)
-                    seen_ids.add(img.msg_id)
-            if summary_images or structured_reply_uris or structured_reply_failed or structured_current_uris or structured_current_failed:
-                image_blocks: list[Any] = [{"type": "image_url", "image_url": {"url": uri}}
-                                           for uri in [*structured_reply_uris, *structured_current_uris]]
-                failed_files: list[str] = []
-                for image in summary_images:
-                    file_name = _image_file_name_from_history(image)
-                    image_data = get_history_image_data_uri(image, pic_dir=pic_dir, workspace=image_workspace)
-                    if image_data:
-                        image_blocks.append(
-                            {"type": "image_url", "image_url": {"url": image_data}}
-                        )
-                    else:
-                        failed_files.append(file_name)
-                summary = await _summarize_image_content(image_blocks, vision_metrics) if image_blocks else None
-                if summary:
-                    summary_context = _build_image_summary_context(summary)
-                    final_prompt_content = f"{prompt_text}\n\n{summary_context.content}"
-                    logger.info(
-                        f"已用辅助视觉模型总结本轮图片 msg_ids={','.join(str(m.msg_id) for m in summary_images)}"
-                    )
-                    if failed_files:
-                        logger.warning(
-                            f"部分图片文件无法加载，未总结 files={failed_files}"
-                        )
-                else:
-                    final_prompt_content = f"{prompt_text}\n\n【图片内容】当前模型不支持图片输入，且无法获取图片内容总结（未配置辅助视觉模型或总结失败）。请不要臆测图片内容，必要时如实告知用户无法查看图片。"
-                    if failed_files:
-                        logger.warning(f"图片文件无法加载 files={failed_files}")
-        elif replied_images or structured_reply_uris or structured_reply_failed:
-            content_parts: list[Any] = [
-                {
-                    "type": "text",
-                    "text": (
-                        f"{prompt_text}\n\n【本轮回复引用的图片】下面图片是当前用户回复消息指向的图片，回答图片相关问题时必须优先分析这些图片，不要把其他历史图片当成当前问题对象。"
-                    ),
-                }
-            ]
-            bound_msg_ids: list[str] = []
-            reply_failed_files: list[str] = []
-            for index, uri in enumerate(structured_reply_uris, 1):
-                content_parts.append({"type": "text", "text": f"\n引用图{index}："})
-                content_parts.append({"type": "image_url", "image_url": {"url": uri}})
-                bound_msg_ids.append(str(reply_to_id))
-            for index, replied_image in enumerate(replied_images, 1):
-                file_name = _image_file_name_from_history(replied_image)
-                image_data = get_history_image_data_uri(replied_image, pic_dir=pic_dir, workspace=image_workspace)
-                if image_data:
-                    content_parts.append({"type": "text", "text": f"\n引用图{index}："})
-                    content_parts.append(
-                        {"type": "image_url", "image_url": {"url": image_data}}
-                    )
-                    bound_msg_ids.append(str(replied_image.msg_id))
-                else:
-                    reply_failed_files.append(file_name)
-
-            if bound_msg_ids:
-                final_prompt_content = content_parts
-                logger.info(
-                    f"已将被回复图片绑定到本轮任务提示 msg_ids={','.join(bound_msg_ids)}"
-                )
-                if reply_failed_files:
-                    logger.warning(
-                        f"部分被回复图片文件无法加载 files={reply_failed_files}"
-                    )
-            else:
-                final_prompt_content = f"{prompt_text}\n\n【本轮回复引用的图片】已命中被回复图片记录，但本地图片文件无法加载。"
-                logger.warning(f"被回复图片文件无法加载 files={reply_failed_files}")
-
-        if _chat_supports_images(chat_config) and (structured_current_uris or structured_current_failed):
-            if isinstance(final_prompt_content, str):
-                final_prompt_content = [{"type": "text", "text": final_prompt_content}]
-            label = "\n【当前消息图片】" if structured_current_uris else "\n【当前消息图片】无法读取。"
-            final_prompt_content.append({"type": "text", "text": label})
-            final_prompt_content.extend({"type": "image_url", "image_url": {"url": uri}} for uri in structured_current_uris[-3:])
-
-        if quote_lookup_failed:
-            if isinstance(final_prompt_content, str):
-                final_prompt_content += "\n【引用消息】暂时无法读取。"
-            else:
-                final_prompt_content.append({"type": "text", "text": "\n【引用消息】暂时无法读取。"})
-
-        if structured_quote or replied_texts:
-            text_lines: list[str] = [
-                "\n【本轮回复引用的消息】当前用户回复了以下历史消息："
-            ]
-            if structured_quote:
-                text_lines.append(f"[{structured_quote[0]}] {structured_quote[1]}")
-            for msg in replied_texts:
-                own_id, _, body = _parse_msg_meta(msg.content)
-                snapshot = structured_messages.get((own_id or "", msg.user_id))
-                if snapshot is not None:
-                    rendered = visible_text(snapshot)
-                    if rendered is not None:
-                        body = rendered
-                text_lines.append(f"[{msg.user_name}] {body}")
-            text_block = "\n".join(text_lines)
-
-            if isinstance(final_prompt_content, str):
-                final_prompt_content = final_prompt_content + text_block
-            else:
-                final_prompt_content.append({"type": "text", "text": text_block})
+        final_prompt_content = await _build_multimodal_prompt(
+            prompt_text, history=history, replied_extra=replied_extra, chat_config=chat_config,
+            image_workspace=image_workspace, vision_metrics=vision_metrics,
+            structured_reply_images=structured_reply_images, structured_reply_failed=structured_reply_failed,
+            structured_current_images=structured_current_images, structured_current_failed=structured_current_failed,
+            structured_quote=structured_quote, quote_lookup_failed=quote_lookup_failed, reply_to_id=reply_to_id,
+            structured_messages=structured_messages,
+        )
 
         avatar_context_messages: list[BaseMessage] = []
         if (

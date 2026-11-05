@@ -565,12 +565,10 @@ async def test_wordcloud_delivery_switch_is_scoped(monkeypatch, tmp_path):
         session = SimpleNamespace(scene=SimpleNamespace(id=group, type=SceneType.GROUP),
                                   user=SimpleNamespace(id="alice"), self_id="bot")
         await plugin._send_wordcloud_image(object(), cast(Any, session), b"image")
-    command_send.assert_awaited_once()
-    legacy_send.assert_awaited_once()
-    assert command_send.await_args is not None
-    assert command_send.await_args.kwargs["reply_to_id"] == "request"
-    assert legacy_send.await_args is not None
-    assert legacy_send.await_args.kwargs["reply_to"] is True
+    assert command_send.await_count == 2
+    legacy_send.assert_not_awaited()
+    assert [call.kwargs["recovery_enabled"] for call in command_send.await_args_list] == [True, False]
+    assert all(call.kwargs["reply_to_id"] == "request" for call in command_send.await_args_list)
 
 
 def test_wordcloud_output_can_be_saved_as_an_image():

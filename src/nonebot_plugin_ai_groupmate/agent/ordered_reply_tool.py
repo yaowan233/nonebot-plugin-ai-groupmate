@@ -66,8 +66,8 @@ def create_ordered_reply_tool(db_session, session_id, request_id, *, workspace, 
         delivery_id = None
         try:
             plan = ReplyPlan.model_validate({"parts": parts, "reply_to": reply_to})
-            meme_count = sum(part.type == "image" and (part.resource_id.startswith("meme:") or
-                             part.resource_id.removeprefix("file:") in prepared_memes) for part in plan.parts)
+            meme_count = sum(part.type == "image" and ((part.resource_id or "").startswith("meme:") or
+                             (part.resource_id or "").removeprefix("file:") in prepared_memes) for part in plan.parts)
             if meme_count > 5:
                 raise ValueError("每条消息最多发送 5 张表情包")
             if request_id and not await is_request_active(session_id, request_id):
@@ -87,7 +87,7 @@ def create_ordered_reply_tool(db_session, session_id, request_id, *, workspace, 
             drawing_ids: set[str] = set()
             persisted_parts: list[dict[str, str]] = []
             total_bytes = 0
-            has_drawing = any(part.type == "image" and part.resource_id.startswith("drawing:") for part in plan.parts)
+            has_drawing = any(part.type == "image" and (part.resource_id or "").startswith("drawing:") for part in plan.parts)
             for part in plan.parts:
                 if part.type == "mention":
                     if part.user_id not in allowed_members:
@@ -96,6 +96,7 @@ def create_ordered_reply_tool(db_session, session_id, request_id, *, workspace, 
                     persisted_parts.append(part.model_dump(exclude_none=True))
                     continue
                 resource_id = part.resource_id
+                assert resource_id is not None
                 kind, sep, identifier = resource_id.partition(":")
                 if not sep:
                     raise ValueError("图片资源标识格式无效")
@@ -105,8 +106,10 @@ def create_ordered_reply_tool(db_session, session_id, request_id, *, workspace, 
                     drawing_ids.add(identifier)
                     persisted_parts.append(part.model_dump(exclude_none=True))
                     continue
+                source_artifact = None
                 if kind == "file":
                     artifact = await asyncio.to_thread(workspace.get, identifier)
+                    source_artifact = artifact
                     data = await asyncio.to_thread(workspace.read, identifier)
                     file_ids.append(artifact.file_id)
                     media_ids.append(None)
@@ -139,7 +142,8 @@ def create_ordered_reply_tool(db_session, session_id, request_id, *, workspace, 
                 elif kind == "file" and has_drawing:
                     # Freeze peer-visible files in this job's own scope so the
                     # background worker can resolve them after reconnect/restart.
-                    artifact = await asyncio.to_thread(workspace.save, data, artifact.name, content_type=artifact.content_type)
+                    assert source_artifact is not None
+                    artifact = await asyncio.to_thread(workspace.save, data, source_artifact.name, content_type=source_artifact.content_type)
                     persisted_parts.append({"type": "image", "resource_id": "file:" + artifact.file_id})
                 else:
                     persisted_parts.append(part.model_dump(exclude_none=True))
@@ -193,8 +197,15 @@ def create_ordered_reply_tool(db_session, session_id, request_id, *, workspace, 
                 header = f"id: {message_id}\n" + (f"回复id: {quoted}\n" if quoted else "")
                 rows = []
                 for part in plan.parts:
-                    content, media_id = (descriptions[part.resource_id] if part.type == "image" else
-                                         (part.text if part.type == "text" else "@" + part.user_id, None))
+                    if part.type == "image":
+                        assert part.resource_id is not None
+                        content, media_id = descriptions[part.resource_id]
+                    elif part.type == "text":
+                        assert part.text is not None
+                        content, media_id = part.text, None
+                    else:
+                        assert part.user_id is not None
+                        content, media_id = "@" + part.user_id, None
                     rows.append(ChatHistory(session_id=session_id, user_id=bot_name, user_name=bot_name,
                                             content_type="bot", content=header + content, media_id=media_id))
                 return rows

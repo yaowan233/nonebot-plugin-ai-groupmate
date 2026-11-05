@@ -2,11 +2,13 @@
 
 import json
 from dataclasses import field, dataclass, replace
+from collections.abc import Sequence
 
 from sqlalchemy import Select
 from nonebot.log import logger
 
 from ..model import MediaStorage, ChatHistorySchema, StructuredMessage, HistoryMessageIndex
+from ..interaction_history import HistoryMessage
 from ..message_mentions import format_member_mention
 from ..message_metadata import platform_message_ids
 from ..media_message import format_media_markers
@@ -92,7 +94,7 @@ def visible_quote_text(snapshot: StructuredSnapshot) -> str | None:
     return "".join(output) or None
 
 
-async def load_structured_context(db, history: list[ChatHistorySchema], *, session_id: str,
+async def load_structured_context(db, history: Sequence[ChatHistorySchema | HistoryMessage], *, session_id: str,
                                   scope: str, platform: str, include_media: bool = True) -> dict[tuple[str, str], StructuredSnapshot]:
     """Return only records for the current platform, conversation and sender."""
     history_rows = [row for row in history if row.session_id == session_id]
@@ -142,7 +144,7 @@ async def load_structured_context(db, history: list[ChatHistorySchema], *, sessi
     }
 
 
-async def load_structured_context_safely(db, history: list[ChatHistorySchema], *, session_id: str,
+async def load_structured_context_safely(db, history: Sequence[ChatHistorySchema | HistoryMessage], *, session_id: str,
                                          scope: str, platform: str,
                                          include_media: bool = True) -> dict[tuple[str, str], StructuredSnapshot] | None:
     """Return None on failure so the caller can rebuild using legacy history."""

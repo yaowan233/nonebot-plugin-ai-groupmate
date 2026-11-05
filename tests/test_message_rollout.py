@@ -10,8 +10,9 @@ def test_rollout_scope_defaults_and_switch():
     from nonebot_plugin_ai_groupmate.message_rollout import message_pilot_enabled
 
     cfg = ScopedConfig()
-    assert not message_pilot_enabled(cfg, "g", is_private=False)
-    assert not message_pilot_enabled(cfg, "g", is_private=True)
+    assert message_pilot_enabled(cfg, "g", is_private=False)
+    assert message_pilot_enabled(cfg, "g", is_private=True)
+    cfg.message_refactor_pilot_private = False
     cfg.message_refactor_pilot_groups = ["g"]
     assert message_pilot_enabled(cfg, "g", is_private=False)
     assert not message_pilot_enabled(cfg, "other", is_private=False)

@@ -57,6 +57,7 @@ async def test_markup_tool_uses_original_and_owned_transparent_layer(monkeypatch
     result = json.loads(await generate.ainvoke({"prompt": "change the circled area", "reference_file_ids": [original.file_id],
                                                "markup_file_id": markup.file_id, "complexity": "low"}))
     assert result["status"] == "succeeded"
+    assert provider.await_args is not None
     assert provider.await_args.args[2][0][0] == png()
     assert provider.await_args.kwargs["markup"][0] == overlay()
     assert provider.await_args.kwargs["complexity"] == "low"
@@ -69,6 +70,7 @@ async def test_gif_defaults_to_auto_even_if_model_picks_a_static_size(monkeypatc
     result = json.loads(await generate.ainvoke({"prompt": "peaceful beach animation", "output_format": "gif",
                                                "size": "1536x1024", "frame_count": 16}))
     assert result["status"] == "succeeded"
+    assert provider.await_args is not None
     assert provider.await_args.kwargs["size"] == "auto"
 
 
@@ -79,6 +81,7 @@ async def test_gif_keeps_explicitly_requested_size(monkeypatch, tmp_path):
     result = json.loads(await generate.ainvoke({"prompt": "peaceful beach animation", "output_format": "gif",
                                                "size": "1024x1024", "size_explicit": True}))
     assert result["status"] == "succeeded"
+    assert provider.await_args is not None
     assert provider.await_args.kwargs["size"] == "1024x1024"
 
 
@@ -103,6 +106,7 @@ async def test_gif_auto_size_survives_background_queue(monkeypatch, tmp_path):
                                                    "size": "1536x1024", "frame_count": 16}))
         assert result["reason_code"] == "drawing_queued"
         job = await db.get(DrawingJob, result["data"]["job_id"])
+        assert job is not None and job.image_options is not None
         assert job.size == "auto"
         assert job.image_options["frame_count"] == 16
 
@@ -188,6 +192,7 @@ async def test_background_gif_options_survive_queue_and_delivery(monkeypatch, tm
         queued = await enqueue_drawing(db, req)
         await db.commit()
     assert await run_generation(queued.job_id, lambda job: service.generate_job(job, root=tmp_path, config=cfg))
+    assert provider.await_args is not None
     assert provider.await_args.kwargs["output_format"] == "gif"
     assert provider.await_args.kwargs["complexity"] == "low"
     assert await run_delivery(queued.job_id, lambda job: service.deliver_job(job, root=tmp_path))
@@ -195,6 +200,7 @@ async def test_background_gif_options_survive_queue_and_delivery(monkeypatch, tm
     assert any(getattr(segment, "raw", None) == animation() for segment in sent[0] if segment.type == "image")
     async with get_session() as db:
         job = await db.get(DrawingJob, queued.job_id)
+        assert job is not None and job.result_file_id is not None
         workspace = FileWorkspace(tmp_path, session_id=group, user_id=req.user_id, bot_id=req.bot_id, is_private=False, peer_bot_ids=())
         artifact = workspace.get(job.result_file_id)
         assert artifact.name.endswith(".gif")
@@ -228,5 +234,6 @@ async def test_background_markup_loads_owned_overlay(monkeypatch, tmp_path):
         job = await enqueue_drawing(db, req)
         await db.commit()
     assert await run_generation(job.job_id, lambda task: service.generate_job(task, root=tmp_path, config=cfg))
+    assert provider.await_args is not None
     assert provider.await_args.kwargs["markup"][0] == overlay()
     assert provider.await_args.kwargs["complexity"] == "low"

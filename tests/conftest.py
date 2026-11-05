@@ -8,15 +8,14 @@ _TEST_LOCALSTORE_ROOT = Path(
     tempfile.mkdtemp(prefix="nonebot-plugin-ai-groupmate-tests-")
 ).resolve()
 _TEST_PROCESS_ROOT = _TEST_LOCALSTORE_ROOT / str(os.getpid())
+_TEST_PROCESS_ROOT.mkdir(parents=True, exist_ok=True)
 
 os.environ["ENVIRONMENT"] = "test"
 os.environ["DRIVER"] = "~none"
 os.environ["LOCALSTORE_CACHE_DIR"] = str(_TEST_PROCESS_ROOT / "cache")
 os.environ["LOCALSTORE_CONFIG_DIR"] = str(_TEST_PROCESS_ROOT / "config")
 os.environ["LOCALSTORE_DATA_DIR"] = str(_TEST_PROCESS_ROOT / "data")
-os.environ["SQLALCHEMY_DATABASE_URL"] = (
-    "sqlite+aiosqlite:///file::memory:?uri=true&cache=shared"
-)
+os.environ["SQLALCHEMY_DATABASE_URL"] = f"sqlite+aiosqlite:///{(_TEST_PROCESS_ROOT / 'tests.sqlite3').as_posix()}"
 os.environ["ALEMBIC_STARTUP_CHECK"] = "false"
 
 import pytest

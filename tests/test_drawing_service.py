@@ -544,7 +544,8 @@ async def test_job_management_only_shows_and_cancels_own_jobs():
         await db.commit()
         tools = create_drawing_management_tools(db, platform="qq", session_id=item.session_id,
                                                is_private=False, user_id="alice", request_id=None)
-        status, cancel = tools
+        status, cancel = (next(tool for tool in tools if tool.name == name)
+                          for name in ("get_drawing_jobs", "cancel_drawing_job"))
         result = json.loads(await status.ainvoke({}))
         assert [job["job_id"] for job in result["data"]["jobs"]] == [own.job_id]
         forbidden = json.loads(await cancel.ainvoke({"job_id": other.job_id}))

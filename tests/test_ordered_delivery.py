@@ -1,11 +1,12 @@
 import io
 import json
+from typing import cast
 from uuid import uuid4
 from types import SimpleNamespace
 from importlib import import_module
 
 from PIL import Image
-from sqlalchemy import Select, update
+from sqlalchemy import Select, update, CursorResult
 
 
 def image_bytes(color):
@@ -53,6 +54,7 @@ async def test_ordered_message_sends_one_chain_and_records_all_images(monkeypatc
             native = await sent[0].export(adapter="OneBot V11", fallback=False)
             assert [segment.type for segment in native] == ["reply", "text", "image", "text", "image", "text"]
             row = await db.scalar(Select(StructuredMessage).where(StructuredMessage.session_id == group))
+            assert row is not None
             assert row.reply_to_id == "123"
             assert [part["type"] for part in row.parts] == ["text", "image", "text", "image", "text"]
             assert [part["file_id"] for part in row.parts if part["type"] == "image"] == [a.file_id, b.file_id]
@@ -114,8 +116,10 @@ async def test_waiting_drawings_deliver_together_and_can_be_cancelled(monkeypatc
         assert len(sent) == 1
         async with get_session() as db:
             row = await db.scalar(Select(StructuredMessage).where(StructuredMessage.session_id == group))
+            assert row is not None
             assert [part["type"] for part in row.parts] == ["image", "text", "image"]
             batch = await db.get(OrderedDeliveryJob, batch_id)
+            assert batch is not None
             assert batch.status == "completed"
             assert not await cancel_batch(db, batch_id, platform="qq", session_id=group, is_private=False, user_id="alice")
         assert not await run_ordered_delivery(batch_id, root=tmp_path / "agent_files")
@@ -149,8 +153,9 @@ async def test_cancel_during_preparation_prevents_dispatch():
         await db.commit()
         result = await db.execute(update(OrderedDeliveryJob).where(OrderedDeliveryJob.job_id == batch_id,
             OrderedDeliveryJob.status == "preparing", OrderedDeliveryJob.claim_token == "worker").values(status="delivering"))
-        assert result.rowcount == 0
-        assert (await db.get(DrawingJob, job_id, populate_existing=True)).status == "cancelled"
+        assert cast(CursorResult, result).rowcount == 0
+        drawing = await db.get(DrawingJob, job_id, populate_existing=True)
+        assert drawing is not None and drawing.status == "cancelled"
 
 
 async def test_prepared_memes_survive_next_search_and_form_one_message(monkeypatch, tmp_path):
@@ -202,6 +207,7 @@ async def test_prepared_memes_survive_next_search_and_form_one_message(monkeypat
             assert result["data"]["meme_count"] == 2
             assert len(sent) == 1
             snapshot = await db.scalar(Select(StructuredMessage).where(StructuredMessage.session_id == group))
+            assert snapshot is not None
             assert [part["type"] for part in snapshot.parts] == ["image", "text", "image"]
     finally:
         await deactivate_request_id(group, request)
@@ -316,11 +322,13 @@ async def test_restart_recovers_preparation_but_does_not_retry_uncertain_send():
         await db.commit()
         first = await db.get(OrderedDeliveryJob, preparing, populate_existing=True)
         second = await db.get(OrderedDeliveryJob, delivering, populate_existing=True)
+        assert first is not None and second is not None
         assert first.status == "waiting"
         assert first.claim_token is None
         assert second.status == "delivery_unknown"
         assert second.claim_token is None
-        assert (await db.get(DrawingJob, job_id, populate_existing=True)).status == "delivery_unknown"
+        drawing = await db.get(DrawingJob, job_id, populate_existing=True)
+        assert drawing is not None and drawing.status == "delivery_unknown"
 
 
 def test_ordered_delivery_migration_preserves_existing_drawings():
@@ -333,12 +341,12 @@ def test_ordered_delivery_migration_preserves_existing_drawings():
     with engine.begin() as connection:
         connection.execute(text("CREATE TABLE nonebot_plugin_ai_groupmate_drawingjob (job_id VARCHAR(32) PRIMARY KEY)"))
         connection.execute(text("INSERT INTO nonebot_plugin_ai_groupmate_drawingjob VALUES ('old-job')"))
-        old_op = migration.op
-        migration.op = Operations(MigrationContext.configure(connection))
+        old_op = getattr(migration, "op")
+        setattr(migration, "op", Operations(MigrationContext.configure(connection)))
         try:
             migration.upgrade()
         finally:
-            migration.op = old_op
+            setattr(migration, "op", old_op)
         assert "nonebot_plugin_ai_groupmate_ordereddeliveryjob" in inspect(connection).get_table_names()
         row = connection.execute(text("SELECT job_id, batch_id FROM nonebot_plugin_ai_groupmate_drawingjob")).one()
         assert tuple(row) == ("old-job", None)

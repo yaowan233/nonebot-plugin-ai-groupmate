@@ -1,6 +1,7 @@
 import re
 import asyncio
 from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 
@@ -39,7 +40,7 @@ async def test_worker_trace_measures_real_global_slot_wait(monkeypatch):
     agent_run_gate.configure(1)
     try:
         async with agent_run_gate.slot():
-            task = asyncio.create_task(plugin._execute_reply_request(request))
+            task = asyncio.create_task(plugin._execute_reply_request(cast(Any, request)))
             await asyncio.sleep(0.03)
             assert not task.done()
         await task
@@ -48,5 +49,7 @@ async def test_worker_trace_measures_real_global_slot_wait(monkeypatch):
         plugin.logger.remove(sink)
     line = next(line for line in logs if "stage=worker_admitted" in line)
     assert f"trace={trace_id('group', 'private-request')}" in line
-    assert int(re.search(r"global_slot_wait_ms=(\d+)", line).group(1)) >= 20
+    match = re.search(r"global_slot_wait_ms=(\d+)", line)
+    assert match is not None
+    assert int(match.group(1)) >= 20
     assert "private-request" not in line

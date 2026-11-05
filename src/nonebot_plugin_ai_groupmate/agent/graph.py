@@ -1678,6 +1678,7 @@ def _make_tool_node(
                     called_finish += 1
                 if (name == "send_ordered_message" and required_side_effect_tool == "send_meme_image"
                         and tool_status == "succeeded" and not delivery_unknown and isinstance(delivery_data, dict)
+                        and isinstance(parsed_tool_result, dict)
                         and parsed_tool_result.get("delivery_state") == "completed"):
                     required_side_effect_success_count += int(delivery_data.get("meme_count", 0))
                     required_side_effect_completed = required_side_effect_success_count >= required_side_effect_target_count

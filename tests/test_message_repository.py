@@ -29,7 +29,7 @@ async def test_structured_quote_lookup_respects_scope_and_legacy_fallback():
         assert await resolve_reply_target(db, session, "structured-only", outbound_identity=group) == "structured-only"
 
 
-async def test_structured_quote_read_error_keeps_legacy_lookup_usable():
+async def test_structured_quote_read_error_fails_closed_and_keeps_database_usable():
     from sqlalchemy import Select, event
     from nonebot_plugin_orm import get_session
 
@@ -48,7 +48,8 @@ async def test_structured_quote_read_error_keeps_legacy_lookup_usable():
         event.listen(engine, "before_cursor_execute", fail_structured)
         try:
             identity = OutboundIdentity("qq", "group", "bot", "miyuki")
-            assert await resolve_reply_target(db, session, "old", outbound_identity=identity) == "old"
+            with pytest.raises(ValueError, match="无法确认消息所属会话"):
+                await resolve_reply_target(db, session, "old", outbound_identity=identity)
             assert await db.scalar(Select(ChatHistory.msg_id).where(ChatHistory.session_id == session)) is not None
         finally:
             event.remove(engine, "before_cursor_execute", fail_structured)

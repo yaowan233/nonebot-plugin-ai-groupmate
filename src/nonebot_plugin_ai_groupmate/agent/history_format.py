@@ -299,7 +299,8 @@ def format_chat_history(
     snapshots = structured_messages or {}
     resolver = TurnHistoryResolver(snapshots)
     # Reply-image records may contain another copy of a bot's adapter echo.
-    combined = deduplicate_bot_echoes([*history, *(extra_inline_images or [])], ids_for=resolver.ids)
+    all_rows: list[ChatHistorySchema] = [*history, *(extra_inline_images or [])]
+    combined = deduplicate_bot_echoes(all_rows, ids_for=resolver.ids)
     retained = {id(message) for message in combined}
     history = [message for message in history if id(message) in retained]
     user_roles = user_roles or {}
@@ -319,7 +320,7 @@ def format_chat_history(
                 if key[1] == message.user_id:
                     ids.update(snapshots[key].history_platform_ids.get(message.msg_id, (key[0],)))
             return ids
-        return platform_message_ids(message.content)
+        return set(platform_message_ids(message.content))
 
     def row_own_id(message: ChatHistorySchema) -> str | None:
         indexed_keys = structured_keys_by_history.get(message.msg_id)

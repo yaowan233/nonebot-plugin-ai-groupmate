@@ -446,12 +446,12 @@ async def test_inbound_text_strips_nul_before_database_write(deliver_message, us
         event.listen(engine, "before_cursor_execute", reject_nul)
         try:
             await deliver(session_id, "-2072206098", text, user_name=user_name, member_nick=member_nick)
-            # The body fallback must compare the same sanitized text across bots.
+            # Different transport IDs remain separate even if their bodies match.
             await deliver(session_id, "-2072206097", text, user_name=user_name, member_nick=member_nick, bot_id="bot-2")
             rows = (await db.execute(Select(ChatHistory).where(ChatHistory.session_id == session_id))).scalars().all()
-            assert len(rows) == 1
-            assert rows[0].user_name == (member_nick or user_name).replace("\x00", "")
-            assert rows[0].content == f"id: -2072206098\n{text.replace(chr(0), '')}"
+            assert len(rows) == 2
+            assert all(row.user_name == (member_nick or user_name).replace("\x00", "") for row in rows)
+            assert {row.content for row in rows} == {f"id: {message_id}\n{text.replace(chr(0), '')}" for message_id in ("-2072206098", "-2072206097")}
         finally:
             event.remove(engine, "before_cursor_execute", reject_nul)
 

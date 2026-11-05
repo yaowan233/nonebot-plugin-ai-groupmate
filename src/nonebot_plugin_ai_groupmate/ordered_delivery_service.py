@@ -3,8 +3,9 @@
 import uuid
 import asyncio
 from pathlib import Path
+from typing import cast
 
-from sqlalchemy import Select, update
+from sqlalchemy import Select, update, CursorResult
 from nonebot.log import logger
 from nonebot_plugin_orm import get_session
 from nonebot_plugin_alconna import Target, UniMessage
@@ -27,6 +28,9 @@ async def run_ordered_delivery(batch_id: str, *, root: Path) -> bool:
             await db.rollback()
             return False
         batch = await db.get(OrderedDeliveryJob, batch_id, populate_existing=True)
+        if batch is None:
+            await db.rollback()
+            return False
         children = list((await db.scalars(Select(DrawingJob).where(DrawingJob.batch_id == batch_id))).all())
         db.expunge(batch)
         for child in children:
@@ -45,9 +49,10 @@ async def run_ordered_delivery(batch_id: str, *, root: Path) -> bool:
             message = UniMessage.text(content)
             if batch.reply_to_id:
                 message = UniMessage.reply(batch.reply_to_id) + message
-            def record(message_id):
+            def record_notice(message_id):
                 return [ChatHistory(session_id=batch.session_id, user_id=batch.bot_name, user_name=batch.bot_name,
                                     content_type="bot", content=f"id: {message_id}\n{content}")]
+            record = record_notice
             publications = []
             file_ids = []
         else:
@@ -70,6 +75,7 @@ async def run_ordered_delivery(batch_id: str, *, root: Path) -> bool:
             for part in plan.parts:
                 if part.type != "image":
                     continue
+                assert part.resource_id is not None
                 kind, _, file_id = part.resource_id.partition(":")
                 if kind != "file":
                     raise ValueError("invalid image resource")
@@ -86,20 +92,24 @@ async def run_ordered_delivery(batch_id: str, *, root: Path) -> bool:
             message = compose_reply(plan, images, batch.reply_to_id)
             if batch.platform == "OneBot V11":
                 await message.export(adapter="OneBot V11", fallback=False)
-            def record(message_id):
+            def record_message(message_id):
                 header = f"id: {message_id}\n" + (f"回复id: {batch.reply_to_id}\n" if batch.reply_to_id else "")
                 rows = []
                 for part in plan.parts:
                     if part.type == "image":
+                        assert part.resource_id is not None
                         file_id = part.resource_id.partition(":")[2]
                         content = f"[图片文件] {names[part.resource_id]} file_id={file_id}"
                     elif part.type == "mention":
+                        assert part.user_id is not None
                         content = "@" + part.user_id
                     else:
+                        assert part.text is not None
                         content = part.text
                     rows.append(ChatHistory(session_id=batch.session_id, user_id=batch.bot_name, user_name=batch.bot_name,
                                             content_type="bot", content=header + content))
                 return rows
+            record = record_message
         if state == "preparing":
             # The transition and cancellation contend on the same row. Once
             # dispatch is claimed, cancellation can no longer promise success.
@@ -109,7 +119,7 @@ async def run_ordered_delivery(batch_id: str, *, root: Path) -> bool:
                     OrderedDeliveryJob.claim_token == claim_token,
                 ).values(status="delivering", updated_at=utcnow()))
                 await db.commit()
-            if result.rowcount != 1:
+            if cast(CursorResult, result).rowcount != 1:
                 return False
             state = "delivering"
         token = delivery_context.set(((batch.bot_id, batch.session_id), False) if not batch.is_private else None)
@@ -138,11 +148,11 @@ async def run_ordered_delivery(batch_id: str, *, root: Path) -> bool:
                 OrderedDeliveryJob.claim_token == claim_token,
             ).values(status=status, claim_token=None, error_code=error_code or ("drawing_unavailable" if state == "notifying" else None), result_message_id=receipt.message_id if receipt else None,
                      updated_at=now, finished_at=now))
-            if result.rowcount and state == "delivering" and status != "failed_notice_pending":
+            if cast(CursorResult, result).rowcount and state == "delivering" and status != "failed_notice_pending":
                 await db.execute(update(DrawingJob).where(DrawingJob.batch_id == batch_id, DrawingJob.status == "generated").values(
                     status=status, error_code=error_code, result_message_id=receipt.message_id if receipt else None,
                     updated_at=now, finished_at=now))
-            if result.rowcount and state == "notifying":
+            if cast(CursorResult, result).rowcount and state == "notifying":
                 for original, terminal in (("failed_notice_pending", "failed"), ("interrupted_notice_pending", "interrupted")):
                     if status == "delivery_unknown":
                         terminal += "_notice_unknown"

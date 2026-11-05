@@ -168,13 +168,14 @@ def test_history_tools_visible_on_first_group_turn_without_loading_a_skill(mode)
     env.update(
         is_private=mode == "private", proactive_meme_only=mode == "meme", proactive_reaction_only=mode == "reaction", proactive_observation=mode == "observation",
         repeat_text="跟读" if mode == "repeat" else None, meme_similar_enabled=False, reaction_enabled=True,
-        web_image_tools=[], file_tools=[], image_generation_tools=[], drawing_management_tools=[], custom_agent_tools=[], lazy_attachment_tools=[],
-        create_explicit_memory_tools=lambda *_: [], create_interaction_history_tools=interaction_tools.create_interaction_history_tools,
+        web_image_tools=[], ordered_reply_tools=[], file_tools=[], image_generation_tools=[], drawing_management_tools=[], custom_agent_tools=[], lazy_attachment_tools=[],
+        create_explicit_memory_tools=lambda *_, **__: [], create_interaction_history_tools=interaction_tools.create_interaction_history_tools,
         create_group_member_tool=create_group_member_tool, member_snapshot=[], interface=None,
         session_id="group-1", request_id=None, bot_id="bot-id", plugin_config=SimpleNamespace(bot_name="miyuki"),
         get_bots=lambda: {"bot-id": object()}, str=str, tuple=tuple, set=set,
         user_id="1", history=[],
-        plugin_data_dir=Path("unused-card-cache"), create_shared_card_tools=lambda *_: [],
+        plugin_data_dir=Path("unused-card-cache"), create_shared_card_tools=lambda *_, **__: [],
+        current_input_batch=SimpleNamespace(get=lambda: ()),
     )
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), env)
     names = {tool.name for tool in _active_tools(env["base_agent_tools"], {}, [])}

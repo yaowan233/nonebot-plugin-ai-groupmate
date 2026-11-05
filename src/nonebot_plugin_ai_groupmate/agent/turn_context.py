@@ -6,6 +6,7 @@ from collections.abc import Sequence
 from nonebot.adapters import Event
 
 from ..model import ChatHistorySchema
+from ..interaction_history import HistoryMessage
 from ..message_mentions import event_mentioned_user_ids, event_text_with_mentions
 from ..message_metadata import platform_message_ids, parse_message_metadata, is_reliable_platform_id
 from .structured_context import StructuredSnapshot, visible_text
@@ -20,16 +21,16 @@ class TurnHistoryResolver:
             for history_id in snapshot.history_ids:
                 self._by_row.setdefault(history_id, []).append((sender_id, snapshot))
 
-    def _snapshot(self, row: ChatHistorySchema) -> StructuredSnapshot | None:
+    def _snapshot(self, row: ChatHistorySchema | HistoryMessage) -> StructuredSnapshot | None:
         matches = [snapshot for sender, snapshot in self._by_row.get(row.msg_id, ()) if sender == row.user_id]
         return matches[0] if len(matches) == 1 else None
 
-    def ids(self, row: ChatHistorySchema) -> frozenset[str]:
+    def ids(self, row: ChatHistorySchema | HistoryMessage) -> frozenset[str]:
         snapshot = self._snapshot(row)
         return (snapshot.history_platform_ids.get(row.msg_id, frozenset((snapshot.platform_id,)))
                 if snapshot else platform_message_ids(row.content))
 
-    def metadata(self, row: ChatHistorySchema) -> tuple[str | None, str | None, str]:
+    def metadata(self, row: ChatHistorySchema | HistoryMessage) -> tuple[str | None, str | None, str]:
         snapshot = self._snapshot(row)
         if snapshot is not None:
             if row.content_type == "image" or (row.content_type == "bot" and

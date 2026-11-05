@@ -1,7 +1,7 @@
 import json
 from uuid import uuid4
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 from datetime import datetime
 from unittest.mock import Mock, AsyncMock
 
@@ -106,9 +106,9 @@ async def test_one_to_one_explicit_conversation_does_not_depend_on_recipient_gue
     choose = AsyncMock(return_value=SimpleNamespace(need_reply=False, text=None))
     monkeypatch.setattr(plugin, "choice_response_strategy", choose)
     try:
-        await plugin.handle_reply_logic("request", SimpleNamespace(scene=SimpleNamespace(id=group, type=SceneType.GROUP), self_id="bot"),
-            SimpleNamespace(get_members=AsyncMock(return_value=[])), SimpleNamespace(self_id="bot"),
-            SimpleNamespace(message_id="100", get_plaintext=lambda: "输出一个很大的素数"),
+        await plugin.handle_reply_logic("request", cast(Any, SimpleNamespace(scene=SimpleNamespace(id=group, type=SceneType.GROUP), self_id="bot")),
+            cast(Any, SimpleNamespace(get_members=AsyncMock(return_value=[]))), cast(Any, SimpleNamespace(self_id="bot")),
+            cast(Any, SimpleNamespace(message_id="100", get_plaintext=lambda: "输出一个很大的素数")),
             "miyuki", "alice", "Alice", False, True, None)
         judge.assert_not_awaited()
         choose.assert_awaited_once()
@@ -145,9 +145,9 @@ async def test_one_to_one_followup_survives_decisions_connect_timeout(monkeypatc
     choose = AsyncMock(return_value=SimpleNamespace(need_reply=False, text=None))
     monkeypatch.setattr(plugin, "choice_response_strategy", choose)
     try:
-        await plugin.handle_reply_logic("request", SimpleNamespace(scene=SimpleNamespace(id=group, type=SceneType.GROUP), self_id="bot"),
-            SimpleNamespace(get_members=AsyncMock(return_value=[])), SimpleNamespace(self_id="bot"),
-            SimpleNamespace(message_id="100", get_plaintext=lambda: "输出一个很大的素数"),
+        await plugin.handle_reply_logic("request", cast(Any, SimpleNamespace(scene=SimpleNamespace(id=group, type=SceneType.GROUP), self_id="bot")),
+            cast(Any, SimpleNamespace(get_members=AsyncMock(return_value=[]))), cast(Any, SimpleNamespace(self_id="bot")),
+            cast(Any, SimpleNamespace(message_id="100", get_plaintext=lambda: "输出一个很大的素数")),
             "miyuki", "alice", "Alice", False, True, None)
         judge.assert_awaited_once()
         choose.assert_awaited_once()
