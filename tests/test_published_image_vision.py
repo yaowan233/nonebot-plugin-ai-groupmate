@@ -37,10 +37,12 @@ def test_recent_image_reference_list_is_bounded_and_uses_transport_ids():
 async def test_unquoted_followup_can_reference_published_bot_image(monkeypatch, tmp_path):
     from uuid import uuid4
     from datetime import datetime
+    from typing import cast
     from unittest.mock import AsyncMock
 
     from sqlalchemy import select
     from nonebot_plugin_orm import get_session
+    from nonebot.adapters import Bot
     from test_image_generation import png, image_config
 
     from nonebot_plugin_ai_groupmate import agent
@@ -79,13 +81,14 @@ async def test_unquoted_followup_can_reference_published_bot_image(monkeypatch, 
                                         content_type="text", content="id: new\n把刚才那张图改成蓝色", created_at=datetime.now()))
         bot = SimpleNamespace(adapter=SimpleNamespace(get_name=lambda: "qq"))
         await agent.choice_response_strategy(db, group, None, history, "bob", "Bob", bot_id="bot-a",
-                                             bot=bot, group_members=[], reply_to_id=None)
+                                             bot=cast(Bot, bot), group_members=[], reply_to_id=None)
         assert "sent-image" in str([m.content for m in captured["messages"]]), "unquoted history must expose the actual image message ID"
         viewer = FileWorkspace(tmp_path / "agent_files", session_id=group, user_id="bob", bot_id="bot-a", is_private=False)
         tool = image_generation_tools.create_image_generation_tool(db, group, None, config=image_config(), workspace=viewer,
                pic_dir=tmp_path / "pics", current_message_id="new", replied_message_id=None)
         result = json.loads(await tool.ainvoke({"prompt": "改成蓝色", "reference_message_ids": ["sent-image"]}))
         assert result["status"] == "succeeded"
+        assert provider.await_args is not None
         assert provider.await_args.args[2][0][0] == png("red")
 
 

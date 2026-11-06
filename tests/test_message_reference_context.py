@@ -70,10 +70,12 @@ def test_reference_context_keeps_structured_only_images():
 async def test_recent_text_ids_reach_model_even_when_drawing_is_disabled(monkeypatch):
     from datetime import datetime
     from types import SimpleNamespace
+    from typing import cast
     from unittest.mock import AsyncMock
     from uuid import uuid4
 
     from nonebot_plugin_orm import get_session
+    from nonebot.adapters import Bot
 
     from nonebot_plugin_ai_groupmate import agent
     from nonebot_plugin_ai_groupmate.model import ChatHistorySchema
@@ -100,7 +102,7 @@ async def test_recent_text_ids_reach_model_even_when_drawing_is_disabled(monkeyp
     bot = SimpleNamespace(adapter=SimpleNamespace(get_name=lambda: "qq"))
     async with get_session() as db:
         await agent.choice_response_strategy(db, group, None, history, "bob", "Bob", bot_id="bot",
-                                             bot=bot, group_members=[], reply_to_id=None)
+                                             bot=cast(Bot, bot), group_members=[], reply_to_id=None)
     contents = str([message.content for message in captured["messages"]])
     assert '"message_id":"456"' in contents
     assert "明天考试" in contents

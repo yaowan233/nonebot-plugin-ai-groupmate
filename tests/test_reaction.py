@@ -6,6 +6,7 @@ from typing import Any, cast
 from unittest.mock import AsyncMock
 
 import pytest
+from nonebot.adapters import Bot, Event
 from langchain_core.messages import AIMessage
 
 
@@ -261,7 +262,7 @@ async def test_reaction_rejects_unscoped_message_without_sending(monkeypatch):
     monkeypatch.setattr(reaction, "message_reaction", apply)
     monkeypatch.setattr(reaction, "resolve_reply_target", resolve, raising=False)
     tool = reaction.create_reaction_tool(SimpleNamespace(add=lambda _: None, commit=AsyncMock()), "group", None, "bot",
-                                         SimpleNamespace(), SimpleNamespace(message_id=123, message_type="group"))
+                                         cast(Bot, SimpleNamespace()), cast(Event, SimpleNamespace(message_id=123, message_type="group")))
     result = json.loads(await tool.ainvoke({"mood": "like", "target_msg_id": "456"}))
     assert result["reason_code"] == "invalid_reaction_target"
     assert calls == []
@@ -277,7 +278,7 @@ async def test_reaction_does_not_redirect_invalid_explicit_target(monkeypatch):
     monkeypatch.setattr(reaction, "is_onebot_context", lambda *_: True)
     monkeypatch.setattr(reaction, "message_reaction", apply)
     tool = reaction.create_reaction_tool(SimpleNamespace(add=lambda _: None), "group", None, "bot",
-                                         SimpleNamespace(), SimpleNamespace(message_id=123, message_type="group"))
+                                         cast(Bot, SimpleNamespace()), cast(Event, SimpleNamespace(message_id=123, message_type="group")))
     result = json.loads(await tool.ainvoke({"mood": "like", "target_msg_id": "不清楚是哪一条"}))
     assert result["reason_code"] == "invalid_reaction_target"
     assert calls == []
@@ -297,7 +298,7 @@ async def test_reaction_does_not_redirect_a_missing_target_to_current_message(mo
     monkeypatch.setattr(reaction, "message_reaction", apply)
     monkeypatch.setattr(reaction, "resolve_reply_target", resolve, raising=False)
     tool = reaction.create_reaction_tool(SimpleNamespace(add=lambda _: None, commit=AsyncMock()), "group", None, "bot",
-                                         SimpleNamespace(), SimpleNamespace(message_id=123, message_type="group"))
+                                         cast(Bot, SimpleNamespace()), cast(Event, SimpleNamespace(message_id=123, message_type="group")))
     result = json.loads(await tool.ainvoke({"mood": "like", "target_msg_id": "456"}))
     assert result["reason_code"] == "reaction_target_not_found"
     assert calls == ["456"]
@@ -324,8 +325,8 @@ async def test_reaction_resolves_history_in_the_current_group_only(monkeypatch):
         db.add(ChatHistory(session_id=group, user_id="alice", user_name="Alice", content_type="text", content="id: 456\nhello"))
         db.add(ChatHistory(session_id="another-" + group, user_id="alice", user_name="Alice", content_type="text", content="id: 789\nother"))
         await db.commit()
-        tool = reaction.create_reaction_tool(db, group, None, "bot", SimpleNamespace(),
-                                             SimpleNamespace(message_id=123, message_type="group"))
+        tool = reaction.create_reaction_tool(db, group, None, "bot", cast(Bot, SimpleNamespace()),
+                                             cast(Event, SimpleNamespace(message_id=123, message_type="group")))
         found = json.loads(await tool.ainvoke({"mood": "like", "target_msg_id": "456"}))
         rejected = json.loads(await tool.ainvoke({"mood": "like", "target_msg_id": "789"}))
         assert found["status"] == "succeeded"
