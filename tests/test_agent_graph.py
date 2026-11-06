@@ -2544,6 +2544,7 @@ async def test_delivery_reply_guidance_only_follows_confirmed_current_file_deliv
     from langchain_core.messages import ToolMessage, HumanMessage
 
     from nonebot_plugin_ai_groupmate.agent import graph as module
+    from nonebot_plugin_ai_groupmate.agent.prompts import DELIVERED_FILE_REPLY_RULE
     from nonebot_plugin_ai_groupmate.agent.tool_results import tool_failure, tool_success
 
     result = tool_success("file_sent", "sent", delivery_state="completed") if outcome in {"completed", "previous_request"} else tool_failure("file_send_failed", "not confirmed", delivery_state="unknown" if outcome == "unknown" else "not_attempted")
@@ -2553,5 +2554,5 @@ async def test_delivery_reply_guidance_only_follows_confirmed_current_file_deliv
         state["messages"].append(HumanMessage(content="下一个问题"))
     model = _ToolSpyModel([AIMessage(content="这轮结果。")])
     await module._make_agent_node(model, [], "system", {}, module.AgentRunLimits())(state)
-    injected = any("【本轮文件已送达】" in str(message.content) for message in model.invoke_messages[0])
+    injected = any(DELIVERED_FILE_REPLY_RULE in str(message.content) for message in model.invoke_messages[0])
     assert injected is (outcome == "completed")

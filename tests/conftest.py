@@ -12,6 +12,8 @@ _TEST_PROCESS_ROOT.mkdir(parents=True, exist_ok=True)
 
 os.environ["ENVIRONMENT"] = "test"
 os.environ["DRIVER"] = "~none"
+# Tests invoke jobs explicitly; background scheduling races with monkeypatched resources.
+os.environ["APSCHEDULER_AUTOSTART"] = "false"
 os.environ["LOCALSTORE_CACHE_DIR"] = str(_TEST_PROCESS_ROOT / "cache")
 os.environ["LOCALSTORE_CONFIG_DIR"] = str(_TEST_PROCESS_ROOT / "config")
 os.environ["LOCALSTORE_DATA_DIR"] = str(_TEST_PROCESS_ROOT / "data")

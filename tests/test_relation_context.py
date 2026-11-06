@@ -96,8 +96,11 @@ def test_chat_prompt_limits_relationship_effects(is_private):
         reaction_tool_instruction="",
     )
 
-    assert "人际关系和印象标签只影响语气亲疏、主动性和玩笑尺度" in result.system_prompt
-    assert "不得因此降低正常请求的回答质量" in result.system_prompt
+    relationship_rule = next(line for line in result.system_prompt.splitlines() if "人际关系和印象标签" in line)
+    for boundary in ("亲疏", "主动性", "玩笑", "降低", "回答质量", "歪曲事实判断"):
+        assert boundary in relationship_rule
+    assert ("不能因为关系好坏" if is_private else "绝不能因此") in relationship_rule
+    assert ("跳过必要的工具" if is_private else "跳过该用的工具") in relationship_rule
 
 
 @pytest.mark.parametrize(

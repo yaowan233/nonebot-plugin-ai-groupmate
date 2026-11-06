@@ -55,9 +55,10 @@ def test_group_prompt_encourages_proactive_memes_with_serious_topic_boundary():
     )
 
     assert "主动考虑调用 `search_meme_image`" in result.system_prompt
-    assert "不必等群友明确索要" in result.system_prompt
-    assert "敏感或沉重话题" in result.system_prompt
-    assert "没有合适候选就不发" in result.system_prompt
+    assert "不用非等群友管你要" in result.system_prompt
+    assert "敏感或者沉重的话题，必须认真对待" in result.system_prompt
+    assert "要是没搜到合适的就算了" in result.system_prompt
+    assert "别拿表情包去替代必须用文字说清楚的内容" in result.system_prompt
 
 
 @pytest.mark.parametrize("is_private", [False, True])
@@ -76,7 +77,11 @@ def test_prompt_routes_public_current_facts_directly_to_web_search(is_private):
         reaction_tool_instruction="",
     )
 
-    assert "直接调用 `search_web`" in result.system_prompt
-    assert "不要改用 `search_history_context`" in result.system_prompt
-    assert "不要向用户反问可通过联网查到的事实" in result.system_prompt
-    assert "保留用户点名的品牌、产品、人物、事件和时间条件" in result.system_prompt
+    search_rule = next(line for line in result.system_prompt.splitlines() if "search_web" in line and "search_history_context" in line)
+    assert "直接调 `search_web`" in search_rule
+    assert "别错用成 `search_history_context`" in search_rule
+    assert "反问给" in search_rule
+    assert ("网上能直接查到的事" if is_private else "联网就能查到的事实") in search_rule
+    assert "保留好用户" in search_rule
+    for condition in ("品牌", "产品", "人物", "事件", "时间"):
+        assert condition in search_rule
