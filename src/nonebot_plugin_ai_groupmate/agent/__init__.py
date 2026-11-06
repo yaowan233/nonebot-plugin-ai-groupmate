@@ -783,6 +783,7 @@ def _build_builtin_agent_skills(
     context_name = "聊天上下文" if is_private else "群内上下文"
     interaction_instruction = "" if is_private else (
         "- 群聊历史工具已直接可用，普通闲聊无需检索；回顾话题、核对往事/约定、梗溯源、比较成员观点或评价排名时按需查证，不用调侃代替调查。\n"
+        "- 查看最近群聊用 read_recent_history，可按时间范围翻页。\n"
         "- 已知成员优先 read_member_history(member=稳定ID或唯一昵称, keyword=关键词)，按日期和 next_before_msg_id 翻页；具体话题/未知说话者用 search_history_context。查回应对象或进展可用 anchor_msg_id 展开，只传工具返回的数据库 msg_id。\n"
         "- search_group_interactions 仅找短时多人同文事件，不代表全部互动或话题热度；member_candidates/example_msg_ids 可展开，翻页用 next_offset。只补明确缺口，不穷尽全群。\n"
         "- 比较观点核对不同日期独立原话与更正；分清说话者/被评价者/引用者/跟读者。最早可见不证明原创，Bot转述、单次玩笑不作真人长期事实。说明查询窗口、遗漏与不确定，不凑共识/排名，不猜真实身份或能力。\n"
@@ -1771,6 +1772,7 @@ async def create_chat_graph(
         *create_interaction_history_tools(
             session_id, request_id, bot_user_ids=tuple({str(uid) for uid in get_bots()} | ({str(bot_id)} if bot_id else set())),
             platform=resolved_platform if resolved_platform != "unknown" and message_pilot else "",
+            upper_history_id=max((row.msg_id for row in history or []), default=None),
         ),
     ]
     base_agent_tools = [
