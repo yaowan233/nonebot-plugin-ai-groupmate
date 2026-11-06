@@ -9,10 +9,10 @@ from nonebot_plugin_alconna import Target, UniMessage
 
 from ..model import ChatHistory
 from .delivery import OutboundIdentity, send_and_finalize
-from .outbound_plan import compose_segments
 from ..reply_guard import is_request_active
 from .member_tools import member_aliases
 from .tool_results import tool_failure, tool_skipped, tool_success
+from .outbound_plan import compose_segments
 from ..message_metadata import is_reliable_platform_id
 from ..message_repository import find_by_platform_id, structured_id_in_scope
 
@@ -70,6 +70,7 @@ def create_reply_tool(
     bot_name: str,
     parse_msg_meta: Callable[[str], tuple[str | None, str | None, str]],
     group_members: list[Any] | None = None,
+    current_user_id: str | None = None,
     repeat_text: str | None = None,
     current_message_id: str | None = None,
     replied_message_id: str | None = None,
@@ -106,7 +107,7 @@ def create_reply_tool(
         向当前会话单独发送文字回复，不要直接返回正文。
         文字要和图片在同一条消息中时，使用发图工具的 text 参数，不要拆成两次发送。
         Args:
-            content: 你想发送的内容。群内提及成员用@用户ID，ID后用空白或标点分隔；
+            content: 你想发送的内容。提及本轮发言者用 @current；群内其他成员用@用户ID，ID后用空白或标点分隔；
                 会生成平台原生@。未知ID或重名时先用get_group_members查询，也支持唯一昵称。
             reply_to: 可选引用回复。填 current 引用用户现在发出的这条消息；
                 引用其他消息则传当前会话的已知平台消息ID。省略则普通发送，不要编造ID。
@@ -150,6 +151,11 @@ def create_reply_tool(
             except ValueError as error:
                 return tool_failure("invalid_reply_target", str(error), delivery_state="not_attempted")
             content = _dedupe_consecutive_lines(content.strip())
+            current_pattern = r"(?<![\w@])@current(?=$|[\s，。,.!！?？:：;；、)）\]\"'”’])"
+            if re.search(current_pattern, content, re.IGNORECASE):
+                if not current_user_id:
+                    return tool_failure("invalid_mention_target", "没有可确认的本轮发言者，未发送。", delivery_state="not_attempted")
+                content = re.sub(current_pattern, lambda _: "@" + str(current_user_id), content, flags=re.IGNORECASE)
             normalized_content = _normalize_text(content)
             if (normalized_content, quoted_id) in attempted_sends:
                 return tool_skipped("duplicate_reply", "本轮已尝试发送该消息，请勿重复发送。", delivery_state="not_attempted")
@@ -173,6 +179,8 @@ def create_reply_tool(
                         aliases_to_ids.setdefault(alias, set()).add(target_id)
                 name_to_id.update({alias: next(iter(ids)) for alias, ids in aliases_to_ids.items() if len(ids) == 1})
                 name_to_id.update({str(member.id): str(member.id) for member in members})
+            if current_user_id:
+                name_to_id[str(current_user_id)] = str(current_user_id)
 
             punctuation = "，。,.!！?？:：;；、)）]\"'”’"
             at_pattern = re.compile(rf"@(\d+(?=$|[\s{re.escape(punctuation)}])|[^\s@]+)")

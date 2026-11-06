@@ -1681,6 +1681,7 @@ async def create_chat_graph(
         bot_name=plugin_config.bot_name,
         parse_msg_meta=_parse_msg_meta,
         group_members=member_snapshot,
+        current_user_id=str(user_id) if user_id and not is_private and not proactive_observation else None,
         repeat_text=repeat_text,
         current_message_id=tool_current_message_id,
         replied_message_id=reply_to_id,
@@ -1740,6 +1741,7 @@ async def create_chat_graph(
         approved_meme_ids=approved_meme_ids, send_target=send_target, bot_name=plugin_config.bot_name,
         members=member_snapshot, current_message_id=tool_current_message_id, replied_message_id=reply_to_id,
         outbound_identity=outbound_identity, recovery_enabled=message_pilot, interface=interface if not is_private else None,
+        current_user_id=str(user_id) if user_id and not is_private and not proactive_observation else None,
     ) if pilot_workspace is not None and not proactive_meme_only and not proactive_reaction_only and repeat_text is None else ())
     if ordered_reply_tools:
         system_prompt += "\n图文穿插用 send_ordered_message 按顺序一次发送；图片用 file:<file_id>、meme:<pic_id>，可用 prepare_meme_image 或 prepare_web_image 准备候选；绘图先 defer_delivery=true，再用 drawing:<job_id>。"

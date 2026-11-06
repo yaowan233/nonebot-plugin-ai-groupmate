@@ -26,7 +26,8 @@ from .file_workspace import FileTaskError
 def create_ordered_reply_tool(db_session, session_id, request_id, *, workspace, pic_dir: Path,
                               approved_meme_ids: set[int], send_target, bot_name: str,
                               members: list[Any] | None, current_message_id: str | None,
-                              replied_message_id: str | None, outbound_identity, recovery_enabled: bool, interface=None):
+                              replied_message_id: str | None, outbound_identity, recovery_enabled: bool, interface=None,
+                              current_user_id: str | None = None):
     attempted: set[str] = set()
     prepared_memes: set[str] = set()
 
@@ -59,13 +60,18 @@ def create_ordered_reply_tool(db_session, session_id, request_id, *, workspace, 
     async def send_ordered_message(parts: list[dict[str, str]], reply_to: str | None = None,
                                    next_step: Literal["end", "continue"] = "end") -> str:
         """发送一条按顺序排列的图文消息。parts 每项为 text/text、image/resource_id 或 mention/user_id。
-        图片用 file:<file_id>、meme:<pic_id> 或 drawing:<job_id>；表情包必须先搜索审核，绘图须先设置 defer_delivery=true。
+        mention 的 user_id 可填 current 提及本轮发言者。图片用 file:<file_id>、meme:<pic_id> 或 drawing:<job_id>；表情包必须先搜索审核，绘图须先设置 defer_delivery=true。
         包含 drawing 的消息提交后台等待生成完成后一起发送。reply_to=current 可引用当前消息。
         所有图片必须准备好才发送；没有实际图片时不要用文字占位。"""
         started = False
         delivery_id = None
         try:
             plan = ReplyPlan.model_validate({"parts": parts, "reply_to": reply_to})
+            for part in plan.parts:
+                if part.type == "mention" and part.user_id == "current":
+                    if not current_user_id:
+                        raise ValueError("无法确认本轮发言者")
+                    part.user_id = str(current_user_id)
             meme_count = sum(part.type == "image" and ((part.resource_id or "").startswith("meme:") or
                              (part.resource_id or "").removeprefix("file:") in prepared_memes) for part in plan.parts)
             if meme_count > 5:
@@ -76,9 +82,11 @@ def create_ordered_reply_tool(db_session, session_id, request_id, *, workspace, 
                     current_message_id=current_message_id, replied_message_id=replied_message_id,
                     outbound_identity=outbound_identity)
             resolved_members = members
-            if resolved_members is None and interface is not None and any(part.type == "mention" for part in plan.parts):
+            if resolved_members is None and interface is not None and any(part.type == "mention" and part.user_id != current_user_id for part in plan.parts):
                 resolved_members = await interface.get_members(SceneType.GROUP, session_id)
             allowed_members = {str(member.id) for member in resolved_members or []}
+            if current_user_id:
+                allowed_members.add(str(current_user_id))
             images: dict[str, bytes] = {}
             file_ids: list[str | None] = []
             media_ids: list[int | None] = []

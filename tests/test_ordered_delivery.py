@@ -1,18 +1,43 @@
 import io
 import json
-from typing import cast
 from uuid import uuid4
 from types import SimpleNamespace
+from typing import cast
 from importlib import import_module
 
 from PIL import Image
-from sqlalchemy import Select, update, CursorResult
+from sqlalchemy import Select, CursorResult, update
 
 
 def image_bytes(color):
     output = io.BytesIO()
     Image.new("RGB", (3, 3), color).save(output, format="PNG")
     return output.getvalue()
+
+
+async def test_ordered_mention_binds_current_speaker(monkeypatch, tmp_path):
+    from nonebot_plugin_orm import get_session
+    from nonebot_plugin_alconna import At, UniMessage
+
+    from nonebot_plugin_ai_groupmate.agent.file_workspace import FileWorkspace
+    from nonebot_plugin_ai_groupmate.agent.ordered_reply_tool import create_ordered_reply_tool
+
+    sent = []
+
+    async def send(message, **_kwargs):
+        sent.append(message)
+        return SimpleNamespace(msg_ids=[{"message_id": "1001"}])
+
+    monkeypatch.setattr(UniMessage, "send", send)
+    group = uuid4().hex
+    workspace = FileWorkspace(tmp_path / "agent_files", session_id=group, user_id="1074376787", bot_id="bot", is_private=False, peer_bot_ids=())
+    async with get_session() as db:
+        sender, _ = create_ordered_reply_tool(db, group, None, workspace=workspace, pic_dir=tmp_path,
+            approved_meme_ids=set(), send_target=None, bot_name="miyuki", members=[], current_message_id=None,
+            replied_message_id=None, outbound_identity=None, recovery_enabled=False, current_user_id="1074376787")
+        result = json.loads(await sender.ainvoke({"parts": [{"type": "mention", "user_id": "current"}, {"type": "text", "text": "你的结果"}]}))
+    assert result["ok"]
+    assert [part.target for part in sent[0] if isinstance(part, At)] == ["1074376787"]
 
 
 async def test_ordered_message_sends_one_chain_and_records_all_images(monkeypatch, tmp_path):
@@ -155,7 +180,8 @@ async def test_cancel_during_preparation_prevents_dispatch():
             OrderedDeliveryJob.status == "preparing", OrderedDeliveryJob.claim_token == "worker").values(status="delivering"))
         assert cast(CursorResult, result).rowcount == 0
         drawing = await db.get(DrawingJob, job_id, populate_existing=True)
-        assert drawing is not None and drawing.status == "cancelled"
+        assert drawing is not None
+        assert drawing.status == "cancelled"
 
 
 async def test_prepared_memes_survive_next_search_and_form_one_message(monkeypatch, tmp_path):
@@ -322,13 +348,15 @@ async def test_restart_recovers_preparation_but_does_not_retry_uncertain_send():
         await db.commit()
         first = await db.get(OrderedDeliveryJob, preparing, populate_existing=True)
         second = await db.get(OrderedDeliveryJob, delivering, populate_existing=True)
-        assert first is not None and second is not None
+        assert first is not None
+        assert second is not None
         assert first.status == "waiting"
         assert first.claim_token is None
         assert second.status == "delivery_unknown"
         assert second.claim_token is None
         drawing = await db.get(DrawingJob, job_id, populate_existing=True)
-        assert drawing is not None and drawing.status == "delivery_unknown"
+        assert drawing is not None
+        assert drawing.status == "delivery_unknown"
 
 
 def test_ordered_delivery_migration_preserves_existing_drawings():

@@ -32,6 +32,56 @@ async def test_member_id_from_directory_reaches_native_mention(monkeypatch, cont
 
 
 @pytest.mark.asyncio
+async def test_current_speaker_mention_uses_bound_sender_not_another_recent_member(monkeypatch):
+    from nonebot_plugin_orm import get_session
+    from nonebot_plugin_alconna import At, UniMessage
+
+    from nonebot_plugin_ai_groupmate.message_metadata import parse_message_metadata
+    from nonebot_plugin_ai_groupmate.agent.reply_tools import create_reply_tool
+
+    sent = []
+
+    async def capture(message, *args, **kwargs):
+        sent.append(message)
+        return SimpleNamespace(msg_ids=[{"message_id": "speaker-mention"}])
+
+    monkeypatch.setattr(UniMessage, "send", capture)
+    members = [SimpleNamespace(id=uid, name=uid, nick=None, user=None) for uid in ["1074376787", "2136339680"]]
+    async with get_session() as db:
+        tool = create_reply_tool(db, f"speaker-{uuid4()}", bot_name="miyuki", parse_msg_meta=parse_message_metadata,
+                                 group_members=members, current_user_id="1074376787")
+        result = json.loads(await tool.ainvoke({"content": "@current 你的印象图", "next_step": "end"}))
+    assert result["ok"]
+    assert [segment.target for segment in sent[0] if isinstance(segment, At)] == ["1074376787"]
+
+
+def test_current_request_boundary_exposes_the_real_sender_id():
+    from nonebot_plugin_ai_groupmate.agent import _build_current_request_boundary
+
+    event = SimpleNamespace(self_id="3083684810", get_plaintext=lambda: "miyuki 分析我的maniapp变化")
+    boundary = _build_current_request_boundary([], "1074376787", "QAQ", cast(Any, event))
+    assert "1074376787" in boundary
+
+
+async def test_current_mention_without_a_current_speaker_is_not_sent(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from nonebot_plugin_orm import get_session
+    from nonebot_plugin_alconna import UniMessage
+
+    from nonebot_plugin_ai_groupmate.message_metadata import parse_message_metadata
+    from nonebot_plugin_ai_groupmate.agent.reply_tools import create_reply_tool
+
+    send = AsyncMock()
+    monkeypatch.setattr(UniMessage, "send", send)
+    async with get_session() as db:
+        tool = create_reply_tool(db, f"speaker-missing-{uuid4()}", bot_name="miyuki", parse_msg_meta=parse_message_metadata, group_members=[])
+        result = json.loads(await tool.ainvoke({"content": "@current 你好", "next_step": "end"}))
+    assert result["reason_code"] == "invalid_mention_target"
+    send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_random_roster_selection_is_deduplicated_excludes_bots_and_sends_native_at(monkeypatch):
     from nonebot_plugin_orm import get_session
     from nonebot_plugin_alconna import At, UniMessage
