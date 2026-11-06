@@ -618,6 +618,7 @@ async def _upsert_model_config_row(
     payload: GroupModelPayload,
     ciphertext: str,
     extra_fields: dict[str, Any],
+    connection_tested: bool,
 ) -> int:
     """Insert or update one scoped model config row; return its new version."""
 
@@ -633,8 +634,8 @@ async def _upsert_model_config_row(
         "chat_multimodal": payload.chat_multimodal,
         "allow_global_fallback": payload.allow_global_fallback,
         "updated_at": now,
-        "last_tested_at": now,
-        "last_test_status": "success",
+        "last_tested_at": now if connection_tested else None,
+        "last_test_status": "success" if connection_tested else "untested",
         "version": next_version,
         **extra_fields,
     }
@@ -654,6 +655,7 @@ async def save_group_model_config(
     operator_id: str,
     payload: GroupModelPayload,
     cipher: LocalSecretCipher,
+    connection_tested: bool = True,
 ) -> ActiveGroupModelConfig:
     group_id = str(group_id)
     next_version = await _upsert_model_config_row(
@@ -661,6 +663,7 @@ async def save_group_model_config(
         row_model=GroupModelConfig,
         subject_id=group_id,
         payload=payload,
+        connection_tested=connection_tested,
         ciphertext=cipher.encrypt(
             payload.api_key,
             purpose=_api_key_purpose(group_id),
@@ -692,6 +695,7 @@ async def save_private_model_config(
     user_id: str,
     payload: GroupModelPayload,
     cipher: LocalSecretCipher,
+    connection_tested: bool = True,
 ) -> ActivePrivateModelConfig:
     user_id = str(user_id)
     next_version = await _upsert_model_config_row(
@@ -699,6 +703,7 @@ async def save_private_model_config(
         row_model=PrivateModelConfig,
         subject_id=user_id,
         payload=payload,
+        connection_tested=connection_tested,
         ciphertext=cipher.encrypt(
             payload.api_key,
             purpose=_private_api_key_purpose(user_id),
