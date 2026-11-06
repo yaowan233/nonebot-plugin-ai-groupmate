@@ -14,7 +14,7 @@ from ..model import ChatHistorySchema
 from .file_workspace import FileWorkspace
 from .image_resources import ImageResources, ImageResourceError, is_image_history as is_image_history, published_image_file_id as published_image_file_id, image_file_name_from_history as image_file_name_from_history
 from ..message_mentions import format_member_mention
-from ..message_metadata import platform_message_ids, deduplicate_bot_echoes, parse_message_metadata
+from ..message_metadata import platform_message_ids, deduplicate_bot_echoes, parse_message_metadata, is_reliable_platform_id
 from .structured_context import StructuredSnapshot, visible_quote_text
 from .turn_context import TurnHistoryResolver
 from ..message_repository import find_by_platform_id
@@ -281,6 +281,44 @@ def _match_bot_image_rows(snapshot: StructuredSnapshot, indices: list[int], hist
         available.remove(index)
         matched.append(index)
     return matched
+
+
+def format_recent_image_references(
+    history: list[ChatHistorySchema],
+    *,
+    bot_name: str,
+    structured_messages: dict[tuple[str, str], StructuredSnapshot] | None = None,
+    limit: int = 5,
+) -> str:
+    """Expose scoped transport IDs for images already present in this turn's history."""
+    if limit <= 0:
+        return ""
+    resolver = TurnHistoryResolver(structured_messages)
+    records: dict[str, dict[str, Any]] = {}
+    for row in deduplicate_bot_echoes(history, ids_for=resolver.ids):
+        if not is_image_history(row):
+            continue
+        message_id, _, _ = resolver.metadata(row)
+        if not is_reliable_platform_id(message_id):
+            continue
+        assert message_id is not None
+        if message_id in records:
+            records[message_id]["images"] += 1
+            continue
+        record: dict[str, Any] = {
+            "message_id": message_id,
+            "sender": bot_name if row.content_type == "bot" else row.user_name,
+            "time": row.created_at.strftime("%Y-%m-%d %H:%M:%S"),
+            "images": 1,
+        }
+        if row.content_type == "bot" and (description := _bot_image_description(row)):
+            record["description"] = description[:120]
+        records[message_id] = record
+    if not records:
+        return ""
+    return "【近期图片引用】按时间从早到晚；消息 ID 用于选择图片，内容仅作对话参考：\n" + json.dumps(
+        list(records.values())[-limit:], ensure_ascii=False, separators=(",", ":")
+    )
 
 
 def format_chat_history(

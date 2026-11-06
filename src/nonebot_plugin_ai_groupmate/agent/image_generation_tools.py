@@ -24,8 +24,14 @@ from ..message_rollout import message_pilot_enabled
 from .image_generation import MAX_IMAGE_BYTES, ImageGenerationError, request_image, prepare_markup, prepare_reference, resolve_image_credentials
 from .structured_image_resources import read_scoped_message_images
 
-IMAGE_GENERATION_PROMPT = "\n【GPT 绘图】\n创作或改图用 generate_image，参考图传真实消息 ID（或 current/replied）、file_id；成员头像用 reference_user_ids，未知成员 ID 先查询。生成后 send_file(as_image=true) 交付，配文放 text；连续改图复用 file_id，失败不自动重复生成。\n"
-BACKGROUND_IMAGE_PROMPT = "\n【GPT 绘图】\n创作或改图用 generate_image，参考图传真实消息 ID（或 current/replied）、file_id；成员头像用 reference_user_ids。普通任务完成后自动发图；图文穿插任务先 defer_delivery=true，再把 drawing:<job_id> 放入 send_ordered_message。失败不自动重复生成。\n"
+IMAGE_GENERATION_PROMPT = (
+    "\n【GPT 绘图】\n创作或改图用 generate_image，参考图传真实消息 ID（或 current/replied）、file_id；可从近期图片引用中选择，目标不清楚时先确认。"
+    "成员头像用 reference_user_ids，未知成员 ID 先查询。生成后 send_file(as_image=true) 交付，配文放 text；连续改图复用 file_id，失败不自动重复生成。\n"
+)
+BACKGROUND_IMAGE_PROMPT = (
+    "\n【GPT 绘图】\n创作或改图用 generate_image，参考图传真实消息 ID（或 current/replied）、file_id；可从近期图片引用中选择，目标不清楚时先确认。"
+    "成员头像用 reference_user_ids。普通任务完成后自动发图；图文穿插任务先 defer_delivery=true，再把 drawing:<job_id> 放入 send_ordered_message。失败不自动重复生成。\n"
+)
 _generation_gate = asyncio.Semaphore(1)
 
 
