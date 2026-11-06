@@ -13,6 +13,8 @@ from ..reply_guard import is_request_active
 from ..reply_request import resolve_current_message_id
 from .tool_results import tool_failure, tool_skipped, tool_success
 from ..participation import record_group_delivery
+from .delivery import OutboundIdentity
+from .reply_tools import resolve_reply_target
 
 ReactionMood = Literal[
     "like",
@@ -124,6 +126,10 @@ def create_reaction_tool(
     bot_name: str,
     bot: Bot | None,
     event: Event | None,
+    *,
+    current_message_id: str | None = None,
+    replied_message_id: str | None = None,
+    outbound_identity: OutboundIdentity | None = None,
 ):
     """
     创建 OneBot 消息表情回复工具，底层使用 nonebot_plugin_alconna.message_reaction。
@@ -249,6 +255,9 @@ def create_reaction_tool(
             )
 
         message_id = _normalize_reaction_message_id(target_msg_id)
+        if (target_msg_id and str(target_msg_id).strip().lower() not in {"current", "current_event", "event"}
+                and message_id is None):
+            return tool_failure("invalid_reaction_target", "无法确认目标消息，未添加表情。", delivery_state="not_attempted")
         if message_id and not _is_supported_onebot_reaction_message_id(message_id):
             logger.info(
                 f"跳过表情回复：当前 OneBot reaction 接口不支持非数字消息 ID {message_id!r}"
@@ -258,6 +267,21 @@ def create_reaction_tool(
                 "目标消息 ID 不是数字，底层 OneBot reaction 接口不支持。",
                 delivery_state="not_attempted",
             )
+        if message_id:
+            try:
+                message_id = await resolve_reply_target(
+                    db_session, session_id, message_id,
+                    current_message_id=current_message_id or _get_event_message_id(),
+                    replied_message_id=replied_message_id, outbound_identity=outbound_identity,
+                )
+                await db_session.commit()
+            except ValueError:
+                return tool_failure("invalid_reaction_target", "当前会话中找不到该目标消息，未添加表情。",
+                                    delivery_state="not_attempted")
+            except Exception as error:
+                logger.warning(f"校验表情回复目标失败 error_type={type(error).__name__}")
+                return tool_failure("reaction_target_unavailable", "暂时无法确认目标消息，未添加表情。",
+                                    delivery_state="not_attempted")
         if not message_id:
             event_message_id = _get_event_message_id()
             if not _is_supported_onebot_reaction_message_id(event_message_id):
@@ -298,16 +322,15 @@ def create_reaction_tool(
             )
 
         try:
+            completed_reactions = 0
             for reaction_emoji in reaction_emojis:
                 try:
                     await _apply_reaction(reaction_emoji, message_id)
+                    completed_reactions += 1
                 except Exception as e:
                     if message_id and "msg not found" in str(e).lower():
-                        logger.warning(
-                            f"表情回复目标消息 {message_id} 不存在，回退到当前触发事件消息"
-                        )
-                        message_id = None
-                        await _apply_reaction(reaction_emoji, None)
+                        return tool_failure("reaction_target_not_found", "目标消息已不可用，未对其他消息添加表情。",
+                                            delivery_state="unknown" if completed_reactions else "not_attempted")
                     else:
                         raise
             action = "取消" if delete else "添加"

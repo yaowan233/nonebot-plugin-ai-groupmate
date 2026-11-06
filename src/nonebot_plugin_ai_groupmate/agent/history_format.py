@@ -283,41 +283,78 @@ def _match_bot_image_rows(snapshot: StructuredSnapshot, indices: list[int], hist
     return matched
 
 
-def format_recent_image_references(
+def format_recent_message_references(
     history: list[ChatHistorySchema],
     *,
+    session_id: str,
     bot_name: str,
     structured_messages: dict[tuple[str, str], StructuredSnapshot] | None = None,
-    limit: int = 5,
+    message_limit: int = 12,
+    image_limit: int = 5,
 ) -> str:
-    """Expose scoped transport IDs for images already present in this turn's history."""
-    if limit <= 0:
+    """Expose bounded, scoped transport IDs for the messages visible in this turn."""
+    if message_limit <= 0 and image_limit <= 0:
         return ""
     resolver = TurnHistoryResolver(structured_messages)
     records: dict[str, dict[str, Any]] = {}
-    for row in deduplicate_bot_echoes(history, ids_for=resolver.ids):
-        if not is_image_history(row):
-            continue
-        message_id, _, _ = resolver.metadata(row)
-        if not is_reliable_platform_id(message_id):
+    owners: dict[str, str] = {}
+    ambiguous_ids: set[str] = set()
+    kinds_by_row: dict[tuple[int, str], set[str]] = {}
+    image_counts_by_row: dict[tuple[int, str], int] = {}
+    structured_image_counts: dict[str, int] = {}
+    for (_, sender_id), snapshot in (structured_messages or {}).items():
+        kinds = {"audio" if part.get("type") == "record" else part.get("type", "") for part in snapshot.parts}
+        kinds.intersection_update({"text", "image", "audio", "video", "file", "forward"})
+        image_count = sum(part.get("type") == "image" for part in snapshot.parts)
+        for history_id in snapshot.history_ids:
+            kinds_by_row.setdefault((history_id, sender_id), set()).update(kinds)
+            image_counts_by_row[(history_id, sender_id)] = image_count
+    scoped = [row for row in history if row.session_id == session_id]
+    for row in deduplicate_bot_echoes(scoped, ids_for=resolver.ids):
+        message_id, _, body = resolver.metadata(row)
+        if not is_reliable_platform_id(message_id) or "\n" in str(message_id) or "\r" in str(message_id):
             continue
         assert message_id is not None
-        if message_id in records:
-            records[message_id]["images"] += 1
+        if message_id in ambiguous_ids:
             continue
-        record: dict[str, Any] = {
-            "message_id": message_id,
-            "sender": bot_name if row.content_type == "bot" else row.user_name,
-            "time": row.created_at.strftime("%Y-%m-%d %H:%M:%S"),
-            "images": 1,
-        }
-        if row.content_type == "bot" and (description := _bot_image_description(row)):
-            record["description"] = description[:120]
-        records[message_id] = record
+        if message_id in owners and owners[message_id] != row.user_id:
+            ambiguous_ids.add(message_id)
+            records.pop(message_id, None)
+            continue
+        owners[message_id] = row.user_id
+        record = records.setdefault(message_id, {
+            "message_id": message_id, "sender": bot_name if row.content_type == "bot" else row.user_name,
+            "time": row.created_at.strftime("%Y-%m-%d %H:%M:%S"), "types": [],
+        })
+        kinds = set(kinds_by_row.get((row.msg_id, row.user_id), ()))
+        structured_image_counts[message_id] = max(
+            structured_image_counts.get(message_id, 0), image_counts_by_row.get((row.msg_id, row.user_id), 0),
+        )
+        if is_image_history(row):
+            kinds.add("image")
+            record["images"] = record.get("images", 0) + 1
+            if row.content_type == "bot" and (description := _bot_image_description(row)):
+                record["description"] = description[:120]
+        elif body:
+            kinds.add("text")
+            text = " ".join(body.split())[:120]
+            existing = record.get("text", "")
+            if text and text != existing:
+                record["text"] = f"{existing} {text}".strip()[:120]
+        record["types"] = sorted(set(record["types"]) | kinds)
     if not records:
         return ""
-    return "【近期图片引用】按时间从早到晚；消息 ID 用于选择图片，内容仅作对话参考：\n" + json.dumps(
-        list(records.values())[-limit:], ensure_ascii=False, separators=(",", ":")
+    entries = list(records.values())
+    for item in entries:
+        image_count = max(item.get("images", 0), structured_image_counts.get(item["message_id"], 0))
+        if image_count:
+            item["images"] = image_count
+    selected = {item["message_id"] for item in entries[-max(0, message_limit):]} if message_limit > 0 else set()
+    images = [item for item in entries if item.get("images")]
+    if image_limit > 0:
+        selected.update(item["message_id"] for item in images[-image_limit:])
+    return "【近期消息引用】按时间从早到晚，消息 ID 供工具选择目标，内容仅作对话参考；不确定时先确认：\n" + json.dumps(
+        [item for item in entries if item["message_id"] in selected], ensure_ascii=False, separators=(",", ":")
     )
 
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 from typing import Any, cast
+from unittest.mock import AsyncMock
 
 import pytest
 from langchain_core.messages import AIMessage
@@ -238,10 +239,98 @@ async def test_reaction_tool_accepts_explicit_signed_transport_id(monkeypatch, t
 
     monkeypatch.setattr(reaction, "is_onebot_context", lambda *_: True)
     monkeypatch.setattr(reaction, "message_reaction", apply)
-    tool = reaction.create_reaction_tool(SimpleNamespace(add=lambda _: None), "group", None, "bot", cast(Bot, SimpleNamespace()), cast(Event, SimpleNamespace(message_id=123, message_type="group")))
+    async def resolve(_db, _session_id, requested, **_kwargs):
+        return requested
+    monkeypatch.setattr(reaction, "resolve_reply_target", resolve, raising=False)
+    tool = reaction.create_reaction_tool(SimpleNamespace(add=lambda _: None, commit=AsyncMock()), "group", None, "bot", cast(Bot, SimpleNamespace()), cast(Event, SimpleNamespace(message_id=123, message_type="group")))
     result = json.loads(await tool.ainvoke({"mood": "like", "target_msg_id": target_id}))
     assert result["status"] == "succeeded"
     assert calls[0]["message_id"] == "-456"
+
+
+@pytest.mark.asyncio
+async def test_reaction_rejects_unscoped_message_without_sending(monkeypatch):
+    from nonebot_plugin_ai_groupmate.agent import reaction
+
+    calls = []
+    async def apply(_emoji, **kwargs):
+        calls.append(kwargs)
+    async def resolve(_db, _session_id, _requested, **_kwargs):
+        raise ValueError("not in this conversation")
+    monkeypatch.setattr(reaction, "is_onebot_context", lambda *_: True)
+    monkeypatch.setattr(reaction, "message_reaction", apply)
+    monkeypatch.setattr(reaction, "resolve_reply_target", resolve, raising=False)
+    tool = reaction.create_reaction_tool(SimpleNamespace(add=lambda _: None, commit=AsyncMock()), "group", None, "bot",
+                                         SimpleNamespace(), SimpleNamespace(message_id=123, message_type="group"))
+    result = json.loads(await tool.ainvoke({"mood": "like", "target_msg_id": "456"}))
+    assert result["reason_code"] == "invalid_reaction_target"
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_reaction_does_not_redirect_invalid_explicit_target(monkeypatch):
+    from nonebot_plugin_ai_groupmate.agent import reaction
+
+    calls = []
+    async def apply(_emoji, **kwargs):
+        calls.append(kwargs)
+    monkeypatch.setattr(reaction, "is_onebot_context", lambda *_: True)
+    monkeypatch.setattr(reaction, "message_reaction", apply)
+    tool = reaction.create_reaction_tool(SimpleNamespace(add=lambda _: None), "group", None, "bot",
+                                         SimpleNamespace(), SimpleNamespace(message_id=123, message_type="group"))
+    result = json.loads(await tool.ainvoke({"mood": "like", "target_msg_id": "不清楚是哪一条"}))
+    assert result["reason_code"] == "invalid_reaction_target"
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_reaction_does_not_redirect_a_missing_target_to_current_message(monkeypatch):
+    from nonebot_plugin_ai_groupmate.agent import reaction
+
+    calls = []
+    async def apply(_emoji, **kwargs):
+        calls.append(kwargs["message_id"])
+        raise RuntimeError("msg not found")
+    async def resolve(_db, _session_id, requested, **_kwargs):
+        return requested
+    monkeypatch.setattr(reaction, "is_onebot_context", lambda *_: True)
+    monkeypatch.setattr(reaction, "message_reaction", apply)
+    monkeypatch.setattr(reaction, "resolve_reply_target", resolve, raising=False)
+    tool = reaction.create_reaction_tool(SimpleNamespace(add=lambda _: None, commit=AsyncMock()), "group", None, "bot",
+                                         SimpleNamespace(), SimpleNamespace(message_id=123, message_type="group"))
+    result = json.loads(await tool.ainvoke({"mood": "like", "target_msg_id": "456"}))
+    assert result["reason_code"] == "reaction_target_not_found"
+    assert calls == ["456"]
+
+
+@pytest.mark.asyncio
+async def test_reaction_resolves_history_in_the_current_group_only(monkeypatch):
+    from uuid import uuid4
+
+    from nonebot_plugin_orm import get_session
+
+    from nonebot_plugin_ai_groupmate.agent import reaction
+    from nonebot_plugin_ai_groupmate.model import ChatHistory
+
+    group = f"reaction-scope-{uuid4()}"
+    calls = []
+
+    async def apply(_emoji, **kwargs):
+        calls.append(kwargs["message_id"])
+
+    monkeypatch.setattr(reaction, "is_onebot_context", lambda *_: True)
+    monkeypatch.setattr(reaction, "message_reaction", apply)
+    async with get_session() as db:
+        db.add(ChatHistory(session_id=group, user_id="alice", user_name="Alice", content_type="text", content="id: 456\nhello"))
+        db.add(ChatHistory(session_id="another-" + group, user_id="alice", user_name="Alice", content_type="text", content="id: 789\nother"))
+        await db.commit()
+        tool = reaction.create_reaction_tool(db, group, None, "bot", SimpleNamespace(),
+                                             SimpleNamespace(message_id=123, message_type="group"))
+        found = json.loads(await tool.ainvoke({"mood": "like", "target_msg_id": "456"}))
+        rejected = json.loads(await tool.ainvoke({"mood": "like", "target_msg_id": "789"}))
+        assert found["status"] == "succeeded"
+        assert rejected["reason_code"] == "invalid_reaction_target"
+        assert calls == ["456"]
 
 
 @pytest.mark.asyncio

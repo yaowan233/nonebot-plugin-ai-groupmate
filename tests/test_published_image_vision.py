@@ -9,7 +9,7 @@ from langchain_core.messages import AIMessage
 def test_recent_image_reference_list_is_bounded_and_uses_transport_ids():
     from test_history_metadata import _history
 
-    from nonebot_plugin_ai_groupmate.agent.history_format import format_recent_image_references
+    from nonebot_plugin_ai_groupmate.agent.history_format import format_recent_message_references
     from nonebot_plugin_ai_groupmate.agent.structured_context import StructuredSnapshot
 
     history = [_history(i, "bot", f"id: old-{i}\n[图片文件] x.png file_id={'a' * 32}") for i in range(1, 7)]
@@ -24,8 +24,8 @@ def test_recent_image_reference_list_is_bounded_and_uses_transport_ids():
     snapshot = StructuredSnapshot(platform_id="indexed-id", sender_id=row.user_id, reply_to_id=None,
                                   parts=({"type": "image", "media_id": "2"},), media_paths={2: "upload.png"},
                                   history_ids=(row.msg_id,))
-    rendered = format_recent_image_references(history, bot_name="miyuki",
-                                             structured_messages={("indexed-id", row.user_id): snapshot})
+    rendered = format_recent_message_references(history, session_id="group-1", bot_name="miyuki", message_limit=0,
+                                               structured_messages={("indexed-id", row.user_id): snapshot})
     entries = json.loads(rendered.split("\n", 1)[1])
     assert [item["message_id"] for item in entries] == ["old-3", "old-4", "old-5", "old-6", "indexed-id"]
     assert entries[-2]["images"] == 1
