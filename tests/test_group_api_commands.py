@@ -1,5 +1,6 @@
 import re
 from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 
@@ -118,7 +119,7 @@ async def test_relay_submit_applies_without_second_model_call(monkeypatch, scope
     monkeypatch.setattr(commands, "_clear_private_chat_model_cache", lambda *_: None)
     session = SimpleNamespace(scene=SimpleNamespace(type=commands.SceneType.PRIVATE), user=SimpleNamespace(id="123"))
     with pytest.raises(Finished) as result:
-        await commands._do_submit(object(), session, scope=scope, code="valid", matcher=Matcher)
+        await commands._do_submit(cast(Any, object()), cast(Any, session), scope=scope, code="valid", matcher=cast(Any, Matcher))
     assert "已更新" in str(result.value)
     assert "测试通过" not in str(result.value)
     assert checked == [(payload.base_url, [])]
