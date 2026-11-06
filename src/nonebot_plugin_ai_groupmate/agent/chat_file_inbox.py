@@ -135,16 +135,25 @@ class ChatFileInbox:
         return item
 
 
-def register_chat_file_markers(files: list[File], workspace: FileWorkspace, *, message_id: str, group_id: str | None = None, metadata: dict[str, Any] | None = None) -> str:
+def register_chat_file_resources(files: list[File], workspace: FileWorkspace, *, message_id: str, group_id: str | None = None, metadata: dict[str, Any] | None = None) -> tuple[str, tuple[str | None, ...]]:
     inbox = ChatFileInbox(workspace)
     markers = []
+    file_ids: list[str | None] = []
     for index, file in enumerate(files[:3]):
         name = json.dumps(clean_filename(file.name), ensure_ascii=False)
         try:
-            inbox.register(file, message_id=message_id, index=index, group_id=group_id, metadata=metadata)
+            item = inbox.register(file, message_id=message_id, index=index, group_id=group_id, metadata=metadata)
+            file_ids.append(item.file_id)
             markers.append(f"[用户上传文件] {name} 已登记，尚未下载原件。用户要求处理时先 list_files 找到 file_id，再 read_file 下载并读取。")
         except FileTaskError as error:
+            file_ids.append(None)
             markers.append(f"[用户上传文件] {name} 未登记：{error}（{error.code}）")
     if len(files) > 3:
         markers.append("单条消息只登记前 3 个文件，其余文件请分开发送。")
-    return "\n".join(markers)
+        file_ids.extend([None] * (len(files) - 3))
+    return "\n".join(markers), tuple(file_ids)
+
+
+def register_chat_file_markers(files: list[File], workspace: FileWorkspace, *, message_id: str, group_id: str | None = None, metadata: dict[str, Any] | None = None) -> str:
+    markers, _ = register_chat_file_resources(files, workspace, message_id=message_id, group_id=group_id, metadata=metadata)
+    return markers

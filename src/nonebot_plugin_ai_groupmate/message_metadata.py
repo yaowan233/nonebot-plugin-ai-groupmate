@@ -3,7 +3,7 @@
 import re
 from typing import TypeVar, Protocol
 from datetime import datetime, timedelta
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 _HEADER = re.compile(r"^(id|回复id|alias_id|aliasid)\s*:\s*(.*)$")
 _UNRELIABLE_IDS = {"", "0", "unknown", "system", "none", "null", "undefined"}
@@ -64,16 +64,21 @@ def platform_message_ids(content: str) -> frozenset[str]:
     )
 
 
-def deduplicate_bot_echoes(history: Sequence[_Record]) -> list[_Record]:
+def deduplicate_bot_echoes(
+    history: Sequence[_Record], *, ids_for: Callable[[_Record], frozenset[str]] | None = None,
+) -> list[_Record]:
     """Keep stored bot records and drop adapter echoes of those same messages.
 
     Different sessions, unknown IDs and ordinary users' multipart messages are
     deliberately left alone. No content similarity or nickname guessing is used.
     """
+    def ids(message: _Record) -> frozenset[str]:
+        return ids_for(message) if ids_for is not None else platform_message_ids(message.content)
+
     bot_times: dict[tuple[str, str], list[datetime]] = {}
     for message in history:
         if message.content_type == "bot":
-            for platform_id in platform_message_ids(message.content):
+            for platform_id in ids(message):
                 bot_times.setdefault((message.session_id, platform_id), []).append(
                     message.created_at
                 )
@@ -83,7 +88,7 @@ def deduplicate_bot_echoes(history: Sequence[_Record]) -> list[_Record]:
         if message.content_type == "bot"
         or not any(
             abs(message.created_at - bot_time) <= BOT_ECHO_LOOKBACK
-            for platform_id in platform_message_ids(message.content)
+            for platform_id in ids(message)
             for bot_time in bot_times.get((message.session_id, platform_id), [])
         )
     ]

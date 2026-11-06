@@ -3,6 +3,7 @@ import uuid
 import datetime
 from typing import Any, Literal, cast
 
+from nonebot import get_bots
 from sqlalchemy import CursorResult, func, select, update
 from nonebot.log import logger
 from langchain.tools import tool
@@ -11,9 +12,13 @@ from nonebot_plugin_alconna import Target, UniMessage
 from nonebot_plugin_apscheduler import scheduler
 
 from ..model import ChatHistory, ScheduledTask
+from .delivery import OutboundIdentity, send_and_finalize
 from ..reply_guard import is_request_active
 from .tool_results import tool_failure, tool_skipped, tool_success
+from ..runtime_config import get_runtime_config
+from ..message_rollout import message_pilot_enabled
 from ..scheduled_tasks import utcnow
+from ..structured_message import adapter_name
 
 TaskStatus = Literal["scheduled", "running", "completed", "failed", "cancelled", "missed", "interrupted", "all"]
 
@@ -32,28 +37,17 @@ async def send_scheduled_text(
             private=is_private,
             self_id=bot_id,
         )
-        result = await UniMessage.text(content).send(target=target)
-
-        msg_id = "unknown"
-        if result.msg_ids:
-            raw_msg_id = result.msg_ids[-1].get("message_id") or result.msg_ids[
-                -1
-            ].get("msg_id")
-            if raw_msg_id is not None:
-                msg_id = str(raw_msg_id)
-
-        async with get_session() as db_session:
-            chat_history = ChatHistory(
-                session_id=session_id,
-                user_id=bot_name,
-                content_type="bot",
-                content=f"id: {msg_id}\n" + content,
-                user_name=bot_name,
-            )
-            db_session.add(chat_history)
-            await db_session.commit()
-
-        logger.info(f"[定时任务] 已发送到 {session_id}: {content}")
+        message = UniMessage.text(content)
+        pilot = message_pilot_enabled(get_runtime_config(), session_id, is_private=is_private)
+        bot = get_bots().get(bot_id or "") if pilot else None
+        identity = OutboundIdentity(adapter_name(bot), "private" if is_private else "group", bot_id or bot_name, bot_name)
+        def record(message_id: str) -> list[ChatHistory]:
+            return [ChatHistory(session_id=session_id, user_id=bot_name, content_type="bot",
+                                content=f"id: {message_id}\n" + content, user_name=bot_name)]
+        receipt = await send_and_finalize(None, session_id, message, send_options={"target": target}, record=record,
+                                           recovery_enabled=pilot, outbound_identity=identity, session_factory=get_session)
+        if not receipt.history_saved or not receipt.structured_saved:
+            logger.warning("定时消息已发送，但本地记录不完整")
     except Exception as e:
         logger.error(f"[定时任务] 发送失败 {session_id}: {e}")
         raise

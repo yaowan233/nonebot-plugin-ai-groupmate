@@ -89,6 +89,7 @@ def create_mute_tool(
     bot_name: str,
     bot: Bot | None = None,
     group_members: list[Any] | None = None,
+    mentioned_user_ids: tuple[str, ...] = (),
 ):
     """创建禁言工具（仅在 bot 是管理员时可用）。"""
 
@@ -107,6 +108,8 @@ def create_mute_tool(
             reason: 禁言原因，用于日志和历史记录。
             target_user_id: 目标用户 ID；已知 ID 时优先使用，能够避免重名。
             target_user_name: 目标用户昵称；不知道 ID 时使用。重名时工具会返回候选 ID。
+
+        省略目标时只使用当前输入中唯一被 @ 的成员；多人时返回候选，不猜对象。
         """
         if request_id is not None and not await is_request_active(
             session_id, request_id
@@ -146,6 +149,12 @@ def create_mute_tool(
 
         normalized_target_id = str(target_user_id or "").strip()
         normalized_target_name = str(target_user_name or "").strip()
+        if not normalized_target_id and not normalized_target_name:
+            mentioned = list(dict.fromkeys(uid for uid in mentioned_user_ids if uid != str(bot_id)))
+            if len(mentioned) == 1:
+                normalized_target_id = mentioned[0]
+            elif len(mentioned) > 1:
+                return _result("failed", "target_ambiguous", "当前输入提及了多个成员，请明确目标用户 ID。", retryable=True, candidates=[{"user_id": uid} for uid in mentioned])
         if not normalized_target_id and not normalized_target_name:
             return _result(
                 "failed",

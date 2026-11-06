@@ -598,7 +598,7 @@ async def test_send_meme_honors_multi_send_limit_and_uses_distinct_ids(
         def __init__(self, raw: bytes):
             self.raw = raw
 
-        async def send(self, target=None):
+        async def send(self, target=None, **kwargs):
             sends.append(self.raw)
             return SimpleNamespace(msg_ids=[{"message_id": len(sends)}])
 
@@ -607,6 +607,7 @@ async def test_send_meme_honors_multi_send_limit_and_uses_distinct_ids(
         "image",
         staticmethod(lambda *, raw: FakeOutgoingMessage(raw)),
     )
+    monkeypatch.setattr(meme_tools, "compose_image_reply", lambda image, *_args: image)
 
     async def no_recent_memes(*_args, **_kwargs):
         return set()
@@ -644,7 +645,7 @@ async def test_send_meme_honors_multi_send_limit_and_uses_distinct_ids(
     assert sends == [b"image-1", b"image-2"]
     assert approved == {3}
     assert len(session.added) == 2
-    assert session.commit_count == 2
+    assert session.commit_count == 4  # Release before each send, persist each confirmed delivery.
 
 
 @pytest.mark.asyncio
@@ -740,7 +741,7 @@ async def test_send_meme_rejects_same_picture_with_different_file_encoding(
         def __init__(self, raw: bytes):
             self.raw = raw
 
-        async def send(self, target=None):
+        async def send(self, target=None, **kwargs):
             sent_images.append(self.raw)
             return SimpleNamespace(msg_ids=[{"message_id": len(sent_images)}])
 
@@ -757,6 +758,7 @@ async def test_send_meme_rejects_same_picture_with_different_file_encoding(
         "image",
         staticmethod(lambda *, raw: FakeOutgoingMessage(raw)),
     )
+    monkeypatch.setattr(meme_tools, "compose_image_reply", lambda image, *_args: image)
     approved = {1, 2}
     session = FakeSession()
     send_tool = meme_tools.create_send_meme_tool(

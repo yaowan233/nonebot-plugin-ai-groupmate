@@ -13,7 +13,8 @@ from nonebot_plugin_orm import get_session
 from ..model import ExplicitMemory, ChatHistorySchema
 from ..reply_guard import is_request_active
 from .tool_results import tool_failure, tool_skipped, tool_success
-from ..message_metadata import parse_message_metadata
+from .structured_context import StructuredSnapshot
+from .turn_context import TurnHistoryResolver
 
 MAX_MEMORIES = 12
 TEMPORARY_IDLE = timedelta(minutes=30)
@@ -75,10 +76,18 @@ async def get_explicit_memory_context(
 def create_explicit_memory_tools(
     session_id: str, user_id: str, bot_id: str, is_private: bool,
     history: list[ChatHistorySchema], request_id: str | None,
+    *, current_message_id: str | None = None,
+    batch_message_ids: tuple[str, ...] = (),
+    structured_messages: dict[tuple[str, str], StructuredSnapshot] | None = None,
 ):
     candidates = [row for row in history if row.session_id == session_id and str(row.user_id) == user_id and row.content_type == "text"]
+    resolver = TurnHistoryResolver(structured_messages)
+    current_ids = {message_id for message_id in (*batch_message_ids, current_message_id) if message_id}
+    if current_ids:
+        candidates = [row for row in candidates if current_ids.intersection(resolver.ids(row))]
     latest = max(candidates, key=lambda row: row.msg_id, default=None)
-    source = parse_message_metadata(latest.content)[2] if latest else ""
+    sources = [(row, resolver.metadata(row)[2]) for row in candidates]
+    source = resolver.metadata(latest)[2] if latest else ""
     scope = _scope(session_id, user_id, bot_id, is_private)
 
     async def expired() -> bool:
@@ -97,8 +106,10 @@ def create_explicit_memory_tools(
         title, source_quote = title.strip(), source_quote.strip()
         if not title or len(title) > 60 or not source_quote or len(source_quote) > 400:
             return tool_failure("invalid_memory", "记忆标题限 1～60 字，正文限 1～400 字；不要截断用户要求。")
-        if not source_quote or source_quote not in source:
+        matches = [row for row, text in sources if source_quote in text]
+        if not matches:
             return tool_failure("invalid_source", "原话不是当前用户本轮消息中的逐字摘录，未保存。")
+        source_row = max(matches, key=lambda row: row.msg_id)
         if lifetime == "long_term" and (not LONG_TERM_REQUEST.search(source_quote) or TEMPORARY_REQUEST.search(source_quote)):
             return tool_failure("missing_long_term_request", "原话未明确授权长期保存，或限定了临时范围；请使用 temporary。")
         if not 0 <= duration_minutes <= 1440 or (lifetime == "long_term" and duration_minutes):
@@ -118,7 +129,7 @@ def create_explicit_memory_tools(
                 row.kind = kind
                 row.lifetime = lifetime
                 row.source_quote = source_quote
-                row.source_msg_id = latest.msg_id if latest else 0
+                row.source_msg_id = source_row.msg_id
                 row.updated_at = now
                 row.last_used_at = now
                 expires_at = None

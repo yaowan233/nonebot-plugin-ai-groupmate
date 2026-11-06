@@ -19,12 +19,18 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from ..model import ChatHistory, MediaStorage, ChatHistorySchema
 from ..memory import DB, expand_meme_search_terms
+from .delivery import OutboundIdentity, send_and_finalize
 from ..deepseek import DeepSeekChatOpenAI
-from .reply_tools import record_image_reply, compose_image_reply, resolve_reply_target
+from .reply_tools import image_reply_rows, compose_image_reply, resolve_reply_target
 from ..reply_guard import is_request_active
 from .meme_visuals import VISUAL_CANDIDATE_LIMIT, build_meme_contact_sheet
 from .tool_results import tool_failure, tool_skipped, tool_success
-from ..participation import record_group_delivery
+from .file_workspace import FileWorkspace
+from .history_format import _image_bytes_to_data_uri
+from .image_resources import ImageResources, ImageResourceError, is_image_history
+from .structured_image_resources import find_recent_scoped_user_image, load_scoped_message, read_message_images
+from ..message_metadata import platform_message_ids
+from ..message_repository import find_by_platform_id
 
 RECENT_MEME_EXCLUSION_COUNT = 10
 MEME_SEARCH_CANDIDATE_LIMIT = 50
@@ -520,6 +526,10 @@ def create_similar_meme_tool(
     *,
     pic_dir: Path,
     approved_meme_ids: set[int] | None = None,
+    platform: str = "",
+    is_private: bool = False,
+    reply_to_id: str | None = None,
+    workspace: FileWorkspace | None = None,
 ):
     """
     创建基于消息ID搜索相似表情包的工具
@@ -531,8 +541,7 @@ def create_similar_meme_tool(
         根据指定的历史图片，搜索与之相似的表情包。
         当用户说"找一张跟这张差不多的"或引用某张图片求相似图时使用。
         参数：
-        - target_msg_id: 聊天记录中图片消息的 id（从聊天记录的 "id: xxxxx" 中获取）。
-          如果不传，则自动使用**当前发消息的用户**最近发送的一张图片（而非群内最新图片）。
+        - target_msg_id: 图片的平台消息 ID。省略时优先使用引用的图片，否则使用当前用户最近发送的图片。
         """
         if approved_meme_ids is not None:
             approved_meme_ids.clear()
@@ -552,41 +561,57 @@ def create_similar_meme_tool(
                 )
                 .order_by(desc(ChatHistory.created_at))
             )
-            if target_msg_id:
-                stmt = base_stmt.where(
-                    ChatHistory.content.contains(f"id: {target_msg_id}\n")
-                ).limit(1)
-            elif user_id:
-                stmt = base_stmt.where(ChatHistory.user_id == user_id).limit(1)
+            selected_id = target_msg_id or reply_to_id
+            msg = None
+            if not selected_id and user_id:
+                msg = await db_session.scalar(base_stmt.where(ChatHistory.user_id == user_id).limit(1))
+                if platform:
+                    recent = await find_recent_scoped_user_image(
+                        db_session, session_id=session_id, platform=platform,
+                        is_private=is_private, user_id=user_id,
+                    )
+                    if recent and (msg is None or recent[0] in platform_message_ids(msg.content)
+                                   or recent[1] >= msg.created_at):
+                        selected_id = recent[0]
+
+            resources = ImageResources(pic_dir, workspace)
+            structured = await load_scoped_message(
+                db_session, session_id=session_id, platform=platform,
+                is_private=is_private, message_id=selected_id,
+            ) if selected_id and platform else None
+            source_media_id = None
+            if structured is not None:
+                parts = [part for part in structured.parts if part.get("type") == "image"]
+                if not parts:
+                    return tool_failure("source_image_not_found", "指定的消息没有图片。")
+                media_id = str(parts[-1].get("media_id") or "")
+                source_media_id = int(media_id) if media_id.isdigit() else None
+                image_bytes = (await read_message_images(resources, structured, max_bytes=10 * 1024 * 1024,
+                                                         max_images=1, last_only=True))[0]
             else:
-                stmt = base_stmt.limit(1)
-            result = await db_session.execute(stmt)
-            msg = result.scalar_one_or_none()
-
-            if not msg:
-                return tool_failure(
-                    "source_image_not_found",
-                    "本群近期没有发送过可用于相似搜索的图片。",
+                if selected_id:
+                    matches = await find_by_platform_id(db_session, session_id, selected_id)
+                    msg = next((row for row in reversed(matches) if is_image_history(row)), None)
+                if not msg:
+                    return tool_failure("source_image_not_found", "没有找到对应图片，请发送或引用图片后再试。")
+                source_media_id = msg.media_id
+                media_obj = await db_session.get(MediaStorage, source_media_id) if source_media_id is not None else None
+                if source_media_id is not None and (media_obj is None or not media_obj.file_path):
+                    return tool_failure("source_file_not_found", "无法找到原图文件，不能进行相似搜索。")
+                image_bytes = await asyncio.to_thread(
+                    resources.read_history, msg, max_bytes=10 * 1024 * 1024,
+                    media_path=media_obj.file_path if media_obj else None,
                 )
-
-            stmt = Select(MediaStorage).where(MediaStorage.media_id == msg.media_id)
-            media_obj = (await db_session.execute(stmt)).scalar_one_or_none()
-
-            if not media_obj or not media_obj.file_path:
-                return tool_failure(
-                    "source_file_not_found",
-                    "无法找到原图文件，不能进行相似搜索。",
-                )
-
-            source_media_id = msg.media_id
-            source_file_path = media_obj.file_path
+            source_image = await asyncio.to_thread(_image_bytes_to_data_uri, image_bytes, source="similar_meme")
+            if not source_image:
+                return tool_failure("source_image_invalid", "无法读取原图，不能进行相似搜索。")
             recent_ids = await _get_recent_sent_meme_ids(db_session, session_id)
             if source_media_id is not None:
                 recent_ids.add(int(source_media_id))
             await db_session.commit()
 
             pic_ids = await DB.search_similar_meme(
-                str(pic_dir / source_file_path),
+                source_image,
                 exclude_ids=recent_ids,
             )
 
@@ -627,6 +652,14 @@ def create_similar_meme_tool(
                 },
             )
 
+        except ImageResourceError as error:
+            if error.code == "expired":
+                return tool_failure("source_image_expired", "原图已过期，请重新发送图片后再试。")
+            if error.code == "unavailable":
+                return tool_failure("source_image_unavailable", "暂时无法读取图片记录，请稍后再试。", retryable=True)
+            if error.code == "too_large":
+                return tool_failure("source_image_too_large", "原图超过 10 MiB，无法进行相似搜索。")
+            return tool_failure("source_file_not_found", "找不到原图文件或无权访问，不能进行相似搜索。")
         except Exception as error:
             logger.error(
                 "相似图片搜索失败: "
@@ -901,6 +934,8 @@ def create_send_meme_tool(
     max_sends: int = 1,
     current_message_id: str | None = None,
     replied_message_id: str | None = None,
+    recovery_enabled: bool = True,
+    outbound_identity: OutboundIdentity | None = None,
 ):
     """
     创建一个带上下文的表情包发送工具
@@ -944,7 +979,7 @@ def create_send_meme_tool(
         send_started = False
         try:
             try:
-                quoted_id = await resolve_reply_target(db_session, session_id, reply_to, current_message_id=current_message_id, replied_message_id=replied_message_id)
+                quoted_id = await resolve_reply_target(db_session, session_id, reply_to, current_message_id=current_message_id, replied_message_id=replied_message_id, outbound_identity=outbound_identity)
             except ValueError as error:
                 return tool_failure("invalid_reply_target", str(error), delivery_state="not_attempted")
             match = re.search(r"\d+", pic_id)
@@ -1052,35 +1087,28 @@ def create_send_meme_tool(
             await db_session.commit()
             text = text.strip()
             message = compose_image_reply(UniMessage.image(raw=pic_data), text, quoted_id)
+            def record(message_id: str):
+                return image_reply_rows(session_id=session_id, bot_name=bot_name, message_id=message_id, text=text, quoted_id=quoted_id,
+                                        image_content=f"发送了图片，图片描述是: {description}\n图片文件: {media_file_path}", media_id=media_id)
             send_started = True
-            res = await (
-                message.send(target=send_target)
-                if send_target is not None
-                else message.send()
-            )
-            msg_id = "unknown"
-            record_group_delivery(session_id)
-            if res.msg_ids:
-                raw_msg_id = res.msg_ids[-1].get("message_id") or res.msg_ids[-1].get(
-                    "msg_id"
-                )
-                if raw_msg_id is not None:
-                    msg_id = str(raw_msg_id)
-            record_image_reply(db_session, session_id=session_id, bot_name=bot_name, message_id=msg_id, text=text, quoted_id=quoted_id,
-                               image_content=f"发送了图片，图片描述是: {description}\n图片文件: {media_file_path}", media_id=media_id)
+            sent_meme_ids.add(selected_pic_id)
+            options = {"target": send_target} if send_target is not None else {}
+            delivery = await send_and_finalize(db_session, session_id, message, send_options=options, record=record,
+                                               recovery_enabled=recovery_enabled, outbound_identity=outbound_identity,
+                                               reply_to_id=quoted_id)
             if approved_meme_ids is not None:
                 approved_meme_ids.discard(selected_pic_id)
-            sent_meme_ids.add(selected_pic_id)
             if perceptual_hash is not None:
                 sent_perceptual_hashes.append(perceptual_hash)
             sent_count += 1
-            logger.info(f"id:{res.msg_ids}\n发送表情包: {description}")
+            logger.info(f"id:{delivery.message_id}\n发送表情包: {description}")
             return tool_success(
                 "meme_sent",
-                "文字和表情包已在同一条消息中发送。" if text else "已成功发送表情包。",
+                delivery.note or ("文字和表情包已在同一条消息中发送。" if text else "已成功发送表情包。"),
                 data={
                     "pic_id": selected_pic_id,
-                    "message_id": msg_id,
+                    "message_id": delivery.message_id,
+                    "history_saved": delivery.history_saved,
                     "reply_to_message_id": quoted_id,
                     "text": text,
                     "description": description,

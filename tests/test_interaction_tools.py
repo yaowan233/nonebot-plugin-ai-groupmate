@@ -13,11 +13,12 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 @pytest.fixture
 async def history_db(tmp_path, monkeypatch):
     from nonebot_plugin_ai_groupmate.agent import interaction_tools
-    from nonebot_plugin_ai_groupmate.model import ChatHistory
+    from nonebot_plugin_ai_groupmate.model import ChatHistory, HistoryMessageIndex
 
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'history.sqlite3'}")
     async with engine.begin() as connection:
         await connection.run_sync(ChatHistory.__table__.create)
+        await connection.run_sync(HistoryMessageIndex.__table__.create)
     sessions = async_sessionmaker(engine, expire_on_commit=False)
     monkeypatch.setattr(interaction_tools, "get_session", sessions)
     yield sessions
@@ -45,6 +46,46 @@ def tools(*, request_id=None):
 
 async def invoke(tool, **kwargs):
     return json.loads(await tool.ainvoke(kwargs))
+
+
+async def test_recent_history_orders_by_time_pages_and_stays_in_group(history_db):
+    from nonebot_plugin_ai_groupmate.agent.interaction_tools import create_interaction_history_tools
+
+    now = datetime.now()
+    await seed(history_db, [
+        {"created_at": now - timedelta(minutes=2), "content": "较早"},
+        {"created_at": now - timedelta(minutes=4), "content": "最早"},
+        {"created_at": now - timedelta(minutes=1), "content_type": "image", "content": "private filename"},
+        {"created_at": now - timedelta(minutes=1), "session_id": "other-group", "content": "不应读到"},
+        {"created_at": now, "content": "请求之后的新消息"},
+    ])
+    bundle = {tool.name: tool for tool in create_interaction_history_tools("group-1", None, upper_history_id=4)}
+    first = await invoke(bundle["read_recent_history"], limit=2, since_minutes=10)
+    assert [row["msg_id"] for row in first["data"]["messages"]] == [3, 1]
+    assert first["data"]["messages"][0]["content"] == "[图片]"
+    second = await invoke(bundle["read_recent_history"], limit=2, since_minutes=10, before_msg_id=first["data"]["next_before_msg_id"])
+    assert [row["msg_id"] for row in second["data"]["messages"]] == [2]
+    assert second["data"]["next_before_msg_id"] is None
+    assert (await invoke(bundle["read_recent_history"], before_msg_id=4))["reason_code"] == "source_not_found"
+    assert (await invoke(bundle["read_recent_history"], since_minutes=1))["data"]["messages"] == []
+
+
+async def test_recent_history_result_budget_keeps_a_usable_cursor(history_db, monkeypatch):
+    from nonebot_plugin_ai_groupmate.agent import interaction_tools
+
+    await seed(history_db, [{"content": f"第{i}条" + "长正文" * 200} for i in range(12)])
+    monkeypatch.setattr(interaction_tools, "RESULT_MAX_CHARS", 1700)
+    recent = tools()["read_recent_history"]
+    found = []
+    cursor = 0
+    while True:
+        result = await invoke(recent, limit=12, before_msg_id=cursor)
+        assert len(json.dumps(result, ensure_ascii=False)) <= 1700
+        found.extend(item["msg_id"] for item in result["data"]["messages"])
+        cursor = result["data"]["next_before_msg_id"]
+        if cursor is None:
+            break
+    assert found == list(range(12, 0, -1))
 
 
 async def test_discovers_interaction_without_evaluation_keyword_and_keeps_roles(history_db):
@@ -167,17 +208,18 @@ def test_history_tools_visible_on_first_group_turn_without_loading_a_skill(mode)
     env.update(
         is_private=mode == "private", proactive_meme_only=mode == "meme", proactive_reaction_only=mode == "reaction", proactive_observation=mode == "observation",
         repeat_text="跟读" if mode == "repeat" else None, meme_similar_enabled=False, reaction_enabled=True,
-        web_image_tools=[], file_tools=[], custom_agent_tools=[], lazy_attachment_tools=[],
-        create_explicit_memory_tools=lambda *_: [], create_interaction_history_tools=interaction_tools.create_interaction_history_tools,
+        web_image_tools=[], ordered_reply_tools=[], file_tools=[], image_generation_tools=[], drawing_management_tools=[], custom_agent_tools=[], lazy_attachment_tools=[],
+        create_explicit_memory_tools=lambda *_, **__: [], create_interaction_history_tools=interaction_tools.create_interaction_history_tools,
         create_group_member_tool=create_group_member_tool, member_snapshot=[], interface=None,
         session_id="group-1", request_id=None, bot_id="bot-id", plugin_config=SimpleNamespace(bot_name="miyuki"),
-        get_bots=lambda: {"bot-id": object()}, str=str, tuple=tuple, set=set,
+        get_bots=lambda: {"bot-id": object()}, str=str, tuple=tuple, set=set, max=max,
         user_id="1", history=[],
-        plugin_data_dir=Path("unused-card-cache"), create_shared_card_tools=lambda *_: [],
+        plugin_data_dir=Path("unused-card-cache"), create_shared_card_tools=lambda *_, **__: [],
+        current_input_batch=SimpleNamespace(get=lambda: ()),
     )
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), env)
     names = {tool.name for tool in _active_tools(env["base_agent_tools"], {}, [])}
-    history_names = {"search_history_context", "search_group_interactions", "read_member_history"}
+    history_names = {"search_history_context", "search_group_interactions", "read_member_history", "read_recent_history"}
     assert names & history_names == (history_names if mode == "group" else set())
     assert ("get_group_members" in names) == (mode == "group")
 

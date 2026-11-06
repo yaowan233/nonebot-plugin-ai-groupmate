@@ -11,8 +11,8 @@ async def test_burst_restarts_quiet_period_but_has_a_hard_cap():
     batcher = InputBatcher[str](lambda: now[0])
     delivered = []
 
-    async def deliver(request):
-        delivered.append((request, current_input_batch.get()))
+    async def deliver(request, messages):
+        delivered.append((request, messages))
 
     key = ("bot", "group", "user", "")
     options: dict[str, Any] = {"delay": 1.2, "max_wait": 4, "merge": lambda a, b: a + "|" + b, "deliver": deliver}
@@ -37,7 +37,7 @@ async def test_batch_isolates_bot_group_sender_and_reply_target_and_deduplicates
     batcher = InputBatcher[str]()
     delivered = []
 
-    async def deliver(request):
+    async def deliver(request, messages):
         delivered.append(request)
 
     keys = [("bot", "group", "u", "q1"), ("bot", "group", "u", "q2"),
@@ -50,13 +50,27 @@ async def test_batch_isolates_bot_group_sender_and_reply_target_and_deduplicates
     assert sorted(delivered) == ["0", "1", "2", "3", "4"]
 
 
+async def test_immediate_delivery_keeps_original_message_reference():
+    from nonebot_plugin_ai_groupmate.message_batching import InputBatcher, current_input_batch
+
+    batcher = InputBatcher[str]()
+    delivered = []
+
+    async def deliver(request, messages):
+        delivered.append((request, messages, current_input_batch.get()))
+
+    await batcher.submit(("bot", "group", "u", ""), "request", message_id="42", text="hello",
+                         delay=0, max_wait=0, merge=lambda previous, latest: latest, deliver=deliver)
+    assert delivered == [("request", (("42", "hello"),), ())]
+
+
 async def test_stop_discards_pending_burst_and_new_burst_is_independent():
     from nonebot_plugin_ai_groupmate.message_batching import InputBatcher
 
     batcher = InputBatcher[str]()
     delivered = []
 
-    async def deliver(request):
+    async def deliver(request, messages):
         delivered.append(request)
 
     options: dict[str, Any] = {"delay": 0.01, "max_wait": 0.1, "merge": lambda a, b: b, "deliver": deliver}
@@ -92,6 +106,8 @@ async def test_integration_keeps_first_address_and_both_inputs_for_worker(monkey
             interface=cast(Any, None), bot=cast(Any, SimpleNamespace(self_id="bot")),
             event=cast(Any, SimpleNamespace(get_plaintext=lambda: text)), bot_name="miyuki",
             user_id="u", user_name="U", is_tome=addressed, is_continuous=False, reply_to_id=reply_id,
+            mentioned_user_ids=("alice", "bob") if number == "a" else ("bob", "charlie"),
+            created_monotonic=10.0 if number == "a" else 20.0,
         )
     await plugin._submit_reply_input("group", request("a", "这个是什么厂的", True, "quoted-image"), "123", "这个是什么厂的")
     await plugin._submit_reply_input("group", request("b", "我说图片右边那个", False, None), "124", "我说图片右边那个")
@@ -100,13 +116,18 @@ async def test_integration_keeps_first_address_and_both_inputs_for_worker(monkey
     ready = requests[0]
     assert ready.is_tome
     assert ready.reply_to_id == "quoted-image"
+    assert ready.mentioned_user_ids == ("alice", "bob", "charlie")
+    assert ready.created_monotonic == 10.0
     assert ready.input_batch == (("123", "这个是什么厂的"), ("124", "我说图片右边那个"))
 
     boundaries = []
-    async def handle(*_args):
+    async def handle(admitted):
+        assert admitted is ready
+        assert admitted.reply_to_id == "quoted-image"
+        assert admitted.mentioned_user_ids == ("alice", "bob", "charlie")
         boundaries.append(_build_current_request_boundary([], "u", "U", ready.event))
         assert current_input_batch.get() == ready.input_batch
-    monkeypatch.setattr(plugin, "handle_reply_logic", handle)
+    monkeypatch.setattr(plugin, "handle_reply_request", handle)
     await plugin._execute_reply_request(ready)
     assert "这个是什么厂的" in boundaries[0]
     assert "我说图片右边那个" in boundaries[0]

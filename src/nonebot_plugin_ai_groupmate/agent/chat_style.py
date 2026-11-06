@@ -17,13 +17,66 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..model import ChatHistory, ChatHistorySchema
 from .style_learning import contextual_style
 from ..message_metadata import deduplicate_bot_echoes, parse_message_metadata
+from ..message_mentions import format_member_mention
+from .structured_context import load_structured_context_safely
 
 STYLE_HISTORY_DAYS = 7
 STYLE_ROWS_PER_DAY = 100
 STYLE_CACHE_SECONDS = 300
 PAIR_HISTORY_LIMIT = 400
-_style_cache: OrderedDict[tuple[str, tuple[str, ...], tuple[str, ...]], tuple[float, list[ChatHistorySchema]]] = OrderedDict()
-_pair_history_cache: OrderedDict[tuple[str, tuple[str, ...], tuple[str, ...]], tuple[float, list[ChatHistorySchema]]] = OrderedDict()
+_style_cache: OrderedDict[tuple[str, tuple[str, ...], tuple[str, ...], str], tuple[float, list[ChatHistorySchema]]] = OrderedDict()
+_pair_history_cache: OrderedDict[tuple[str, tuple[str, ...], tuple[str, ...], str], tuple[float, list[ChatHistorySchema]]] = OrderedDict()
+
+
+async def _structured_style_history(
+    db_session: AsyncSession, history: Sequence[ChatHistorySchema], *, session_id: str, platform: str | None,
+) -> list[ChatHistorySchema]:
+    """Use scoped message text while retaining stable legacy learning cursors."""
+    rows = list(history)
+    if not platform or not rows:
+        return rows
+    snapshots = await load_structured_context_safely(
+        db_session, rows, session_id=session_id, scope="group", platform=platform, include_media=False,
+    )
+    if not snapshots:
+        return rows
+    history_by_id = {row.msg_id: row for row in rows}
+    replacements: dict[int, str] = {}
+    ambiguous: set[int] = set()
+    for (message_id, sender_id), snapshot in snapshots.items():
+        # Cards and unknown parts retain their old representation, including the
+        # existing filters that keep shared content out of style examples.
+        if not snapshot.parts or any(part.get("type") not in {"text", "mention", "image", "face", "mface"}
+                                     for part in snapshot.parts):
+            continue
+        text = "".join(
+            part.get("text", "") if part.get("type") == "text" else
+            format_member_mention(part.get("target", ""), part.get("name", "")) if part.get("type") == "mention" else
+            "[表情]" if part.get("type") in {"face", "mface"} else ""
+            for part in snapshot.parts
+        )
+        # The compatibility reader treats leading transport headers as metadata;
+        # don't reinterpret a human's own first line as an alias or reply ID.
+        if (not text or any(char in message_id for char in "\r\n") or
+                re.match(r"^(?:id|回复id|alias_id|aliasid)\s*:", text)):
+            continue
+        header = f"id: {message_id}\n"
+        if snapshot.reply_to_id and not any(char in snapshot.reply_to_id for char in "\r\n"):
+            header += f"回复id: {snapshot.reply_to_id}\n"
+        for history_id in snapshot.history_ids:
+            row = history_by_id.get(history_id)
+            if row is None or row.session_id != session_id or row.user_id != sender_id or row.content_type != "text":
+                continue
+            if history_id in replacements:
+                ambiguous.add(history_id)
+                continue
+            aliases = sorted(snapshot.history_platform_ids.get(history_id, ()))
+            alias_headers = "".join(f"alias_id: {alias}\n" for alias in aliases
+                                    if alias != message_id and not any(char in alias for char in "\r\n"))
+            replacements[history_id] = header + alias_headers + text
+    return [row.model_copy(update={"content": replacements[row.msg_id]})
+            if row.msg_id in replacements and row.msg_id not in ambiguous else row
+            for row in rows]
 
 
 def _human_expressions(
@@ -56,6 +109,7 @@ def _human_expressions(
         if (
             own_id == "system"
             or not 2 <= len(body) <= max_length
+            or not body.replace("[表情]", "").strip()
             or len(body.splitlines()) > max_lines
             or body.startswith(("/", "!", "！", "#"))
             or any(marker in body for marker in ("http://", "https://", "[CQ:", "```"))
@@ -147,9 +201,10 @@ async def load_group_style_context(
     current_history: Sequence[ChatHistorySchema] = (),
     model_factory: Callable[[], Any] | None = None,
     store_root: Path | None = None,
+    structured_platform: str | None = None,
 ) -> str:
     """Rebuild from stored chat, independently of the 20-message reply window."""
-    key = (session_id, tuple(sorted(set(bot_user_ids))), tuple(sorted(set(bot_names))))
+    key = (session_id, tuple(sorted(set(bot_user_ids))), tuple(sorted(set(bot_names))), structured_platform or "")
     cached = _style_cache.get(key) if now is None else None
     if cached is not None and time.monotonic() - cached[0] < STYLE_CACHE_SECONDS:
         _style_cache.move_to_end(key)
@@ -170,6 +225,7 @@ async def load_group_style_context(
             ).order_by(ChatHistory.created_at.desc(), ChatHistory.msg_id.desc()).limit(STYLE_ROWS_PER_DAY))
             rows.extend(result.scalars().all())
         history = [ChatHistorySchema.model_validate(row) for row in sorted(rows, key=lambda row: (row.created_at, row.msg_id))]
+        history = await _structured_style_history(db_session, history, session_id=session_id, platform=structured_platform)
         if now is None:
             _style_cache[key] = (time.monotonic(), history)
             _style_cache.move_to_end(key)
@@ -190,11 +246,15 @@ async def load_group_style_context(
                 ChatHistory.created_at <= (now or datetime.now()),
             ).order_by(ChatHistory.created_at.desc(), ChatHistory.msg_id.desc()).limit(PAIR_HISTORY_LIMIT))
             pair_history = [ChatHistorySchema.model_validate(row) for row in reversed(result.scalars().all())]
+            pair_history = await _structured_style_history(db_session, pair_history, session_id=session_id,
+                                                           platform=structured_platform)
             if now is None:
                 _pair_history_cache[key] = (time.monotonic(), pair_history)
                 _pair_history_cache.move_to_end(key)
                 while len(_pair_history_cache) > 128:
                     _pair_history_cache.popitem(last=False)
+        current_history = await _structured_style_history(db_session, current_history, session_id=session_id,
+                                                          platform=structured_platform)
         await db_session.commit()  # Do not hold a pooled connection during model I/O.
         recent = []
         for row in current_history[-12:]:

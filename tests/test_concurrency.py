@@ -120,7 +120,7 @@ async def test_group_workers_wait_for_agent_slot_before_running(monkeypatch):
         await asyncio.sleep(0.01)
         active -= 1
 
-    monkeypatch.setattr(plugin, "handle_reply_logic", fake_handle_reply_logic)
+    monkeypatch.setattr(plugin, "handle_reply_request", fake_handle_reply_logic)
     plugin._group_reply_states.clear()
 
     try:
@@ -199,8 +199,8 @@ async def test_addressed_requests_queue_without_background_preemption(monkeypatc
     async def fake_set_latest_request_id(group_id: str, request_id: str) -> None:
         invalidated_requests.append(request_id)
 
-    monkeypatch.setattr(plugin, "handle_reply_logic", fake_handle_reply_logic)
-    monkeypatch.setattr(plugin, "set_latest_request_id", fake_set_latest_request_id)
+    monkeypatch.setattr(plugin, "handle_reply_request", fake_handle_reply_logic)
+    monkeypatch.setattr(plugin.group_reply_scheduler, "set_latest_request_id", fake_set_latest_request_id)
     plugin._group_reply_states.clear()
     direct_request = request("direct-1", "user-1", is_tome=True)
     accepted = await plugin._queue_group_reply_request(
@@ -289,9 +289,9 @@ async def test_group_runs_two_addressed_requests_concurrently_and_queues_third(
             ),
         )
 
-    async def fake_handle_reply_logic(request_id: str, *args, **kwargs) -> None:
+    async def fake_handle_reply_logic(request, *args, **kwargs) -> None:
         nonlocal finished
-        started.append(request_id)
+        started.append(request.request_id)
         if len(started) == 2:
             two_started.set()
         await release.wait()
@@ -299,7 +299,7 @@ async def test_group_runs_two_addressed_requests_concurrently_and_queues_third(
         if finished == 3:
             all_finished.set()
 
-    monkeypatch.setattr(plugin, "handle_reply_logic", fake_handle_reply_logic)
+    monkeypatch.setattr(plugin, "handle_reply_request", fake_handle_reply_logic)
     monkeypatch.setattr(plugin.plugin_config, "agent_max_concurrency_per_group", 2)
     plugin._group_reply_states.clear()
 

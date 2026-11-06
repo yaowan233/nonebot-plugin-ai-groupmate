@@ -103,7 +103,7 @@ async def test_observation_never_interrupts_existing_requests(monkeypatch, busy)
 
     state = plugin.GroupReplyState()
     setattr(state, busy, True if busy == "running" else ["existing"])
-    monkeypatch.setattr(plugin, "_group_reply_states", {"group": state})
+    monkeypatch.setattr(plugin._reply_scheduler, "states", {"group": state})
     request = cast(plugin.ReplyRequest, SimpleNamespace(proactive_observation=True))
     assert not await plugin._queue_group_reply_request("group", request)
     assert getattr(state, busy)

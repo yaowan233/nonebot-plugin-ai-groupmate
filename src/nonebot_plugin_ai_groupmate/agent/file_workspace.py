@@ -6,6 +6,7 @@ import time
 import uuid
 import hashlib
 import threading
+from copy import copy
 from pathlib import Path
 from dataclasses import asdict, dataclass
 from collections.abc import Iterable
@@ -83,6 +84,10 @@ class FileWorkspace:
     def __init__(self, root: Path, *, session_id: str, user_id: str, bot_id: str, is_private: bool,
                  peer_bot_ids: Iterable[str] | None = None):
         self.root = root.resolve()
+        self.session_id = session_id
+        self.user_id = user_id
+        self.bot_id = bot_id
+        self.is_private = is_private
         if peer_bot_ids is None:
             from nonebot import get_bots
 
@@ -95,6 +100,10 @@ class FileWorkspace:
         )
         # New files retain their owner; group follow-ups may read connected peers.
         self.directory = self.directories[0]
+        # Only explicitly sent images are shared. Private chats retain their
+        # user/Bot scope; a group publication can be quoted by other members.
+        publication_scope = [True, session_id, user_id, bot_id] if is_private else [False, session_id]
+        self.publication_directory = self.root / "published_images" / hashlib.sha256(json.dumps(publication_scope, ensure_ascii=False).encode()).hexdigest()
 
     def _folder(self, file_id: str) -> Path:
         if not _FILE_ID.fullmatch(file_id):
@@ -119,11 +128,15 @@ class FileWorkspace:
             if metadata.stat().st_size > 16384:
                 raise OSError("metadata too large")
             artifact = Artifact(**json.loads(metadata.read_text(encoding="utf-8")))
-            if artifact.file_id != file_id or time.time() >= artifact.created_at + FILE_TTL_SECONDS:
-                raise OSError("expired")
+            if artifact.file_id != file_id:
+                raise OSError("invalid file id")
+            if time.time() >= artifact.created_at + FILE_TTL_SECONDS:
+                raise FileTaskError("file_expired", "文件已过期，请重新发送或生成。")
             if data.stat().st_size != artifact.size or artifact.size > MAX_FILE_BYTES:
                 raise OSError("size mismatch")
             return artifact
+        except FileTaskError:
+            raise
         except (OSError, ValueError, TypeError):
             raise FileTaskError("file_not_found", "文件不存在、已过期，或不属于当前用户和会话。请先 list_files 或重新下载。") from None
 
@@ -133,6 +146,50 @@ class FileWorkspace:
 
     def read(self, file_id: str) -> bytes:
         return self.path(file_id).read_bytes()
+
+    def _publication_path(self, file_id: str, message_id: str | None = None) -> Path:
+        if not _FILE_ID.fullmatch(file_id) or message_id == "" or message_id == "unknown":
+            raise FileTaskError("published_image_not_found", "没有这条消息对应的已发送图片。")
+        name = hashlib.sha256(json.dumps([message_id, file_id]).encode()).hexdigest() + ".json"
+        path = self.publication_directory / name
+        if path.is_symlink() or path.parent.is_symlink() or path.parent.parent.is_symlink() or not path.resolve().is_relative_to(self.root):
+            raise FileTaskError("published_image_not_found", "已发送图片的关联不可访问。")
+        return path
+
+    def publish_image(self, file_id: str, message_id: str) -> None:
+        """Called only after a validated native image was actually delivered."""
+        with _STORE_LOCK:
+            self.get(file_id)
+            path = self._publication_path(file_id, message_id)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            for old in path.parent.glob("*.json"):
+                if not old.is_symlink() and time.time() - old.stat().st_mtime > FILE_TTL_SECONDS:
+                    old.unlink(missing_ok=True)
+            record = {"file_id": file_id, "message_id": message_id, "directory": self._folder(file_id).parent.name}
+            for index in (path, self._publication_path(file_id)):
+                temporary = index.with_suffix("." + uuid.uuid4().hex + ".tmp")
+                temporary.write_text(json.dumps(record), encoding="utf-8")
+                temporary.replace(index)
+
+    def read_published_image(self, file_id: str, message_id: str | None = None) -> bytes:
+        """Read only an artifact published under this exact conversation/message."""
+        try:
+            path = self._publication_path(file_id, message_id)
+            if path.stat().st_size > 1024:
+                raise ValueError("invalid publication")
+            record = json.loads(path.read_text(encoding="utf-8"))
+            if record.get("file_id") != file_id or (message_id is not None and record.get("message_id") != message_id) or not isinstance(record.get("directory"), str) or not _SCOPE_ID.fullmatch(record["directory"]):
+                raise ValueError("invalid publication")
+            published = copy(self)
+            published.directory = self.root / record["directory"]
+            published.directories = (published.directory,)
+            return published.read(file_id)  # Includes the original expiry/path checks.
+        except FileTaskError as error:
+            if error.code == "file_expired":
+                raise
+            raise FileTaskError("published_image_not_found", "这条消息的图片未登记或不属于当前会话。") from None
+        except (OSError, ValueError, TypeError, AttributeError):
+            raise FileTaskError("published_image_not_found", "这条消息的图片未登记、已过期或不属于当前会话。") from None
 
     def list(self) -> list[Artifact]:
         with _STORE_LOCK:

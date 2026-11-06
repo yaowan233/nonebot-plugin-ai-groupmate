@@ -228,7 +228,7 @@ def test_moderation_prompt_allows_requests_from_regular_members():
 
     _, instruction = build_permission_prompt_parts(True)
 
-    assert "发起者不需要是管理员" in instruction
+    assert "谁提议的都行，别因为提出禁言的人只是普通群友就拒绝执行" in instruction
     assert "target_user_id" in instruction
 
 

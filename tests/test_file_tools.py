@@ -411,8 +411,9 @@ async def test_full_agent_fetch_download_summarize_and_send(tmp_path, monkeypatc
     tools = [*toolset(tmp_path).values(), finish]
     graph = build_chat_graph(model, tools, "Read the web page, download Excel, summarize and deliver.")
     result = await graph.ainvoke({"messages": [HumanMessage(content="Summarize the Excel on this web page and send me the file.")], "session_id": "group", "request_id": None})
-    assert result["called_finish"] == 1
-    assert model.step == 7
+    # Successful terminal file delivery ends the run without a separate finish call.
+    assert result["reply_count"] == 1
+    assert model.step == 6
     assert len(sent) == 1
     assert sent[0][1]["fallback"] is False
     assert sent[0][1]["target"].id == "group"

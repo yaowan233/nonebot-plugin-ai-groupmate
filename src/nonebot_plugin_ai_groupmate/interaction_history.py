@@ -24,6 +24,16 @@ class HistoryMessage:
     content: str
     created_at: datetime
     media_id: int | None = None
+    structured_ids: frozenset[str] | None = None
+    structured_metadata: tuple[str | None, str | None, str] | None = None
+
+
+def history_ids(row: HistoryMessage) -> frozenset[str]:
+    return row.structured_ids if row.structured_ids is not None else platform_message_ids(row.content)
+
+
+def history_metadata(row: HistoryMessage) -> tuple[str | None, str | None, str]:
+    return row.structured_metadata if row.structured_metadata is not None else parse_message_metadata(row.content)
 
 
 def prepare_history(
@@ -39,22 +49,22 @@ def prepare_history(
     bot_times: dict[tuple[str, str], list[datetime]] = defaultdict(list)
     for row in rows:
         if row.content_type == "bot":
-            for platform_id in platform_message_ids(row.content):
+            for platform_id in history_ids(row):
                 bot_times[row.session_id, platform_id].append(row.created_at)
     pairs: dict[str, set[str]] = defaultdict(set)
     for row in rows:
         if row.content_type != "text":
             continue
-        for platform_id in platform_message_ids(row.content):
+        for platform_id in history_ids(row):
             if any(abs(row.created_at - when) <= BOT_ECHO_LOOKBACK for when in bot_times.get((row.session_id, platform_id), ())):
                 pairs[str(row.user_id)].add(platform_id)
     bot_ids = {str(uid) for uid in bot_user_ids}
     bot_ids.update(uid for uid, ids in pairs.items() if len(ids) >= 2)
-    return deduplicate_bot_echoes(rows), bot_ids
+    return deduplicate_bot_echoes(rows, ids_for=history_ids), bot_ids
 
 
 def message_evidence(row: HistoryMessage, bot_ids: set[str], *, max_chars: int = 420) -> dict:
-    _, reply_id, body = parse_message_metadata(row.content)
+    _, reply_id, body = history_metadata(row)
     return {
         "msg_id": row.msg_id,
         "user_id": str(row.user_id),
@@ -85,7 +95,7 @@ def find_repeat_interactions(
             continue
         names[uid] = row.user_name[:80]
         volumes[uid] += 1
-        body = unicodedata.normalize("NFKC", parse_message_metadata(row.content)[2]).strip()
+        body = unicodedata.normalize("NFKC", history_metadata(row)[2]).strip()
         if row.media_id is not None or not 8 <= len(body) <= 180 or body.startswith(("[", "【", "@", "/")):
             continue
         if any(token in body for token in ("file_id=", "forward_id:", "需要查看", "需要了解")):
