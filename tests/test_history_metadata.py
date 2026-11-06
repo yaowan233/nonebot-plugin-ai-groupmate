@@ -1,7 +1,17 @@
 from datetime import datetime
 
 import pytest
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
+
+
+def test_active_thread_retains_latest_thousand_model_messages():
+    from nonebot_plugin_ai_groupmate.agent.conversation import trim_thread_messages
+
+    messages: list[BaseMessage] = [HumanMessage(content=str(index)) for index in range(1001)]
+    retained = trim_thread_messages(messages)
+    assert len(retained) == 1000
+    assert retained[0].content == "1"
+    assert retained[-1].content == "1000"
 
 
 @pytest.mark.asyncio

@@ -15,7 +15,7 @@ from .structured_context import StructuredSnapshot, load_structured_context_safe
 from .turn_context import TurnHistoryResolver
 
 ACTIVE_THREAD_TTL = datetime.timedelta(minutes=10)
-ACTIVE_THREAD_MAX_MESSAGES = 24
+ACTIVE_THREAD_MAX_MESSAGES = 1000
 
 
 @dataclass
