@@ -283,6 +283,8 @@ async def test_group_model_config_is_encrypted_persisted_and_resolved():
         )
         row = await session.get(GroupModelConfig, group_id)
         assert row is not None
+        assert row.last_test_status == "success"
+        assert row.last_tested_at is not None
         assert "sk-group-secret" not in row.api_key_ciphertext
         assert row.reply_probability == 0.075
         assert active.version == 1
@@ -316,6 +318,34 @@ async def test_group_model_config_is_encrypted_persisted_and_resolved():
         assert await delete_group_model_config(session, group_id) is True
         assert resolve_chat_config(group_id, global_config) is global_config
         assert resolve_group_reply_probability(group_id, global_config) == 0.02
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("private", [False, True])
+async def test_relay_configuration_is_not_marked_as_backend_tested(private):
+    from nonebot_plugin_orm import get_session
+
+    from nonebot_plugin_ai_groupmate.model import GroupModelConfig, PrivateModelConfig
+    from nonebot_plugin_ai_groupmate.group_model_config import LocalSecretCipher, save_group_model_config, save_private_model_config
+
+    cipher = LocalSecretCipher(LocalSecretCipher.generate_key())
+    row_model = PrivateModelConfig if private else GroupModelConfig
+    row_id = "relay-untested-test"
+    async with get_session() as session:
+        existing = await session.get(row_model, row_id)
+        if existing:
+            await session.delete(existing)
+            await session.commit()
+        if private:
+            await save_private_model_config(session, user_id=row_id, payload=_payload(), cipher=cipher, connection_tested=False)
+        else:
+            await save_group_model_config(session, group_id=row_id, operator_id="admin", payload=_payload(), cipher=cipher, connection_tested=False)
+        row = await session.get(row_model, row_id)
+        assert row is not None
+        assert row.last_test_status == "untested"
+        assert row.last_tested_at is None
+        await session.delete(row)
+        await session.commit()
 
 
 @pytest.mark.asyncio

@@ -76,6 +76,7 @@ async def test_identical_text_can_reply_to_different_messages(monkeypatch):
 
     from nonebot_plugin_ai_groupmate.message_metadata import parse_message_metadata
     from nonebot_plugin_ai_groupmate.agent.reply_tools import create_reply_tool
+    from nonebot_plugin_ai_groupmate.model import ChatHistory
 
     sent = []
 
@@ -86,9 +87,12 @@ async def test_identical_text_can_reply_to_different_messages(monkeypatch):
     monkeypatch.setattr(UniMessage, "send", capture)
     async with get_session() as db:
         group = f"quote-duplicates-{uuid4()}"
+        db.add_all([ChatHistory(session_id=group, user_id="user", user_name="user", content_type="text", content=f"id: {target}\nhello")
+                    for target in ("11", "22")])
+        await db.commit()
+        tool = create_reply_tool(db, group, bot_name="miyuki", parse_msg_meta=parse_message_metadata, group_members=[])
         for target, expected in [("11", "succeeded"), ("22", "succeeded"), ("22", "skipped")]:
-            tool = create_reply_tool(db, group, bot_name="miyuki", parse_msg_meta=parse_message_metadata, group_members=[], current_message_id=target)
-            result = json.loads(await tool.ainvoke({"content": "收到，这条我看见了", "next_step": "end", "reply_to": "current"}))
+            result = json.loads(await tool.ainvoke({"content": "收到，这条我看见了", "next_step": "end", "reply_to": target}))
             assert result["status"] == expected
     assert len(sent) == 2
 

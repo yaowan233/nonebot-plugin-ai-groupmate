@@ -1,6 +1,5 @@
 import re
 import math
-import asyncio
 import datetime
 from typing import Literal, cast
 from functools import lru_cache
@@ -13,9 +12,7 @@ from nonebot_plugin_orm import async_scoped_session
 from nonebot_plugin_uninfo import Uninfo, SceneType
 from nonebot_plugin_alconna import Target, UniMessage
 from sqlalchemy.ext.asyncio import AsyncSession
-from langchain_core.messages import HumanMessage
 
-from .config import create_chat_llm
 from .runtime_config import get_runtime_config
 from .group_api_relay import (
     RelayError,
@@ -34,11 +31,9 @@ from .group_model_config import (
     save_group_model_config,
     delete_group_model_config,
     save_private_model_config,
-    build_candidate_chat_config,
     delete_private_model_config,
     get_group_model_config_summary,
     get_private_model_config_summary,
-    validate_group_model_test_response,
     validate_group_provider_resolution,
 )
 
@@ -74,11 +69,6 @@ def _relay() -> GroupModelRelay:
 
 
 ConfigScope = Literal["group", "private"]
-_CONNECTION_TEST_IMAGE_DATA_URI = (
-    "data:image/png;base64,"
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8A"
-    "AQUBAScY42YAAAAASUVORK5CYII="
-)
 
 
 def _feature_name(scope: ConfigScope) -> str:
@@ -140,29 +130,6 @@ def _clear_private_chat_model_cache(user_id: str) -> None:
     from .agent import clear_private_chat_model_cache
 
     clear_private_chat_model_cache(user_id)
-
-
-async def _test_candidate_connection(payload) -> None:
-    config = build_candidate_chat_config(payload, get_runtime_config())
-    await validate_group_provider_resolution(
-        payload.base_url,
-        config.group_api_allowed_provider_hosts,
-    )
-    model = create_chat_llm(config)
-    test_content = "请只回复 OK"
-    if payload.chat_multimodal:
-        test_content = [
-            {"type": "text", "text": "请只回复 OK"},
-            {
-                "type": "image_url",
-                "image_url": {"url": _CONNECTION_TEST_IMAGE_DATA_URI},
-            },
-        ]
-    response = await asyncio.wait_for(
-        model.ainvoke([HumanMessage(content=test_content)]),
-        timeout=min(config.agent_llm_timeout_seconds, 20.0),
-    )
-    validate_group_model_test_response(response)
 
 
 def _command_pattern(*names: str) -> str:
@@ -308,10 +275,12 @@ async def _do_submit(
         return
 
     try:
-        await _test_candidate_connection(redeemed.payload)
+        await validate_group_provider_resolution(
+            redeemed.payload.base_url, get_runtime_config().group_api_allowed_provider_hosts,
+        )
     except Exception as error:
         logger.warning(
-            f"模型 API 连接测试失败: scope={redeemed.target.scope}, subject={redeemed.target.subject_id}, error_type={type(error).__name__}"
+            f"模型服务地址校验失败: scope={redeemed.target.scope}, subject={redeemed.target.subject_id}, error_type={type(error).__name__}"
         )
         try:
             await relay.acknowledge(database, redeemed, outcome="rejected")
@@ -320,7 +289,7 @@ async def _do_submit(
                 f"确认删除失败的群 API 配置密文失败: ticket={redeemed.ticket_id[-6:]}"
             )
         await matcher.finish(
-            "模型连接测试失败，原有配置未变更。请检查 Base URL、API Key 和模型名称后重新配置。"
+            "模型服务地址未通过检查，原有配置未变更。请检查 Base URL 后重新配置。"
         )
 
     try:
@@ -330,6 +299,7 @@ async def _do_submit(
                 user_id=redeemed.target.subject_id,
                 payload=redeemed.payload,
                 cipher=relay.cipher,
+                connection_tested=False,
             )
             _clear_private_chat_model_cache(redeemed.target.subject_id)
         else:
@@ -339,6 +309,7 @@ async def _do_submit(
                 operator_id=redeemed.target.operator_id,
                 payload=redeemed.payload,
                 cipher=relay.cipher,
+                connection_tested=False,
             )
             _clear_group_chat_model_cache(redeemed.target.subject_id)
     except Exception as error:
@@ -362,10 +333,10 @@ async def _do_submit(
         )
     if isinstance(active, ActivePrivateModelConfig):
         await matcher.finish(
-            f"模型连接测试通过。你的私聊主模型已更新为 {active.chat_model}，之后不再占用每日公共模型额度。"
+            f"你的私聊主模型已更新为 {active.chat_model}，之后不再占用每日公共模型额度。"
         )
     await matcher.finish(
-        f"模型连接测试通过。群 {active.group_id} 的主聊天模型已更新为 {active.chat_model}。\n"
+        f"群 {active.group_id} 的主聊天模型已更新为 {active.chat_model}。\n"
         + (
             "主动发言概率继续跟随 Bot 全局配置。"
             if active.reply_probability is None

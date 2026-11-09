@@ -1,6 +1,7 @@
 import re
 import json
 import random
+import asyncio
 import datetime
 import traceback
 import collections
@@ -11,11 +12,13 @@ from sqlalchemy import Select, desc, func, extract
 from nonebot.log import logger
 from langchain.tools import tool
 from nonebot_plugin_orm import get_session
-from nonebot_plugin_alconna import UniMessage
+from nonebot_plugin_alconna import Target, UniMessage
 
 from ..model import ChatHistory, UserRelation
+from .delivery import PublishedImage, OutboundIdentity, send_and_finalize
 from ..reply_guard import is_request_active
 from .tool_results import tool_failure, tool_skipped, tool_success
+from .file_workspace import FileWorkspace
 
 
 def create_report_tool(
@@ -221,6 +224,9 @@ def create_relation_tool(
     bot_name: str,
     up_pic: bytes,
     down_pic: bytes,
+    outbound_identity: OutboundIdentity | None = None,
+    workspace: FileWorkspace | None = None,
+    send_target: Target | None = None,
 ):
     """
     创建绑定了特定用户的关系管理工具 (支持增删 Tag)
@@ -361,19 +367,34 @@ def create_relation_tool(
                     try:
                         if new_tier > old_tier:
                             tip = f"好感度提升！现在的关系是：{tier_names[new_tier]}"
-                            res = await UniMessage.image(raw=up_pic).text(tip).send()
+                            image_data = up_pic
                         else:
                             tip = f"好感度下降…现在的关系是：{tier_names[new_tier]}"
-                            res = await UniMessage.image(raw=down_pic).text(tip).send()
-                        msg_id = res.msg_ids[-1]["message_id"] if res.msg_ids else "unknown"
-                        chat_history = ChatHistory(
-                            session_id=session_id,
-                            user_id=bot_name,
-                            content_type="bot",
-                            content=f"id: {msg_id}\n{tip}",
-                            user_name=bot_name,
-                        )
-                        session.add(chat_history)
+                            image_data = down_pic
+                        message = UniMessage.image(raw=image_data).text(tip)
+                        artifact = None
+                        if outbound_identity is not None and workspace is not None:
+                            try:
+                                artifact = await asyncio.to_thread(workspace.save, image_data, "关系变化.jpg")
+                            except Exception as error:
+                                logger.warning(f"保存关系图片失败，继续发送 error_type={type(error).__name__}")
+                        def record(message_id: str) -> list[ChatHistory]:
+                            rows = []
+                            if artifact is not None:
+                                rows.append(ChatHistory(session_id=session_id, user_id=bot_name, user_name=bot_name,
+                                                        content_type="bot", content=f"id: {message_id}\n[图片文件] {artifact.name} file_id={artifact.file_id}"))
+                            rows.append(ChatHistory(session_id=session_id, user_id=bot_name, user_name=bot_name,
+                                                    content_type="bot", content=f"id: {message_id}\n{tip}"))
+                            return rows
+                        publication = PublishedImage(workspace, artifact.file_id) if workspace and artifact else None
+                        options = {"target": send_target} if send_target is not None else {}
+                        receipt = await send_and_finalize(session, session_id, message, send_options=options, record=record,
+                                                          publish=publication.publish if publication else None,
+                                                          publication=publication.describe if publication else None,
+                                                          recovery_enabled=outbound_identity is not None,
+                                                          outbound_identity=outbound_identity)
+                        if receipt.note:
+                            logger.warning("关系变化消息已发送，但本地记录不完整")
                     except Exception as send_err:
                         logger.warning(f"发送好感度图片失败: {send_err}")
 

@@ -8,6 +8,13 @@ from langchain_openai import ChatOpenAI
 from .deepseek import DeepSeekChatOpenAI, is_deepseek_endpoint
 
 
+def agent_run_timeout_seconds(config: "ScopedConfig") -> float:
+    """Reserve time for the image call and subsequent artifact delivery."""
+    if config.image_generation_enabled and config.agent_file_tools_enabled:
+        return max(config.agent_timeout_seconds, config.image_generation_timeout_seconds + 90)
+    return config.agent_timeout_seconds
+
+
 class ScopedConfig(BaseModel):
     bot_name: str = "bot"
     reply_probability: float = 0.01
@@ -118,6 +125,18 @@ class ScopedConfig(BaseModel):
         description="调用千问 Responses API 时启用 medium 强度思考",
     )
 
+    # === GPT 绘图（独立 Images API，默认关闭） ===
+    image_generation_enabled: bool = False
+    image_generation_model: str = "gpt-image-2.5-sunburst"
+    image_generation_api_key: str = ""
+    image_generation_base_url: str = ""
+    image_generation_quality: Literal["low", "medium", "high", "xhigh", "max", "auto"] = "medium"
+    image_generation_timeout_seconds: float = Field(default=120.0, ge=10, le=600)
+    image_generation_background_groups: list[str] = Field(default_factory=lambda: ["*"], description="独立绘图群号；* 表示全部群")
+    image_generation_background_private: bool = Field(default=True, description="私聊是否使用独立绘图任务")
+    message_refactor_pilot_groups: list[str] = Field(default_factory=lambda: ["*"], description="结构化消息群号；* 表示全部群")
+    message_refactor_pilot_private: bool = Field(default=True, description="私聊是否启用结构化消息")
+
     # === Google Vertex AI（chat/tagging/vision 共用） ===
     # 凭据优先级：vertex_credentials_path > vertex_api_key > ADC。
     # ADC 可通过 GOOGLE_APPLICATION_CREDENTIALS、Workload Identity 或
@@ -147,6 +166,7 @@ class ScopedConfig(BaseModel):
 
     # === 快速决策模型（Gatekeeper） ===
     gatekeeper_provider: Literal["flash", "decisions"] = "flash"
+    decisions_api_key: str = ""
     flash_model: str = "qwen-flash"
     flash_api_key: str = ""
     flash_base_url: str = ""
@@ -202,7 +222,7 @@ class ScopedConfig(BaseModel):
             return None
         return value
 
-    @field_validator("chat_responses_builtin_tools", mode="before")
+    @field_validator("chat_responses_builtin_tools", "image_generation_background_groups", "message_refactor_pilot_groups", mode="before")
     @classmethod
     def _parse_chat_responses_builtin_tools(cls, value: Any) -> Any:
         """Accept JSON arrays from env vars and comma-separated WebUI input."""
@@ -219,10 +239,10 @@ class ScopedConfig(BaseModel):
             if item.strip()
         ]
 
-    @field_validator("chat_responses_builtin_tools")
+    @field_validator("chat_responses_builtin_tools", "image_generation_background_groups", "message_refactor_pilot_groups")
     @classmethod
     def _deduplicate_chat_responses_builtin_tools(cls, value: list[str]) -> list[str]:
-        return list(dict.fromkeys(value))
+        return list(dict.fromkeys(item.strip() for item in value if item.strip()))
 
     rerank_api_url: str = ""
     rerank_api_key: str = ""
@@ -272,6 +292,8 @@ def create_chat_openai(
     role: str = "chat",
     temperature: float | None = None,
     max_tokens: int | None = None,
+    max_retries: int | None = None,
+    request_timeout: float | None = None,
 ) -> ChatOpenAI:
     model = getattr(cfg, f"{role}_model") or cfg.base_model
     api_key = getattr(cfg, f"{role}_api_key") or cfg.llm_api_key or cfg.qwen_token
@@ -290,6 +312,10 @@ def create_chat_openai(
     }
     if max_tokens is not None:
         kwargs["max_completion_tokens"] = max_tokens
+    if max_retries is not None:
+        kwargs["max_retries"] = max_retries
+    if request_timeout is not None:
+        kwargs["timeout"] = request_timeout
     effort = cfg.chat_reasoning_effort if role == "chat" else None
     if effort is not None:
         kwargs["reasoning_effort"] = effort
@@ -329,6 +355,8 @@ def create_vertex_llm(
     role: str = "chat",
     temperature: float | None = None,
     max_tokens: int | None = None,
+    max_retries: int | None = None,
+    request_timeout: float | None = None,
 ) -> Any:
     """Create a Gemini chat model backed by Vertex AI with renewable auth."""
     from langchain_google_genai import ChatGoogleGenerativeAI
@@ -373,17 +401,29 @@ def create_vertex_llm(
 
     if max_tokens is not None:
         kwargs["max_tokens"] = max_tokens
+    if max_retries is not None:
+        kwargs["max_retries"] = max_retries
+    if request_timeout is not None:
+        kwargs["request_timeout"] = request_timeout
     return ChatGoogleGenerativeAI(**kwargs)
 
 
-def create_chat_llm(cfg: ScopedConfig) -> Any:
+def create_chat_llm(cfg: ScopedConfig, *, max_retries: int | None = None, request_timeout: float | None = None) -> Any:
+    client_options: dict[str, Any] = {}
+    if max_retries is not None:
+        client_options["max_retries"] = max_retries
+    if request_timeout is not None:
+        client_options["request_timeout"] = request_timeout
     if cfg.chat_api_format == "vertex":
-        return create_vertex_llm(cfg, "chat")
+        return create_vertex_llm(cfg, "chat", **client_options)
     if cfg.chat_api_format == "anthropic":
         from langchain_anthropic import ChatAnthropic
 
         api_key = cfg.chat_api_key or cfg.llm_api_key or cfg.qwen_token
         base_url = cfg.chat_base_url or cfg.llm_base_url
+        anthropic_options: dict[str, Any] = {}
+        if max_retries is not None:
+            anthropic_options["max_retries"] = max_retries
 
         return ChatAnthropic(
             model_name=cfg.chat_model or cfg.base_model,
@@ -391,10 +431,11 @@ def create_chat_llm(cfg: ScopedConfig) -> Any:
             base_url=base_url,
             temperature=cfg.chat_temperature,
             max_tokens_to_sample=cfg.chat_max_tokens or 4096,
-            timeout=None,
+            timeout=request_timeout,
+            **anthropic_options,
             stop=None,
         )
-    return create_chat_openai(cfg, "chat")
+    return create_chat_openai(cfg, "chat", **client_options)
 
 
 def create_tagging_llm(cfg: ScopedConfig) -> Any:

@@ -1,5 +1,6 @@
 import re
 from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 
@@ -66,58 +67,61 @@ def test_submit_commands_capture_the_config_code_argument():
     assert pattern.fullmatch("/提交api")
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("chat_multimodal", [False, True])
-async def test_candidate_connection_checks_declared_image_capability(
-    monkeypatch,
-    chat_multimodal,
-):
-    from nonebot_plugin_ai_groupmate import group_api_commands
+@pytest.mark.parametrize("scope", ["group", "private"])
+async def test_relay_submit_applies_without_second_model_call(monkeypatch, scope):
+    from nonebot_plugin_ai_groupmate import group_api_commands as commands
+    from nonebot_plugin_ai_groupmate.group_model_config import ActiveGroupModelConfig, ActivePrivateModelConfig
 
-    invoked_messages = []
+    saved = []
+    acknowledged = []
+    checked = []
+    payload = SimpleNamespace(base_url="https://example.com/v1", chat_model="test-model")
+    redeemed = SimpleNamespace(payload=payload, target=SimpleNamespace(scope=scope, subject_id="123", operator_id="123"), ticket_id="ticket")
 
-    class _Model:
-        async def ainvoke(self, messages):
-            invoked_messages.extend(messages)
-            return object()
+    class Relay:
+        cipher = object()
 
-    async def fake_validate_provider(*args, **kwargs):
-        return None
+        async def redeem(self, *args, **kwargs):
+            return redeemed
 
-    config = SimpleNamespace(
-        agent_llm_timeout_seconds=30.0,
-        group_api_allowed_provider_hosts=[],
-    )
-    payload = SimpleNamespace(
-        base_url="https://example.com",
-        chat_multimodal=chat_multimodal,
-    )
-    monkeypatch.setattr(
-        group_api_commands,
-        "build_candidate_chat_config",
-        lambda payload, runtime_config: config,
-    )
-    monkeypatch.setattr(
-        group_api_commands,
-        "validate_group_provider_resolution",
-        fake_validate_provider,
-    )
-    monkeypatch.setattr(
-        group_api_commands,
-        "create_chat_llm",
-        lambda candidate_config: _Model(),
-    )
-    monkeypatch.setattr(
-        group_api_commands,
-        "validate_group_model_test_response",
-        lambda response: None,
-    )
+        async def acknowledge(self, db, item, *, outcome):
+            acknowledged.append(outcome)
 
-    await group_api_commands._test_candidate_connection(payload)
+    class Finished(Exception):
+        pass
 
-    content = invoked_messages[0].content
-    if chat_multimodal:
-        assert isinstance(content, list)
-        assert any(block.get("type") == "image_url" for block in content)
-    else:
-        assert content == "请只回复 OK"
+    class Matcher:
+        @staticmethod
+        async def finish(message):
+            raise Finished(message)
+
+    async def check_provider(url, allowed):
+        checked.append((url, allowed))
+
+    async def save_group(db, **kwargs):
+        saved.append(kwargs)
+        return ActiveGroupModelConfig(group_id="123", api_format="openai", base_url=payload.base_url, api_key="secret", chat_model=payload.chat_model, chat_multimodal=True)
+
+    async def save_private(db, **kwargs):
+        saved.append(kwargs)
+        return ActivePrivateModelConfig(user_id="123", api_format="openai", base_url=payload.base_url, api_key="secret", chat_model=payload.chat_model, chat_multimodal=True)
+
+    async def no_model_call(*args, **kwargs):
+        pytest.fail("relay submit must not perform another model request")
+
+    monkeypatch.setattr(commands, "_relay", lambda: Relay())
+    monkeypatch.setattr(commands, "get_runtime_config", lambda: SimpleNamespace(group_api_allowed_provider_hosts=[]))
+    monkeypatch.setattr(commands, "validate_group_provider_resolution", check_provider)
+    monkeypatch.setattr(commands, "_test_candidate_connection", no_model_call, raising=False)
+    monkeypatch.setattr(commands, "save_group_model_config", save_group)
+    monkeypatch.setattr(commands, "save_private_model_config", save_private)
+    monkeypatch.setattr(commands, "_clear_group_chat_model_cache", lambda *_: None)
+    monkeypatch.setattr(commands, "_clear_private_chat_model_cache", lambda *_: None)
+    session = SimpleNamespace(scene=SimpleNamespace(type=commands.SceneType.PRIVATE), user=SimpleNamespace(id="123"))
+    with pytest.raises(Finished) as result:
+        await commands._do_submit(cast(Any, object()), cast(Any, session), scope=scope, code="valid", matcher=cast(Any, Matcher))
+    assert "已更新" in str(result.value)
+    assert "测试通过" not in str(result.value)
+    assert checked == [(payload.base_url, [])]
+    assert saved[0]["connection_tested"] is False
+    assert acknowledged == ["applied"]

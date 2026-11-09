@@ -1,7 +1,7 @@
 from datetime import date, datetime
 
 from pydantic import BaseModel
-from sqlalchemy import JSON, Text, Float, Index, String, Boolean, Integer, UniqueConstraint
+from sqlalchemy import JSON, Text, Float, Index, String, Boolean, Integer, ForeignKey, UniqueConstraint
 from sqlalchemy.orm import Mapped, validates, mapped_column
 
 from .db_types import NulSafeModel
@@ -29,6 +29,109 @@ class MediaStorageSchema(BaseModel):
     description: str
     vectorized: bool
     embedding_version: int = 0
+
+
+class StructuredMessage(NulSafeModel):
+    """A complete transport message; legacy history remains a compatibility view."""
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    platform: Mapped[str] = mapped_column(String(64))
+    scope: Mapped[str] = mapped_column(String(16))
+    session_id: Mapped[str] = mapped_column(String(255))
+    platform_id: Mapped[str] = mapped_column(String(255))
+    sender_id: Mapped[str] = mapped_column(String(255))
+    sender_name: Mapped[str] = mapped_column(Text)
+    sender_kind: Mapped[str] = mapped_column(String(16))
+    bot_id: Mapped[str] = mapped_column(String(255))
+    reply_to_id: Mapped[str | None] = mapped_column(String(255))
+    parts: Mapped[list[dict]] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(default=datetime.now)
+
+    __table_args__ = (
+        UniqueConstraint("platform", "scope", "session_id", "platform_id", name="uq_structured_message_scope_platform"),
+        Index("ix_structured_message_session_time", "platform", "scope", "session_id", "created_at"),
+    )
+
+
+class DrawingJob(NulSafeModel):
+    """Durable image-generation work; credentials and image bytes are never stored here."""
+
+    job_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    platform: Mapped[str] = mapped_column(String(64))
+    session_id: Mapped[str] = mapped_column(String(255))
+    is_private: Mapped[bool] = mapped_column(Boolean)
+    bot_id: Mapped[str] = mapped_column(String(255))
+    bot_name: Mapped[str] = mapped_column(String(255))
+    user_id: Mapped[str] = mapped_column(String(255))
+    request_id: Mapped[str] = mapped_column(String(255))
+    reply_to_id: Mapped[str | None] = mapped_column(String(255))
+    fingerprint: Mapped[str] = mapped_column(String(64))
+    batch_id: Mapped[str | None] = mapped_column(String(32), index=True)
+    prompt: Mapped[str] = mapped_column(Text)
+    reference_file_ids: Mapped[list[str]] = mapped_column(JSON)
+    size: Mapped[str] = mapped_column(String(32))
+    transparent_background: Mapped[bool] = mapped_column(Boolean)
+    model: Mapped[str] = mapped_column(String(255))
+    quality: Mapped[str] = mapped_column(String(16))
+    image_options: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    endpoint_hash: Mapped[str] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(32))
+    claim_token: Mapped[str | None] = mapped_column(String(32))
+    lease_until: Mapped[datetime | None] = mapped_column()
+    result_file_id: Mapped[str | None] = mapped_column(String(32))
+    result_message_id: Mapped[str | None] = mapped_column(String(255))
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column()
+    updated_at: Mapped[datetime] = mapped_column()
+    finished_at: Mapped[datetime | None] = mapped_column()
+
+    @validates("prompt", "bot_name")
+    def _strip_nul(self, _key: str, value: str) -> str:
+        return value.replace("\x00", "")
+
+    __table_args__ = (
+        UniqueConstraint("platform", "session_id", "is_private", "user_id", "request_id", "fingerprint", name="uq_drawing_job_request"),
+        Index("ix_drawing_job_status_created", "status", "created_at"),
+        Index("ix_drawing_job_status_lease", "status", "lease_until"),
+        Index("ix_drawing_job_scope", "platform", "session_id", "is_private", "user_id", "created_at"),
+    )
+
+
+class OrderedDeliveryJob(NulSafeModel):
+    """A durable ordered reply waiting for one or more drawing artifacts."""
+
+    job_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    platform: Mapped[str] = mapped_column(String(64))
+    session_id: Mapped[str] = mapped_column(String(255))
+    is_private: Mapped[bool] = mapped_column(Boolean)
+    bot_id: Mapped[str] = mapped_column(String(255))
+    bot_name: Mapped[str] = mapped_column(String(255))
+    user_id: Mapped[str] = mapped_column(String(255))
+    request_id: Mapped[str] = mapped_column(String(255))
+    reply_to_id: Mapped[str | None] = mapped_column(String(255))
+    fingerprint: Mapped[str] = mapped_column(String(64))
+    parts: Mapped[list[dict]] = mapped_column(JSON)
+    status: Mapped[str] = mapped_column(String(32))
+    claim_token: Mapped[str | None] = mapped_column(String(32))
+    result_message_id: Mapped[str | None] = mapped_column(String(255))
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column()
+    updated_at: Mapped[datetime] = mapped_column()
+    finished_at: Mapped[datetime | None] = mapped_column()
+
+    __table_args__ = (
+        UniqueConstraint("platform", "session_id", "is_private", "user_id", "request_id", "fingerprint", name="uq_ordered_delivery_request"),
+        Index("ix_ordered_delivery_status_created", "status", "created_at"),
+    )
+
+
+class DeliveryRecoveryReceipt(NulSafeModel):
+    """Idempotency marker for an acknowledged delivery's local history."""
+
+    receipt_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    created_at: Mapped[datetime] = mapped_column()
+
+    __table_args__ = (Index("ix_delivery_recovery_created_at", "created_at"),)
 
 
 class ChatHistory(NulSafeModel):
@@ -59,6 +162,29 @@ class ChatHistory(NulSafeModel):
             "media_id",
         ),
     )
+
+
+class HistoryMessageIndex(NulSafeModel):
+    """Exact transport ID lookup for newly written compatibility history rows."""
+
+    history_id: Mapped[int] = mapped_column(ForeignKey("nonebot_plugin_ai_groupmate_chathistory.msg_id", ondelete="CASCADE"), primary_key=True)
+    platform_id: Mapped[str] = mapped_column(String(255), primary_key=True)
+    session_id: Mapped[str] = mapped_column(String(255))
+
+    __table_args__ = (Index("ix_history_message_lookup", "session_id", "platform_id"),)
+
+
+class HistoryIndexProgress(NulSafeModel):
+    """Bounded historical index coverage for one existing conversation."""
+
+    session_id: Mapped[str] = mapped_column(String(255), primary_key=True)
+    cutoff_id: Mapped[int] = mapped_column(Integer)
+    last_created_at: Mapped[datetime | None] = mapped_column()
+    last_history_id: Mapped[int] = mapped_column(Integer, default=0)
+    complete: Mapped[bool] = mapped_column(Boolean, default=False)
+    updated_at: Mapped[datetime] = mapped_column()
+
+    __table_args__ = (Index("ix_history_index_progress_pending", "complete", "updated_at"),)
 
 
 class ScheduledTask(NulSafeModel):

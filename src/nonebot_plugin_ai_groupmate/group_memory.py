@@ -155,7 +155,7 @@ async def _call_summary_model(existing_summary: str, chat_text: str) -> str | No
     return None
 
 
-def _format_message(message: ChatHistory) -> str | None:
+def _format_message(message: ChatHistory, *, structured_text: str | None = None) -> str | None:
     own_id, _, content = parse_message_metadata(message.content)
     if message.content_type == "bot" and (
         own_id == "system"
@@ -163,6 +163,8 @@ def _format_message(message: ChatHistory) -> str | None:
         or content.startswith(("发送了网络图片，", "发送了图片，", "图片文件:"))
     ):
         return None
+    if structured_text is not None:
+        content = structured_text
     if not content:
         return None
     bot_marker = "[BOT] " if message.content_type == "bot" else ""
@@ -197,6 +199,7 @@ async def update_group_memory(
     session_id: str,
     *,
     bot_name: str,
+    platform: str | None = None,
 ) -> str:
     """按 agent 的决定更新一个群的认知档案，并返回适合工具消费的状态。"""
     async with _get_update_lock(session_id):
@@ -236,11 +239,49 @@ async def update_group_memory(
         if not recent_messages:
             return "没有新的文本聊天可归档，本次无需更新。"
 
-        chat_text = "\n".join(
-            line
-            for message in deduplicate_bot_echoes(recent_messages)
-            if (line := _format_message(message))
-        )
+        recent_messages = deduplicate_bot_echoes(recent_messages)
+        structured_by_row = {}
+        if platform:
+            # Import lazily: agent tools also import this module.
+            from .agent.structured_context import load_structured_context_safely, visible_text
+
+            snapshots = await load_structured_context_safely(
+                db_session, recent_messages, session_id=session_id, scope="group",
+                platform=platform, include_media=False,
+            )
+            if snapshots:
+                rows_by_id = {row.msg_id: row for row in recent_messages}
+                ambiguous = set()
+                for (_, sender_id), snapshot in snapshots.items():
+                    if not any(part.get("type") in {"text", "card"} and part.get("text")
+                               for part in snapshot.parts):
+                        continue
+                    text = visible_text(snapshot)
+                    if text is None:
+                        continue
+                    for history_id in snapshot.history_ids:
+                        row = rows_by_id.get(history_id)
+                        if row is None or row.user_id != sender_id:
+                            continue
+                        if history_id in structured_by_row:
+                            ambiguous.add(history_id)
+                        else:
+                            structured_by_row[history_id] = (snapshot.platform_id, sender_id, text)
+                for history_id in ambiguous:
+                    structured_by_row.pop(history_id, None)
+
+        lines = []
+        emitted = set()
+        for message in recent_messages:
+            structured = structured_by_row.get(message.msg_id)
+            if structured and structured[:2] in emitted:
+                continue
+            line = _format_message(message, structured_text=structured[2] if structured else None)
+            if line:
+                lines.append(line)
+                if structured:
+                    emitted.add(structured[:2])
+        chat_text = "\n".join(lines)
         if not chat_text:
             return "没有新的文本聊天可归档，本次无需更新。"
         existing_summary = (

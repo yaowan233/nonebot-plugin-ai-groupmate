@@ -7,8 +7,11 @@ from nonebot_plugin_uninfo import SceneType, QryItrface
 from nonebot_plugin_alconna import Target, UniMessage
 
 from ..model import ChatHistory
+from .delivery import OutboundIdentity, send_and_finalize
 from ..reply_guard import is_request_active
 from .tool_results import tool_failure, tool_skipped, tool_success
+from ..runtime_config import get_runtime_config
+from ..message_rollout import message_pilot_enabled
 
 
 def create_private_message_tool(
@@ -20,6 +23,7 @@ def create_private_message_tool(
     bot_id: str | None,
     bot_name: str,
     group_members: list[Any] | None = None,
+    platform: str = "unknown",
 ):
     async def _resolve_group_member(
         target_user_id: str | None, target_name: str | None
@@ -144,43 +148,21 @@ def create_private_message_tool(
             # the adapter to send the private message.
             await db_session.commit()
             target = Target(id=target_id, private=True, self_id=bot_id)
-            result = await UniMessage.text(content).send(target=target)
-            msg_id = "unknown"
-            if result.msg_ids:
-                raw_msg_id = result.msg_ids[-1].get("message_id") or result.msg_ids[
-                    -1
-                ].get("msg_id")
-                if raw_msg_id is not None:
-                    msg_id = str(raw_msg_id)
-
-            private_history = ChatHistory(
-                session_id=target_id,
-                user_id=bot_name,
-                content_type="bot",
-                content=f"id: {msg_id}\n{content}",
-                user_name=bot_name,
-            )
-            group_history = ChatHistory(
-                session_id=session_id,
-                user_id=bot_name,
-                content_type="bot",
-                content=(
-                    "id: system\n"
-                    f"已主动私聊用户 {target_id}: {reason or '未填写原因'}"
-                ),
-                user_name=bot_name,
-            )
-            db_session.add(private_history)
-            db_session.add(group_history)
-            logger.info(
-                f"已主动私聊用户 {target_id}，reason={reason or '未填写原因'}"
-            )
-            return tool_success(
-                "private_message_sent",
-                f"已主动私聊用户 {target_id}。",
-                data={"target_user_id": target_id, "message_id": msg_id},
-                delivery_state="completed",
-            )
+            message = UniMessage.text(content)
+            pilot = message_pilot_enabled(get_runtime_config(), target_id, is_private=True)
+            def record(message_id: str) -> list[ChatHistory]:
+                return [
+                    ChatHistory(session_id=target_id, user_id=bot_name, user_name=bot_name,
+                                content_type="bot", content=f"id: {message_id}\n{content}"),
+                    ChatHistory(session_id=session_id, user_id=bot_name, user_name=bot_name,
+                                content_type="bot", content=f"id: system\n已主动私聊用户 {target_id}: {reason or '未填写原因'}"),
+                ]
+            identity = OutboundIdentity(platform, "private", bot_id or bot_name, bot_name)
+            receipt = await send_and_finalize(db_session, target_id, message, send_options={"target": target},
+                                              record=record, recovery_enabled=pilot, outbound_identity=identity)
+            return tool_success("private_message_sent", receipt.note or f"已主动私聊用户 {target_id}。",
+                                data={"target_user_id": target_id, "message_id": receipt.message_id,
+                                      "history_saved": receipt.history_saved}, delivery_state="completed")
         except Exception as error:
             logger.warning(
                 "主动私聊发送失败: "

@@ -30,11 +30,11 @@ class InputBatcher(Generic[T]):
     async def submit(
         self, key: tuple[str, ...], request: T, *, message_id: str, text: str,
         delay: float, max_wait: float, merge: Callable[[T, T], T],
-        deliver: Callable[[T], Awaitable[None]],
+        deliver: Callable[[T, tuple[tuple[str, str], ...]], Awaitable[None]],
     ) -> None:
         batch = self.pending.get(key)
         if batch is None and (delay <= 0 or max_wait <= 0 or len(self.pending) >= 128):
-            await deliver(request)
+            await deliver(request, ((message_id, text),))
             return
         now = self.clock()
         if batch is not None:
@@ -53,7 +53,8 @@ class InputBatcher(Generic[T]):
         self.tasks.add(task)
         task.add_done_callback(self.tasks.discard)
 
-    async def _deliver_when_ready(self, key: tuple[str, ...], batch: PendingInput[T], deliver: Callable[[T], Awaitable[None]]) -> None:
+    async def _deliver_when_ready(self, key: tuple[str, ...], batch: PendingInput[T],
+                                  deliver: Callable[[T, tuple[tuple[str, str], ...]], Awaitable[None]]) -> None:
         try:
             while True:
                 if batch.cancelled:
@@ -67,11 +68,7 @@ class InputBatcher(Generic[T]):
                 except asyncio.TimeoutError:
                     pass
             self.pending.pop(key, None)  # A new burst cannot mutate an admitted task.
-            token = current_input_batch.set(tuple(batch.messages))
-            try:
-                await deliver(batch.request)
-            finally:
-                current_input_batch.reset(token)
+            await deliver(batch.request, tuple(batch.messages))
         finally:
             if self.pending.get(key) is batch:
                 self.pending.pop(key, None)

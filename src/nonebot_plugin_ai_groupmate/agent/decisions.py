@@ -34,10 +34,12 @@ async def close_client() -> None:
 
 
 async def classify(cfg: ScopedConfig, policy: str, context: str) -> dict[str, Any]:
-    base_url = (cfg.chat_base_url or cfg.llm_base_url).rstrip("/")
-    api_key = cfg.chat_api_key or cfg.llm_api_key or cfg.qwen_token
-    if base_url != "https://api.openai.com/v1" or not api_key:
-        raise ValueError("Decisions 需要已配置的 OpenAI 官方主模型凭据")
+    api_key = cfg.decisions_api_key.strip()
+    if not api_key:
+        base_url = (cfg.chat_base_url or cfg.llm_base_url).rstrip("/")
+        api_key = cfg.chat_api_key or cfg.llm_api_key or cfg.qwen_token
+        if base_url != "https://api.openai.com/v1" or not api_key:
+            raise ValueError("Decisions 需要独立的 OpenAI API Key，或 OpenAI 官方主模型凭据")
     instructions = re.sub(r"只输出JSON：\{[^\n]*\}。", "", policy)
     response = await get_client().post(
         "https://api.openai.com/v1/decisions",
