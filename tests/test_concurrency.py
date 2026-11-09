@@ -334,6 +334,58 @@ async def test_group_runs_two_addressed_requests_concurrently_and_queues_third(
 
 
 @pytest.mark.asyncio
+async def test_second_mention_preserves_first_reply_while_background_is_cancelling():
+    from nonebot_plugin_ai_groupmate.reply_guard import is_request_active
+    from nonebot_plugin_ai_groupmate.group_reply_scheduler import GroupReplyScheduler
+
+    background_started = asyncio.Event()
+    background_cancelling = asyncio.Event()
+    release_background = asyncio.Event()
+    release_replies = asyncio.Event()
+    first_started = asyncio.Event()
+    delivered: list[str] = []
+    group = "mentions-during-background-cancellation"
+
+    async def execute(request):
+        if not request.is_tome:
+            background_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                background_cancelling.set()
+                await release_background.wait()
+            return
+        if request.request_id == "alice":
+            first_started.set()
+        await release_replies.wait()
+        if await is_request_active(group, request.request_id):
+            delivered.append(request.request_id)
+
+    scheduler = GroupReplyScheduler(execute, lambda: 2)
+
+    def request(request_id, *, addressed=True):
+        return cast(Any, SimpleNamespace(request_id=request_id, user_id=request_id,
+                                        is_tome=addressed, is_continuous=False))
+
+    try:
+        assert await scheduler.enqueue(group, request("background", addressed=False))
+        await asyncio.wait_for(background_started.wait(), 1)
+        assert await scheduler.enqueue(group, request("alice"))
+        await asyncio.wait_for(background_cancelling.wait(), 1)
+        await asyncio.wait_for(first_started.wait(), 1)
+        assert not await is_request_active(group, "background")
+        assert await scheduler.enqueue(group, request("bob"))
+        release_replies.set()
+        await asyncio.gather(*list(scheduler.states[group].addressed_tasks.values()))
+        assert sorted(delivered) == ["alice", "bob"]
+    finally:
+        release_background.set()
+        release_replies.set()
+        state = scheduler.states[group]
+        await asyncio.gather(*(task for task in [state.task, *state.addressed_tasks.values()] if task is not None), return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_small_pool_survives_many_slow_agent_runs(tmp_path):
     from sqlalchemy import text
     from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
