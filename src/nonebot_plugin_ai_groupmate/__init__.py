@@ -1289,7 +1289,7 @@ async def handle_message(
             async with get_session() as observation_session:
                 await record_message(observation_session, platform=adapter_name(bot), bot_id=str(bot.self_id),
                                      scene_id=str(session.scene.id), message_id=incoming_message_id,
-                                     user_id=str(session.user.id), text=stripped_plain_text,
+                                     user_id=str(session.user.id), text=stripped_plain_text, reply_to=reply_id,
                                      now=datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None))
                 await observation_session.commit()
         except Exception:

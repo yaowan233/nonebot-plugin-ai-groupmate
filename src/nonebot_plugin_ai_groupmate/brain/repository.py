@@ -12,7 +12,7 @@ from sqlalchemy import exists, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..model import BrainTask, BrainWait, BrainAction
+from ..model import BrainTask, BrainWait, BrainAction, BrainObservationMessage
 
 
 @dataclass(frozen=True)
@@ -24,6 +24,7 @@ class TaskInput:
     source_user: str
     request: str
     deadline: datetime
+    transport_bot_id: str | None = None
 
 
 async def submit(db: AsyncSession, item: TaskInput, *, now: datetime) -> tuple[BrainTask, bool]:
@@ -38,7 +39,7 @@ async def submit(db: AsyncSession, item: TaskInput, *, now: datetime) -> tuple[B
     existing = await db.scalar(query)
     if existing is not None:
         return existing, False
-    task = BrainTask(task_id=uuid4().hex, brain_id=item.brain_id, platform=item.platform,
+    task = BrainTask(task_id=uuid4().hex, brain_id=item.brain_id, bot_id=item.transport_bot_id or item.brain_id, platform=item.platform,
                      source_scene=item.source_scene, source_message=item.source_message, source_user=item.source_user,
                      request=item.request, status="queued", revision=0, deadline=item.deadline,
                      claim_token=None, lease_until=None, created_at=now, updated_at=now)
@@ -102,6 +103,25 @@ async def matching_waits(db: AsyncSession, *, platform: str, target_scene: str, 
     ))).all())
 
 
+async def pending_reply_candidates(db: AsyncSession, *, task_id: str, now: datetime) -> list[BrainObservationMessage]:
+    """Read scoped candidates, including messages stored before wait registration.
+
+    A quoted message is evidence of association, not proof it answers the
+    question. The coordinator must validate its meaning before accept_reply.
+    """
+    return list((await db.scalars(select(BrainObservationMessage).join(
+        BrainWait, (BrainObservationMessage.platform == BrainWait.platform)
+        & (BrainObservationMessage.scene_id == BrainWait.target_scene)
+        & (BrainObservationMessage.reply_to == BrainWait.question_message),
+    ).join(BrainTask, BrainTask.task_id == BrainWait.task_id).where(
+        BrainTask.task_id == task_id, BrainTask.status == "waiting_input", BrainTask.deadline > now,
+        BrainWait.status == "open", BrainWait.deadline > now,
+        BrainObservationMessage.bot_id == BrainTask.bot_id,
+        BrainObservationMessage.created_at >= BrainTask.created_at,
+        BrainObservationMessage.created_at <= now,
+    ).order_by(BrainObservationMessage.created_at, BrainObservationMessage.id).limit(30))).all())
+
+
 async def finish(db: AsyncSession, task_id: str, token: str, *, now: datetime) -> bool:
     """Finish only after the current owner has no unconfirmed actions."""
     result = await db.execute(update(BrainTask).where(
@@ -114,13 +134,43 @@ async def finish(db: AsyncSession, task_id: str, token: str, *, now: datetime) -
 
 
 async def expire_wait(db: AsyncSession, task_id: str, *, now: datetime) -> bool:
-    """Mark an expired wait for a future, separately persisted timeout notice."""
+    """Atomically reserve a timeout notice when a task's wait expires."""
     result = await db.execute(update(BrainTask).where(
         BrainTask.task_id == task_id, BrainTask.status == "waiting_input",
         BrainTask.task_id.in_(select(BrainWait.task_id).where(BrainWait.status == "open", BrainWait.deadline <= now)),
     ).values(status="finalizing", revision=BrainTask.revision + 1, updated_at=now))
     if result.rowcount:
         await db.execute(update(BrainWait).where(BrainWait.task_id == task_id, BrainWait.status == "open").values(status="expired"))
+        task = await db.get(BrainTask, task_id)
+        if task is None:
+            raise RuntimeError("Expired task disappeared")
+        db.add(BrainAction(action_id=uuid4().hex, task_id=task_id, logical_step="timeout", effect_slot="notice",
+                           platform=task.platform, target_scene=task.source_scene, content="还没有收到对方群的答复。",
+                           status="prepared", claim_token=None, lease_until=None, receipt_message_id=None,
+                           created_at=now, updated_at=now))
+        await db.flush()
+    return bool(result.rowcount)
+
+
+async def claim_finalization(db: AsyncSession, task_id: str, token: str, *, now: datetime, lease_seconds: int = 180) -> bool:
+    if not token or lease_seconds <= 0:
+        raise ValueError("A claim token and positive lease duration are required")
+    result = await db.execute(update(BrainTask).where(
+        BrainTask.task_id == task_id, BrainTask.status == "finalizing",
+        (BrainTask.claim_token.is_(None)) | (BrainTask.lease_until <= now),
+    ).values(claim_token=token, lease_until=now + timedelta(seconds=lease_seconds),
+             revision=BrainTask.revision + 1, updated_at=now))
+    return bool(result.rowcount)
+
+
+async def finish_expired(db: AsyncSession, task_id: str, token: str, *, now: datetime) -> bool:
+    result = await db.execute(update(BrainTask).where(
+        BrainTask.task_id == task_id, BrainTask.status == "finalizing", BrainTask.claim_token == token,
+        BrainTask.lease_until > now,
+        exists(select(BrainAction.action_id).where(BrainAction.task_id == task_id,
+               BrainAction.logical_step == "timeout", BrainAction.effect_slot == "notice", BrainAction.status == "confirmed")),
+    ).values(status="expired", claim_token=None, lease_until=None,
+             revision=BrainTask.revision + 1, updated_at=now))
     return bool(result.rowcount)
 
 

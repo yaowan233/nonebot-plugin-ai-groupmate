@@ -76,9 +76,12 @@ async def test_task_keeps_scope_across_restarts_and_only_accepts_exact_reply():
 
 @pytest.mark.asyncio
 async def test_timeout_and_reply_are_mutually_exclusive():
+    from sqlalchemy import select
     from nonebot_plugin_orm import get_session
 
-    from nonebot_plugin_ai_groupmate.brain.repository import TaskInput, claim, submit, expire_wait, accept_reply, wait_for_reply
+    from nonebot_plugin_ai_groupmate.model import BrainAction
+    from nonebot_plugin_ai_groupmate.brain.actions import confirm, claim_send
+    from nonebot_plugin_ai_groupmate.brain.repository import TaskInput, claim, submit, expire_wait, accept_reply, finish_expired, wait_for_reply, claim_finalization
 
     now = datetime(2026, 11, 10, 12)
     deadline = now + timedelta(minutes=30)
@@ -92,7 +95,42 @@ async def test_timeout_and_reply_are_mutually_exclusive():
         assert await expire_wait(db, task_id, now=deadline)
         assert not await accept_reply(db, task_id, platform="qq", target_scene="B", reply_to="q", message_id="r", user_id="bob", text="八点", now=deadline)
         assert not await expire_wait(db, task_id, now=deadline)
+        action = await db.scalar(select(BrainAction).where(BrainAction.task_id == task_id))
+        assert action is not None
+        assert action.target_scene == item.source_scene
+        assert await claim_finalization(db, task_id, "finalizer", now=deadline)
+        assert not await finish_expired(db, task_id, "finalizer", now=deadline)
+        assert await claim_send(db, action.action_id, task_token="finalizer", send_token="sender", now=deadline)
+        assert await confirm(db, action.action_id, send_token="sender", message_id="timeout-notice", now=deadline)
+        assert await finish_expired(db, task_id, "finalizer", now=deadline)
         await db.commit()
+
+
+@pytest.mark.asyncio
+async def test_reply_recorded_before_wait_registration_is_found_without_crossing_scope():
+    from nonebot_plugin_orm import get_session
+
+    from nonebot_plugin_ai_groupmate.brain.repository import TaskInput, claim, submit, wait_for_reply, pending_reply_candidates
+    from nonebot_plugin_ai_groupmate.brain.observations import record_message
+
+    now = datetime(2026, 11, 10, 12)
+    item = TaskInput("shared-brain", "qq", uuid4().hex, "m1", "alice", "问 B 群", now + timedelta(hours=1), transport_bot_id="bot")
+    async with get_session() as db:
+        task, _ = await submit(db, item, now=now)
+        task_id = task.task_id
+        assert await claim(db, task_id, "worker", now=now)
+        for scene, bot, message in [("B", "bot", "good"), ("C", "bot", "wrong-group"), ("B", "other-bot", "wrong-bot")]:
+            assert await record_message(db, platform="qq", bot_id=bot, scene_id=scene, message_id=message,
+                                        user_id="bob", text="八点", reply_to="question", now=now)
+        await db.commit()
+    async with get_session() as db:
+        assert await wait_for_reply(db, task_id, "worker", platform="qq", target_scene="B", question_message="question",
+                                    deadline=now + timedelta(minutes=30), now=now)
+        await db.commit()
+    async with get_session() as db:
+        candidates = await pending_reply_candidates(db, task_id=task_id, now=now)
+        assert [event.message_id for event in candidates] == ["good"]
+        assert candidates[0].text == "八点"
 
 
 @pytest.mark.asyncio

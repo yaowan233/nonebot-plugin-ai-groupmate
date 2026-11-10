@@ -8,7 +8,7 @@ from uuid import uuid4
 from datetime import datetime, timedelta
 from dataclasses import dataclass
 
-from sqlalchemy import select, update
+from sqlalchemy import or_, exists, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -67,8 +67,10 @@ async def claim_send(db: AsyncSession, action_id: str, *, task_token: str, send_
     # cancellation cannot slip between task ownership validation and the claim.
     owner = await db.execute(update(BrainTask).where(
         BrainTask.task_id.in_(select(BrainAction.task_id).where(BrainAction.action_id == action_id)),
-        BrainTask.status == "running", BrainTask.claim_token == task_token,
-        BrainTask.lease_until > now, BrainTask.deadline > now,
+        BrainTask.claim_token == task_token, BrainTask.lease_until > now,
+        or_((BrainTask.status == "running") & (BrainTask.deadline > now),
+            (BrainTask.status == "finalizing") & exists(select(BrainAction.action_id).where(
+                BrainAction.action_id == action_id, BrainAction.logical_step == "timeout", BrainAction.effect_slot == "notice"))),
     ).values(revision=BrainTask.revision + 1, updated_at=now))
     if not owner.rowcount:
         return False

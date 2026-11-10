@@ -12,6 +12,7 @@ class BrainTask(NulSafeModel):
 
     task_id: Mapped[str] = mapped_column(String(32), primary_key=True)
     brain_id: Mapped[str] = mapped_column(String(255))
+    bot_id: Mapped[str] = mapped_column(String(255))
     platform: Mapped[str] = mapped_column(String(64))
     source_scene: Mapped[str] = mapped_column(String(255))
     source_message: Mapped[str] = mapped_column(String(255))
@@ -87,6 +88,7 @@ class BrainObservationMessage(NulSafeModel):
     bot_id: Mapped[str] = mapped_column(String(255))
     scene_id: Mapped[str] = mapped_column(String(255))
     message_id: Mapped[str] = mapped_column(String(255))
+    reply_to: Mapped[str | None] = mapped_column(String(255))
     user_id: Mapped[str] = mapped_column(String(255))
     text: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column()

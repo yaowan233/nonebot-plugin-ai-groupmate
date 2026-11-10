@@ -26,10 +26,10 @@ def configured_space(spaces: dict[str, list[str]], scene_id: str) -> str | None:
 
 
 async def record_message(db: AsyncSession, *, platform: str, bot_id: str, scene_id: str,
-                         message_id: str, user_id: str, text: str, now: datetime) -> bool:
+                         message_id: str, user_id: str, text: str, now: datetime, reply_to: str | None = None) -> bool:
     if platform == "unknown" or not all((platform, bot_id, scene_id, user_id, text.strip())) or not is_reliable_platform_id(message_id):
         return False
-    row = BrainObservationMessage(platform=platform, bot_id=bot_id, scene_id=scene_id, message_id=message_id,
+    row = BrainObservationMessage(platform=platform, bot_id=bot_id, scene_id=scene_id, message_id=message_id, reply_to=reply_to,
                                   user_id=user_id, text=text.strip()[:1200], created_at=now)
     try:
         async with db.begin_nested():
