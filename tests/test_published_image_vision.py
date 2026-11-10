@@ -6,6 +6,47 @@ import pytest
 from langchain_core.messages import AIMessage
 
 
+async def test_history_image_tool_reads_exact_scoped_images(tmp_path):
+    from uuid import uuid4
+
+    from nonebot_plugin_orm import get_session
+    from test_image_generation import png
+
+    from nonebot_plugin_ai_groupmate.agent.file_workspace import FileWorkspace
+    from nonebot_plugin_ai_groupmate.agent.history_image_tools import create_history_image_tool
+    from nonebot_plugin_ai_groupmate.agent.reply_tools import record_image_reply
+    from nonebot_plugin_ai_groupmate.config import ScopedConfig
+    from nonebot_plugin_ai_groupmate.model import ChatHistory
+
+    group = f"history-image-{uuid4()}"
+    pics = tmp_path / "pics"
+    pics.mkdir()
+    (pics / "upload.png").write_bytes(png("red"))
+    owner = FileWorkspace(tmp_path / "files", session_id=group, user_id="alice", bot_id="bot", is_private=False)
+    artifact = owner.save(png("blue"), "draw.png")
+    owner.publish_image(artifact.file_id, "bot-image")
+    viewer = FileWorkspace(tmp_path / "files", session_id=group, user_id="bob", bot_id="bot", is_private=False)
+    async with get_session() as db:
+        row = ChatHistory(session_id=group, user_id="alice", user_name="Alice", content_type="image",
+                          content="id: upload-id\nupload.png")
+        db.add(row)
+        record_image_reply(db, session_id=group, bot_name="miyuki", message_id="bot-image",
+                           image_content=f"[图片文件] draw.png file_id={artifact.file_id}")
+        await db.commit()
+        await db.refresh(row)
+        kwargs = dict(pic_dir=pics, workspace=viewer, config=ScopedConfig(), platform="qq", is_private=False)
+        image_tool = create_history_image_tool(db, group, None, **kwargs)
+        for target in ({"message_id": "upload-id"}, {"history_row_id": row.msg_id}, {"message_id": "bot-image"}):
+            result = await image_tool.ainvoke(target)
+            assert isinstance(result, list)
+            assert result[1]["image_url"]["url"].startswith("data:image/")
+
+        foreign = FileWorkspace(tmp_path / "files", session_id="another-group", user_id="bob", bot_id="bot", is_private=False)
+        other_tool = create_history_image_tool(db, "another-group", None, **{**kwargs, "workspace": foreign})
+        assert json.loads(await other_tool.ainvoke({"history_row_id": row.msg_id}))["status"] == "failed"
+        assert json.loads(await other_tool.ainvoke({"message_id": "bot-image"}))["status"] == "failed"
+
+
 def test_recent_image_reference_list_is_bounded_and_uses_transport_ids():
     from test_history_metadata import _history
 

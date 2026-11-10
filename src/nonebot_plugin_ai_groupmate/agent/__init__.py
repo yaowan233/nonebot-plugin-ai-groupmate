@@ -75,10 +75,13 @@ from .common_tools import (
     create_scoped_history_search_tool,
 )
 from .conversation import (
+    ACTIVE_THREAD_MAX_IMAGES,
     get_active_thread,
     update_active_thread,
     build_append_only_history,
+    limit_history_images,
 )
+from .history_image_tools import create_history_image_tool
 from .custom_tools import (
     AgentSkill,
     AgentToolBundle,
@@ -1806,6 +1809,17 @@ async def create_chat_graph(
             reachable_groups=lambda allowed: reachable_group_ids(bot, allowed),
         ),
     ]
+    history_image_tool = None
+    if ordinary_tool_turn and not proactive_observation:
+        image_workspace = pilot_workspace or FileWorkspace(
+            plugin_data_dir / "agent_files", session_id=session_id, user_id=str(user_id),
+            bot_id=str(bot_id or plugin_config.bot_name), is_private=is_private,
+        )
+        history_image_tool = create_history_image_tool(
+            db_session, session_id, request_id, pic_dir=pic_dir, workspace=image_workspace,
+            config=plugin_config, platform=resolved_platform, is_private=is_private,
+        )
+        system_prompt += "\n需要查看历史图片时，用 view_history_image 读取近期消息引用中的消息 ID 或历史查询的 msg_id。"
     base_agent_tools = [
         *([create_coordination_tool(config=plugin_config, platform=resolved_platform, bot_id=str(bot_id or ""),
                                     scene_id=session_id, user_id=str(user_id), message_id=tool_current_message_id,
@@ -1856,6 +1870,7 @@ async def create_chat_graph(
         *image_generation_tools,
         *drawing_management_tools,
         *history_tools,
+        *([history_image_tool] if history_image_tool is not None else []),
         *create_explicit_memory_tools(
             session_id, str(user_id), str(bot_id or plugin_config.bot_name), is_private,
             history or [], request_id,
@@ -2444,6 +2459,14 @@ async def choice_response_strategy(
                 history_variant=history_variant,
                 structured_messages=structured_messages if history_variant == "structured" else None,
             )
+        # Current and quoted pictures take priority over older cached images.
+        reserved_images = len(structured_current_images or []) + len(structured_reply_images or [])
+        if structured_reply_images is None:
+            reserved_images += sum(_is_image_history(row) for row in replied_extra)
+        image_budget = max(0, ACTIVE_THREAD_MAX_IMAGES - reserved_images)
+        if structured_reply_failed or structured_current_failed:
+            image_budget = 0
+        chat_history_messages = limit_history_images(chat_history_messages, image_budget)
         input_max_msg_id = max((msg.msg_id for msg in history), default=0)
         active_thread = get_active_thread(session_id)
         if reused_thread and active_thread:

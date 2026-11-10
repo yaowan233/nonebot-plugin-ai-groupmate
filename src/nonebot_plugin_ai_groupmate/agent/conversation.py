@@ -16,6 +16,7 @@ from .turn_context import TurnHistoryResolver
 
 ACTIVE_THREAD_TTL = datetime.timedelta(minutes=10)
 ACTIVE_THREAD_MAX_MESSAGES = 1000
+ACTIVE_THREAD_MAX_IMAGES = 3
 
 
 @dataclass
@@ -35,9 +36,31 @@ FormatHistory = Callable[
 
 
 def trim_thread_messages(messages: list[BaseMessage]) -> list[BaseMessage]:
-    if len(messages) <= ACTIVE_THREAD_MAX_MESSAGES:
-        return messages
-    return messages[-ACTIVE_THREAD_MAX_MESSAGES:]
+    return limit_history_images(messages[-ACTIVE_THREAD_MAX_MESSAGES:], 0)
+
+
+def limit_history_images(messages: list[BaseMessage], max_images: int = ACTIVE_THREAD_MAX_IMAGES) -> list[BaseMessage]:
+    """Keep recent image parts without accumulating pixels across chat turns."""
+    remaining = max(0, max_images)
+    result = list(messages)
+    for index in range(len(result) - 1, -1, -1):
+        message = result[index]
+        if not isinstance(message.content, list):
+            continue
+        parts = list(message.content)
+        changed = False
+        for part_index in range(len(parts) - 1, -1, -1):
+            part = parts[part_index]
+            if not isinstance(part, dict) or part.get("type") not in {"image_url", "image", "input_image"}:
+                continue
+            if remaining:
+                remaining -= 1
+            else:
+                parts[part_index] = {"type": "text", "text": "[图片]"}
+                changed = True
+        if changed:
+            result[index] = message.model_copy(update={"content": parts})
+    return result
 
 
 def get_active_thread(session_id: str) -> ActiveConversationThread | None:
@@ -72,17 +95,17 @@ def build_append_only_history(
 
     if not thread:
         return (
-            format_history(history, 3, user_roles, extra_inline_images),
+            limit_history_images(format_history(history, 3, user_roles, extra_inline_images)),
             history,
             False,
         )
 
     new_history = [msg for msg in history if msg.msg_id > thread.last_msg_id]
     if not new_history:
-        return list(thread.messages), [], True
+        return limit_history_images(thread.messages, 0), [], True
 
     new_messages = format_history(new_history, 3, user_roles, extra_inline_images)
-    return list(thread.messages) + new_messages, new_history, True
+    return limit_history_images([*limit_history_images(thread.messages, 0), *new_messages]), new_history, True
 
 
 async def update_active_thread(
