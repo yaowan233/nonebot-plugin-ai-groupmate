@@ -65,7 +65,6 @@ from .meme_tools import (
 )
 from .media_tools import create_read_media_tools
 from .reply_tools import create_reply_tool
-from .ordered_reply_tool import create_ordered_reply_tool
 from ..concurrency import agent_run_gate, configure_concurrency
 from .common_tools import (
     finish,
@@ -102,13 +101,13 @@ from .private_tools import create_private_message_tool
 from .profile_tools import create_report_tool, create_relation_tool
 from ..media_message import LazyMediaRegistry, extract_media_message_refs
 from ..message_trace import trace_id
+from ..reply_request import resolve_current_message_id
 from .file_workspace import FileWorkspace
 from .history_format import (
     parse_msg_meta,
     is_image_history,
     get_image_data_uri as _get_image_data_uri,
     format_chat_history as _format_chat_history,
-    format_recent_message_references,
     current_message_images,
     _image_bytes_to_data_uri,
     get_history_image_data_uri,
@@ -116,6 +115,7 @@ from .history_format import (
     build_avatar_context_messages,
     should_include_avatar_context,
     load_replied_message_histories,
+    format_recent_message_references,
 )
 from .schedule_tools import (
     create_schedule_message_tool,
@@ -139,13 +139,14 @@ from .web_image_search import (
 from ..message_batching import current_input_batch
 from ..message_mentions import event_mentioned_user_ids, current_mentioned_user_ids
 from ..message_metadata import platform_message_ids, is_reliable_platform_id
-from ..reply_request import resolve_current_message_id
 from .interaction_tools import create_interaction_history_tools
 from .shared_card_tools import create_shared_card_tools
 from .drawing_management import create_drawing_management_tools
 from .group_memory_tools import create_group_memory_tool
 from .image_search_tools import create_web_image_tools
-from .structured_context import StructuredSnapshot, visible_text, visible_quote_text, load_structured_context_safely, merge_snapshots
+from .ordered_reply_tool import create_ordered_reply_tool
+from .structured_context import StructuredSnapshot, visible_text, merge_snapshots, visible_quote_text, load_structured_context_safely
+from ..brain.observations import relevant_context
 from ..group_model_config import (
     resolve_chat_config,
     resolve_session_chat_config,
@@ -154,7 +155,7 @@ from ..group_model_config import (
 from ..structured_message import adapter_name
 from .qwen_responses_tools import create_qwen_code_interpreter_tool
 from .image_generation_tools import BACKGROUND_IMAGE_PROMPT, IMAGE_GENERATION_PROMPT, create_image_generation_tool
-from .structured_image_resources import load_scoped_message, load_scoped_messages, read_message_images
+from .structured_image_resources import load_scoped_message, read_message_images, load_scoped_messages
 
 
 async def _finish_db_operation(coro):
@@ -1154,6 +1155,20 @@ async def create_chat_graph(
     if not is_private:
         group_context = await get_group_context(db_session, session_id)
         group_context += "\n" + group_feeling_context((str(bot_id or plugin_config.bot_name), session_id))
+        if plugin_config.cross_group_spaces and event is not None:
+            try:
+                batch = current_input_batch.get()
+                query = "\n".join(text for _, text in batch) if batch else event.get_plaintext()
+                cross_context = await relevant_context(
+                    db_session, spaces=plugin_config.cross_group_spaces, platform=resolved_platform,
+                    bot_id=str(bot_id or ""), scene_id=session_id, query=query,
+                    now=datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None),
+                )
+                if cross_context:
+                    group_context += "\n" + cross_context
+            except Exception as error:
+                logger.warning(f"读取跨群观察线索失败 error_type={type(error).__name__}")
+                await _safe_rollback(db_session)
         recent_relations_context = await get_recent_relations_context(
             db_session, history or []
         )

@@ -62,6 +62,62 @@ class BrainAction(NulSafeModel):
     __table_args__ = (UniqueConstraint("task_id", "logical_step", "effect_slot", "platform", "target_scene", name="uq_brain_action_effect"),)
 
 
+class BrainInteraction(NulSafeModel):
+    """Confirmed human-to-Bot turn used to determine observation eligibility."""
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    platform: Mapped[str] = mapped_column(String(64))
+    bot_id: Mapped[str] = mapped_column(String(255))
+    scene_id: Mapped[str] = mapped_column(String(255))
+    turn_id: Mapped[str] = mapped_column(String(255))
+    explicitly_addressed: Mapped[bool] = mapped_column(Boolean)
+    created_at: Mapped[datetime] = mapped_column()
+
+    __table_args__ = (
+        UniqueConstraint("platform", "bot_id", "scene_id", "turn_id", name="uq_brain_interaction_turn"),
+        Index("ix_brain_interaction_scene_time", "platform", "bot_id", "scene_id", "created_at"),
+    )
+
+
+class BrainObservationMessage(NulSafeModel):
+    """Scoped inbound text eligible for selective observation."""
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    platform: Mapped[str] = mapped_column(String(64))
+    bot_id: Mapped[str] = mapped_column(String(255))
+    scene_id: Mapped[str] = mapped_column(String(255))
+    message_id: Mapped[str] = mapped_column(String(255))
+    user_id: Mapped[str] = mapped_column(String(255))
+    text: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column()
+
+    __table_args__ = (
+        UniqueConstraint("platform", "bot_id", "scene_id", "message_id", name="uq_brain_observation_message"),
+        Index("ix_brain_observation_scene_time", "platform", "bot_id", "scene_id", "created_at"),
+    )
+
+
+class BrainSceneObservation(NulSafeModel):
+    platform: Mapped[str] = mapped_column(String(64), primary_key=True)
+    bot_id: Mapped[str] = mapped_column(String(255), primary_key=True)
+    scene_id: Mapped[str] = mapped_column(String(255), primary_key=True)
+    last_message_id: Mapped[int] = mapped_column(Integer, default=0)
+    next_due: Mapped[datetime] = mapped_column()
+    active: Mapped[bool] = mapped_column(Boolean, default=False)
+    digest: Mapped[str] = mapped_column(Text, default="")
+    source_ids: Mapped[list[int]] = mapped_column(JSON, default=list)
+    updated_at: Mapped[datetime] = mapped_column()
+
+
+class BrainObservationRun(NulSafeModel):
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    platform: Mapped[str] = mapped_column(String(64))
+    bot_id: Mapped[str] = mapped_column(String(255))
+    scene_id: Mapped[str] = mapped_column(String(255))
+    started_at: Mapped[datetime] = mapped_column(index=True)
+    status: Mapped[str] = mapped_column(String(32))
+
+
 class MediaStorage(NulSafeModel):
     """媒体资源中心化存储"""
 

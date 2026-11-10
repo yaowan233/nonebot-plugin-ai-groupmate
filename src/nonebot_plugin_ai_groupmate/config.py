@@ -19,6 +19,8 @@ class ScopedConfig(BaseModel):
     bot_name: str = "bot"
     reply_probability: float = 0.01
     proactive_observation_enabled: bool = True
+    # Explicit group lists define which groups may share observation summaries.
+    cross_group_spaces: dict[str, list[str]] = Field(default_factory=dict)
     global_model_daily_group_limit_enabled: bool = True
     global_model_daily_group_limit: int = Field(
         default=50,

@@ -761,3 +761,30 @@ async def test_old_bot_id_outside_echo_window_does_not_hide_new_input(deliver_me
         rows = (await db.execute(Select(ChatHistory).where(ChatHistory.session_id == "old-platform-id"))).scalars().all()
         assert len(rows) == 2
         assert rows[-1].content_type == "text"
+
+
+@pytest.mark.asyncio
+async def test_inbound_handler_only_records_opted_in_human_message(deliver_message, monkeypatch):
+    from uuid import uuid4
+
+    from sqlalchemy import select
+    from nonebot_plugin_orm import get_session
+
+    import nonebot_plugin_ai_groupmate as plugin
+    from nonebot_plugin_ai_groupmate.model import BrainObservationMessage
+
+    group, peer, other = uuid4().hex, uuid4().hex, uuid4().hex
+    monkeypatch.setattr(plugin.plugin_config, "cross_group_spaces", {"test": [group, peer]})
+    monkeypatch.setattr(plugin, "adapter_name", lambda _bot: "test-platform")
+    deliver, _, _ = deliver_message
+    await deliver(group, "source-1", "周末有活动", user_id="alice")
+    await deliver(group, "source-1", "周末有活动", user_id="alice")
+    await deliver(other, "source-2", "普通群消息", user_id="bob")
+    async with get_session() as db:
+        rows = list((await db.scalars(select(BrainObservationMessage).where(
+            BrainObservationMessage.platform == "test-platform",
+            BrainObservationMessage.scene_id.in_([group, other]),
+        ))).all())
+        assert len(rows) == 1
+        assert rows[0].scene_id == group
+        assert rows[0].text == "周末有活动"

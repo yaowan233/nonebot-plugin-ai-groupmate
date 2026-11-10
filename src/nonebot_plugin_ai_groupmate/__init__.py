@@ -9,9 +9,9 @@ import traceback
 from io import BytesIO
 from typing import Any
 from pathlib import Path
-from urllib.parse import urlsplit
 from functools import lru_cache
 from dataclasses import replace
+from urllib.parse import urlsplit
 
 import jieba
 from nonebot import logger, require, get_bots, on_notice, get_driver, on_command, on_message, get_plugin_config
@@ -36,7 +36,7 @@ from nonebot_plugin_alconna import (
     File,
     Image,
     Target,
-    UniMessage,
+    UniMessage,  # noqa: F401 - public compatibility import
     image_fetch,
     get_message_id,
 )
@@ -72,7 +72,7 @@ from .drawing_poll import poll_drawing_jobs, stop_drawing_jobs, start_drawing_jo
 from .shared_cards import MAX_CARD_TEXT, save_card_links, parse_shared_segment
 from .media_message import format_media_markers
 from .message_trace import trace_id
-from .participation import participation, delivery_context, observation_guard
+from .participation import participation, delivery_context, observation_guard, confirmed_turn_delivery
 from .reply_request import ReplyRequest, GroupReplyState, merge_reply_requests, current_transport_message_id
 from .agent.delivery import OutboundIdentity
 from .agent.reaction import is_onebot_context, requested_reaction_emoji
@@ -89,11 +89,9 @@ from .message_rollout import message_pilot_enabled
 from .scheduled_tasks import poll_scheduled_tasks, stop_scheduled_tasks
 from .agent.chat_files import chat_file_source_key
 from .message_batching import InputBatcher, current_input_batch
-from .message_mentions import (format_member_mention, event_mentioned_user_ids, mentioned_user_ids,
-                               current_mentioned_user_ids, current_normalized_message)
-from .message_metadata import BOT_ECHO_LOOKBACK, is_reliable_platform_id, platform_message_ids
+from .message_mentions import mentioned_user_ids, format_member_mention, event_mentioned_user_ids, current_mentioned_user_ids, current_normalized_message
+from .message_metadata import BOT_ECHO_LOOKBACK, platform_message_ids, is_reliable_platform_id
 from .agent.reply_tools import create_reply_tool
-from .agent.turn_context import is_one_to_one_exchange
 from .delivery_recovery import prune_receipts, recover_pending
 from .group_daily_quota import (
     GroupDailyQuotaStatus,
@@ -104,8 +102,8 @@ from .group_daily_quota import (
     get_private_user_daily_quota_status,
     build_private_quota_exhausted_message,
 )
-from .agent.turn_context import bind_turn_history, build_turn_context, TurnHistoryResolver
-from .agent.structured_context import load_structured_context_safely
+from .agent.turn_context import TurnHistoryResolver, bind_turn_history, build_turn_context, is_one_to_one_exchange
+from .brain.observations import record_message, configured_space, poll_observations, prune_observations, record_interaction
 from .group_model_config import (
     LOCAL_ENCRYPTION_KEY_FILENAME,
     LocalSecretCipher,
@@ -126,6 +124,7 @@ from .group_reply_scheduler import GroupReplyScheduler
 from .agent.command_delivery import send_command_image
 from .agent.web_image_search import is_explicit_web_image_search_request
 from .history_index_backfill import backfill_one, has_pending_backfill
+from .agent.structured_context import load_structured_context_safely
 
 
 async def _safe_rollback(db_session) -> None:
@@ -360,6 +359,35 @@ async def _close_vector_resources() -> None:
 
 
 _observation_schedule: ObservationSchedule[ReplyRequest] = ObservationSchedule()
+
+
+@scheduler.scheduled_job("interval", minutes=1, max_instances=1, coalesce=True, id="ai_groupmate_cross_group_observe")
+async def _poll_cross_group_observations() -> None:
+    if not plugin_config.cross_group_spaces:
+        return
+    from .group_memory import get_summary_model
+
+    connected = {str(bot_id): adapter_name(bot) for bot_id, bot in get_bots().items()}
+    try:
+        async with maintenance_gate.slot():
+            await poll_observations(
+                spaces=plugin_config.cross_group_spaces, connected=connected,
+                paused=lambda bot_id, scene: time.monotonic() < participation.state((bot_id, scene)).quiet_until,
+                model_factory=get_summary_model,
+                now=datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None),
+            )
+    except Exception:
+        logger.exception("跨群观察调度失败")
+
+
+@scheduler.scheduled_job("interval", hours=1, max_instances=1, coalesce=True, id="ai_groupmate_prune_cross_group_observations")
+async def _prune_cross_group_observations() -> None:
+    try:
+        async with get_session() as db:
+            await prune_observations(db, now=datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None))
+            await db.commit()
+    except Exception:
+        logger.exception("跨群观察数据清理失败")
 
 
 def _observation_enabled(key: tuple[str, str]) -> bool:
@@ -1255,6 +1283,17 @@ async def handle_message(
         proactive_reaction_only = False
         proactive_meme_only = False
     should_reply = not disengaged and (to_me or continuous_to_me or random_reply_sample or proactive_reaction_only or proactive_meme_only or repeat_reply_sample)
+    if (is_group and is_new_text_message and not sender_is_connected_bot and not command_like and stripped_plain_text
+            and configured_space(plugin_config.cross_group_spaces, str(session.scene.id))):
+        try:
+            async with get_session() as observation_session:
+                await record_message(observation_session, platform=adapter_name(bot), bot_id=str(bot.self_id),
+                                     scene_id=str(session.scene.id), message_id=incoming_message_id,
+                                     user_id=str(session.user.id), text=stripped_plain_text,
+                                     now=datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None))
+                await observation_session.commit()
+        except Exception:
+            logger.exception("记录跨群观察消息失败，请确认已执行 nb orm upgrade")
     if explicit_to_me and not disengaged:
         _refresh_continuous_conversation(session.scene.id, session.user.id, bot_id)
         if _is_explicit_conversation_request(stripped_plain_text):
@@ -1689,6 +1728,8 @@ async def handle_reply_request(request: ReplyRequest) -> None:
         None if is_private else (participation_key, autonomous)
     )
     observation_token = observation_guard.set((lambda: _observation_enabled(participation_key)) if proactive_observation else None)
+    delivered = [False]
+    delivered_token = confirmed_turn_delivery.set(delivered)
     previous_sent = participation.state(participation_key).last_sent
     group_quota_limit = plugin_config.global_model_daily_group_limit
     private_quota_limit = plugin_config.global_model_daily_private_user_limit
@@ -2087,6 +2128,18 @@ async def handle_reply_request(request: ReplyRequest) -> None:
         logger.error(f"回复逻辑执行失败: {e}")
         print(traceback.format_exc())
     finally:
+        confirmed_turn_delivery.reset(delivered_token)
+        if (not is_private and delivered[0] and (is_tome or is_continuous) and not proactive_observation
+                and not proactive_meme_only and not proactive_reaction_only and repeat_text is None
+                and configured_space(plugin_config.cross_group_spaces, str(session.scene.id))):
+            try:
+                async with get_session() as observation_session:
+                    await record_interaction(observation_session, platform=adapter_name(bot), bot_id=str(bot.self_id),
+                                             scene_id=str(session.scene.id), turn_id=request_id, explicitly_addressed=is_tome,
+                                             now=datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None))
+                    await observation_session.commit()
+            except Exception:
+                logger.exception("记录跨群观察交互失败，请确认已执行 nb orm upgrade")
         if not is_private and participation.state(participation_key).last_sent > previous_sent:
             _observation_schedule.participated(participation_key)
         observation_guard.reset(observation_token)

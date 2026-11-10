@@ -139,11 +139,15 @@ delivery_context: ContextVar[tuple[tuple[str, str], bool] | None] = ContextVar(
     "group_participation_delivery", default=None
 )
 observation_guard: ContextVar[Callable[[], bool] | None] = ContextVar("group_observation_guard", default=None)
+confirmed_turn_delivery: ContextVar[list[bool] | None] = ContextVar("confirmed_turn_delivery", default=None)
 
 
 def record_group_delivery(session_id: str) -> None:
     context = delivery_context.get()
     if context is not None and context[0][1] == session_id:
+        marker = confirmed_turn_delivery.get()
+        if marker is not None:
+            marker[0] = True
         participation.sent(context[0], proactive=context[1])
 
 
