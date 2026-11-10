@@ -32,6 +32,17 @@ async def test_onebot_group_info_and_linked_group_list():
 
 
 @pytest.mark.asyncio
+async def test_reachable_groups_are_the_intersection_of_membership_and_config():
+    from nonebot_plugin_ai_groupmate.agent.platform_queries import reachable_group_ids
+
+    bot = SimpleNamespace(adapter=SimpleNamespace(get_name=lambda: "OneBot V11"), call_api=AsyncMock(return_value=[
+        {"group_id": 101, "group_name": "来源"}, {"group_id": 303, "group_name": "未授权"},
+    ]))
+    assert await reachable_group_ids(bot, {"101", "202"}) == {"101"}
+    bot.call_api.assert_awaited_once_with("get_group_list")
+
+
+@pytest.mark.asyncio
 async def test_members_query_and_scope_change():
     from nonebot_plugin_ai_groupmate.agent.platform_queries import create_platform_query_tool
 

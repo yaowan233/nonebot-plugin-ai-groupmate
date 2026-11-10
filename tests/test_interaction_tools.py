@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from typing import Any
 from pathlib import Path
 from datetime import datetime, timedelta
+from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import func, select
@@ -13,12 +14,13 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 @pytest.fixture
 async def history_db(tmp_path, monkeypatch):
     from nonebot_plugin_ai_groupmate.agent import interaction_tools
-    from nonebot_plugin_ai_groupmate.model import ChatHistory, HistoryMessageIndex
+    from nonebot_plugin_ai_groupmate.model import ChatHistory, StructuredMessage, HistoryMessageIndex
 
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'history.sqlite3'}")
     async with engine.begin() as connection:
         await connection.run_sync(ChatHistory.__table__.create)
         await connection.run_sync(HistoryMessageIndex.__table__.create)
+        await connection.run_sync(StructuredMessage.__table__.create)
     sessions = async_sessionmaker(engine, expire_on_commit=False)
     monkeypatch.setattr(interaction_tools, "get_session", sessions)
     yield sessions
@@ -86,6 +88,55 @@ async def test_recent_history_result_budget_keeps_a_usable_cursor(history_db, mo
         if cursor is None:
             break
     assert found == list(range(12, 0, -1))
+
+
+async def test_recent_history_reads_only_reachable_configured_groups(history_db):
+    from nonebot_plugin_ai_groupmate.model import StructuredMessage
+    from nonebot_plugin_ai_groupmate.agent.interaction_tools import create_interaction_history_tools
+
+    now = datetime.now()
+    await seed(history_db, [
+        {"session_id": "group-1", "content": "当前群消息", "created_at": now - timedelta(minutes=2)},
+        {"session_id": "group-2", "content": "目标群消息", "created_at": now - timedelta(minutes=1)},
+        {"session_id": "group-3", "content": "无权读取", "created_at": now},
+        {"session_id": "group-2", "content": "请求之后的消息", "created_at": now + timedelta(minutes=1)},
+    ])
+    async with history_db() as session:
+        for index, (scope, platform, body, created_at) in enumerate([
+            ("group", "OneBot V11", "目标群消息", now - timedelta(minutes=1)),
+            ("private", "OneBot V11", "同号私聊不能读", now),
+            ("group", "other", "其他平台不能读", now),
+            ("group", "OneBot V11", "请求之后的消息", now + timedelta(minutes=1)),
+            ("group", "OneBot V11", "更早的群消息", now - timedelta(minutes=3)),
+        ], 1):
+            session.add(StructuredMessage(id=index, platform=platform, scope=scope, session_id="group-2",
+                platform_id=f"msg-{index}", sender_id="user", sender_name="用户", sender_kind="user", bot_id="bot",
+                reply_to_id=None, parts=[{"type": "text", "text": body}], created_at=created_at))
+        await session.commit()
+    spaces = {"linked": ["group-1", "group-2"], "other": ["group-3", "group-4"]}
+    reachable = AsyncMock(return_value={"group-1", "group-2"})
+    recent = next(t for t in create_interaction_history_tools(
+        "group-1", None, upper_history_id=1, platform="OneBot V11", configured_spaces=lambda: spaces,
+        reachable_groups=reachable,
+    ) if t.name == "read_recent_history")
+    result = await invoke(recent, target_group_id="group-2", limit=1)
+    assert result["data"]["scope"] == "linked_group"
+    assert result["data"]["group_id"] == "group-2"
+    assert [item["content"] for item in result["data"]["messages"]] == ["目标群消息"]
+    page = await invoke(recent, target_group_id="group-2", limit=1, before_msg_id=result["data"]["next_before_msg_id"])
+    assert [item["content"] for item in page["data"]["messages"]] == ["更早的群消息"]
+    assert (await invoke(recent, target_group_id="group-2", before_msg_id=2))["reason_code"] == "source_not_found"
+    assert (await invoke(recent, target_group_id="group-3"))["reason_code"] == "group_not_allowed"
+    reachable.return_value = {"group-1"}
+    assert (await invoke(recent, target_group_id="group-2"))["reason_code"] == "group_unavailable"
+    async def revoked(_allowed):
+        spaces.clear()
+        return {"group-1", "group-2"}
+
+    reachable.side_effect = revoked
+    assert (await invoke(recent, target_group_id="group-2"))["reason_code"] == "group_not_allowed"
+    spaces.clear()
+    assert (await invoke(recent, target_group_id="group-2"))["reason_code"] == "group_not_allowed"
 
 
 async def test_discovers_interaction_without_evaluation_keyword_and_keeps_roles(history_db):

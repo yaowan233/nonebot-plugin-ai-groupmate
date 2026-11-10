@@ -98,6 +98,18 @@ def supports_platform_queries(bot: Any) -> bool:
     return bot is not None and adapter_name(bot) in QUERY_PROVIDERS
 
 
+async def reachable_group_ids(bot: Any, allowed: set[str]) -> set[str]:
+    """Return allowed groups the current adapter confirms this bot belongs to."""
+    provider_factory = QUERY_PROVIDERS.get(adapter_name(bot)) if bot is not None else None
+    if provider_factory is None:
+        raise QueryError("unsupported_query", "当前平台无法确认群成员关系。")
+    result = await asyncio.wait_for(provider_factory(bot).query(
+        "list_groups", group_id="", user_id="", keyword="", limit=max(1, len(allowed)), allowed=allowed,
+        random_selection=False, exclude_user_ids=set(),
+    ), timeout=8)
+    return {str(row["group_id"]) for row in result.get("groups", []) if row.get("group_id") in allowed}
+
+
 def create_platform_query_tool(bot: Any, session_id: str, request_id: str | None,
                                spaces: Callable[[], dict[str, list[str]]], *, interface: Any = None,
                                group_members: list[Any] | None = None, bot_user_ids: Sequence[str] = ()):
