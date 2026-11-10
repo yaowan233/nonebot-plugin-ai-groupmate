@@ -132,6 +132,7 @@ from .jargon_learning import create_jargon_tool, get_jargon_context
 from ..forward_message import extract_forward_message_ids
 from ..message_rollout import message_pilot_enabled
 from .moderation_tools import create_mute_tool
+from .platform_queries import supports_platform_queries, create_platform_query_tool
 from .web_image_search import (
     create_last_image_search_tool,
     create_reverse_image_search_tool,
@@ -1782,6 +1783,8 @@ async def create_chat_graph(
         )]
         system_prompt += BACKGROUND_IMAGE_PROMPT if background_drawing else IMAGE_GENERATION_PROMPT
     history_tools = [] if is_private else [
+        *([create_platform_query_tool(bot, session_id, request_id, lambda: plugin_config.cross_group_spaces)]
+          if supports_platform_queries(bot) else []),
         create_group_member_tool(
             session_id, request_id, interface, group_members=member_snapshot,
             bot_user_ids=tuple({str(uid) for uid in get_bots()} | ({str(bot_id)} if bot_id else set())),
