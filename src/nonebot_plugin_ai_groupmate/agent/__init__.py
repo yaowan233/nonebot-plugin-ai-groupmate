@@ -1809,7 +1809,8 @@ async def create_chat_graph(
     base_agent_tools = [
         *([create_coordination_tool(config=plugin_config, platform=resolved_platform, bot_id=str(bot_id or ""),
                                     scene_id=session_id, user_id=str(user_id), message_id=tool_current_message_id,
-                                    request_id=request_id, request_text=current_request_text)]
+                                    request_id=request_id, request_text=current_request_text,
+                                    reachable_groups=lambda allowed: reachable_group_ids(bot, allowed))]
           if not is_private and not proactive_observation and event is not None and request_id
           and getattr(event, "is_tome", lambda: False)() and configured_space(plugin_config.cross_group_spaces, session_id)
           else []),

@@ -43,6 +43,48 @@ async def _block(task_id: str, token: str, now: datetime) -> None:
         await db.commit()
 
 
+async def _confirm_direct_send(task_id: str, token: str, *, platform: str, bot_id: str, source: str,
+                               source_message: str, target: str, spaces: Spaces, sender: Sender, clock: Clock) -> str:
+    """Journal the source acknowledgment after the target send is confirmed."""
+    if not configured_space(_spaces(spaces), source):
+        await _block(task_id, token, clock())
+        return "blocked"
+    async with get_session() as db:
+        notice, _ = await prepare(db, ActionSpec(task_id, "send_notice", "notice", platform, source,
+                                                 f"已向 {target} 群发送消息。"), task_token=token, now=clock())
+        action_id, status, receipt = notice.action_id, notice.status, notice.receipt_message_id
+        await db.commit()
+    if status in {"sending", "delivery_unknown"}:
+        await _block(task_id, token, clock())
+        return "delivery_unknown"
+    if status == "prepared":
+        send_token = uuid4().hex
+        async with get_session() as db:
+            if not await claim_send(db, action_id, task_token=token, send_token=send_token, now=clock()):
+                await db.rollback()
+                return "unavailable"
+            await db.commit()
+        try:
+            receipt = await sender(platform, bot_id, source, f"已向 {target} 群发送消息。", source_message)
+        except Exception:
+            await _block(task_id, token, clock())
+            return "delivery_unknown"
+        if not is_reliable_platform_id(receipt):
+            await _block(task_id, token, clock())
+            return "delivery_unknown"
+        async with get_session() as db:
+            if not await confirm(db, action_id, send_token=send_token, message_id=receipt, now=clock()):
+                await db.rollback()
+                return "delivery_unknown"
+            await db.commit()
+    elif status != "confirmed" or not is_reliable_platform_id(receipt):
+        raise ValueError("Source notice cannot be delivered")
+    async with get_session() as db:
+        completed = await finish(db, task_id, token, now=clock())
+        await db.commit()
+    return "completed" if completed else "unavailable"
+
+
 async def process_candidate(task_id: str, *, spaces: Spaces, model, clock: Clock = utcnow) -> str:
     """Classify at most one quoted candidate; persist decisions before retrying."""
     async with get_session() as db:
@@ -169,8 +211,9 @@ async def run_task(task_id: str, *, spaces: Spaces, model, sender: Sender,
         assert task is not None
         snapshot = (task.platform, task.bot_id, task.source_scene, task.source_message, task.request, task.deadline)
         answer = (waiting.answer_text, waiting.target_scene) if waiting and waiting.status == "answered" else None
-        step = "return" if answer else "ask"
-        previous = await db.scalar(select(BrainAction).where(BrainAction.task_id == task_id, BrainAction.logical_step == step))
+        direct = await db.scalar(select(BrainAction).where(BrainAction.task_id == task_id, BrainAction.logical_step == "send"))
+        step = "return" if answer else "send" if direct is not None else "ask"
+        previous = direct if step == "send" else await db.scalar(select(BrainAction).where(BrainAction.task_id == task_id, BrainAction.logical_step == step))
         prior = (previous.action_id, previous.platform, previous.target_scene, previous.content,
                  previous.status, previous.receipt_message_id) if previous else None
         await db.commit()
@@ -218,7 +261,7 @@ async def run_task(task_id: str, *, spaces: Spaces, model, sender: Sender,
         current_spaces = _spaces(spaces)
         current_space = configured_space(current_spaces, source)
         if (action_platform != platform or current_space != space or configured_space(current_spaces, target) != space
-                or target not in allowed or (answer and target != source)):
+                or target not in allowed or (answer and target != source) or (step == "send" and target == source)):
             raise ValueError("Action target no longer permitted")
         if status in {"sending", "delivery_unknown"}:
             await _block(task_id, token, clock())
@@ -247,6 +290,10 @@ async def run_task(task_id: str, *, spaces: Spaces, model, sender: Sender,
         elif status != "confirmed" or not is_reliable_platform_id(receipt_id):
             raise ValueError("Action cannot be delivered")
 
+        if step == "send":
+            return await _confirm_direct_send(task_id, token, platform=platform, bot_id=bot_id, source=source,
+                                              source_message=source_message, target=target, spaces=spaces,
+                                              sender=sender, clock=clock)
         async with get_session() as db:
             if target == source:
                 completed = await finish(db, task_id, token, now=clock())
