@@ -7,6 +7,74 @@ from sqlalchemy import Select
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("request_text", "incoming", "expected"), [
+    ("总结我的群聊情况", "**用户交流群**\n聊了工具。\n**结论**：经常交流。", "用户交流群\n聊了工具。\n结论：经常交流。"),
+    ("请用 Markdown 格式输出", "**标题**\n这是正文。", "**标题**\n这是正文。"),
+    ("请原样发送", "**保留原文**", "**保留原文**"),
+    ("总结对话", "他说过“**原样保留**”，另有 **总结**。", "他说过“**原样保留**”，另有 总结。"),
+    ("解释一下", "### 标题\n```python\n    x = 2 ** 3\n```\n**答案**", "标题\n```python\n    x = 2 ** 3\n```\n答案"),
+    ("不要使用 Markdown", "**标题**", "标题"),
+    ("做一道数学题", "**答案** 2**3**4", "答案 2**3**4"),
+    ("总结", "他说：'**原话**'，这是 **结论**。", "他说：'**原话**'，这是 结论。"),
+    ("总结", "他说「**原话**」，这是 **结论**。", "他说「**原话**」，这是 结论。"),
+    ("给我脚本", "# 注释\nx = 2**3**4", "# 注释\nx = 2**3**4"),
+])
+async def test_text_replies_render_unrequested_markdown_without_changing_requested_content(monkeypatch, request_text, incoming, expected):
+    from nonebot_plugin_orm import get_session
+    from nonebot_plugin_alconna import UniMessage
+
+    from nonebot_plugin_ai_groupmate.message_metadata import parse_message_metadata
+    from nonebot_plugin_ai_groupmate.agent.reply_tools import create_reply_tool
+
+    sent = []
+
+    async def capture(message, *args, **kwargs):
+        sent.append(message)
+        return SimpleNamespace(msg_ids=[{"message_id": "sent-md"}])
+
+    monkeypatch.setattr(UniMessage, "send", capture)
+    async with get_session() as db:
+        tool = create_reply_tool(db, f"format-{uuid4()}", bot_name="miyuki", parse_msg_meta=parse_message_metadata,
+                                 group_members=[], request_text=request_text)
+        result = json.loads(await tool.ainvoke({"content": incoming, "next_step": "end"}))
+        assert result["status"] == "succeeded"
+        assert str(sent[0]) == expected
+
+
+@pytest.mark.asyncio
+async def test_plain_model_response_fallback_uses_chat_formatting(monkeypatch):
+    from nonebot_plugin_orm import get_session
+    from nonebot_plugin_alconna import UniMessage
+    from langchain_core.messages import AIMessage, HumanMessage
+
+    from nonebot_plugin_ai_groupmate.agent.graph import build_chat_graph
+    from nonebot_plugin_ai_groupmate.message_metadata import parse_message_metadata
+    from nonebot_plugin_ai_groupmate.agent.reply_tools import create_reply_tool
+
+    sent = []
+
+    async def capture(message, *args, **kwargs):
+        sent.append(message)
+        return SimpleNamespace(msg_ids=[{"message_id": "fallback-md"}])
+
+    class Model:
+        def bind_tools(self, _tools):
+            return self
+
+        async def ainvoke(self, _messages, **_kwargs):
+            return AIMessage(content="**用户交流群**\n大家在讨论工具。")
+
+    monkeypatch.setattr(UniMessage, "send", capture)
+    group = f"format-fallback-{uuid4()}"
+    async with get_session() as db:
+        tool = create_reply_tool(db, group, bot_name="miyuki", parse_msg_meta=parse_message_metadata,
+                                 group_members=[], request_text="说说群里在聊什么")
+        graph = build_chat_graph(Model(), [tool], "自然聊天")
+        await graph.ainvoke({"messages": [HumanMessage(content="说说群里在聊什么")], "session_id": group, "request_id": None})
+        assert str(sent[0]) == "用户交流群\n大家在讨论工具。"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(("reply_to", "expected"), [(None, None), ("current", "-123"), ("-456", "-456"), ("-789", "-789"), ("alias-789", "alias-789")])
 async def test_text_quote_reaches_transport_and_history(monkeypatch, tmp_path, reply_to, expected):
     from nonebot_plugin_orm import get_session
@@ -74,9 +142,9 @@ async def test_identical_text_can_reply_to_different_messages(monkeypatch):
     from nonebot_plugin_orm import get_session
     from nonebot_plugin_alconna import UniMessage
 
+    from nonebot_plugin_ai_groupmate.model import ChatHistory
     from nonebot_plugin_ai_groupmate.message_metadata import parse_message_metadata
     from nonebot_plugin_ai_groupmate.agent.reply_tools import create_reply_tool
-    from nonebot_plugin_ai_groupmate.model import ChatHistory
 
     sent = []
 

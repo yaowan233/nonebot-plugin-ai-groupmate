@@ -9,6 +9,7 @@ from nonebot_plugin_alconna import Target, UniMessage
 
 from ..model import ChatHistory
 from .delivery import OutboundIdentity, send_and_finalize
+from .chat_text import plain_chat_text, wants_original_format
 from ..reply_guard import is_request_active
 from .member_tools import member_aliases
 from .tool_results import tool_failure, tool_skipped, tool_success
@@ -72,6 +73,7 @@ def create_reply_tool(
     group_members: list[Any] | None = None,
     current_user_id: str | None = None,
     repeat_text: str | None = None,
+    request_text: str = "",
     current_message_id: str | None = None,
     replied_message_id: str | None = None,
     recovery_enabled: bool = True,
@@ -150,7 +152,10 @@ def create_reply_tool(
                 quoted_id = await resolve_reply_target(db_session, session_id, reply_to, current_message_id=current_message_id, replied_message_id=replied_message_id, outbound_identity=outbound_identity)
             except ValueError as error:
                 return tool_failure("invalid_reply_target", str(error), delivery_state="not_attempted")
-            content = _dedupe_consecutive_lines(content.strip())
+            if repeat_text is None:
+                content = plain_chat_text(content.strip(), request_text=request_text)
+                if not wants_original_format(request_text) and "```" not in content and "~~~" not in content:
+                    content = _dedupe_consecutive_lines(content)
             current_pattern = r"(?<![\w@])@current(?=$|[\s，。,.!！?？:：;；、)）\]\"'”’])"
             if re.search(current_pattern, content, re.IGNORECASE):
                 if not current_user_id:

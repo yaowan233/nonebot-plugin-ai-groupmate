@@ -1713,6 +1713,7 @@ async def create_chat_graph(
         group_members=member_snapshot,
         current_user_id=str(user_id) if user_id and not is_private and not proactive_observation else None,
         repeat_text=repeat_text,
+        request_text=current_request_text,
         current_message_id=tool_current_message_id,
         replied_message_id=reply_to_id,
         recovery_enabled=message_pilot,
