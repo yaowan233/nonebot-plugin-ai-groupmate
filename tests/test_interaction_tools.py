@@ -207,7 +207,7 @@ def test_history_tools_visible_on_first_group_turn_without_loading_a_skill(mode)
     env.update(
         is_private=mode == "private", proactive_meme_only=mode == "meme", proactive_reaction_only=mode == "reaction", proactive_observation=mode == "observation",
         repeat_text="跟读" if mode == "repeat" else None, meme_similar_enabled=False, reaction_enabled=True,
-        web_image_tools=[], ordered_reply_tools=[], file_tools=[], image_generation_tools=[], drawing_management_tools=[], custom_agent_tools=[], lazy_attachment_tools=[],
+        web_image_tools=[], ordered_reply_tools=[], file_tools=[], file_delivery_tools=[], image_generation_tools=[], drawing_management_tools=[], custom_agent_tools=[], lazy_attachment_tools=[],
         create_explicit_memory_tools=lambda *_, **__: [], create_interaction_history_tools=interaction_tools.create_interaction_history_tools,
         create_platform_query_tool=lambda *_, **__: SimpleNamespace(name="query_platform"), member_snapshot=[], interface=None,
         session_id="group-1", request_id=None, bot_id="bot-id", plugin_config=SimpleNamespace(bot_name="miyuki"),
