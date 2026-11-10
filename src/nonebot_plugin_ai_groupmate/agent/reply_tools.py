@@ -108,7 +108,7 @@ def create_reply_tool(
         文字要和图片在同一条消息中时，使用发图工具的 text 参数，不要拆成两次发送。
         Args:
             content: 你想发送的内容。提及本轮发言者用 @current；群内其他成员用@用户ID，ID后用空白或标点分隔；
-                会生成平台原生@。未知ID或重名时先用get_group_members查询，也支持唯一昵称。
+                会生成平台原生@。未知ID或重名时先用query_platform的list_members查询，也支持唯一昵称。
             reply_to: 可选引用回复。填 current 引用用户现在发出的这条消息；
                 引用其他消息则传当前会话的已知平台消息ID。省略则普通发送，不要编造ID。
             next_step: 当前请求已处理并交付结果或明确说明阻塞后填 end；
@@ -215,7 +215,7 @@ def create_reply_tool(
                 target_id = name_to_id.get(mention_name)
                 if not target_id:
                     if mention_name.isdigit():
-                        return tool_failure("invalid_mention_target", "当前群成员名单中无法确认该用户ID，未发送；请先用get_group_members核对。", delivery_state="not_attempted")
+                        return tool_failure("invalid_mention_target", "当前群成员名单中无法确认该用户ID，未发送；请先用query_platform的list_members核对。", delivery_state="not_attempted")
                     continue
 
                 append_text(content[cursor:start])

@@ -193,7 +193,6 @@ def test_history_tools_visible_on_first_group_turn_without_loading_a_skill(mode)
     """Exercise the production registration and first-turn tool selection."""
     from nonebot_plugin_ai_groupmate.agent import interaction_tools
     from nonebot_plugin_ai_groupmate.agent.graph import _active_tools
-    from nonebot_plugin_ai_groupmate.agent.member_tools import create_group_member_tool
 
     source = Path(interaction_tools.__file__).with_name("__init__.py")
     tree = ast.parse(source.read_text(encoding="utf-8"))
@@ -210,7 +209,7 @@ def test_history_tools_visible_on_first_group_turn_without_loading_a_skill(mode)
         repeat_text="跟读" if mode == "repeat" else None, meme_similar_enabled=False, reaction_enabled=True,
         web_image_tools=[], ordered_reply_tools=[], file_tools=[], image_generation_tools=[], drawing_management_tools=[], custom_agent_tools=[], lazy_attachment_tools=[],
         create_explicit_memory_tools=lambda *_, **__: [], create_interaction_history_tools=interaction_tools.create_interaction_history_tools,
-        create_group_member_tool=create_group_member_tool, supports_platform_queries=lambda _: False, member_snapshot=[], interface=None,
+        create_platform_query_tool=lambda *_, **__: SimpleNamespace(name="query_platform"), member_snapshot=[], interface=None,
         session_id="group-1", request_id=None, bot_id="bot-id", plugin_config=SimpleNamespace(bot_name="miyuki"),
         get_bots=lambda: {"bot-id": object()}, str=str, tuple=tuple, set=set, max=max,
         user_id="1", history=[],
@@ -221,7 +220,7 @@ def test_history_tools_visible_on_first_group_turn_without_loading_a_skill(mode)
     names = {tool.name for tool in _active_tools(env["base_agent_tools"], {}, [])}
     history_names = {"search_history_context", "search_group_interactions", "read_member_history", "read_recent_history"}
     assert names & history_names == (history_names if mode == "group" else set())
-    assert ("get_group_members" in names) == (mode == "group")
+    assert ("query_platform" in names) == (mode == "group")
 
 
 def test_group_skill_exposes_interaction_guidance():

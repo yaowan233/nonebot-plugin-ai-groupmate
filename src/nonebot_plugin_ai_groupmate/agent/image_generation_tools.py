@@ -66,7 +66,7 @@ def create_image_generation_tool(db_session, session_id: str, request_id: str | 
 
         prompt 保留用户的内容和风格要求；改图须传参考图。reference_message_ids 是本会话图片的真实消息ID，
         current=当前消息，replied=当前用户引用的消息；reference_file_ids 可传已生成或下载的图片 file_id。
-        reference_user_ids 取当前群已知成员头像作为真实参考图，current=当前用户；不确定 ID 先 get_group_members，不猜昵称或ID。
+        reference_user_ids 取当前群已知成员头像作为真实参考图，current=当前用户；不确定 ID 先用 query_platform 的 list_members 查询，不猜昵称或ID。
         合计最多4张参考图。size 支持 1024x1024、1536x1024、1024x1536、auto。可用透明背景。
         图文穿插需要等多张绘图一起发送时设置 defer_delivery=true，返回待组合的 job_id，不会单独发送。
         需要引用消息中的某一张图时，传单个 reference_message_ids 和从 1 开始的 reference_image_index。

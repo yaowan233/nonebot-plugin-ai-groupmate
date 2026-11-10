@@ -127,7 +127,68 @@ async def test_agent_exposes_query_tool_for_onebot_group_only(monkeypatch):
     await agent.create_chat_graph(SimpleNamespace(commit=AsyncMock()), "101", None, "alice", "Alice",
                                   history=[], bot_id="123", bot=bot, event=event, group_members=[])  # pyright: ignore[reportArgumentType]
     assert "query_platform" in captured
+    assert "get_group_members" not in captured
     captured.clear()
     await agent.create_chat_graph(SimpleNamespace(commit=AsyncMock()), "101", None, "alice", "Alice",
                                   history=[], bot_id="123", bot=bot, event=event, group_members=[], is_private=True)  # pyright: ignore[reportArgumentType]
     assert "query_platform" not in captured
+
+
+@pytest.mark.asyncio
+async def test_unified_member_query_preserves_random_selection_and_bot_exclusion(monkeypatch):
+    from nonebot_plugin_ai_groupmate.agent import member_tools
+    from nonebot_plugin_ai_groupmate.agent.platform_queries import create_platform_query_tool
+
+    members = [SimpleNamespace(id=uid, name="群友", nick=None, user=None) for uid in ["111", "222", "222", "333", "444"]]
+    populations = []
+
+    def sample(population, count):
+        populations.append(population)
+        return [population[-1]]
+
+    monkeypatch.setattr(member_tools.random, "sample", sample)
+    bot = SimpleNamespace(adapter=SimpleNamespace(get_name=lambda: "Other Adapter"))
+    tool = create_platform_query_tool(bot, "group-a", None, lambda: {}, group_members=members, bot_user_ids=["444"])
+    result = json.loads(await tool.ainvoke({"operation": "list_members", "random_selection": True,
+                                            "limit": 1, "exclude_user_ids": ["111"]}))
+    assert [item["user_id"] for item in populations[0]] == ["222", "333"]
+    assert result["data"]["members"][0]["user_id"] == "333"
+    assert result["data"]["matched_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_unified_member_query_uses_generic_interface_and_reuses_snapshot():
+    from nonebot_plugin_uninfo import SceneType
+
+    from nonebot_plugin_ai_groupmate.agent.platform_queries import create_platform_query_tool
+
+    members = [SimpleNamespace(id="member:123", name="群名片", nick=None, user=SimpleNamespace(name="Nickname", nick=None))]
+    interface = SimpleNamespace(get_members=AsyncMock(return_value=members))
+    bot = SimpleNamespace(adapter=SimpleNamespace(get_name=lambda: "Other Adapter"))
+    tool = create_platform_query_tool(bot, "room:abc", None, lambda: {}, interface=interface)
+    for query in ("nickname", "群名", "@member:123"):
+        result = json.loads(await tool.ainvoke({"operation": "list_members", "keyword": query}))
+        assert result["data"]["members"] == [{"user_id": "member:123", "name": "群名片"}]
+    interface.get_members.assert_awaited_once_with(SceneType.GROUP, "room:abc")
+
+
+@pytest.mark.asyncio
+async def test_onebot_direct_list_randomly_excludes_bots_and_duplicates(monkeypatch):
+    from nonebot_plugin_ai_groupmate.agent import platform_queries
+
+    rows = [{"user_id": 111, "nickname": "一"}, {"user_id": 222, "nickname": "二"},
+            {"user_id": 222, "nickname": "二"}, {"user_id": 333, "nickname": "三"}, {"user_id": 444, "nickname": "机器人"}]
+    bot = SimpleNamespace(adapter=SimpleNamespace(get_name=lambda: "OneBot V11"), call_api=AsyncMock(return_value=rows))
+    tool = platform_queries.create_platform_query_tool(bot, "101", None, lambda: {}, bot_user_ids=["444"])
+    populations = []
+
+    def sample(population, count):
+        populations.append(population)
+        return [population[-1]]
+
+    monkeypatch.setattr(platform_queries.random, "sample", sample)
+    result = json.loads(await tool.ainvoke({"operation": "list_members", "random_selection": True,
+                                            "limit": 1, "exclude_user_ids": ["111"]}))
+    assert [item["user_id"] for item in populations[0]] == ["222", "333"]
+    assert result["data"]["members"][0]["user_id"] == "333"
+    assert result["data"]["matched_count"] == 2

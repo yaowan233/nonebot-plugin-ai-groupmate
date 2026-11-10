@@ -1,12 +1,15 @@
 """Adapter-independent, read-only platform queries for the chat agent."""
 
+import random
 import asyncio
-from typing import Any, Protocol
-from collections.abc import Callable
+from typing import Any, Protocol, Annotated
+from collections.abc import Callable, Sequence
 
+from pydantic import Field
 from langchain.tools import tool
 
 from ..reply_guard import is_request_active
+from .member_tools import create_group_member_tool
 from .tool_results import tool_failure, tool_skipped, tool_success
 from ..brain.observations import configured_space
 from ..structured_message import adapter_name
@@ -21,7 +24,7 @@ class QueryError(Exception):
 
 class QueryProvider(Protocol):
     async def query(self, operation: str, *, group_id: str, user_id: str, keyword: str,
-                    limit: int, allowed: set[str]) -> dict[str, Any]: ...
+                    limit: int, allowed: set[str], random_selection: bool, exclude_user_ids: set[str]) -> dict[str, Any]: ...
 
 
 def _id(value: Any) -> str:
@@ -52,7 +55,7 @@ class OneBotQueryProvider:
         self.bot = bot
 
     async def query(self, operation: str, *, group_id: str, user_id: str, keyword: str,
-                    limit: int, allowed: set[str]) -> dict[str, Any]:
+                    limit: int, allowed: set[str], random_selection: bool, exclude_user_ids: set[str]) -> dict[str, Any]:
         if operation != "list_groups" and not _id(group_id):
             raise QueryError("invalid_group_id", "群号无效。")
         if operation == "member_info" and not _id(user_id):
@@ -77,10 +80,13 @@ class OneBotQueryProvider:
             response = await self.bot.call_api("get_group_member_list", group_id=int(group_id))
             if not isinstance(response, list):
                 raise ValueError("Invalid member list")
-            query = keyword.casefold()
-            members = [item for row in response if (item := _member(row))
-                       and (not query or any(query in item[field].casefold() for field in ("user_id", "nickname", "card")))]
-            return {"members": members[:limit], "matched_count": len(members)}
+            query = keyword.removeprefix("@").casefold()
+            matches = {item["user_id"]: item for row in response if (item := _member(row))
+                       and item["user_id"] not in exclude_user_ids
+                       and (not query or any(query in item[field].casefold() for field in ("user_id", "nickname", "card")))}
+            members = list(matches.values())
+            selected = random.sample(members, min(limit, len(members))) if random_selection else members[:limit]
+            return {"members": selected, "matched_count": len(members), "random_selection": random_selection}
         raise QueryError("unsupported_query", "当前平台不支持该查询。")
 
 
@@ -93,9 +99,11 @@ def supports_platform_queries(bot: Any) -> bool:
 
 
 def create_platform_query_tool(bot: Any, session_id: str, request_id: str | None,
-                               spaces: Callable[[], dict[str, list[str]]]):
+                               spaces: Callable[[], dict[str, list[str]]], *, interface: Any = None,
+                               group_members: list[Any] | None = None, bot_user_ids: Sequence[str] = ()):
     provider_factory = QUERY_PROVIDERS.get(adapter_name(bot)) if bot is not None else None
     provider = provider_factory(bot) if provider_factory is not None else None
+    member_tool = create_group_member_tool(session_id, request_id, interface, group_members=group_members, bot_user_ids=bot_user_ids)
 
     def allowed_groups() -> set[str]:
         current_spaces = spaces()
@@ -104,22 +112,30 @@ def create_platform_query_tool(bot: Any, session_id: str, request_id: str | None
                 if space else {session_id})
 
     @tool("query_platform")
-    async def query_platform(operation: str, group_id: str = "", user_id: str = "", keyword: str = "", limit: int = 10) -> str:
-        """查询平台信息：group_info 群信息、list_groups 可联动群、member_info 成员、list_members 成员列表。群默认当前群；可按 keyword 筛选成员。"""
+    async def query_platform(operation: str, group_id: str = "", user_id: str = "", keyword: str = "",
+                             limit: Annotated[int, Field(ge=1, le=20)] = 10, random_selection: bool = False,
+                             exclude_user_ids: Annotated[list[str], Field(max_length=20)] | None = None) -> str:
+        """查询群信息 group_info、联动群 list_groups、成员 member_info 或 list_members。默认当前群；keyword 筛选，random_selection 随机抽人，自动排除机器人。提及时使用返回的 user_id。"""
         if request_id is not None and not await is_request_active(session_id, request_id):
             return tool_skipped("request_expired", "请求已过期。")
-        if provider is None or operation not in {"group_info", "list_groups", "member_info", "list_members"}:
+        if operation not in {"group_info", "list_groups", "member_info", "list_members"}:
             return tool_failure("unsupported_query", "当前平台不支持该查询。")
         group_id = group_id.strip() or session_id
         allowed = allowed_groups()
         if operation != "list_groups" and group_id not in allowed:
             return tool_failure("group_not_allowed", "该群不在当前群的可查询范围。")
+        if operation == "list_members" and group_id == session_id and (group_members is not None or interface is not None or provider is None):
+            return await member_tool.ainvoke({"keyword": keyword, "limit": limit, "random_selection": random_selection,
+                                             "exclude_user_ids": exclude_user_ids})
+        if provider is None:
+            return tool_failure("unsupported_query", "当前平台不支持该查询。")
         if operation == "member_info" and not user_id.strip():
             return tool_failure("invalid_user_id", "成员 ID 无效。")
         try:
             data = await asyncio.wait_for(provider.query(operation, group_id=group_id, user_id=user_id,
                                                           keyword=keyword.strip()[:100], limit=max(1, min(limit, 20)),
-                                                          allowed=allowed), timeout=8)
+                                                          allowed=allowed, random_selection=random_selection,
+                                                          exclude_user_ids={str(uid) for uid in bot_user_ids} | set(exclude_user_ids or [])), timeout=8)
         except QueryError as error:
             return tool_failure(error.code, error.message)
         except Exception:

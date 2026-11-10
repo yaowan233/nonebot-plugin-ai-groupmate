@@ -389,7 +389,7 @@ async def test_full_agent_fetch_download_summarize_and_send(tmp_path, monkeypatc
             if self.step == 0:
                 name, args = "fetch_url", {"url": "https://example.org/page"}
             elif self.step == 1:
-                name, args = "download_file", {"url": results[-1]["data"]["links"][0]["url"]}
+                name, args = "fetch_url", {"url": results[-1]["data"]["links"][0]["url"], "read_preview": False}
             elif self.step == 2:
                 self.input_id = results[-1]["data"]["file_id"]
                 name, args = "read_file", {"file_id": self.input_id}
@@ -409,6 +409,7 @@ async def test_full_agent_fetch_download_summarize_and_send(tmp_path, monkeypatc
 
     model = Model()
     tools = [*toolset(tmp_path).values(), finish]
+    assert "download_file" not in {tool.name for tool in tools}
     graph = build_chat_graph(model, tools, "Read the web page, download Excel, summarize and deliver.")
     result = await graph.ainvoke({"messages": [HumanMessage(content="Summarize the Excel on this web page and send me the file.")], "session_id": "group", "request_id": None})
     # Successful terminal file delivery ends the run without a separate finish call.
@@ -426,8 +427,9 @@ async def test_full_agent_fetch_download_summarize_and_send(tmp_path, monkeypatc
 
 @pytest.mark.asyncio
 async def test_connected_group_bots_can_deliver_existing_files_without_crossing_users(tmp_path, monkeypatch):
-    from nonebot_plugin_ai_groupmate.agent import file_workspace as module
     import nonebot
+
+    from nonebot_plugin_ai_groupmate.agent import file_workspace as module
 
     monkeypatch.setattr(nonebot, "get_bots", lambda: {"bot": object(), "peer": object()})
     old = workspace(tmp_path).save(b"picture", "desert_boss.png")
