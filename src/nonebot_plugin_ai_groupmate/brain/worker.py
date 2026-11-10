@@ -157,7 +157,8 @@ async def run_finalization(task_id: str, *, spaces: Spaces, sender: Sender, cloc
 
 
 async def run_task(task_id: str, *, spaces: Spaces, model, sender: Sender,
-                   clock: Clock = utcnow, target_names: dict[str, str] | None = None) -> str:
+                   clock: Clock = utcnow, target_names: dict[str, str] | None = None,
+                   name_resolver: Callable[[str, str, tuple[str, ...]], Awaitable[dict[str, str]]] | None = None) -> str:
     """Advance a queued task to waiting, completed, blocked or unavailable."""
     token = uuid4().hex
     async with get_session() as db:
@@ -192,6 +193,11 @@ async def run_task(task_id: str, *, spaces: Spaces, model, sender: Sender,
                 target, text = source, f"{answer_scene} 群回复：{answer_text}"
             else:
                 try:
+                    if name_resolver is not None:
+                        try:
+                            target_names = await asyncio.wait_for(name_resolver(platform, bot_id, allowed), 4)
+                        except Exception:
+                            pass
                     proposal = await asyncio.wait_for(plan_request(model, request=request, source_scene=source, target_scenes=allowed,
                                                                     target_names=target_names), 60)
                 except Exception:

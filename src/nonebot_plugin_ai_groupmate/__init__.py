@@ -361,6 +361,15 @@ async def _close_vector_resources() -> None:
 _observation_schedule: ObservationSchedule[ReplyRequest] = ObservationSchedule()
 
 
+from .brain.group_names import GroupNameResolver
+
+_cross_group_names = GroupNameResolver()
+
+
+async def _resolve_cross_group_names(platform: str, bot_id: str, group_ids: tuple[str, ...]) -> dict[str, str]:
+    return await _cross_group_names.resolve(get_bots().get(bot_id), platform, group_ids, plugin_config.cross_group_scene_names)
+
+
 @scheduler.scheduled_job("interval", minutes=1, max_instances=1, coalesce=True, id="ai_groupmate_cross_group_observe")
 async def _poll_cross_group_observations() -> None:
     if not plugin_config.cross_group_spaces:
@@ -391,7 +400,8 @@ async def _poll_cross_group_tasks() -> None:
 
     try:
         await poll(spaces=lambda: plugin_config.cross_group_spaces, connected=connected, model_factory=get_chat_model,
-                   sender=_send_cross_group_message, target_names=plugin_config.cross_group_scene_names)
+                   sender=_send_cross_group_message, target_names=plugin_config.cross_group_scene_names,
+                   name_resolver=_resolve_cross_group_names)
     except Exception:
         logger.exception("跨群任务调度失败")
 

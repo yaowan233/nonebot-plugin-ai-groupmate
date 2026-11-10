@@ -1,7 +1,7 @@
 """Poll durable cross-group tasks without holding a DB session during I/O."""
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Callable, Awaitable
 
 from sqlalchemy import or_, func, exists, select
 from nonebot_plugin_orm import get_session
@@ -23,7 +23,8 @@ class _LazyModel:
 
 
 async def poll(*, spaces: Spaces, connected: dict[str, str], model_factory: Callable, sender: Sender,
-               target_names: dict[str, str] | None = None) -> str:
+               target_names: dict[str, str] | None = None,
+               name_resolver: Callable[[str, str, tuple[str, ...]], Awaitable[dict[str, str]]] | None = None) -> str:
     """Advance at most one runnable task per call (single active process)."""
     if _lock.locked():
         return "busy"
@@ -86,4 +87,5 @@ async def poll(*, spaces: Spaces, connected: dict[str, str], model_factory: Call
             return await process_candidate(task_id, spaces=spaces, model=_LazyModel(model_factory))
         if status == "finalizing":
             return await run_finalization(task_id, spaces=spaces, sender=sender)
-        return await run_task(task_id, spaces=spaces, model=_LazyModel(model_factory), sender=sender, target_names=target_names)
+        return await run_task(task_id, spaces=spaces, model=_LazyModel(model_factory), sender=sender, target_names=target_names,
+                              name_resolver=name_resolver)
