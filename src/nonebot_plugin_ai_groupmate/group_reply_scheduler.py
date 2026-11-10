@@ -100,7 +100,9 @@ class GroupReplyScheduler:
                 state.addressed.append(request)
                 state.latest = None
                 if state.active is not None and state.task is not None:
-                    await set_latest_request_id(group_id, request.request_id)
+                    # Cleanup may overlap several mentions; revoke only the
+                    # background turn, preserving every addressed reply.
+                    await deactivate_request_id(group_id, state.active.request_id)
                     state.task.cancel()
                     logger.info(f"群 {group_id} 收到明确 @，已取消后台回复")
                 self._start_addressed_locked(group_id, state)
