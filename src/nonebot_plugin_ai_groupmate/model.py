@@ -7,6 +7,61 @@ from sqlalchemy.orm import Mapped, validates, mapped_column
 from .db_types import NulSafeModel
 
 
+class BrainTask(NulSafeModel):
+    """Durable cross-group coordination; platform objects never enter this record."""
+
+    task_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    brain_id: Mapped[str] = mapped_column(String(255))
+    platform: Mapped[str] = mapped_column(String(64))
+    source_scene: Mapped[str] = mapped_column(String(255))
+    source_message: Mapped[str] = mapped_column(String(255))
+    source_user: Mapped[str] = mapped_column(String(255))
+    request: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(32), index=True)
+    revision: Mapped[int] = mapped_column(Integer, default=0)
+    claim_token: Mapped[str | None] = mapped_column(String(32))
+    lease_until: Mapped[datetime | None] = mapped_column()
+    deadline: Mapped[datetime] = mapped_column()
+    created_at: Mapped[datetime] = mapped_column()
+    updated_at: Mapped[datetime] = mapped_column()
+
+    __table_args__ = (UniqueConstraint("brain_id", "platform", "source_scene", "source_message", name="uq_brain_task_source"),)
+
+
+class BrainWait(NulSafeModel):
+    task_id: Mapped[str] = mapped_column(String(32), ForeignKey("nonebot_plugin_ai_groupmate_braintask.task_id"), primary_key=True)
+    platform: Mapped[str] = mapped_column(String(64))
+    target_scene: Mapped[str] = mapped_column(String(255))
+    question_message: Mapped[str] = mapped_column(String(255))
+    answer_message: Mapped[str | None] = mapped_column(String(255))
+    answer_user: Mapped[str | None] = mapped_column(String(255))
+    answer_text: Mapped[str | None] = mapped_column(Text)
+    deadline: Mapped[datetime] = mapped_column()
+    status: Mapped[str] = mapped_column(String(32))
+
+    __table_args__ = (Index("ix_brain_wait_lookup", "platform", "target_scene", "question_message", "status"),)
+
+
+class BrainAction(NulSafeModel):
+    """Persist one logical platform side effect before it is attempted."""
+
+    action_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    task_id: Mapped[str] = mapped_column(String(32), ForeignKey("nonebot_plugin_ai_groupmate_braintask.task_id"))
+    logical_step: Mapped[str] = mapped_column(String(128))
+    effect_slot: Mapped[str] = mapped_column(String(128))
+    platform: Mapped[str] = mapped_column(String(64))
+    target_scene: Mapped[str] = mapped_column(String(255))
+    content: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(32), index=True)
+    claim_token: Mapped[str | None] = mapped_column(String(32))
+    lease_until: Mapped[datetime | None] = mapped_column()
+    receipt_message_id: Mapped[str | None] = mapped_column(String(255))
+    created_at: Mapped[datetime] = mapped_column()
+    updated_at: Mapped[datetime] = mapped_column()
+
+    __table_args__ = (UniqueConstraint("task_id", "logical_step", "effect_slot", "platform", "target_scene", name="uq_brain_action_effect"),)
+
+
 class MediaStorage(NulSafeModel):
     """媒体资源中心化存储"""
 
