@@ -37,10 +37,9 @@ WEB_SEARCH_TOOL_NAMES = frozenset({"search_web", "search_web_images"})
 PARALLEL_SAFE_TOOL_NAMES = frozenset({
     "calculate_expression",
     "qwen_code_interpreter",
-    "read_audio_message",
+    "read_media_message",
     "read_forward_message",
     "read_member_history",
-    "read_video_message",
     "search_web",
 })
 EMPTY_RESPONSE_RETRY_PROMPT = (
