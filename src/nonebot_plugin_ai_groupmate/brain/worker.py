@@ -10,7 +10,7 @@ from uuid import uuid4
 from datetime import datetime, timezone
 from collections.abc import Callable, Awaitable
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from nonebot_plugin_orm import get_session
 
@@ -61,10 +61,21 @@ async def process_candidate(task_id: str, *, spaces: Spaces, model, clock: Clock
         if action is None or not candidates:
             return "unavailable"
         candidate = candidates[0]
-        candidate_id, question, text = candidate.id, action.content, candidate.text
+        candidate_id, question, text, unquoted = candidate.id, action.content, candidate.text, candidate.reply_to is None
+        ambiguous = False
+        if unquoted:
+            overlapping = await db.scalar(select(func.count()).select_from(BrainWait).join(
+                BrainTask, BrainTask.task_id == BrainWait.task_id,
+            ).where(BrainTask.bot_id == task.bot_id, BrainTask.status == "waiting_input",
+                    BrainWait.platform == candidate.platform, BrainWait.target_scene == candidate.scene_id,
+                    BrainWait.status == "open", BrainWait.unquoted_from <= candidate.created_at,
+                    BrainWait.unquoted_until >= candidate.created_at))
+            ambiguous = (overlapping or 0) > 1
 
     try:
-        decision = await asyncio.wait_for(classify_reply(model, question=question, candidate=text), 60)
+        decision = "uncertain" if ambiguous else await asyncio.wait_for(
+            classify_reply(model, question=question, candidate=text, unquoted=unquoted), 60,
+        )
     except Exception:
         # Remember an inconclusive attempt so one bad model response cannot
         # trigger a new paid call on every scheduler tick.
@@ -91,7 +102,7 @@ async def process_candidate(task_id: str, *, spaces: Spaces, model, clock: Clock
         if decision == "answer":
             accepted = await accept_reply(db, task_id, platform=candidate.platform, target_scene=candidate.scene_id,
                                           reply_to=candidate.reply_to or "", message_id=candidate.message_id,
-                                          user_id=candidate.user_id, text=candidate.text, now=clock())
+                                          user_id=candidate.user_id, text=candidate.text, now=clock(), unquoted=unquoted)
             if not accepted:
                 await db.rollback()
                 return "unavailable"

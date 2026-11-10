@@ -7,6 +7,23 @@ from sqlalchemy.orm import Mapped, validates, mapped_column
 from .db_types import NulSafeModel
 
 
+class GroupReplyJob(NulSafeModel):
+    """Persist an addressed group request before batching and execution."""
+
+    job_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    platform: Mapped[str] = mapped_column(String(64))
+    bot_id: Mapped[str] = mapped_column(String(255))
+    scene_id: Mapped[str] = mapped_column(String(255))
+    user_id: Mapped[str] = mapped_column(String(255))
+    message_id: Mapped[str] = mapped_column(String(255))
+    payload: Mapped[dict] = mapped_column(JSON)
+    status: Mapped[str] = mapped_column(String(32), index=True)
+    created_at: Mapped[datetime] = mapped_column()
+    updated_at: Mapped[datetime] = mapped_column()
+
+    __table_args__ = (UniqueConstraint("platform", "bot_id", "scene_id", "message_id", name="uq_group_reply_job_message"),)
+
+
 class BrainTask(NulSafeModel):
     """Durable cross-group coordination; platform objects never enter this record."""
 
@@ -35,6 +52,8 @@ class BrainWait(NulSafeModel):
     platform: Mapped[str] = mapped_column(String(64))
     target_scene: Mapped[str] = mapped_column(String(255))
     question_message: Mapped[str] = mapped_column(String(255))
+    unquoted_from: Mapped[datetime] = mapped_column()
+    unquoted_until: Mapped[datetime] = mapped_column()
     answer_message: Mapped[str | None] = mapped_column(String(255))
     answer_user: Mapped[str | None] = mapped_column(String(255))
     answer_text: Mapped[str | None] = mapped_column(Text)
@@ -90,6 +109,7 @@ class BrainObservationMessage(NulSafeModel):
     scene_id: Mapped[str] = mapped_column(String(255))
     message_id: Mapped[str] = mapped_column(String(255))
     reply_to: Mapped[str | None] = mapped_column(String(255))
+    addressed_other: Mapped[bool] = mapped_column(Boolean, default=False)
     user_id: Mapped[str] = mapped_column(String(255))
     text: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column()
@@ -126,6 +146,21 @@ class BrainObservationRun(NulSafeModel):
     scene_id: Mapped[str] = mapped_column(String(255))
     started_at: Mapped[datetime] = mapped_column(index=True)
     status: Mapped[str] = mapped_column(String(32))
+
+
+class BrainProactive(NulSafeModel):
+    """Journal one autonomous fact-to-group decision and any resulting send."""
+
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    platform: Mapped[str] = mapped_column(String(64))
+    bot_id: Mapped[str] = mapped_column(String(255))
+    source_scene: Mapped[str] = mapped_column(String(255))
+    target_scene: Mapped[str] = mapped_column(String(255))
+    status: Mapped[str] = mapped_column(String(32), index=True)
+    content: Mapped[str | None] = mapped_column(Text)
+    receipt_message_id: Mapped[str | None] = mapped_column(String(255))
+    created_at: Mapped[datetime] = mapped_column()
+    updated_at: Mapped[datetime] = mapped_column()
 
 
 class MediaStorage(NulSafeModel):

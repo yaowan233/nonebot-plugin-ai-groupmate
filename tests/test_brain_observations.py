@@ -93,9 +93,9 @@ async def test_confirmed_reply_handler_records_one_interaction(monkeypatch):
 
     monkeypatch.setattr(plugin, "choice_response_strategy", execute)
     await plugin.handle_reply_logic(
-        "request-1", SimpleNamespace(scene=SimpleNamespace(id=group, type=SceneType.GROUP), self_id="bot"),
-        SimpleNamespace(get_members=AsyncMock(return_value=[])), SimpleNamespace(self_id="bot"),
-        SimpleNamespace(message_id="100", get_plaintext=lambda: "你好"), "bot", "alice", "Alice", True, False, None,
+        "request-1", SimpleNamespace(scene=SimpleNamespace(id=group, type=SceneType.GROUP), self_id="bot"),  # pyright: ignore[reportArgumentType]
+        SimpleNamespace(get_members=AsyncMock(return_value=[])), SimpleNamespace(self_id="bot"),  # pyright: ignore[reportArgumentType]
+        SimpleNamespace(message_id="100", get_plaintext=lambda: "你好"), "bot", "alice", "Alice", True, False, None,  # pyright: ignore[reportArgumentType]
     )
     async with get_session() as db:
         rows = list((await db.scalars(select(BrainInteraction).where(BrainInteraction.scene_id == group))).all())

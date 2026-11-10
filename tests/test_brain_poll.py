@@ -120,6 +120,7 @@ async def test_unavailable_main_model_notifies_source_without_sending_to_target(
     assert await poll(**kwargs) == "finalizing"
     sender.assert_not_awaited()
     assert await poll(**kwargs) == "failed"
+    assert sender.await_args is not None
     assert sender.await_args.args[2] == group_a
     async with get_session() as db:
         task = await db.get(BrainTask, task_id)
@@ -149,12 +150,12 @@ async def test_agent_exposes_coordination_only_for_addressed_group_requests(monk
     bot = SimpleNamespace(self_id="bot", adapter=SimpleNamespace(get_name=lambda: "qq"))
     event = SimpleNamespace(message_id="source", is_tome=lambda: True, get_plaintext=lambda: "去另一个群问问")
     await agent.create_chat_graph(SimpleNamespace(commit=AsyncMock()), group, "request", "alice", "Alice",
-                                  history=[], bot_id="bot", bot=bot, event=event, group_members=[])
+                                  history=[], bot_id="bot", bot=bot, event=event, group_members=[])  # pyright: ignore[reportArgumentType]
     assert "request_cross_group_coordination" in captured
     captured.clear()
     event.is_tome = lambda: False
     await agent.create_chat_graph(SimpleNamespace(commit=AsyncMock()), group, "request", "alice", "Alice",
-                                  history=[], bot_id="bot", bot=bot, event=event, group_members=[])
+                                  history=[], bot_id="bot", bot=bot, event=event, group_members=[])  # pyright: ignore[reportArgumentType]
     assert "request_cross_group_coordination" not in captured
 
 

@@ -13,6 +13,37 @@ def upgrade(name: str = "") -> None:
     if name:
         return
     op.create_table(
+        "nonebot_plugin_ai_groupmate_groupreplyjob",
+        sa.Column("job_id", sa.String(32), primary_key=True),
+        sa.Column("platform", sa.String(64), nullable=False),
+        sa.Column("bot_id", sa.String(255), nullable=False),
+        sa.Column("scene_id", sa.String(255), nullable=False),
+        sa.Column("user_id", sa.String(255), nullable=False),
+        sa.Column("message_id", sa.String(255), nullable=False),
+        sa.Column("payload", sa.JSON(), nullable=False),
+        sa.Column("status", sa.String(32), nullable=False),
+        sa.Column("created_at", sa.DateTime(), nullable=False),
+        sa.Column("updated_at", sa.DateTime(), nullable=False),
+        sa.UniqueConstraint("platform", "bot_id", "scene_id", "message_id", name="uq_group_reply_job_message"),
+        info={"bind_key": "nonebot_plugin_ai_groupmate"},
+    )
+    op.create_index("ix_nonebot_plugin_ai_groupmate_groupreplyjob_status", "nonebot_plugin_ai_groupmate_groupreplyjob", ["status"])
+    op.create_table(
+        "nonebot_plugin_ai_groupmate_brainproactive",
+        sa.Column("key", sa.String(64), primary_key=True),
+        sa.Column("platform", sa.String(64), nullable=False),
+        sa.Column("bot_id", sa.String(255), nullable=False),
+        sa.Column("source_scene", sa.String(255), nullable=False),
+        sa.Column("target_scene", sa.String(255), nullable=False),
+        sa.Column("status", sa.String(32), nullable=False),
+        sa.Column("content", sa.Text()),
+        sa.Column("receipt_message_id", sa.String(255)),
+        sa.Column("created_at", sa.DateTime(), nullable=False),
+        sa.Column("updated_at", sa.DateTime(), nullable=False),
+        info={"bind_key": "nonebot_plugin_ai_groupmate"},
+    )
+    op.create_index("ix_nonebot_plugin_ai_groupmate_brainproactive_status", "nonebot_plugin_ai_groupmate_brainproactive", ["status"])
+    op.create_table(
         "nonebot_plugin_ai_groupmate_braintask",
         sa.Column("task_id", sa.String(32), primary_key=True),
         sa.Column("brain_id", sa.String(255), nullable=False),
@@ -40,6 +71,8 @@ def upgrade(name: str = "") -> None:
         sa.Column("platform", sa.String(64), nullable=False),
         sa.Column("target_scene", sa.String(255), nullable=False),
         sa.Column("question_message", sa.String(255), nullable=False),
+        sa.Column("unquoted_from", sa.DateTime(), nullable=False),
+        sa.Column("unquoted_until", sa.DateTime(), nullable=False),
         sa.Column("answer_message", sa.String(255)),
         sa.Column("answer_user", sa.String(255)),
         sa.Column("answer_text", sa.Text()),
@@ -88,6 +121,7 @@ def upgrade(name: str = "") -> None:
         sa.Column("scene_id", sa.String(255), nullable=False),
         sa.Column("message_id", sa.String(255), nullable=False),
         sa.Column("reply_to", sa.String(255)),
+        sa.Column("addressed_other", sa.Boolean(), nullable=False),
         sa.Column("user_id", sa.String(255), nullable=False),
         sa.Column("text", sa.Text(), nullable=False),
         sa.Column("created_at", sa.DateTime(), nullable=False),
@@ -131,6 +165,8 @@ def upgrade(name: str = "") -> None:
 
 def downgrade(name: str = "") -> None:
     if not name:
+        op.drop_table("nonebot_plugin_ai_groupmate_brainproactive")
+        op.drop_table("nonebot_plugin_ai_groupmate_groupreplyjob")
         op.drop_table("nonebot_plugin_ai_groupmate_braincandidatedecision")
         op.drop_table("nonebot_plugin_ai_groupmate_brainobservationrun")
         op.drop_table("nonebot_plugin_ai_groupmate_brainsceneobservation")

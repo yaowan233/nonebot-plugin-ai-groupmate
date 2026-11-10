@@ -12,7 +12,7 @@ from nonebot_plugin_orm import get_session
 from sqlalchemy.ext.asyncio import AsyncSession
 from langchain_core.messages import HumanMessage, SystemMessage
 
-from ..model import BrainInteraction, BrainObservationRun, BrainSceneObservation, BrainObservationMessage
+from ..model import GroupReplyJob, BrainProactive, BrainInteraction, BrainObservationRun, BrainSceneObservation, BrainObservationMessage
 from .attention import Interaction, ObservationState, evaluate
 from ..message_metadata import is_reliable_platform_id
 
@@ -26,10 +26,11 @@ def configured_space(spaces: dict[str, list[str]], scene_id: str) -> str | None:
 
 
 async def record_message(db: AsyncSession, *, platform: str, bot_id: str, scene_id: str,
-                         message_id: str, user_id: str, text: str, now: datetime, reply_to: str | None = None) -> bool:
+                         message_id: str, user_id: str, text: str, now: datetime, reply_to: str | None = None,
+                         addressed_other: bool = False) -> bool:
     if platform == "unknown" or not all((platform, bot_id, scene_id, user_id, text.strip())) or not is_reliable_platform_id(message_id):
         return False
-    row = BrainObservationMessage(platform=platform, bot_id=bot_id, scene_id=scene_id, message_id=message_id, reply_to=reply_to,
+    row = BrainObservationMessage(platform=platform, bot_id=bot_id, scene_id=scene_id, message_id=message_id, reply_to=reply_to, addressed_other=addressed_other,
                                   user_id=user_id, text=text.strip()[:1200], created_at=now)
     try:
         async with db.begin_nested():
@@ -225,3 +226,8 @@ async def prune_observations(db: AsyncSession, *, now: datetime) -> None:
     await db.execute(delete(BrainInteraction).where(BrainInteraction.created_at < now - timedelta(hours=2)))
     await db.execute(delete(BrainObservationRun).where(BrainObservationRun.started_at < now - timedelta(hours=24)))
     await db.execute(delete(BrainSceneObservation).where(BrainSceneObservation.updated_at < now - timedelta(days=30)))
+    await db.execute(delete(BrainProactive).where(BrainProactive.created_at < now - timedelta(days=30)))
+    await db.execute(delete(GroupReplyJob).where(GroupReplyJob.status.in_(("completed", "merged", "cancelled")),
+                                                  GroupReplyJob.updated_at < now - timedelta(days=7)))
+    await db.execute(delete(GroupReplyJob).where(GroupReplyJob.status == "interrupted",
+                                                  GroupReplyJob.updated_at < now - timedelta(days=30)))

@@ -3,7 +3,7 @@
 import asyncio
 from collections.abc import Callable
 
-from sqlalchemy import func, exists, select
+from sqlalchemy import or_, func, exists, select
 from nonebot_plugin_orm import get_session
 
 from ..model import BrainTask, BrainWait, BrainCandidateDecision, BrainObservationMessage
@@ -50,7 +50,10 @@ async def poll(*, spaces: Spaces, connected: dict[str, str], model_factory: Call
             pending = exists(select(BrainObservationMessage.id).join(
                 BrainWait, (BrainObservationMessage.platform == BrainWait.platform)
                 & (BrainObservationMessage.scene_id == BrainWait.target_scene)
-                & (BrainObservationMessage.reply_to == BrainWait.question_message),
+                & or_(BrainObservationMessage.reply_to == BrainWait.question_message,
+                      (BrainObservationMessage.reply_to.is_(None)) & (BrainObservationMessage.addressed_other.is_(False))
+                      & (BrainObservationMessage.created_at >= BrainWait.unquoted_from)
+                      & (BrainObservationMessage.created_at <= BrainWait.unquoted_until)),
             ).where(
                 BrainWait.task_id == BrainTask.task_id, BrainWait.status == "open", BrainWait.deadline > now,
                 BrainObservationMessage.bot_id == BrainTask.bot_id,

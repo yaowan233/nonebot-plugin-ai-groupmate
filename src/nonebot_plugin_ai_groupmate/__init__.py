@@ -386,32 +386,59 @@ async def _poll_cross_group_tasks() -> None:
         return
     from .agent import get_chat_model
     from .brain.poll import poll
-    from .agent.outbound_plan import compose_segments
-
     connected_bots = get_bots()
     connected = {str(bot_id): adapter_name(bot) for bot_id, bot in connected_bots.items()}
 
-    async def send(platform: str, bot_id: str, scene_id: str, text: str, reply_to: str | None) -> str:
-        bot = get_bots().get(bot_id)
-        if bot is None or adapter_name(bot) != platform:
-            raise RuntimeError("Bot is unavailable")
-        message = compose_segments([UniMessage.text(text)], reply_to)
-        target = Target(id=scene_id, private=False, self_id=bot_id)
-        identity = OutboundIdentity(platform, "group", bot_id, plugin_config.bot_name)
-
-        def record(message_id: str) -> list[ChatHistory]:
-            return [ChatHistory(session_id=scene_id, user_id=plugin_config.bot_name, user_name=plugin_config.bot_name,
-                                content_type="bot", content=f"id: {message_id}\n{text}")]
-
-        receipt = await send_and_finalize(None, scene_id, message, send_options={"target": target, "bot": bot},
-                                           record=record, outbound_identity=identity, session_factory=get_session)
-        return receipt.message_id
-
     try:
         await poll(spaces=lambda: plugin_config.cross_group_spaces, connected=connected, model_factory=get_chat_model,
-                   sender=send, target_names=plugin_config.cross_group_scene_names)
+                   sender=_send_cross_group_message, target_names=plugin_config.cross_group_scene_names)
     except Exception:
         logger.exception("跨群任务调度失败")
+
+
+async def _send_cross_group_message(platform: str, bot_id: str, scene_id: str, text: str, reply_to: str | None) -> str:
+    from .agent.outbound_plan import compose_segments
+
+    bot = get_bots().get(bot_id)
+    if bot is None or adapter_name(bot) != platform:
+        raise RuntimeError("Bot is unavailable")
+    message = compose_segments([UniMessage.text(text)], reply_to)
+    target = Target(id=scene_id, private=False, self_id=bot_id)
+    identity = OutboundIdentity(platform, "group", bot_id, plugin_config.bot_name)
+
+    def record(message_id: str) -> list[ChatHistory]:
+        return [ChatHistory(session_id=scene_id, user_id=plugin_config.bot_name, user_name=plugin_config.bot_name,
+                            content_type="bot", content=f"id: {message_id}\n{text}")]
+
+    receipt = await send_and_finalize(None, scene_id, message, send_options={"target": target, "bot": bot},
+                                      record=record, outbound_identity=identity, session_factory=get_session)
+    return receipt.message_id
+
+
+@scheduler.scheduled_job("interval", minutes=1, max_instances=1, coalesce=True, id="ai_groupmate_cross_group_proactive")
+async def _poll_cross_group_proactive() -> None:
+    if not plugin_config.cross_group_spaces or not plugin_config.cross_group_proactive_enabled:
+        return
+    from .group_memory import get_summary_model
+    from .brain.proactive import poll_proactive
+
+    try:
+        async with maintenance_gate.slot():
+            await poll_proactive(spaces=lambda: plugin_config.cross_group_spaces,
+                                 connected={str(bot_id): adapter_name(bot) for bot_id, bot in get_bots().items()},
+                                 allowed=lambda bot_id, scene: (
+                                     plugin_config.cross_group_proactive_enabled
+                                     and resolve_group_reply_probability(scene) > 0
+                                     and participation.can_reply((bot_id, scene))
+                                     and time.monotonic() >= participation.state((bot_id, scene)).quiet_until
+                                 ), model_factory=get_summary_model, sender=_send_cross_group_message,
+                                 source_allowed=lambda bot_id, scene: (
+                                     resolve_group_reply_probability(scene) > 0
+                                     and time.monotonic() >= participation.state((bot_id, scene)).quiet_until
+                                 ), on_sent=lambda bot_id, scene: participation.sent((bot_id, scene), proactive=True),
+                                 now=datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None))
+    except Exception:
+        logger.exception("主动跨群联动调度失败")
 
 
 @scheduler.scheduled_job("interval", hours=1, max_instances=1, coalesce=True, id="ai_groupmate_prune_cross_group_observations")
@@ -468,6 +495,9 @@ _reply_scheduler = GroupReplyScheduler(lambda request: _execute_reply_request(re
                                        lambda: plugin_config.agent_max_concurrency_per_group)
 _group_reply_states: dict[str, GroupReplyState] = _reply_scheduler.states
 _input_batcher: InputBatcher[ReplyRequest] = InputBatcher()
+_durable_queue_lock = asyncio.Lock()
+_durable_queue_initialized = False
+_durable_dispatched: set[str] = set()
 _continuous_conversation_until: dict[tuple[str, str, str], datetime.datetime] = {}
 _explicit_conversation_until: dict[tuple[str, str, str], datetime.datetime] = {}
 
@@ -497,15 +527,64 @@ async def _submit_reply_input(group_id: str, request: ReplyRequest, message_id: 
         await _queue_group_reply_request(group_id, request)
         return
 
+    key = _input_batch_key(str(request.bot.self_id), group_id, request.user_id, request.reply_to_id)
+    previous = _input_batcher.pending.get(key)
+    addressed = request.is_tome or request.is_continuous or bool(
+        previous and (previous.request.is_tome or previous.request.is_continuous)
+    )
+    if addressed:
+        from .durable_group_queue import stage
+
+        await _init_durable_queue()
+        request, admitted = await stage(replace(request, is_tome=request.is_tome or bool(previous)), text)
+        if not admitted:
+            return
+
     async def deliver(ready: ReplyRequest, messages: tuple[tuple[str, str], ...]) -> None:
+        from .durable_group_queue import admit
+
         logger.info(f"[InputBatch] group={group_id} messages={len(messages)} ids={[mid for mid, _ in messages]}")
-        await _queue_group_reply_request(group_id, replace(ready, input_batch=messages))
+        ready = replace(ready, input_batch=messages)
+        if await admit(ready):
+            await _queue_group_reply_request(group_id, ready)
 
     await _input_batcher.submit(
-        _input_batch_key(str(request.bot.self_id), group_id, request.user_id, request.reply_to_id), request,
+        key, request,
         message_id=message_id if is_reliable_platform_id(message_id) else "", text=text, delay=plugin_config.group_message_debounce_seconds,
         max_wait=plugin_config.group_message_debounce_max_seconds, merge=merge_reply_requests, deliver=deliver,
     )
+
+
+async def _init_durable_queue() -> None:
+    global _durable_queue_initialized
+    if _durable_queue_initialized:
+        return
+    async with _durable_queue_lock:
+        if not _durable_queue_initialized:
+            from .durable_group_queue import recover_startup
+
+            await recover_startup()
+            _durable_queue_initialized = True
+
+
+@scheduler.scheduled_job("interval", seconds=5, max_instances=1, coalesce=True, id="ai_groupmate_durable_group_queue")
+async def _poll_durable_group_queue() -> None:
+    from .durable_group_queue import queued, restore
+
+    try:
+        await _init_durable_queue()
+        bots = get_bots()
+        for job in await queued():
+            bot = bots.get(job.bot_id)
+            if bot is None or job.job_id in _durable_dispatched:
+                continue
+            try:
+                request = restore(job, bot)
+                await _queue_group_reply_request(job.scene_id, request)
+            except Exception:
+                logger.exception(f"持久化群请求无法恢复 job={job.job_id}")
+    except Exception:
+        logger.exception("持久化群请求调度失败")
 
 # 多bot去重锁: 每个群串行化消息记录,防止并发SELECT查不到对方未提交数据
 _dedup_locks: dict[str, asyncio.Lock] = {}
@@ -870,6 +949,27 @@ def _extract_reply_message_id_from_event(event: Event) -> str | None:
 
 
 async def _execute_reply_request(request: ReplyRequest) -> None:
+    from .durable_group_queue import transition
+
+    job_id = getattr(request, "durable_job_id", None)
+    if job_id is not None and not await transition(job_id, "queued", "running"):
+        _durable_dispatched.discard(job_id)
+        return
+    try:
+        await _execute_reply_request_inner(request)
+    except BaseException:
+        if job_id is not None:
+            await transition(job_id, "running", "interrupted")
+        raise
+    else:
+        if job_id is not None:
+            await transition(job_id, "running", "completed")
+    finally:
+        if job_id is not None:
+            _durable_dispatched.discard(job_id)
+
+
+async def _execute_reply_request_inner(request: ReplyRequest) -> None:
     # Wait for a global Agent slot before opening a database session. This
     # bounds cross-group concurrency without consuming pool capacity while queued.
     slot_started = time.monotonic()
@@ -905,7 +1005,20 @@ async def _execute_reply_request(request: ReplyRequest) -> None:
 
 
 async def _queue_group_reply_request(group_id: str, request: ReplyRequest) -> bool:
-    return await _reply_scheduler.enqueue(group_id, request)
+    job_id = getattr(request, "durable_job_id", None)
+    if job_id is not None:
+        if job_id in _durable_dispatched:
+            return False
+        _durable_dispatched.add(job_id)
+    try:
+        accepted = await _reply_scheduler.enqueue(group_id, request)
+    except BaseException:
+        if job_id is not None:
+            _durable_dispatched.discard(job_id)
+        raise
+    if not accepted and job_id is not None:
+        _durable_dispatched.discard(job_id)
+    return accepted
 
 
 async def _run_group_reply_worker(group_id: str) -> None:
@@ -1259,6 +1372,9 @@ async def handle_message(
     disengaged = is_group and (explicit_to_me or ((active_followup or group_followup) and not has_at_mention and not reply_id)) and _is_explicit_disengagement(stripped_plain_text, plugin_config.bot_name)
     if disengaged:
         _input_batcher.discard_speaker((bot_id, session.scene.id, session.user.id))
+        from .durable_group_queue import cancel_staged
+
+        await cancel_staged(bot_id, session.scene.id, session.user.id)
         _continuous_conversation_until.pop(_continuous_key(session.scene.id, session.user.id, bot_id), None)
         _explicit_conversation_until.pop(_continuous_key(session.scene.id, session.user.id, bot_id), None)
         logger.debug("用户明确退出当前 bot 对话，本条保持沉默并结束跟进窗口")
@@ -1324,6 +1440,7 @@ async def handle_message(
                 await record_message(observation_session, platform=adapter_name(bot), bot_id=str(bot.self_id),
                                      scene_id=str(session.scene.id), message_id=incoming_message_id,
                                      user_id=str(session.user.id), text=stripped_plain_text, reply_to=reply_id,
+                                     addressed_other=has_at_mention and not explicit_to_me,
                                      now=datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None))
                 await observation_session.commit()
         except Exception:

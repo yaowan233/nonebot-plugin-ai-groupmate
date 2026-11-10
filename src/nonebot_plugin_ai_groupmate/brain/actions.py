@@ -5,11 +5,13 @@ An unknown delivery is never automatically retried.
 """
 
 from uuid import uuid4
+from typing import cast
 from datetime import datetime, timedelta
 from dataclasses import dataclass
 
 from sqlalchemy import or_, exists, select, update
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..model import BrainTask, BrainAction
@@ -33,7 +35,7 @@ async def prepare(db: AsyncSession, spec: ActionSpec, *, task_token: str, now: d
         BrainTask.task_id == spec.task_id, BrainTask.status == "running", BrainTask.claim_token == task_token,
         BrainTask.lease_until > now, BrainTask.deadline > now,
     ).values(revision=BrainTask.revision + 1, updated_at=now))
-    if not result.rowcount:
+    if not cast(CursorResult, result).rowcount:
         raise ValueError("Task lease is not active")
     query = select(BrainAction).where(
         BrainAction.task_id == spec.task_id, BrainAction.logical_step == spec.logical_step,
@@ -72,12 +74,12 @@ async def claim_send(db: AsyncSession, action_id: str, *, task_token: str, send_
             (BrainTask.status == "finalizing") & exists(select(BrainAction.action_id).where(
                 BrainAction.action_id == action_id, BrainAction.logical_step == "timeout", BrainAction.effect_slot == "notice"))),
     ).values(revision=BrainTask.revision + 1, updated_at=now))
-    if not owner.rowcount:
+    if not cast(CursorResult, owner).rowcount:
         return False
     result = await db.execute(update(BrainAction).where(
         BrainAction.action_id == action_id, BrainAction.status == "prepared",
     ).values(status="sending", claim_token=send_token, lease_until=now + timedelta(seconds=lease_seconds), updated_at=now))
-    return bool(result.rowcount)
+    return bool(cast(CursorResult, result).rowcount)
 
 
 async def confirm(db: AsyncSession, action_id: str, *, send_token: str, message_id: str, now: datetime) -> bool:
@@ -88,11 +90,11 @@ async def confirm(db: AsyncSession, action_id: str, *, send_token: str, message_
         BrainAction.action_id == action_id, BrainAction.status.in_(("sending", "delivery_unknown")),
         BrainAction.claim_token == send_token,
     ).values(status="confirmed", receipt_message_id=message_id, lease_until=None, updated_at=now))
-    return bool(result.rowcount)
+    return bool(cast(CursorResult, result).rowcount)
 
 
 async def mark_unknown(db: AsyncSession, *, now: datetime) -> int:
     result = await db.execute(update(BrainAction).where(
         BrainAction.status == "sending", BrainAction.lease_until <= now,
     ).values(status="delivery_unknown", lease_until=None, updated_at=now))
-    return int(result.rowcount or 0)
+    return int(cast(CursorResult, result).rowcount or 0)

@@ -5,11 +5,13 @@ All timestamps are naive UTC, matching scheduled_tasks.
 """
 
 from uuid import uuid4
+from typing import cast
 from datetime import datetime, timedelta
 from dataclasses import dataclass
 
 from sqlalchemy import or_, case, exists, select, update
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.dialects.postgresql import insert as postgres_insert
@@ -55,7 +57,7 @@ async def submit(db: AsyncSession, item: TaskInput, *, now: datetime) -> tuple[B
         saved = await db.scalar(query)
         if saved is None:
             raise RuntimeError("Task insertion could not be read back")
-        return saved, bool(result.rowcount)
+        return saved, bool(cast(CursorResult, result).rowcount)
     try:
         async with db.begin_nested():
             db.add(task)
@@ -75,14 +77,14 @@ async def claim(db: AsyncSession, task_id: str, token: str, *, now: datetime, le
         BrainTask.task_id == task_id, BrainTask.status == "queued", BrainTask.deadline > now,
     ).values(status="running", claim_token=token, lease_until=now + timedelta(seconds=lease_seconds),
              revision=BrainTask.revision + 1, updated_at=now))
-    return bool(result.rowcount)
+    return bool(cast(CursorResult, result).rowcount)
 
 
 async def recover_expired_claims(db: AsyncSession, *, now: datetime) -> int:
     result = await db.execute(update(BrainTask).where(
         BrainTask.status == "running", BrainTask.lease_until <= now, BrainTask.deadline > now,
     ).values(status="queued", claim_token=None, lease_until=None, revision=BrainTask.revision + 1, updated_at=now))
-    return int(result.rowcount or 0)
+    return int(cast(CursorResult, result).rowcount or 0)
 
 
 async def wait_for_reply(db: AsyncSession, task_id: str, token: str, *, platform: str, target_scene: str,
@@ -97,10 +99,17 @@ async def wait_for_reply(db: AsyncSession, task_id: str, token: str, *, platform
         BrainTask.lease_until > now, BrainTask.deadline >= deadline,
     ).values(status="waiting_input", claim_token=None, lease_until=None,
              revision=BrainTask.revision + 1, updated_at=now))
-    if not result.rowcount:
+    if not cast(CursorResult, result).rowcount:
         return False
+    inquiry = await db.scalar(select(BrainAction).where(
+        BrainAction.task_id == task_id, BrainAction.logical_step == "ask", BrainAction.status == "confirmed",
+        BrainAction.platform == platform, BrainAction.target_scene == target_scene,
+        BrainAction.receipt_message_id == question_message,
+    ))
+    unquoted_from = inquiry.created_at if inquiry is not None else now
     db.add(BrainWait(task_id=task_id, platform=platform, target_scene=target_scene,
-                     question_message=question_message, answer_message=None, answer_user=None,
+                     question_message=question_message, unquoted_from=unquoted_from,
+                     unquoted_until=min(unquoted_from + timedelta(minutes=2), deadline), answer_message=None, answer_user=None,
                      answer_text=None, deadline=deadline, status="open"))
     await db.flush()
     return True
@@ -125,7 +134,10 @@ async def pending_reply_candidates(db: AsyncSession, *, task_id: str, now: datet
     return list((await db.scalars(select(BrainObservationMessage).join(
         BrainWait, (BrainObservationMessage.platform == BrainWait.platform)
         & (BrainObservationMessage.scene_id == BrainWait.target_scene)
-        & (BrainObservationMessage.reply_to == BrainWait.question_message),
+        & or_(BrainObservationMessage.reply_to == BrainWait.question_message,
+              (BrainObservationMessage.reply_to.is_(None)) & (BrainObservationMessage.addressed_other.is_(False))
+              & (BrainObservationMessage.created_at >= BrainWait.unquoted_from)
+              & (BrainObservationMessage.created_at <= BrainWait.unquoted_until)),
     ).join(BrainTask, BrainTask.task_id == BrainWait.task_id).where(
         BrainTask.task_id == task_id, BrainTask.status == "waiting_input", BrainTask.deadline > now,
         BrainWait.status == "open", BrainWait.deadline > now,
@@ -146,7 +158,7 @@ async def finish(db: AsyncSession, task_id: str, token: str, *, now: datetime) -
         ~exists(select(BrainAction.action_id).where(BrainAction.task_id == task_id, BrainAction.status != "confirmed")),
     ).values(status="completed", claim_token=None, lease_until=None,
              revision=BrainTask.revision + 1, updated_at=now))
-    return bool(result.rowcount)
+    return bool(cast(CursorResult, result).rowcount)
 
 
 async def expire_wait(db: AsyncSession, task_id: str, *, now: datetime) -> bool:
@@ -155,7 +167,7 @@ async def expire_wait(db: AsyncSession, task_id: str, *, now: datetime) -> bool:
         BrainTask.task_id == task_id, BrainTask.status == "waiting_input",
         BrainTask.task_id.in_(select(BrainWait.task_id).where(BrainWait.status == "open", BrainWait.deadline <= now)),
     ).values(status="finalizing", revision=BrainTask.revision + 1, updated_at=now))
-    if result.rowcount:
+    if cast(CursorResult, result).rowcount:
         await db.execute(update(BrainWait).where(BrainWait.task_id == task_id, BrainWait.status == "open").values(status="expired"))
         task = await db.get(BrainTask, task_id)
         if task is None:
@@ -165,7 +177,7 @@ async def expire_wait(db: AsyncSession, task_id: str, *, now: datetime) -> bool:
                            status="prepared", claim_token=None, lease_until=None, receipt_message_id=None,
                            created_at=now, updated_at=now))
         await db.flush()
-    return bool(result.rowcount)
+    return bool(cast(CursorResult, result).rowcount)
 
 
 async def expire_queued(db: AsyncSession, task_id: str, *, now: datetime) -> bool:
@@ -178,7 +190,7 @@ async def expire_queued(db: AsyncSession, task_id: str, *, now: datetime) -> boo
         )),
     ).values(status="finalizing", claim_token=None, lease_until=None,
              revision=BrainTask.revision + 1, updated_at=now))
-    if not result.rowcount:
+    if not cast(CursorResult, result).rowcount:
         return False
     task = await db.get(BrainTask, task_id)
     if task is None:
@@ -199,7 +211,7 @@ async def fail_before_send(db: AsyncSession, task_id: str, token: str, *, now: d
         ~exists(select(BrainAction.action_id).where(BrainAction.task_id == task_id)),
     ).values(status="finalizing", failure_reason="planning_failed", claim_token=None, lease_until=None,
              revision=BrainTask.revision + 1, updated_at=now))
-    if not result.rowcount:
+    if not cast(CursorResult, result).rowcount:
         return False
     task = await db.get(BrainTask, task_id)
     if task is None:
@@ -220,7 +232,7 @@ async def claim_finalization(db: AsyncSession, task_id: str, token: str, *, now:
         (BrainTask.claim_token.is_(None)) | (BrainTask.lease_until <= now),
     ).values(claim_token=token, lease_until=now + timedelta(seconds=lease_seconds),
              revision=BrainTask.revision + 1, updated_at=now))
-    return bool(result.rowcount)
+    return bool(cast(CursorResult, result).rowcount)
 
 
 async def finish_expired(db: AsyncSession, task_id: str, token: str, *, now: datetime) -> bool:
@@ -231,21 +243,37 @@ async def finish_expired(db: AsyncSession, task_id: str, token: str, *, now: dat
                BrainAction.logical_step == "timeout", BrainAction.effect_slot == "notice", BrainAction.status == "confirmed")),
     ).values(status=case((BrainTask.failure_reason == "planning_failed", "failed"), else_="expired"), claim_token=None, lease_until=None,
              revision=BrainTask.revision + 1, updated_at=now))
-    return bool(result.rowcount)
+    return bool(cast(CursorResult, result).rowcount)
 
 
 async def accept_reply(db: AsyncSession, task_id: str, *, platform: str, target_scene: str, reply_to: str,
-                       message_id: str, user_id: str, text: str, now: datetime) -> bool:
-    if not all((platform, target_scene, reply_to, message_id, user_id, text.strip())):
+                       message_id: str, user_id: str, text: str, now: datetime, unquoted: bool = False) -> bool:
+    if not all((platform, target_scene, message_id, user_id, text.strip())):
         return False
     waiting = await db.get(BrainWait, task_id)
-    if waiting is None or (waiting.platform, waiting.target_scene, waiting.question_message) != (platform, target_scene, reply_to):
+    if waiting is None or (waiting.platform, waiting.target_scene) != (platform, target_scene):
+        return False
+    if unquoted:
+        task = await db.get(BrainTask, task_id)
+        if task is None or reply_to:
+            return False
+        candidate = await db.scalar(select(BrainObservationMessage.id).where(
+            BrainObservationMessage.platform == platform, BrainObservationMessage.bot_id == task.bot_id,
+            BrainObservationMessage.scene_id == target_scene, BrainObservationMessage.message_id == message_id,
+            BrainObservationMessage.user_id == user_id, BrainObservationMessage.text == text,
+            BrainObservationMessage.reply_to.is_(None), BrainObservationMessage.addressed_other.is_(False),
+            BrainObservationMessage.created_at >= waiting.unquoted_from,
+            BrainObservationMessage.created_at <= waiting.unquoted_until,
+        ))
+        if candidate is None:
+            return False
+    elif waiting.question_message != reply_to:
         return False
     result = await db.execute(update(BrainTask).where(
         BrainTask.task_id == task_id, BrainTask.status == "waiting_input", BrainTask.deadline > now,
         BrainTask.task_id.in_(select(BrainWait.task_id).where(BrainWait.status == "open", BrainWait.deadline > now)),
     ).values(status="queued", revision=BrainTask.revision + 1, updated_at=now))
-    if not result.rowcount:
+    if not cast(CursorResult, result).rowcount:
         return False
     await db.execute(update(BrainWait).where(BrainWait.task_id == task_id, BrainWait.status == "open").values(
         status="answered", answer_message=message_id, answer_user=user_id, answer_text=text))
@@ -258,6 +286,6 @@ async def cancel(db: AsyncSession, task_id: str, *, brain_id: str, platform: str
         BrainTask.platform == platform, BrainTask.source_scene == source_scene,
         BrainTask.status.in_(("queued", "running", "waiting_input")),
     ).values(status="cancelled", claim_token=None, lease_until=None, revision=BrainTask.revision + 1, updated_at=now))
-    if result.rowcount:
+    if cast(CursorResult, result).rowcount:
         await db.execute(update(BrainWait).where(BrainWait.task_id == task_id, BrainWait.status == "open").values(status="cancelled"))
-    return bool(result.rowcount)
+    return bool(cast(CursorResult, result).rowcount)
