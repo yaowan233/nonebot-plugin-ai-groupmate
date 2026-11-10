@@ -446,6 +446,7 @@ async def _poll_cross_group_proactive() -> None:
                                      resolve_group_reply_probability(scene) > 0
                                      and time.monotonic() >= participation.state((bot_id, scene)).quiet_until
                                  ), on_sent=lambda bot_id, scene: participation.sent((bot_id, scene), proactive=True),
+                                 name_resolver=_resolve_cross_group_names,
                                  now=datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None))
     except Exception:
         logger.exception("主动跨群联动调度失败")
