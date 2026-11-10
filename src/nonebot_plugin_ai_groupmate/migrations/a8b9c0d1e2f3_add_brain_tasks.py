@@ -23,6 +23,7 @@ def upgrade(name: str = "") -> None:
         sa.Column("source_user", sa.String(255), nullable=False),
         sa.Column("request", sa.Text(), nullable=False),
         sa.Column("status", sa.String(32), nullable=False),
+        sa.Column("failure_reason", sa.String(64)),
         sa.Column("revision", sa.Integer(), nullable=False),
         sa.Column("claim_token", sa.String(32)),
         sa.Column("lease_until", sa.DateTime()),
@@ -118,10 +119,19 @@ def upgrade(name: str = "") -> None:
         info={"bind_key": "nonebot_plugin_ai_groupmate"},
     )
     op.create_index("ix_nonebot_plugin_ai_groupmate_brainobservationrun_started_at", "nonebot_plugin_ai_groupmate_brainobservationrun", ["started_at"])
+    op.create_table(
+        "nonebot_plugin_ai_groupmate_braincandidatedecision",
+        sa.Column("task_id", sa.String(32), sa.ForeignKey("nonebot_plugin_ai_groupmate_braintask.task_id"), primary_key=True),
+        sa.Column("observation_id", sa.Integer(), primary_key=True),
+        sa.Column("decision", sa.String(32), nullable=False),
+        sa.Column("created_at", sa.DateTime(), nullable=False),
+        info={"bind_key": "nonebot_plugin_ai_groupmate"},
+    )
 
 
 def downgrade(name: str = "") -> None:
     if not name:
+        op.drop_table("nonebot_plugin_ai_groupmate_braincandidatedecision")
         op.drop_table("nonebot_plugin_ai_groupmate_brainobservationrun")
         op.drop_table("nonebot_plugin_ai_groupmate_brainsceneobservation")
         op.drop_table("nonebot_plugin_ai_groupmate_brainobservationmessage")

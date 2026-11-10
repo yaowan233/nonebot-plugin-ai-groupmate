@@ -74,7 +74,7 @@ from .media_message import format_media_markers
 from .message_trace import trace_id
 from .participation import participation, delivery_context, observation_guard, confirmed_turn_delivery
 from .reply_request import ReplyRequest, GroupReplyState, merge_reply_requests, current_transport_message_id
-from .agent.delivery import OutboundIdentity
+from .agent.delivery import OutboundIdentity, send_and_finalize
 from .agent.reaction import is_onebot_context, requested_reaction_emoji
 from .group_affinity import note_group_activity, load_group_affinities
 from .runtime_config import (
@@ -378,6 +378,40 @@ async def _poll_cross_group_observations() -> None:
             )
     except Exception:
         logger.exception("跨群观察调度失败")
+
+
+@scheduler.scheduled_job("interval", seconds=5, max_instances=1, coalesce=True, id="ai_groupmate_cross_group_tasks")
+async def _poll_cross_group_tasks() -> None:
+    if not plugin_config.cross_group_spaces:
+        return
+    from .agent import get_chat_model
+    from .brain.poll import poll
+    from .agent.outbound_plan import compose_segments
+
+    connected_bots = get_bots()
+    connected = {str(bot_id): adapter_name(bot) for bot_id, bot in connected_bots.items()}
+
+    async def send(platform: str, bot_id: str, scene_id: str, text: str, reply_to: str | None) -> str:
+        bot = get_bots().get(bot_id)
+        if bot is None or adapter_name(bot) != platform:
+            raise RuntimeError("Bot is unavailable")
+        message = compose_segments([UniMessage.text(text)], reply_to)
+        target = Target(id=scene_id, private=False, self_id=bot_id)
+        identity = OutboundIdentity(platform, "group", bot_id, plugin_config.bot_name)
+
+        def record(message_id: str) -> list[ChatHistory]:
+            return [ChatHistory(session_id=scene_id, user_id=plugin_config.bot_name, user_name=plugin_config.bot_name,
+                                content_type="bot", content=f"id: {message_id}\n{text}")]
+
+        receipt = await send_and_finalize(None, scene_id, message, send_options={"target": target, "bot": bot},
+                                           record=record, outbound_identity=identity, session_factory=get_session)
+        return receipt.message_id
+
+    try:
+        await poll(spaces=lambda: plugin_config.cross_group_spaces, connected=connected, model_factory=get_chat_model,
+                   sender=send, target_names=plugin_config.cross_group_scene_names)
+    except Exception:
+        logger.exception("跨群任务调度失败")
 
 
 @scheduler.scheduled_job("interval", hours=1, max_instances=1, coalesce=True, id="ai_groupmate_prune_cross_group_observations")

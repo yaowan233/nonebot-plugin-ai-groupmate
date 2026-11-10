@@ -22,6 +22,8 @@ BOOTSTRAP_FIELDS = frozenset(
         "group_api_relay_timeout_seconds",
         "group_api_ticket_ttl_seconds",
         "group_api_allowed_provider_hosts",
+        "cross_group_spaces",
+        "cross_group_scene_names",
     }
 )
 RESTART_REQUIRED_FIELDS = frozenset(

@@ -65,6 +65,7 @@ from .meme_tools import (
 )
 from .media_tools import create_read_media_tools
 from .reply_tools import create_reply_tool
+from ..brain.tools import create_coordination_tool
 from ..concurrency import agent_run_gate, configure_concurrency
 from .common_tools import (
     finish,
@@ -146,7 +147,7 @@ from .group_memory_tools import create_group_memory_tool
 from .image_search_tools import create_web_image_tools
 from .ordered_reply_tool import create_ordered_reply_tool
 from .structured_context import StructuredSnapshot, visible_text, merge_snapshots, visible_quote_text, load_structured_context_safely
-from ..brain.observations import relevant_context
+from ..brain.observations import configured_space, relevant_context
 from ..group_model_config import (
     resolve_chat_config,
     resolve_session_chat_config,
@@ -1793,6 +1794,12 @@ async def create_chat_graph(
         ),
     ]
     base_agent_tools = [
+        *([create_coordination_tool(config=plugin_config, platform=resolved_platform, bot_id=str(bot_id or ""),
+                                    scene_id=session_id, user_id=str(user_id), message_id=tool_current_message_id,
+                                    request_id=request_id, request_text=current_request_text)]
+          if not is_private and not proactive_observation and event is not None and request_id
+          and getattr(event, "is_tome", lambda: False)() and configured_space(plugin_config.cross_group_spaces, session_id)
+          else []),
         *(
             [reply_tool]
             if not proactive_meme_only and not proactive_reaction_only

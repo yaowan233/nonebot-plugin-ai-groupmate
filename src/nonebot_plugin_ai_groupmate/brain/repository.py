@@ -8,11 +8,13 @@ from uuid import uuid4
 from datetime import datetime, timedelta
 from dataclasses import dataclass
 
-from sqlalchemy import exists, select, update
+from sqlalchemy import or_, case, exists, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.dialects.postgresql import insert as postgres_insert
 
-from ..model import BrainTask, BrainWait, BrainAction, BrainObservationMessage
+from ..model import BrainTask, BrainWait, BrainAction, BrainCandidateDecision, BrainObservationMessage
 
 
 @dataclass(frozen=True)
@@ -41,8 +43,19 @@ async def submit(db: AsyncSession, item: TaskInput, *, now: datetime) -> tuple[B
         return existing, False
     task = BrainTask(task_id=uuid4().hex, brain_id=item.brain_id, bot_id=item.transport_bot_id or item.brain_id, platform=item.platform,
                      source_scene=item.source_scene, source_message=item.source_message, source_user=item.source_user,
-                     request=item.request, status="queued", revision=0, deadline=item.deadline,
+                     request=item.request, status="queued", failure_reason=None, revision=0, deadline=item.deadline,
                      claim_token=None, lease_until=None, created_at=now, updated_at=now)
+    dialect = db.get_bind().dialect.name
+    if dialect in {"sqlite", "postgresql"}:
+        insert = sqlite_insert if dialect == "sqlite" else postgres_insert
+        values = {column.name: getattr(task, column.name) for column in BrainTask.__table__.columns}
+        result = await db.execute(insert(BrainTask).values(**values).on_conflict_do_nothing(
+            index_elements=["brain_id", "platform", "source_scene", "source_message"],
+        ))
+        saved = await db.scalar(query)
+        if saved is None:
+            raise RuntimeError("Task insertion could not be read back")
+        return saved, bool(result.rowcount)
     try:
         async with db.begin_nested():
             db.add(task)
@@ -119,6 +132,9 @@ async def pending_reply_candidates(db: AsyncSession, *, task_id: str, now: datet
         BrainObservationMessage.bot_id == BrainTask.bot_id,
         BrainObservationMessage.created_at >= BrainTask.created_at,
         BrainObservationMessage.created_at <= now,
+        ~exists(select(BrainCandidateDecision.task_id).where(
+            BrainCandidateDecision.task_id == task_id, BrainCandidateDecision.observation_id == BrainObservationMessage.id,
+        )),
     ).order_by(BrainObservationMessage.created_at, BrainObservationMessage.id).limit(30))).all())
 
 
@@ -152,6 +168,50 @@ async def expire_wait(db: AsyncSession, task_id: str, *, now: datetime) -> bool:
     return bool(result.rowcount)
 
 
+async def expire_queued(db: AsyncSession, task_id: str, *, now: datetime) -> bool:
+    """Expire an unstarted or abandoned task without duplicating unknown sends."""
+    result = await db.execute(update(BrainTask).where(
+        BrainTask.task_id == task_id, BrainTask.deadline <= now,
+        or_(BrainTask.status == "queued", (BrainTask.status == "running") & (BrainTask.lease_until <= now)),
+        ~exists(select(BrainAction.action_id).where(
+            BrainAction.task_id == task_id, BrainAction.status.in_(("sending", "delivery_unknown")),
+        )),
+    ).values(status="finalizing", claim_token=None, lease_until=None,
+             revision=BrainTask.revision + 1, updated_at=now))
+    if not result.rowcount:
+        return False
+    task = await db.get(BrainTask, task_id)
+    if task is None:
+        raise RuntimeError("Expired task disappeared")
+    db.add(BrainAction(action_id=uuid4().hex, task_id=task_id, logical_step="timeout", effect_slot="notice",
+                       platform=task.platform, target_scene=task.source_scene, content="跨群任务超时，暂时没能完成。",
+                       status="prepared", claim_token=None, lease_until=None, receipt_message_id=None,
+                       created_at=now, updated_at=now))
+    await db.flush()
+    return True
+
+
+async def fail_before_send(db: AsyncSession, task_id: str, token: str, *, now: datetime) -> bool:
+    """Persist a failure notice only if this task has not attempted an action."""
+    result = await db.execute(update(BrainTask).where(
+        BrainTask.task_id == task_id, BrainTask.status == "running", BrainTask.claim_token == token,
+        BrainTask.lease_until > now,
+        ~exists(select(BrainAction.action_id).where(BrainAction.task_id == task_id)),
+    ).values(status="finalizing", failure_reason="planning_failed", claim_token=None, lease_until=None,
+             revision=BrainTask.revision + 1, updated_at=now))
+    if not result.rowcount:
+        return False
+    task = await db.get(BrainTask, task_id)
+    if task is None:
+        raise RuntimeError("Failed task disappeared")
+    db.add(BrainAction(action_id=uuid4().hex, task_id=task_id, logical_step="timeout", effect_slot="notice",
+                       platform=task.platform, target_scene=task.source_scene, content="跨群协调暂时无法完成，请稍后再试。",
+                       status="prepared", claim_token=None, lease_until=None, receipt_message_id=None,
+                       created_at=now, updated_at=now))
+    await db.flush()
+    return True
+
+
 async def claim_finalization(db: AsyncSession, task_id: str, token: str, *, now: datetime, lease_seconds: int = 180) -> bool:
     if not token or lease_seconds <= 0:
         raise ValueError("A claim token and positive lease duration are required")
@@ -169,7 +229,7 @@ async def finish_expired(db: AsyncSession, task_id: str, token: str, *, now: dat
         BrainTask.lease_until > now,
         exists(select(BrainAction.action_id).where(BrainAction.task_id == task_id,
                BrainAction.logical_step == "timeout", BrainAction.effect_slot == "notice", BrainAction.status == "confirmed")),
-    ).values(status="expired", claim_token=None, lease_until=None,
+    ).values(status=case((BrainTask.failure_reason == "planning_failed", "failed"), else_="expired"), claim_token=None, lease_until=None,
              revision=BrainTask.revision + 1, updated_at=now))
     return bool(result.rowcount)
 

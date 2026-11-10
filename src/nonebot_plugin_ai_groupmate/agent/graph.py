@@ -59,6 +59,7 @@ BUDGET_FINALIZATION_FALLBACK = (
 )
 TOOL_MARKUP_FALLBACK = "本轮未能完成操作，请让我继续处理。"
 SIDE_EFFECT_TOOL_NAMES = frozenset({
+    "request_cross_group_coordination",
     "add_message_reaction",
     "cancel_scheduled_task",
     "cancel_drawing_job",

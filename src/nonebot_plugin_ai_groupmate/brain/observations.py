@@ -69,6 +69,7 @@ async def poll_observations(*, spaces: dict[str, list[str]], connected: dict[str
         async with get_session() as db:
             count = await db.scalar(select(func.count()).select_from(BrainObservationRun).where(
                 BrainObservationRun.started_at > now - timedelta(hours=1),
+                BrainObservationRun.started_at <= now,
             ))
             if (count or 0) >= 6:
                 return False

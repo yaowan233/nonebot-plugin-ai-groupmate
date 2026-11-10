@@ -134,6 +134,23 @@ async def test_reply_recorded_before_wait_registration_is_found_without_crossing
 
 
 @pytest.mark.asyncio
+async def test_task_submission_rolls_back_before_acknowledgement():
+    from nonebot_plugin_orm import get_session
+
+    from nonebot_plugin_ai_groupmate.model import BrainTask
+    from nonebot_plugin_ai_groupmate.brain.repository import TaskInput, submit
+
+    now = datetime(2026, 11, 10, 12)
+    item = TaskInput("bot", "qq", uuid4().hex, "source", "alice", "询问", now + timedelta(hours=1))
+    async with get_session() as db:
+        task, _ = await submit(db, item, now=now)
+        task_id = task.task_id
+        await db.rollback()
+    async with get_session() as db:
+        assert await db.get(BrainTask, task_id) is None
+
+
+@pytest.mark.asyncio
 async def test_expired_lease_and_cancellation_fence_old_worker():
     from nonebot_plugin_orm import get_session
 

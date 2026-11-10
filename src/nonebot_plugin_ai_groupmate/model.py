@@ -19,6 +19,7 @@ class BrainTask(NulSafeModel):
     source_user: Mapped[str] = mapped_column(String(255))
     request: Mapped[str] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(32), index=True)
+    failure_reason: Mapped[str | None] = mapped_column(String(64))
     revision: Mapped[int] = mapped_column(Integer, default=0)
     claim_token: Mapped[str | None] = mapped_column(String(32))
     lease_until: Mapped[datetime | None] = mapped_column()
@@ -109,6 +110,13 @@ class BrainSceneObservation(NulSafeModel):
     digest: Mapped[str] = mapped_column(Text, default="")
     source_ids: Mapped[list[int]] = mapped_column(JSON, default=list)
     updated_at: Mapped[datetime] = mapped_column()
+
+
+class BrainCandidateDecision(NulSafeModel):
+    task_id: Mapped[str] = mapped_column(String(32), ForeignKey("nonebot_plugin_ai_groupmate_braintask.task_id"), primary_key=True)
+    observation_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    decision: Mapped[str] = mapped_column(String(32))
+    created_at: Mapped[datetime] = mapped_column()
 
 
 class BrainObservationRun(NulSafeModel):
