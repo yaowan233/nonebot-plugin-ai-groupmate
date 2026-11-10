@@ -1645,6 +1645,8 @@ async def create_chat_graph(
             model=model,
         )
     )
+    deferred_custom_names = {tool.name for skill in custom_agent_skills for tool in skill.tools}
+    custom_agent_tools = [tool for tool in custom_agent_tools if tool.name not in deferred_custom_names]
     if custom_tool_instructions:
         system_prompt += (
             "\n【自定义工具】\n" + "\n".join(custom_tool_instructions) + "\n"
@@ -1877,6 +1879,9 @@ async def create_chat_graph(
         "schedule_tools": [schedule_tool, schedule_agent_tool, *schedule_management_tools],
         "profile_memory_tools": [relation_tool, report_tool],
     }
+    for skill in custom_agent_skills:
+        if skill.tools:
+            tools_by_skill.setdefault(skill.name.strip(), []).extend(skill.tools)
     if is_private:
         tools_by_skill["meme_tools"] = (
             [search_meme_tool, similar_meme_tool, send_meme_tool]
