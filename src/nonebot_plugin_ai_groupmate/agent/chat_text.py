@@ -5,7 +5,11 @@ import re
 _PROTECTED = re.compile(r"```[\s\S]*?```|~~~[\s\S]*?~~~|`[^`\n]*`|“[^”\n]*”|‘[^’\n]*’|「[^」\n]*」|『[^』\n]*』|\"[^\"\n]*\"|(?<![a-zA-Z0-9])'[^'\n]*'(?![a-zA-Z0-9])|https?://[^\s]+")
 _BOLD = re.compile(r"(?<!\\)\*\*(?=\S)([^\n]*?\S)(?<!\\)\*\*")
 _HEADING = re.compile(r"(?m)^[ \t]{0,3}#{1,6}[ \t]+")
-_MARKDOWN_REQUEST = re.compile(r"markdown|(?<![a-z])md(?![a-z])", re.IGNORECASE)
+_MARKDOWN_REQUEST = re.compile(
+    r"(?:(?:用|以|按|采用|转成|转换成|输出为|输出成|生成|提供|保留).{0,8}(?:markdown|(?<![a-z])md(?![a-z]))"
+    r"|(?:markdown|(?<![a-z])md(?![a-z])).{0,8}(?:输出|发送|发给|给我|源码|原文))",
+    re.IGNORECASE,
+)
 _MARKDOWN_NEGATION = re.compile(r"(?:不要|别|不用|禁止|去掉|去除|删除|取消).{0,8}(?:markdown|(?<![a-z])md(?![a-z]))", re.IGNORECASE)
 _VERBATIM_REQUEST = re.compile(r"原样|逐字|照抄|原封不动|一字不差|代码|程序|脚本|正则表达式|命令行|\b(?:sql|json|yaml)\b", re.IGNORECASE)
 
