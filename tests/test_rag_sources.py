@@ -11,12 +11,13 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 async def source_db(tmp_path, monkeypatch):
     import nonebot_plugin_orm
 
-    from nonebot_plugin_ai_groupmate.model import ChatHistory, HistoryMessageIndex
+    from nonebot_plugin_ai_groupmate.model import ChatHistory, StructuredMessage, HistoryMessageIndex
 
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'sources.sqlite3'}")
     async with engine.begin() as connection:
         await connection.run_sync(ChatHistory.__table__.create)
         await connection.run_sync(HistoryMessageIndex.__table__.create)
+        await connection.run_sync(StructuredMessage.__table__.create)
     sessions = async_sessionmaker(engine, expire_on_commit=False)
     monkeypatch.setattr(nonebot_plugin_orm, "get_session", sessions)
     async with sessions() as session:
@@ -110,3 +111,34 @@ async def test_source_ids_are_bound_to_reranked_text(source_db):
     result = await operator.search_chat("计划", "g")
     assert result.index("msg_id=1") < result.index("msg_id=4")
     assert '[user_id="200" msg_id=4 role=user]' in result
+
+
+async def test_cross_group_rag_never_reranks_unverified_or_private_text(source_db):
+    from nonebot_plugin_ai_groupmate.model import StructuredMessage, HistoryMessageIndex
+
+    async with source_db() as session:
+        session.add_all([
+            HistoryMessageIndex(history_id=3, platform_id="private-3", session_id="g"),
+            StructuredMessage(platform="OneBot V11", scope="group", session_id="g", platform_id="transport-1",
+                sender_id="100", sender_name="旧昵称", sender_kind="user", bot_id="bot", reply_to_id=None,
+                parts=[{"type": "text", "text": "我之前反对这个计划"}], created_at=datetime(2026, 1, 1)),
+            StructuredMessage(platform="OneBot V11", scope="private", session_id="g", platform_id="private-3",
+                sender_id="100", sender_name="用户", sender_kind="user", bot_id="bot", reply_to_id=None,
+                parts=[{"type": "text", "text": "私聊机密"}], created_at=datetime(2026, 1, 3)),
+        ])
+        await session.commit()
+    operator = operator_for([SimpleNamespace(payload={"text": "群消息与私聊机密", "msg_ids": [1, 3]})])
+    rerank = AsyncMock(side_effect=lambda query, docs, limit: docs[:limit])
+    operator._rerank = rerank
+    result = await operator.search_chat("计划", "g", platform="OneBot V11", require_group_scope=True)
+    assert "我之前反对这个计划" in result
+    assert '[platform_message_id="transport-1"]' in result
+    assert "私聊机密" not in result
+    assert "私聊机密" not in str(rerank.await_args)
+
+
+async def test_cross_group_rag_rejects_legacy_vectors_without_source_ids():
+    operator = operator_for([SimpleNamespace(payload={"text": "无来源旧片段"})])
+    operator._rerank = AsyncMock()
+    assert await operator.search_chat("计划", "g", platform="OneBot V11", require_group_scope=True) == "未找到相关历史记录"
+    operator._rerank.assert_not_awaited()

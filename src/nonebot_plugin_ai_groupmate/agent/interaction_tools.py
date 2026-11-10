@@ -13,11 +13,11 @@ from nonebot_plugin_orm import get_session
 
 from ..model import ChatHistory, StructuredMessage
 from ..reply_guard import is_request_active
+from .group_access import linked_groups, check_linked_group
 from .tool_results import tool_failure, tool_skipped, tool_success
 from .turn_context import TurnHistoryResolver
 from .image_resources import is_image_history
 from .structured_context import StructuredSnapshot, visible_quote_text, load_structured_context_safely
-from ..brain.observations import configured_space
 from ..interaction_history import HistoryMessage, prepare_history, history_metadata, message_evidence, find_repeat_interactions
 
 SCAN_LIMIT = 120_000
@@ -84,7 +84,7 @@ def create_interaction_history_tools(
     scan_cache: list[HistoryMessage] | None = None
     known_bot_ids = {str(uid) for uid in bot_user_ids}
     scan_truncated = False
-    scan_window: tuple[str, str] | None = None
+    scan_window: tuple[str, str, str] | None = None
     reference_now = datetime.now()
 
     async def expired() -> bool:
@@ -100,6 +100,16 @@ def create_interaction_history_tools(
             return rows
         resolver = TurnHistoryResolver(snapshots)
         return [replace(row, structured_ids=resolver.ids(row), structured_metadata=resolver.metadata(row)) for row in rows]
+
+    def structured_evidence(row: StructuredMessage, max_chars: int = 420) -> dict:
+        parts = tuple(part for part in row.parts if isinstance(part, dict))
+        snapshot = StructuredSnapshot(platform_id=row.platform_id, sender_id=row.sender_id,
+                                      reply_to_id=row.reply_to_id, parts=parts, media_paths={})
+        body = visible_quote_text(snapshot) or "[暂不支持的消息]"
+        return {"msg_id": row.id, "user_id": row.sender_id, "user_name": row.sender_name[:80],
+                "created_at": row.created_at.isoformat(), "role": row.sender_kind,
+                "platform_message_id": row.platform_id, "reply_platform_id": row.reply_to_id,
+                "content": body[:max_chars], "content_truncated": len(body) > max_chars}
 
     async def resolve_member(session, member: str) -> tuple[str | None, list[dict]]:
         member = member.strip()
@@ -160,24 +170,11 @@ def create_interaction_history_tools(
         target = target_group_id.strip() or session_id
         cross_group = target != session_id
         if cross_group:
-            def allowed_groups() -> set[str]:
-                spaces = configured_spaces() if configured_spaces else {}
-                space = configured_space(spaces, session_id)
-                return {group for group in spaces.get(space, []) if configured_space(spaces, group) == space} if space else set()
-
-            allowed = allowed_groups()
-            if target not in allowed:
+            access_error = await check_linked_group(session_id, target, configured_spaces, reachable_groups)
+            if access_error == "group_not_allowed":
                 return tool_failure("group_not_allowed", "目标群不在当前群的联动范围。")
-            if reachable_groups is None:
+            if access_error:
                 return tool_failure("group_unavailable", "无法确认当前账号是否在目标群。")
-            try:
-                reachable = await reachable_groups(allowed)
-            except Exception:
-                return tool_failure("group_unavailable", "无法确认当前账号是否在目标群。", retryable=True)
-            if target not in allowed_groups():
-                return tool_failure("group_not_allowed", "目标群已不在当前群的联动范围。")
-            if target not in reachable:
-                return tool_failure("group_unavailable", "当前账号不在目标群，或无法确认其群成员关系。")
             if await expired():
                 return tool_skipped("request_expired", "请求已过期，已取消历史查询。")
             target_platform = linked_platform or platform
@@ -200,20 +197,13 @@ def create_interaction_history_tools(
                                            and_(StructuredMessage.created_at == anchor.created_at, StructuredMessage.id < anchor.id)))
                     rows = list((await session.scalars(select(StructuredMessage).where(*filters)
                                 .order_by(StructuredMessage.created_at.desc(), StructuredMessage.id.desc()).limit(limit + 1))).all())
-                if target not in allowed_groups():
+                if target not in linked_groups(session_id, configured_spaces):
                     return tool_failure("group_not_allowed", "目标群已不在当前群的联动范围。")
                 if await expired():
                     return tool_skipped("request_expired", "请求已过期，已取消历史查询。")
                 messages = []
                 for row in rows[:limit]:
-                    parts = tuple(part for part in row.parts if isinstance(part, dict))
-                    snapshot = StructuredSnapshot(platform_id=row.platform_id, sender_id=row.sender_id,
-                                                  reply_to_id=row.reply_to_id, parts=parts, media_paths={})
-                    body = visible_quote_text(snapshot) or "[暂不支持的消息]"
-                    messages.append({"msg_id": row.id, "user_id": row.sender_id, "user_name": row.sender_name[:80],
-                                     "created_at": row.created_at.isoformat(), "role": row.sender_kind,
-                                     "platform_message_id": row.platform_id, "reply_platform_id": row.reply_to_id,
-                                     "content": body[:300], "content_truncated": len(body) > 300})
+                    messages.append(structured_evidence(row, 300))
                 return _bounded_result("recent_history_found", "已按时间读取联动群的已保存消息。",
                     {"scope": "linked_group", "group_id": target, "mode": "recent", "order": "newest_first",
                      "messages": messages, "next_before_msg_id": messages[-1]["msg_id"] if len(rows) > limit else None,
@@ -275,8 +265,9 @@ def create_interaction_history_tools(
         end_date: str = "",
         offset: Annotated[int, Field(ge=0, le=SCAN_LIMIT)] = 0,
         limit: Annotated[int, Field(ge=1, le=8)] = 5,
+        target_group_id: str = "",
     ) -> str:
-        """查当前群多人跟读的原话、参与者和代表消息，辅助调查梗的传播、共鸣和互动。
+        """查群内多人跟读的原话、参与者和代表消息；默认本群，可指定已联动群 target_group_id。
 
         只发现短时间内多人发送相同文本的事件，不能代表全部讨论或完整话题热度。
         查某人的过往发言优先 read_member_history；查具体话题可用 search_history_context。
@@ -294,29 +285,63 @@ def create_interaction_history_tools(
             _date_filters(start_date, end_date)
         except (ValueError, OverflowError):
             return tool_failure("invalid_date", "日期需为 YYYY-MM-DD，起始日不能晚于结束日。")
+        target = target_group_id.strip() or session_id
+        cross_group = target != session_id
+        target_platform = linked_platform or platform
+        if cross_group:
+            error = await check_linked_group(session_id, target, configured_spaces, reachable_groups)
+            if error == "group_not_allowed":
+                return tool_failure(error, "目标群不在当前群的联动范围。")
+            if error or not target_platform or target_platform == "unknown":
+                return tool_failure("group_unavailable", "无法确认当前账号是否在目标群。")
         try:
-            if scan_cache is None or scan_window != (start_date, end_date):
+            if scan_cache is None or scan_window != (target, start_date, end_date):
                 async with get_session() as session:
-                    raw = await _rows(
-                        session,
-                        select(*_COLUMNS)
-                        .where(
-                            ChatHistory.session_id == session_id,
-                            ChatHistory.content_type.in_(("text", "bot")),
-                            *_date_filters(start_date, end_date),
+                    if cross_group:
+                        filters = [StructuredMessage.platform == target_platform, StructuredMessage.scope == "group",
+                                   StructuredMessage.session_id == target, StructuredMessage.created_at <= reference_now,
+                                   StructuredMessage.sender_kind.in_(("user", "bot"))]
+                        if start_date:
+                            filters.append(StructuredMessage.created_at >= datetime.strptime(start_date, "%Y-%m-%d"))
+                        if end_date:
+                            filters.append(StructuredMessage.created_at < datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1))
+                        scoped = list((await session.scalars(select(StructuredMessage).where(*filters)
+                                      .order_by(StructuredMessage.created_at.desc(), StructuredMessage.id.desc()).limit(SCAN_LIMIT + 1))).all())
+                        raw = []
+                        for row in scoped:
+                            evidence = structured_evidence(row, 1200)
+                            raw.append(HistoryMessage(msg_id=row.id, session_id=target, user_id=row.sender_id,
+                                user_name=row.sender_name, content_type="bot" if row.sender_kind == "bot" else "text",
+                                content=evidence["content"], created_at=row.created_at,
+                                structured_ids=frozenset((row.platform_id,)),
+                                structured_metadata=(row.platform_id, row.reply_to_id, evidence["content"])))
+                    else:
+                        raw = await _rows(
+                            session,
+                            select(*_COLUMNS)
+                            .where(ChatHistory.session_id == session_id, ChatHistory.content_type.in_(("text", "bot")),
+                                   *_date_filters(start_date, end_date))
+                            .order_by(ChatHistory.created_at.desc(), ChatHistory.msg_id.desc()).limit(SCAN_LIMIT + 1),
                         )
-                        .order_by(ChatHistory.created_at.desc(), ChatHistory.msg_id.desc())
-                        .limit(SCAN_LIMIT + 1),
-                    )
                 scan_truncated = len(raw) > SCAN_LIMIT
                 scan_cache, known_bot_ids = prepare_history(raw[:SCAN_LIMIT], known_bot_ids)
-                scan_window = (start_date, end_date)
+                scan_window = (target, start_date, end_date)
             member_id = None
             if member.strip():
-                async with get_session() as session:
-                    member_id, choices = await resolve_member(session, member)
+                if cross_group:
+                    exact = {row.user_id for row in scan_cache if row.user_id == member.strip() and row.content_type == "text"}
+                    matches = exact or {row.user_id for row in scan_cache if member.strip() in row.user_name and row.content_type == "text"}
+                    member_id = next(iter(matches)) if len(matches) == 1 else None
+                    choices = [{"user_id": uid} for uid in sorted(matches)[:9]]
+                else:
+                    async with get_session() as session:
+                        member_id, choices = await resolve_member(session, member)
                 if member_id is None:
                     return tool_failure("ambiguous_member" if choices else "member_not_found", "请从候选用户ID中选择成员。" if choices else "本会话没有匹配成员。", data={"candidates": choices})
+            if cross_group and target not in linked_groups(session_id, configured_spaces):
+                return tool_failure("group_not_allowed", "目标群已不在当前群的联动范围。")
+            if await expired():
+                return tool_skipped("request_expired", "请求已过期，已取消历史查询。")
             selected = scan_cache
             events, candidates = find_repeat_interactions(selected, known_bot_ids)
             if member_id:
@@ -335,7 +360,8 @@ def create_interaction_history_tools(
                 "interactions_found",
                 "互动候选已读取；结合原始上下文判断。",
                 {
-                    "scope": "current_group",
+                    "scope": "linked_group" if cross_group else "current_group",
+                    **({"group_id": target} if cross_group else {}),
                     "scanned_messages": len(scan_cache),
                     "scan_limit": SCAN_LIMIT,
                     "scan_truncated": scan_truncated,
@@ -364,27 +390,94 @@ def create_interaction_history_tools(
         start_date: str = "",
         end_date: str = "",
         limit: Annotated[int, Field(ge=1, le=12)] = 10,
+        target_group_id: str = "",
+        anchor_platform_id: str = "",
     ) -> str:
-        """按成员用户ID/唯一昵称查本群原话，用于往事/约定核对、观点比较、变化追踪和话题溯源。
+        """按成员用户ID/唯一昵称查群聊原话，默认本群；target_group_id 可指定同一联动组的群号。
 
         keyword 为正文子串匹配，日期限定范围；next_before_msg_id 翻页。空结果不证明从未说过。
         或仅传 anchor_msg_id 展开这条消息前后各3条的对话（包含其他成员和标记的BOT）。
         source_message 是所查消息的说话者，messages 中其他人可能仅为跟读或被评价者。
         anchor_msg_id 是工具返回的数据库 msg_id，不是平台回复ID；两种模式不可混用。
+        跨群可用 anchor_platform_id 展开由 RAG 或其他历史工具返回的平台消息ID。
         日期 YYYY-MM-DD（含结束日）；内容截断会标记，不据此补写缺失信息。
         """
         if await expired():
             return tool_skipped("request_expired", "请求已过期，已取消历史查询。")
         if not 1 <= limit <= 12 or min(anchor_msg_id, before_msg_id) < 0 or len(member) > 80 or len(keyword) > 180:
             return tool_failure("invalid_query", "limit 为 1～12，消息ID非负，成员限80字、关键词限180字。")
-        if anchor_msg_id and (member or keyword or before_msg_id or start_date or end_date):
+        if (anchor_msg_id or anchor_platform_id) and (member or keyword or before_msg_id or start_date or end_date):
             return tool_failure("invalid_query", "展开上下文时仅传 anchor_msg_id；成员查询请使用其他参数。")
-        if not anchor_msg_id and not member.strip():
+        if anchor_msg_id and anchor_platform_id:
+            return tool_failure("invalid_query", "请只提供一种来源消息ID。")
+        if not anchor_msg_id and not anchor_platform_id and not member.strip():
             return tool_failure("missing_member", "请提供成员用户ID/昵称，或 anchor_msg_id。")
         try:
             dates = _date_filters(start_date, end_date)
         except (ValueError, OverflowError):
             return tool_failure("invalid_date", "日期需为 YYYY-MM-DD，起始日不能晚于结束日。")
+        target = target_group_id.strip() or session_id
+        if target != session_id:
+            error = await check_linked_group(session_id, target, configured_spaces, reachable_groups)
+            if error == "group_not_allowed":
+                return tool_failure(error, "目标群不在当前群的联动范围。")
+            target_platform = linked_platform or platform
+            if error or not target_platform or target_platform == "unknown":
+                return tool_failure("group_unavailable", "无法确认当前账号是否在目标群。")
+            try:
+                async with get_session() as session:
+                    scope = [StructuredMessage.platform == target_platform, StructuredMessage.scope == "group",
+                             StructuredMessage.session_id == target, StructuredMessage.created_at <= reference_now,
+                             StructuredMessage.sender_kind.in_(("user", "bot"))]
+                    if anchor_msg_id or anchor_platform_id:
+                        anchor_filter = StructuredMessage.id == anchor_msg_id if anchor_msg_id else StructuredMessage.platform_id == anchor_platform_id
+                        anchor = await session.scalar(select(StructuredMessage).where(*scope, anchor_filter))
+                        if anchor is None:
+                            return tool_failure("source_not_found", "目标群没有这条来源消息。")
+                        earlier = or_(StructuredMessage.created_at < anchor.created_at, and_(StructuredMessage.created_at == anchor.created_at, StructuredMessage.id < anchor.id))
+                        later = or_(StructuredMessage.created_at > anchor.created_at, and_(StructuredMessage.created_at == anchor.created_at, StructuredMessage.id > anchor.id))
+                        left = list((await session.scalars(select(StructuredMessage).where(*scope, earlier).order_by(StructuredMessage.created_at.desc(), StructuredMessage.id.desc()).limit(3))).all())
+                        right = list((await session.scalars(select(StructuredMessage).where(*scope, later).order_by(StructuredMessage.created_at, StructuredMessage.id).limit(3))).all())
+                        evidence = [structured_evidence(row, 300) for row in [anchor, *left, *right]]
+                        data = {"mode": "context", "anchor_msg_id": anchor.id, "source_message": structured_evidence(anchor, 300),
+                                "messages": evidence, "context_truncated": False}
+                    else:
+                        uid = member.strip()
+                        exact = await session.scalar(select(StructuredMessage.sender_id).where(*scope, StructuredMessage.sender_id == uid, StructuredMessage.sender_kind == "user").limit(1))
+                        if exact is None:
+                            matches = list((await session.scalars(select(StructuredMessage.sender_id).where(
+                                *scope, StructuredMessage.sender_kind == "user", StructuredMessage.sender_name.contains(uid, autoescape=True),
+                            ).distinct().limit(9))).all())
+                            if len(matches) != 1:
+                                return tool_failure("ambiguous_member" if matches else "member_not_found", "请使用准确成员ID。", data={"candidates": [{"user_id": item} for item in matches]})
+                            uid = matches[0]
+                        if uid in known_bot_ids:
+                            return tool_failure("bot_member", "该ID是已识别的BOT，不能作为真人成员查询。")
+                        filters = [*scope, StructuredMessage.sender_id == uid, StructuredMessage.sender_kind == "user"]
+                        if start_date:
+                            filters.append(StructuredMessage.created_at >= datetime.strptime(start_date, "%Y-%m-%d"))
+                        if end_date:
+                            filters.append(StructuredMessage.created_at < datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1))
+                        if before_msg_id:
+                            filters.append(StructuredMessage.id < before_msg_id)
+                        scan_limit = max(limit * 8, 200) if keyword.strip() else limit + 1
+                        rows = list((await session.scalars(select(StructuredMessage).where(*filters).order_by(StructuredMessage.id.desc()).limit(scan_limit))).all())
+                        selected = [row for row in rows if not keyword.strip() or keyword.strip() in structured_evidence(row, 100_000)["content"]]
+                        matches = [structured_evidence(row) for row in selected]
+                        page = matches[:limit]
+                        cursor = page[-1]["msg_id"] if len(matches) > limit else rows[-1].id if len(rows) == scan_limit else None
+                        data = {"mode": "member", "user_id": uid, "messages": page, "next_before_msg_id": cursor}
+                if target not in linked_groups(session_id, configured_spaces):
+                    return tool_failure("group_not_allowed", "目标群已不在当前群的联动范围。")
+                if await expired():
+                    return tool_skipped("request_expired", "请求已过期，已取消历史查询。")
+                return _bounded_result("history_read", "联动群原始历史已读取。",
+                    {**data, "scope": "linked_group", "group_id": target, "safety_notice": EVIDENCE_NOTICE}, "messages")
+            except Exception:
+                logger.exception("读取联动群成员历史失败")
+                return tool_failure("history_read_failed", "历史查询失败，不能据此判断没有事例。", retryable=True)
+        if anchor_platform_id:
+            return tool_failure("invalid_query", "本群请使用 anchor_msg_id。")
         try:
             scope = ChatHistory.session_id == session_id
             async with get_session() as session:

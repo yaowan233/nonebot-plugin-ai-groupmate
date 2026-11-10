@@ -126,6 +126,16 @@ async def test_recent_history_reads_only_reachable_configured_groups(history_db)
     page = await invoke(recent, target_group_id="group-2", limit=1, before_msg_id=result["data"]["next_before_msg_id"])
     assert [item["content"] for item in page["data"]["messages"]] == ["更早的群消息"]
     assert (await invoke(recent, target_group_id="group-2", before_msg_id=2))["reason_code"] == "source_not_found"
+    member_tool = next(t for t in create_interaction_history_tools(
+        "group-1", None, linked_platform="OneBot V11", configured_spaces=lambda: spaces,
+        reachable_groups=reachable,
+    ) if t.name == "read_member_history")
+    member_result = await invoke(member_tool, member="user", target_group_id="group-2")
+    assert member_result["data"]["scope"] == "linked_group"
+    assert [item["content"] for item in member_result["data"]["messages"]] == ["更早的群消息", "目标群消息"]
+    context = await invoke(member_tool, target_group_id="group-2", anchor_platform_id="msg-1")
+    assert context["data"]["source_message"]["content"] == "目标群消息"
+    assert (await invoke(member_tool, member="user", target_group_id="group-3"))["reason_code"] == "group_not_allowed"
     assert (await invoke(recent, target_group_id="group-3"))["reason_code"] == "group_not_allowed"
     reachable.return_value = {"group-1"}
     assert (await invoke(recent, target_group_id="group-2"))["reason_code"] == "group_unavailable"
@@ -137,6 +147,28 @@ async def test_recent_history_reads_only_reachable_configured_groups(history_db)
     assert (await invoke(recent, target_group_id="group-2"))["reason_code"] == "group_not_allowed"
     spaces.clear()
     assert (await invoke(recent, target_group_id="group-2"))["reason_code"] == "group_not_allowed"
+
+
+async def test_cross_group_interactions_use_scoped_structured_messages(history_db):
+    from nonebot_plugin_ai_groupmate.model import StructuredMessage
+    from nonebot_plugin_ai_groupmate.agent.interaction_tools import create_interaction_history_tools
+
+    now = datetime.now() - timedelta(minutes=2)
+    async with history_db() as session:
+        for i in range(4):
+            session.add(StructuredMessage(platform="OneBot V11", scope="private" if i == 3 else "group",
+                session_id="group-2", platform_id=f"msg-{i}", sender_id=f"user-{i}", sender_name=f"用户{i}",
+                sender_kind="user", bot_id="bot", reply_to_id=None, parts=[{"type": "text", "text": "大家一起重复这句测试内容"}],
+                created_at=now + timedelta(seconds=i)))
+        await session.commit()
+    bundle = create_interaction_history_tools("group-1", None, linked_platform="OneBot V11",
+        configured_spaces=lambda: {"friends": ["group-1", "group-2"]},
+        reachable_groups=AsyncMock(return_value={"group-1", "group-2"}))
+    tool = next(t for t in bundle if t.name == "search_group_interactions")
+    result = await invoke(tool, target_group_id="group-2")
+    assert result["data"]["scope"] == "linked_group"
+    assert result["data"]["scanned_messages"] == 3
+    assert result["data"]["events"][0]["participant_count"] == 3
 
 
 async def test_discovers_interaction_without_evaluation_keyword_and_keeps_roles(history_db):
@@ -261,6 +293,7 @@ def test_history_tools_visible_on_first_group_turn_without_loading_a_skill(mode)
         web_image_tools=[], ordered_reply_tools=[], file_tools=[], file_delivery_tools=[], image_generation_tools=[], drawing_management_tools=[], custom_agent_tools=[], lazy_attachment_tools=[],
         create_explicit_memory_tools=lambda *_, **__: [], create_interaction_history_tools=interaction_tools.create_interaction_history_tools,
         create_platform_query_tool=lambda *_, **__: SimpleNamespace(name="query_platform"), member_snapshot=[], interface=None,
+        create_scoped_history_search_tool=lambda *_, **__: SimpleNamespace(name="search_history_context"),
         session_id="group-1", request_id=None, bot_id="bot-id", plugin_config=SimpleNamespace(bot_name="miyuki"),
         get_bots=lambda: {"bot-id": object()}, str=str, tuple=tuple, set=set, max=max,
         user_id="1", history=[],
