@@ -1,3 +1,4 @@
+from typing import Any, cast
 from datetime import datetime
 
 import pytest
@@ -23,22 +24,23 @@ def test_active_thread_limits_images_across_turns_without_losing_text():
             {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{index}"}},
         ])
 
-    original = [turn(index) for index in range(5)]
+    original: list[BaseMessage] = [turn(index) for index in range(5)]
     limited = limit_history_images(original)
-    assert [part["image_url"]["url"] for message in limited for part in message.content
+    limited_parts = [cast(list[dict[str, Any]], message.content) for message in limited]
+    assert [part["image_url"]["url"] for parts in limited_parts for part in parts
             if part.get("type") == "image_url"] == [
         "data:image/png;base64,2", "data:image/png;base64,3", "data:image/png;base64,4",
     ]
-    assert [message.content[0]["text"] for message in limited] == [f"消息 {index}" for index in range(5)]
-    assert limited[0].content[1] == {"type": "text", "text": "[图片]"}
-    assert original[0].content[1]["type"] == "image_url"
+    assert [parts[0]["text"] for parts in limited_parts] == [f"消息 {index}" for index in range(5)]
+    assert limited_parts[0][1] == {"type": "text", "text": "[图片]"}
+    assert cast(list[dict[str, Any]], original[0].content)[1]["type"] == "image_url"
 
 
 def test_reused_thread_applies_image_limit_to_cached_and_new_messages():
     from nonebot_plugin_ai_groupmate.agent.conversation import (
         ActiveConversationThread,
-        active_conversation_threads,
         build_append_only_history,
+        active_conversation_threads,
     )
 
     def image(index):
@@ -55,8 +57,9 @@ def test_reused_thread_applies_image_limit_to_cached_and_new_messages():
     finally:
         active_conversation_threads.pop("image-limit", None)
 
-    assert reused and len(appended) == 1
-    assert [part["image_url"]["url"] for message in messages for part in message.content
+    assert reused
+    assert len(appended) == 1
+    assert [part["image_url"]["url"] for message in messages for part in cast(list[dict[str, Any]], message.content)
             if part.get("type") == "image_url"] == ["4", "5"]
 
 

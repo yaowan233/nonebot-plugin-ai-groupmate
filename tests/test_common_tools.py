@@ -530,7 +530,7 @@ async def test_cross_group_rag_uses_authorized_target(monkeypatch):
     reachable = AsyncMock(return_value={"group-1", "group-2"})
     tool = common_tools.create_scoped_history_search_tool(
         "group-1", None, platform="OneBot V11", configured_spaces=lambda: {"friends": ["group-1", "group-2"]},
-        reachable_groups=reachable,
+        reachable_groups=reachable, allow_cross_group_history=True,
     )
     result = json.loads(await tool.ainvoke({"query": "572473053 计划", "target_group_id": "group-2"}))
     assert result["status"] == "succeeded"

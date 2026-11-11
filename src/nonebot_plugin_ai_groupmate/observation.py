@@ -9,9 +9,9 @@ from collections.abc import Callable
 
 T = TypeVar("T")
 GroupKey = tuple[str, str]
-MIN_NEW_MESSAGES = 12
+MIN_NEW_MESSAGES = 10
 RECENT_ACTIVITY_SECONDS = 900
-RECENT_PARTICIPATION_SECONDS = 2700
+RECENT_PARTICIPATION_SECONDS = 900
 
 
 @dataclass
@@ -27,7 +27,7 @@ class ObservationSchedule(Generic[T]):
     def __init__(
         self,
         clock: Callable[[], float] = time.monotonic,
-        delay: Callable[[], float] = lambda: random.uniform(2700, 5400),
+        delay: Callable[[], float] = lambda: random.uniform(900, 1800),
     ):
         self.clock = clock
         self.delay = delay

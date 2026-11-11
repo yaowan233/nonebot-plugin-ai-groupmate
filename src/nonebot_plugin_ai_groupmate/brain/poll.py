@@ -3,13 +3,14 @@
 import asyncio
 from collections.abc import Callable, Awaitable
 
-from sqlalchemy import or_, func, exists, select
+from sqlalchemy import func, exists, select
 from nonebot_plugin_orm import get_session
 
-from ..model import BrainTask, BrainWait, BrainCandidateDecision, BrainObservationMessage
+from ..model import BrainTask, BrainWait, BrainAction, BrainCandidateDecision, BrainObservationMessage
 from .worker import Sender, Spaces, utcnow, run_task, run_finalization, process_candidate
 from .actions import mark_unknown
 from .repository import expire_wait, expire_queued, recover_expired_claims, pending_reply_candidates
+from .coordinator import CROSS_GROUP_REPLY_DISCLOSURE
 
 _lock = asyncio.Lock()
 
@@ -51,12 +52,16 @@ async def poll(*, spaces: Spaces, connected: dict[str, str], model_factory: Call
             pending = exists(select(BrainObservationMessage.id).join(
                 BrainWait, (BrainObservationMessage.platform == BrainWait.platform)
                 & (BrainObservationMessage.scene_id == BrainWait.target_scene)
-                & or_(BrainObservationMessage.reply_to == BrainWait.question_message,
-                      (BrainObservationMessage.reply_to.is_(None)) & (BrainObservationMessage.addressed_other.is_(False))
-                      & (BrainObservationMessage.created_at >= BrainWait.unquoted_from)
-                      & (BrainObservationMessage.created_at <= BrainWait.unquoted_until)),
+                & (BrainObservationMessage.reply_to == BrainWait.question_message),
             ).where(
                 BrainWait.task_id == BrainTask.task_id, BrainWait.status == "open", BrainWait.deadline > now,
+                exists(select(BrainAction.action_id).where(
+                    BrainAction.task_id == BrainWait.task_id, BrainAction.logical_step == "ask", BrainAction.status == "confirmed",
+                    BrainAction.platform == BrainWait.platform, BrainAction.target_scene == BrainWait.target_scene,
+                    BrainAction.receipt_message_id == BrainWait.question_message,
+                    BrainAction.content.startswith("来自", autoescape=True),
+                    BrainAction.content.contains(CROSS_GROUP_REPLY_DISCLOSURE, autoescape=True),
+                )),
                 BrainObservationMessage.bot_id == BrainTask.bot_id,
                 BrainObservationMessage.created_at >= BrainTask.created_at,
                 BrainObservationMessage.created_at <= now,

@@ -52,7 +52,7 @@ async def test_members_query_and_scope_change():
             return {"user_id": kwargs["user_id"], "nickname": "小猫", "card": "猫猫", "role": "member", "ignored": 1}
         return [{"user_id": 1, "nickname": "小猫"}, {"user_id": 2, "nickname": "小狗"}]
     bot = SimpleNamespace(adapter=SimpleNamespace(get_name=lambda: "OneBot V11"), call_api=AsyncMock(side_effect=call))
-    tool = create_platform_query_tool(bot, "101", None, lambda: spaces)
+    tool = create_platform_query_tool(bot, "101", None, lambda: spaces, allow_cross_group_members=True)
     result = json.loads(await tool.ainvoke({"operation": "member_info", "group_id": "202", "user_id": "123"}))
     assert result["data"]["member"]["nickname"] == "小猫"
     assert "ignored" not in result["data"]["member"]

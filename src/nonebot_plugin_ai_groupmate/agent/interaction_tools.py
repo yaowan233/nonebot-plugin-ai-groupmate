@@ -78,6 +78,7 @@ def create_interaction_history_tools(
     upper_history_id: int | None = None,
     configured_spaces: Callable[[], dict[str, list[str]]] | None = None,
     reachable_groups: Callable[[set[str]], Awaitable[set[str]]] | None = None,
+    allow_cross_group_history: bool = False,
 ):
     # This cache lives for one Agent request, never as a background index. A
     # second call can filter/page the same evidence without another large scan.
@@ -157,7 +158,7 @@ def create_interaction_history_tools(
     ) -> str:
         """按时间从新到旧读取群聊历史，不需要关键词；默认本群。
 
-        target_group_id 可指定同一联动组内的其他群号；先用 query_platform 的 list_groups 查群名和群号。
+        默认只能读取当前群，不按用户要求调取其他群的聊天记录。
         limit 为每页最多条数（1～50）；since_minutes 限定最近多少分钟，0 表示不限。
         按返回的 next_before_msg_id 继续向前翻页，翻页时保持 since_minutes 不变。
         msg_id 是数据库游标，跨群游标只用于本工具；platform_message_id 才是平台消息 ID。图片只标记类型，不代表已看到图片内容。
@@ -180,6 +181,8 @@ def create_interaction_history_tools(
             target_platform = linked_platform or platform
             if not target_platform or target_platform == "unknown":
                 return tool_failure("group_unavailable", "无法确定目标群所属平台。")
+            if not allow_cross_group_history:
+                return tool_failure("cross_group_history_private", "不能按请求读取或转述其他群的聊天记录。")
             try:
                 async with get_session() as session:
                     filters = [StructuredMessage.platform == target_platform, StructuredMessage.scope == "group",
@@ -267,7 +270,7 @@ def create_interaction_history_tools(
         limit: Annotated[int, Field(ge=1, le=8)] = 5,
         target_group_id: str = "",
     ) -> str:
-        """查群内多人跟读的原话、参与者和代表消息；默认本群，可指定已联动群 target_group_id。
+        """查本群多人跟读的原话、参与者和代表消息；不按用户要求调取其他群的聊天记录。
 
         只发现短时间内多人发送相同文本的事件，不能代表全部讨论或完整话题热度。
         查某人的过往发言优先 read_member_history；查具体话题可用 search_history_context。
@@ -294,6 +297,8 @@ def create_interaction_history_tools(
                 return tool_failure(error, "目标群不在当前群的联动范围。")
             if error or not target_platform or target_platform == "unknown":
                 return tool_failure("group_unavailable", "无法确认当前账号是否在目标群。")
+            if not allow_cross_group_history:
+                return tool_failure("cross_group_history_private", "不能按请求读取或转述其他群的聊天记录。")
         try:
             if scan_cache is None or scan_window != (target, start_date, end_date):
                 async with get_session() as session:
@@ -393,13 +398,12 @@ def create_interaction_history_tools(
         target_group_id: str = "",
         anchor_platform_id: str = "",
     ) -> str:
-        """按成员用户ID/唯一昵称查群聊原话，默认本群；target_group_id 可指定同一联动组的群号。
+        """按成员用户ID/唯一昵称查本群聊天原话，不按用户要求调取其他群的聊天记录。
 
         keyword 为正文子串匹配，日期限定范围；next_before_msg_id 翻页。空结果不证明从未说过。
         或仅传 anchor_msg_id 展开这条消息前后各3条的对话（包含其他成员和标记的BOT）。
         source_message 是所查消息的说话者，messages 中其他人可能仅为跟读或被评价者。
         anchor_msg_id 是工具返回的数据库 msg_id，不是平台回复ID；两种模式不可混用。
-        跨群可用 anchor_platform_id 展开由 RAG 或其他历史工具返回的平台消息ID。
         日期 YYYY-MM-DD（含结束日）；内容截断会标记，不据此补写缺失信息。
         """
         if await expired():
@@ -424,6 +428,8 @@ def create_interaction_history_tools(
             target_platform = linked_platform or platform
             if error or not target_platform or target_platform == "unknown":
                 return tool_failure("group_unavailable", "无法确认当前账号是否在目标群。")
+            if not allow_cross_group_history:
+                return tool_failure("cross_group_history_private", "不能按请求读取或转述其他群的聊天记录。")
             try:
                 async with get_session() as session:
                     scope = [StructuredMessage.platform == target_platform, StructuredMessage.scope == "group",

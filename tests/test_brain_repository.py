@@ -29,6 +29,7 @@ async def test_task_keeps_scope_across_restarts_and_only_accepts_exact_reply():
     from nonebot_plugin_orm import get_session
 
     from nonebot_plugin_ai_groupmate.model import BrainTask, BrainWait
+    from nonebot_plugin_ai_groupmate.brain.actions import ActionSpec, confirm, prepare, claim_send
     from nonebot_plugin_ai_groupmate.brain.repository import TaskInput, claim, finish, submit, accept_reply, matching_waits, wait_for_reply
 
     now = datetime(2026, 11, 10, 12)
@@ -45,6 +46,9 @@ async def test_task_keeps_scope_across_restarts_and_only_accepts_exact_reply():
         assert distinct.task_id != task_id
         assert await claim(db, task_id, "worker", now=now)
         assert not await claim(db, task_id, "other", now=now)
+        action, _ = await prepare(db, ActionSpec(task_id, "ask", "message", "qq", "B", "来自群 A的跨群提问；引用这条消息回复会转告：几点出发？"), task_token="worker", now=now)
+        assert await claim_send(db, action.action_id, task_token="worker", send_token="sender", now=now)
+        assert await confirm(db, action.action_id, send_token="sender", message_id="question", now=now)
         assert await wait_for_reply(db, task_id, "worker", platform="qq", target_scene="B", question_message="question",
                                     deadline=now + timedelta(minutes=30), now=now)
         await db.commit()
@@ -110,6 +114,7 @@ async def test_timeout_and_reply_are_mutually_exclusive():
 async def test_reply_recorded_before_wait_registration_is_found_without_crossing_scope():
     from nonebot_plugin_orm import get_session
 
+    from nonebot_plugin_ai_groupmate.brain.actions import ActionSpec, confirm, prepare, claim_send
     from nonebot_plugin_ai_groupmate.brain.repository import TaskInput, claim, submit, wait_for_reply, pending_reply_candidates
     from nonebot_plugin_ai_groupmate.brain.observations import record_message
 
@@ -119,6 +124,9 @@ async def test_reply_recorded_before_wait_registration_is_found_without_crossing
         task, _ = await submit(db, item, now=now)
         task_id = task.task_id
         assert await claim(db, task_id, "worker", now=now)
+        action, _ = await prepare(db, ActionSpec(task_id, "ask", "message", "qq", "B", "来自群 A的跨群提问；引用这条消息回复会转告：几点出发？"), task_token="worker", now=now)
+        assert await claim_send(db, action.action_id, task_token="worker", send_token="sender", now=now)
+        assert await confirm(db, action.action_id, send_token="sender", message_id="question", now=now)
         for scene, bot, message in [("B", "bot", "good"), ("C", "bot", "wrong-group"), ("B", "other-bot", "wrong-bot")]:
             assert await record_message(db, platform="qq", bot_id=bot, scene_id=scene, message_id=message,
                                         user_id="bob", text="八点", reply_to="question", now=now)
@@ -131,6 +139,33 @@ async def test_reply_recorded_before_wait_registration_is_found_without_crossing
         candidates = await pending_reply_candidates(db, task_id=task_id, now=now)
         assert [event.message_id for event in candidates] == ["good"]
         assert candidates[0].text == "八点"
+
+
+@pytest.mark.asyncio
+async def test_old_undisclosed_question_cannot_relay_a_reply():
+    from nonebot_plugin_orm import get_session
+
+    from nonebot_plugin_ai_groupmate.brain.actions import ActionSpec, confirm, prepare, claim_send
+    from nonebot_plugin_ai_groupmate.brain.repository import TaskInput, claim, submit, accept_reply, wait_for_reply, pending_reply_candidates
+    from nonebot_plugin_ai_groupmate.brain.observations import record_message
+
+    now = datetime(2026, 11, 10, 12)
+    source, target, bot = (uuid4().hex for _ in range(3))
+    async with get_session() as db:
+        task, _ = await submit(db, TaskInput(bot, "qq", source, "m", "alice", "问 B", now + timedelta(hours=1)), now=now)
+        assert await claim(db, task.task_id, "worker", now=now)
+        action, _ = await prepare(db, ActionSpec(task.task_id, "ask", "message", "qq", target, "几点出发？"), task_token="worker", now=now)
+        assert await claim_send(db, action.action_id, task_token="worker", send_token="send", now=now)
+        assert await confirm(db, action.action_id, send_token="send", message_id="old-question", now=now)
+        assert await wait_for_reply(db, task.task_id, "worker", platform="qq", target_scene=target,
+                                    question_message="old-question", deadline=now + timedelta(minutes=30), now=now)
+        assert await record_message(db, platform="qq", bot_id=bot, scene_id=target, message_id="reply", user_id="bob",
+                                    text="八点", reply_to="old-question", now=now)
+        await db.flush()
+        assert await pending_reply_candidates(db, task_id=task.task_id, now=now) == []
+        assert not await accept_reply(db, task.task_id, platform="qq", target_scene=target, reply_to="old-question",
+                                      message_id="reply", user_id="bob", text="八点", now=now)
+        await db.rollback()
 
 
 @pytest.mark.asyncio

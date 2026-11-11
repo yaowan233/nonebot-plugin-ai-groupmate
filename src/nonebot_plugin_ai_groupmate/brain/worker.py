@@ -17,9 +17,10 @@ from nonebot_plugin_orm import get_session
 from ..model import BrainTask, BrainWait, BrainAction, BrainCandidateDecision
 from .actions import ActionSpec, confirm, prepare, claim_send
 from .repository import claim, finish, accept_reply, finish_expired, wait_for_reply, fail_before_send, claim_finalization, pending_reply_candidates
-from .coordinator import plan_request, classify_reply
+from .coordinator import CROSS_GROUP_REPLY_DISCLOSURE, plan_request, classify_reply
 from .observations import configured_space
 from ..message_metadata import is_reliable_platform_id
+from ..cross_group_privacy import hide_other_group_ids, asks_for_group_records, asks_for_personal_data, contains_personal_data
 
 Sender = Callable[[str, str, str, str, str | None], Awaitable[str]]
 Clock = Callable[[], datetime]
@@ -51,7 +52,7 @@ async def _confirm_direct_send(task_id: str, token: str, *, platform: str, bot_i
         return "blocked"
     async with get_session() as db:
         notice, _ = await prepare(db, ActionSpec(task_id, "send_notice", "notice", platform, source,
-                                                 f"已向 {target} 群发送消息。"), task_token=token, now=clock())
+                                                 "已向对方群发送消息。"), task_token=token, now=clock())
         action_id, status, receipt = notice.action_id, notice.status, notice.receipt_message_id
         await db.commit()
     if status in {"sending", "delivery_unknown"}:
@@ -65,7 +66,7 @@ async def _confirm_direct_send(task_id: str, token: str, *, platform: str, bot_i
                 return "unavailable"
             await db.commit()
         try:
-            receipt = await sender(platform, bot_id, source, f"已向 {target} 群发送消息。", source_message)
+            receipt = await sender(platform, bot_id, source, "已向对方群发送消息。", source_message)
         except Exception:
             await _block(task_id, token, clock())
             return "delivery_unknown"
@@ -233,7 +234,9 @@ async def run_task(task_id: str, *, spaces: Spaces, model, sender: Sender,
                 answer_text, answer_scene = answer
                 if not answer_text or answer_scene not in allowed:
                     raise ValueError("Answer source is no longer in this space")
-                target, text = source, f"{answer_scene} 群回复：{answer_text}"
+                target = source
+                text = ("对方群的答复涉及个人敏感信息，我没有跨群转述。" if contains_personal_data(answer_text)
+                        else f"对方群回复：{answer_text}")
             else:
                 try:
                     if name_resolver is not None:
@@ -250,6 +253,12 @@ async def run_task(task_id: str, *, spaces: Spaces, model, sender: Sender,
                     return "finalizing" if recorded else "unavailable"
                 target = proposal.target_scene if proposal.kind == "ask" else source
                 text = proposal.text
+                if proposal.kind == "ask" and asks_for_group_records(text):
+                    target, text = source, "我不会跨群索取或搬运其他群的聊天记录。"
+                elif proposal.kind == "ask" and (contains_personal_data(text) or asks_for_personal_data(text)):
+                    target, text = source, "这个问题涉及个人敏感信息，我不跨群询问。"
+                elif proposal.kind == "ask":
+                    text = f"来自另一群{CROSS_GROUP_REPLY_DISCLOSURE}{text}"
             assert target is not None
             async with get_session() as db:
                 action, _ = await prepare(db, ActionSpec(task_id, step, "message", platform, target, text),
@@ -274,7 +283,8 @@ async def run_task(task_id: str, *, spaces: Spaces, model, sender: Sender,
                     return "unavailable"
                 await db.commit()
             try:
-                receipt_id = await sender(platform, bot_id, target, text, source_message if target == source else None)
+                safe_text = hide_other_group_ids(text, target, _spaces(spaces))
+                receipt_id = await sender(platform, bot_id, target, safe_text, source_message if target == source else None)
             except Exception:
                 # Leave sending in the journal. Lease recovery marks it unknown.
                 await _block(task_id, token, clock())

@@ -117,7 +117,7 @@ async def test_recent_history_reads_only_reachable_configured_groups(history_db)
     reachable = AsyncMock(return_value={"group-1", "group-2"})
     recent = next(t for t in create_interaction_history_tools(
         "group-1", None, upper_history_id=1, platform="OneBot V11", configured_spaces=lambda: spaces,
-        reachable_groups=reachable,
+        reachable_groups=reachable, allow_cross_group_history=True,
     ) if t.name == "read_recent_history")
     result = await invoke(recent, target_group_id="group-2", limit=1)
     assert result["data"]["scope"] == "linked_group"
@@ -128,7 +128,7 @@ async def test_recent_history_reads_only_reachable_configured_groups(history_db)
     assert (await invoke(recent, target_group_id="group-2", before_msg_id=2))["reason_code"] == "source_not_found"
     member_tool = next(t for t in create_interaction_history_tools(
         "group-1", None, linked_platform="OneBot V11", configured_spaces=lambda: spaces,
-        reachable_groups=reachable,
+        reachable_groups=reachable, allow_cross_group_history=True,
     ) if t.name == "read_member_history")
     member_result = await invoke(member_tool, member="user", target_group_id="group-2")
     assert member_result["data"]["scope"] == "linked_group"
@@ -163,7 +163,7 @@ async def test_cross_group_interactions_use_scoped_structured_messages(history_d
         await session.commit()
     bundle = create_interaction_history_tools("group-1", None, linked_platform="OneBot V11",
         configured_spaces=lambda: {"friends": ["group-1", "group-2"]},
-        reachable_groups=AsyncMock(return_value={"group-1", "group-2"}))
+        reachable_groups=AsyncMock(return_value={"group-1", "group-2"}), allow_cross_group_history=True)
     tool = next(t for t in bundle if t.name == "search_group_interactions")
     result = await invoke(tool, target_group_id="group-2")
     assert result["data"]["scope"] == "linked_group"

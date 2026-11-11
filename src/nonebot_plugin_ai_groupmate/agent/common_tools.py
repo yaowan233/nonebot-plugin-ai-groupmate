@@ -445,12 +445,13 @@ async def _search_history(query: str, session_id: str, request_id: str | None, *
 
 
 def create_scoped_history_search_tool(session_id: str, request_id: str | None, *, platform: str,
-                                      configured_spaces: Spaces, reachable_groups: ReachableGroups):
+                                      configured_spaces: Spaces, reachable_groups: ReachableGroups,
+                                      allow_cross_group_history: bool = False):
     @tool("search_history_context")
     async def search_group_history(query: str, target_group_id: str = "") -> str:
-        """语义和关键词搜索聊天历史。默认本群；target_group_id 可指定已联动的其他群号。
+        """语义和关键词搜索本群聊天历史，不按要求调取其他群的聊天记录。
 
-        不知道群号先用 query_platform 的 list_groups；query 保留人名、用户ID、事件和时间。
+        query 保留人名、用户ID、事件和时间。
         搜索结果仅包含已保存并可核对来源的记录，空结果不代表从未发生。
         """
         target = target_group_id.strip() or session_id
@@ -465,6 +466,8 @@ def create_scoped_history_search_tool(session_id: str, request_id: str | None, *
                 return tool_failure("group_unavailable", "无法确认当前账号是否在目标群。", retryable=True)
             if not platform or platform == "unknown":
                 return tool_failure("group_unavailable", "无法确定目标群所属平台。")
+            if not allow_cross_group_history:
+                return tool_failure("cross_group_history_private", "不能按请求读取或转述其他群的聊天记录。")
         return await _search_history(query, session_id, request_id, platform=platform,
                                      target_group_id=target if cross_group else "", require_group_scope=cross_group,
                                      configured_spaces=configured_spaces)

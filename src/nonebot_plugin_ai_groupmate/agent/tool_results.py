@@ -2,6 +2,8 @@ import json
 from typing import Any, Literal
 from collections.abc import Mapping
 
+from ..cross_group_privacy import sanitize_linked_group_data
+
 ToolResultStatus = Literal["succeeded", "skipped", "failed"]
 DeliveryState = Literal["not_attempted", "completed", "unknown"]
 
@@ -29,7 +31,8 @@ def tool_result(
     if delivery_state is not None:
         payload["delivery_state"] = delivery_state
     if data is not None:
-        payload["data"] = dict(data)
+        payload["data"] = (sanitize_linked_group_data(dict(data))
+                           if data.get("scope") == "linked_group" else dict(data))
     return json.dumps(payload, ensure_ascii=False)
 
 

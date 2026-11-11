@@ -112,7 +112,8 @@ async def reachable_group_ids(bot: Any, allowed: set[str]) -> set[str]:
 
 def create_platform_query_tool(bot: Any, session_id: str, request_id: str | None,
                                spaces: Callable[[], dict[str, list[str]]], *, interface: Any = None,
-                               group_members: list[Any] | None = None, bot_user_ids: Sequence[str] = ()):
+                               group_members: list[Any] | None = None, bot_user_ids: Sequence[str] = (),
+                               allow_cross_group_members: bool = False):
     provider_factory = QUERY_PROVIDERS.get(adapter_name(bot)) if bot is not None else None
     provider = provider_factory(bot) if provider_factory is not None else None
     member_tool = create_group_member_tool(session_id, request_id, interface, group_members=group_members, bot_user_ids=bot_user_ids)
@@ -127,7 +128,7 @@ def create_platform_query_tool(bot: Any, session_id: str, request_id: str | None
     async def query_platform(operation: str, group_id: str = "", user_id: str = "", keyword: str = "",
                              limit: Annotated[int, Field(ge=1, le=20)] = 10, random_selection: bool = False,
                              exclude_user_ids: Annotated[list[str], Field(max_length=20)] | None = None) -> str:
-        """查询群信息 group_info、联动群 list_groups、成员 member_info 或 list_members。默认当前群；keyword 筛选，random_selection 随机抽人，自动排除机器人。提及时使用返回的 user_id。"""
+        """查询群信息 group_info、联动群 list_groups，或本群成员 member_info / list_members。keyword 筛选，random_selection 随机抽人，自动排除机器人。提及时使用返回的 user_id。"""
         if request_id is not None and not await is_request_active(session_id, request_id):
             return tool_skipped("request_expired", "请求已过期。")
         if operation not in {"group_info", "list_groups", "member_info", "list_members"}:
@@ -136,6 +137,8 @@ def create_platform_query_tool(bot: Any, session_id: str, request_id: str | None
         allowed = allowed_groups()
         if operation != "list_groups" and group_id not in allowed:
             return tool_failure("group_not_allowed", "该群不在当前群的可查询范围。")
+        if group_id != session_id and operation in {"member_info", "list_members"} and not allow_cross_group_members:
+            return tool_failure("cross_group_members_private", "不能按请求查询其他群的成员名单或成员资料。")
         if operation == "list_members" and group_id == session_id and (group_members is not None or interface is not None or provider is None):
             return await member_tool.ainvoke({"keyword": keyword, "limit": limit, "random_selection": random_selection,
                                              "exclude_user_ids": exclude_user_ids})

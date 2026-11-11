@@ -381,7 +381,8 @@ async def _poll_cross_group_observations() -> None:
         async with maintenance_gate.slot():
             await poll_observations(
                 spaces=plugin_config.cross_group_spaces, connected=connected,
-                paused=lambda bot_id, scene: time.monotonic() < participation.state((bot_id, scene)).quiet_until,
+                paused=lambda bot_id, scene: (resolve_group_reply_probability(scene) <= 0
+                                              or time.monotonic() < participation.state((bot_id, scene)).quiet_until),
                 model_factory=get_summary_model,
                 now=datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None),
             )
@@ -2113,6 +2114,7 @@ async def handle_reply_request(request: ReplyRequest) -> None:
                     resolver=recent_resolver,
                 ) if not is_private else "",
                 is_continuous=is_continuous,
+                proactive_observation=proactive_observation,
                 on_failure=lambda error_type, status: gate_failure.append((error_type, status)),
             )
             if pilot_trace:

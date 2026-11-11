@@ -34,7 +34,7 @@ async def test_cross_group_round_trip_survives_reloaded_sessions():
 
     spaces = {"friends": [group_a, group_b]}
     assert await run_task(task_id, spaces=spaces, model=model, sender=send, clock=lambda: now) == "waiting_input"
-    assert sent == [("qq", "bot", group_b, "郊游几点出发？", None)]
+    assert sent == [("qq", "bot", group_b, "来自另一群的跨群提问；引用这条消息回复会转告：郊游几点出发？", None)]
     async with get_session() as db:
         assert await record_message(db, platform="qq", bot_id="bot", scene_id=group_b, message_id="answer",
                                     user_id="bob", text="八点出发", reply_to="receipt-1", now=now)
@@ -44,7 +44,7 @@ async def test_cross_group_round_trip_survives_reloaded_sessions():
     model.ainvoke.return_value.content = '{"result":"answer"}'
     assert await process_candidate(task_id, spaces=spaces, model=model, clock=lambda: now) == "answer"
     assert await run_task(task_id, spaces=spaces, model=model, sender=send, clock=lambda: now) == "completed"
-    assert sent[1] == ("qq", "bot", group_a, f"{group_b} 群回复：八点出发", "source-message")
+    assert sent[1] == ("qq", "bot", group_a, "对方群回复：八点出发", "source-message")
     assert await run_task(task_id, spaces=spaces, model=model, sender=send, clock=lambda: now) == "unavailable"
     assert len(sent) == 2
     async with get_session() as db:
@@ -106,7 +106,7 @@ async def test_unrelated_candidate_is_not_reclassified_on_every_poll():
 
 
 @pytest.mark.asyncio
-async def test_unquoted_answer_is_checked_without_capturing_other_mentions():
+async def test_only_explicit_replies_are_candidates_for_cross_group_return():
     from nonebot_plugin_orm import get_session
 
     from nonebot_plugin_ai_groupmate.brain.worker import run_task, process_candidate
@@ -131,13 +131,15 @@ async def test_unquoted_answer_is_checked_without_capturing_other_mentions():
                                     user_id="bob", text="九点", now=now + timedelta(minutes=3))
         assert await record_message(db, platform="qq", bot_id="bot", scene_id=group_b, message_id="answer",
                                     user_id="bob", text="八点", now=now + timedelta(seconds=1))
+        assert await record_message(db, platform="qq", bot_id="bot", scene_id=group_b, message_id="quoted",
+                                    user_id="bob", text="八点", reply_to="question", now=now + timedelta(seconds=2))
         await db.commit()
     async with get_session() as db:
         candidates = await pending_reply_candidates(db, task_id=task_id, now=now + timedelta(minutes=4))
-        assert [row.message_id for row in candidates] == ["answer"]
+        assert [row.message_id for row in candidates] == ["quoted"]
     model.ainvoke.return_value.content = '{"result":"answer"}'
     assert await process_candidate(task_id, spaces=spaces, model=model, clock=lambda: now + timedelta(minutes=4)) == "answer"
-    assert '"unquoted": true' in model.ainvoke.await_args.args[0][1].content
+    assert '"unquoted": false' in model.ainvoke.await_args.args[0][1].content
 
 
 @pytest.mark.asyncio
@@ -166,5 +168,5 @@ async def test_unquoted_message_does_not_choose_between_two_open_questions():
                              user_id="bob", text="八点", now=now + timedelta(seconds=1))
         await db.commit()
     calls_before = model.ainvoke.await_count
-    assert await process_candidate(tasks[0], spaces=spaces, model=model, clock=lambda: now + timedelta(seconds=2)) == "uncertain"
+    assert await process_candidate(tasks[0], spaces=spaces, model=model, clock=lambda: now + timedelta(seconds=2)) == "unavailable"
     assert model.ainvoke.await_count == calls_before

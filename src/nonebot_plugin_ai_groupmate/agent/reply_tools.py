@@ -16,6 +16,7 @@ from .tool_results import tool_failure, tool_skipped, tool_success
 from .outbound_plan import compose_segments
 from ..message_metadata import is_reliable_platform_id
 from ..message_repository import find_by_platform_id, structured_id_in_scope
+from ..cross_group_privacy import hide_other_group_ids
 
 
 async def resolve_reply_target(db_session, session_id: str, reply_to: str | None, *, current_message_id: str | None = None, replied_message_id: str | None = None, outbound_identity: OutboundIdentity | None = None) -> str | None:
@@ -78,6 +79,7 @@ def create_reply_tool(
     replied_message_id: str | None = None,
     recovery_enabled: bool = True,
     outbound_identity: OutboundIdentity | None = None,
+    cross_group_spaces: dict[str, list[str]] | None = None,
 ):
     """
     核心工具：用于发送消息。
@@ -156,6 +158,7 @@ def create_reply_tool(
                 content = plain_chat_text(content.strip(), request_text=request_text)
                 if not wants_original_format(request_text) and "```" not in content and "~~~" not in content:
                     content = _dedupe_consecutive_lines(content)
+            content = hide_other_group_ids(content, session_id, cross_group_spaces or {})
             current_pattern = r"(?<![\w@])@current(?=$|[\s，。,.!！?？:：;；、)）\]\"'”’])"
             if re.search(current_pattern, content, re.IGNORECASE):
                 if not current_user_id:

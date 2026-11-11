@@ -17,6 +17,7 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.dialects.postgresql import insert as postgres_insert
 
 from ..model import BrainTask, BrainWait, BrainAction, BrainCandidateDecision, BrainObservationMessage
+from .coordinator import CROSS_GROUP_REPLY_DISCLOSURE
 
 
 @dataclass(frozen=True)
@@ -126,7 +127,7 @@ async def matching_waits(db: AsyncSession, *, platform: str, target_scene: str, 
 
 
 async def pending_reply_candidates(db: AsyncSession, *, task_id: str, now: datetime) -> list[BrainObservationMessage]:
-    """Read scoped candidates, including messages stored before wait registration.
+    """Read explicit replies, including messages stored before wait registration.
 
     A quoted message is evidence of association, not proof it answers the
     question. The coordinator must validate its meaning before accept_reply.
@@ -134,13 +135,17 @@ async def pending_reply_candidates(db: AsyncSession, *, task_id: str, now: datet
     return list((await db.scalars(select(BrainObservationMessage).join(
         BrainWait, (BrainObservationMessage.platform == BrainWait.platform)
         & (BrainObservationMessage.scene_id == BrainWait.target_scene)
-        & or_(BrainObservationMessage.reply_to == BrainWait.question_message,
-              (BrainObservationMessage.reply_to.is_(None)) & (BrainObservationMessage.addressed_other.is_(False))
-              & (BrainObservationMessage.created_at >= BrainWait.unquoted_from)
-              & (BrainObservationMessage.created_at <= BrainWait.unquoted_until)),
+        & (BrainObservationMessage.reply_to == BrainWait.question_message),
     ).join(BrainTask, BrainTask.task_id == BrainWait.task_id).where(
         BrainTask.task_id == task_id, BrainTask.status == "waiting_input", BrainTask.deadline > now,
         BrainWait.status == "open", BrainWait.deadline > now,
+        exists(select(BrainAction.action_id).where(
+            BrainAction.task_id == BrainWait.task_id, BrainAction.logical_step == "ask",
+            BrainAction.status == "confirmed", BrainAction.platform == BrainWait.platform,
+            BrainAction.target_scene == BrainWait.target_scene, BrainAction.receipt_message_id == BrainWait.question_message,
+            BrainAction.content.startswith("来自", autoescape=True),
+            BrainAction.content.contains(CROSS_GROUP_REPLY_DISCLOSURE, autoescape=True),
+        )),
         BrainObservationMessage.bot_id == BrainTask.bot_id,
         BrainObservationMessage.created_at >= BrainTask.created_at,
         BrainObservationMessage.created_at <= now,
@@ -250,24 +255,20 @@ async def accept_reply(db: AsyncSession, task_id: str, *, platform: str, target_
                        message_id: str, user_id: str, text: str, now: datetime, unquoted: bool = False) -> bool:
     if not all((platform, target_scene, message_id, user_id, text.strip())):
         return False
+    if unquoted:
+        return False
     waiting = await db.get(BrainWait, task_id)
     if waiting is None or (waiting.platform, waiting.target_scene) != (platform, target_scene):
         return False
-    if unquoted:
-        task = await db.get(BrainTask, task_id)
-        if task is None or reply_to:
-            return False
-        candidate = await db.scalar(select(BrainObservationMessage.id).where(
-            BrainObservationMessage.platform == platform, BrainObservationMessage.bot_id == task.bot_id,
-            BrainObservationMessage.scene_id == target_scene, BrainObservationMessage.message_id == message_id,
-            BrainObservationMessage.user_id == user_id, BrainObservationMessage.text == text,
-            BrainObservationMessage.reply_to.is_(None), BrainObservationMessage.addressed_other.is_(False),
-            BrainObservationMessage.created_at >= waiting.unquoted_from,
-            BrainObservationMessage.created_at <= waiting.unquoted_until,
-        ))
-        if candidate is None:
-            return False
-    elif waiting.question_message != reply_to:
+    if waiting.question_message != reply_to:
+        return False
+    disclosed = await db.scalar(select(BrainAction.action_id).where(
+        BrainAction.task_id == task_id, BrainAction.logical_step == "ask", BrainAction.status == "confirmed",
+        BrainAction.platform == platform, BrainAction.target_scene == target_scene,
+        BrainAction.receipt_message_id == reply_to, BrainAction.content.startswith("来自", autoescape=True),
+        BrainAction.content.contains(CROSS_GROUP_REPLY_DISCLOSURE, autoescape=True),
+    ))
+    if disclosed is None:
         return False
     result = await db.execute(update(BrainTask).where(
         BrainTask.task_id == task_id, BrainTask.status == "waiting_input", BrainTask.deadline > now,

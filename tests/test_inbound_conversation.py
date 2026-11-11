@@ -296,7 +296,7 @@ async def test_only_new_group_text_feeds_affinity_with_public_api(deliver_messag
 @pytest.mark.asyncio
 async def test_ordinary_chat_is_counted_locally_and_only_due_looks_are_queued(deliver_message, monkeypatch):
     import nonebot_plugin_ai_groupmate as plugin
-    from nonebot_plugin_ai_groupmate.observation import ObservationSchedule
+    from nonebot_plugin_ai_groupmate.observation import MIN_NEW_MESSAGES, ObservationSchedule
 
     deliver, queued, _ = deliver_message
     now = [1000.0]
@@ -313,7 +313,7 @@ async def test_ordinary_chat_is_counted_locally_and_only_due_looks_are_queued(de
     await deliver("observation-inbound", "command", "/查看群API")
     await deliver("observation-private", "private", "私聊不观察", is_private=True)
     queued.reset_mock()  # Private delivery is an addressed request.
-    assert observer.watches[("bot-1", "observation-inbound")].messages == 12
+    assert observer.watches[("bot-1", "observation-inbound")].messages == MIN_NEW_MESSAGES
     assert len(observer.watches) == 1
     await plugin._occasionally_observe_groups()
     queued.assert_not_awaited()

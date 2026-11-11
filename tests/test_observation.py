@@ -18,10 +18,10 @@ def schedule():
 def test_time_new_messages_and_recent_activity_are_all_required(schedule):
     observer, now = schedule
     allowed = Mock(return_value=True)
-    for number in range(11):
+    for number in range(9):
         observer.note(KEY, str(number))
     now[0] += 2700
-    assert observer.take_due(allowed) is None  # Fewer than twelve messages.
+    assert observer.take_due(allowed) is None  # Fewer than ten messages.
     observer.note(KEY, "latest")
     assert observer.take_due(allowed) == "latest"
     allowed.assert_called_once_with(KEY)
@@ -29,7 +29,7 @@ def test_time_new_messages_and_recent_activity_are_all_required(schedule):
         assert observer.take_due(allowed) is None
     now[0] += 2700
     assert observer.take_due(allowed) is None  # Time alone earns no look.
-    for _ in range(12):
+    for _ in range(10):
         observer.note(KEY, "new conversation")
     now[0] += 901
     assert observer.take_due(allowed) is None  # An idle group isn't awakened.
@@ -39,7 +39,7 @@ def test_time_new_messages_and_recent_activity_are_all_required(schedule):
 
 def test_new_messages_do_not_bypass_interval_and_blocked_looks_back_off(schedule):
     observer, now = schedule
-    for _ in range(12):
+    for _ in range(10):
         observer.note(KEY, "chat")
     allowed = Mock(return_value=False)
     now[0] += 2699
@@ -59,18 +59,18 @@ def test_stop_pauses_until_addressed_and_bot_participation_defers_looks(schedule
     observer, now = schedule
     observer.note(KEY, "stop", disengaged=True)
     now[0] += 2700
-    for _ in range(12):
+    for _ in range(10):
         observer.note(KEY, "others talking")
     assert observer.take_due(lambda _: True) is None
     observer.note(KEY, "called bot again", addressed=True)
-    for _ in range(12):
+    for _ in range(10):
         observer.note(KEY, "chat")
     now[0] += 2000
     observer.participated(KEY)
     now[0] += 2700
     observer.note(KEY, "one new message")
     assert observer.take_due(lambda _: True) is None
-    for _ in range(11):
+    for _ in range(9):
         observer.note(KEY, "new conversation")
     assert observer.take_due(lambda _: True) == "new conversation"
 
@@ -79,7 +79,7 @@ def test_groups_are_scoped_globally_throttled_bounded_and_expire(schedule):
     observer, now = schedule
     keys = (KEY, ("other-bot", "group"), ("bot", "other-group"))
     for key in keys:
-        for _ in range(12):
+        for _ in range(10):
             observer.note(key, str(key))
     now[0] += 2700
     for key in keys:
@@ -144,11 +144,56 @@ async def test_observation_prompt_has_no_current_request_or_reused_thread(monkey
     assert not result.need_reply
     assert "没有当前用户请求" in captured["prompt"]
     assert 'next_step="end"' in captured["prompt"]
-    assert "看完就调用 `finish`" in captured["prompt"]
+    assert "不合适时调用 `finish`" in captured["prompt"]
     assert "追答旧问题" in captured["prompt"]
     no_thread.assert_not_called()
     thread_update.assert_not_awaited()
     avatar.assert_not_awaited()
+
+
+async def test_proactive_observation_receives_relevant_cross_group_inspiration(monkeypatch):
+    from datetime import datetime
+
+    from nonebot_plugin_orm import get_session
+
+    from nonebot_plugin_ai_groupmate import agent
+    from nonebot_plugin_ai_groupmate.model import ChatHistorySchema
+
+    captured = {}
+
+    class Graph:
+        async def ainvoke(self, state, **kwargs):
+            captured["prompt"] = state["messages"][-1].content
+            return {**state, "called_finish": 1, "llm_call_count": 1}
+
+    for name in ("get_user_relation_context", "get_recent_relations_context", "get_group_context"):
+        monkeypatch.setattr(agent, name, AsyncMock(return_value=""))
+    monkeypatch.setattr(agent.plugin_config, "cross_group_spaces", {"test": ["target", "source"]})
+    cross = AsyncMock(return_value="【内部观察线索】osu! 编辑器更新")
+    monkeypatch.setattr(agent, "relevant_context", cross)
+    monkeypatch.setattr(agent, "build_registered_agent_extensions", AsyncMock(return_value=([], [], [])))
+    monkeypatch.setattr(agent, "get_chat_model", lambda: object())
+    monkeypatch.setattr(agent, "build_chat_graph", lambda *_, **__: Graph())
+    monkeypatch.setattr(agent, "record_token_usage", AsyncMock())
+    history = [ChatHistorySchema(msg_id=1, session_id="target", user_id="member", user_name="Member",
+                                 content_type="text", content="osu 更新了什么", created_at=datetime.now())]
+    async with get_session() as db:
+        await agent.choice_response_strategy(db, "target", None, history, "member", "Member", bot_id="bot",
+                                             group_members=[], proactive_observation=True)
+    cross.assert_awaited_once()
+    assert cross.await_args is not None
+    assert "osu" in cross.await_args.kwargs["query"]
+
+
+def test_proactive_prompt_allows_natural_everyday_banter():
+    from nonebot_plugin_ai_groupmate.agent import _chat_task_instruction
+
+    prompt = _chat_task_instruction(proactive_observation=True, repeat_text=None, reaction_required=False,
+                                    is_private=False, proactive_reaction_only=False, proactive_meme_only=False,
+                                    meme_required=False, meme_send_count=1)
+    assert "通常看完就调用" not in prompt
+    assert "符合你的兴趣" not in prompt
+    assert "接话" in prompt
 
 
 @pytest.mark.asyncio

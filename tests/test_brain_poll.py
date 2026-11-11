@@ -7,6 +7,10 @@ from unittest.mock import AsyncMock
 import pytest
 
 
+def _allow_relay_model():
+    return SimpleNamespace(ainvoke=AsyncMock(return_value=SimpleNamespace(content='{"send": true, "reason": ""}')))
+
+
 @pytest.fixture
 async def cleanup_direct_tasks():
     yield
@@ -24,21 +28,31 @@ async def cleanup_direct_tasks():
 
 @pytest.mark.asyncio
 async def test_send_to_linked_group_uses_explicit_content_and_confirms_delivery(cleanup_direct_tasks):
+    from nonebot_plugin_orm import get_session
+
+    from nonebot_plugin_ai_groupmate.model import BrainTask
     from nonebot_plugin_ai_groupmate.brain.poll import poll
     from nonebot_plugin_ai_groupmate.brain.tools import create_coordination_tool
 
     group_a, group_b, bot = f"cross-send-test-{uuid4().hex}", uuid4().hex, uuid4().hex
     spaces = {"friends": [group_a, group_b]}
     reachable = AsyncMock(return_value={group_a, group_b})
+    reviewer = _allow_relay_model()
     tool = create_coordination_tool(config=SimpleNamespace(cross_group_spaces=spaces), platform="qq", bot_id=bot,
                                     scene_id=group_a, user_id="alice", message_id="source", request_id=None,
-                                    request_text="你随便吧", reachable_groups=reachable)
+                                    request_text="你随便吧", reachable_groups=reachable,
+                                    review_model=reviewer, user_name="Alice")
     args = {"reason": "用户让我去交流群发一句问候", "operation": "send", "target_group_id": group_b, "message": "大家好呀"}
     result = json.loads(await tool.ainvoke(args))
     assert result["reason_code"] == "coordination_queued"
+    async with get_session() as db:
+        task = await db.get(BrainTask, result["data"]["task_id"])
+        assert task is not None
+        assert (task.deadline - task.created_at).total_seconds() == 120
     assert json.loads(await tool.ainvoke(args))["data"]["created"] is False
     conflict = json.loads(await tool.ainvoke({**args, "message": "另一条消息"}))
     assert conflict["reason_code"] == "task_conflict"
+    assert reviewer.ainvoke.await_count == 1
     assert json.loads(await tool.ainvoke({"reason": "询问群友"}))["reason_code"] == "task_conflict"
     model = SimpleNamespace(ainvoke=AsyncMock())
     sent = []
@@ -49,7 +63,7 @@ async def test_send_to_linked_group_uses_explicit_content_and_confirms_delivery(
 
     kwargs = {"spaces": spaces, "connected": {bot: "qq"}, "model_factory": lambda: model, "sender": sender}
     assert await poll(**kwargs) == "completed"
-    assert sent[0] == ("qq", bot, group_b, "大家好呀", None)
+    assert sent[0] == ("qq", bot, group_b, "另一群的 Alice 托我转达：大家好呀", None)
     assert sent[1][2] == group_a
     assert sent[1][4] == "source"
     assert "发送消息" in sent[1][3]
@@ -74,6 +88,48 @@ async def test_direct_send_rejects_unlinked_or_unreachable_targets(cleanup_direc
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("model_response", "expected"), [
+    ('{"send": false, "reason": "那边正在聊严肃的事，先不打断了。"}', "relay_declined"),
+    ("不是有效的判断结果", "review_unavailable"),
+])
+async def test_direct_relay_reviews_both_conversations_before_queueing(model_response, expected, cleanup_direct_tasks):
+    from sqlalchemy import delete, select
+    from nonebot_plugin_orm import get_session
+
+    from nonebot_plugin_ai_groupmate.model import BrainTask, ChatHistory, HistoryMessageIndex
+    from nonebot_plugin_ai_groupmate.brain.tools import create_coordination_tool
+
+    source, target, bot = f"cross-send-test-{uuid4().hex}", uuid4().hex, uuid4().hex
+    now = datetime.now()
+    prior = SimpleNamespace(content_type="text", user_name="Alice", content="id: prior\n源群正在聊比赛", created_at=now)
+    async with get_session() as db:
+        db.add(ChatHistory(session_id=target, user_id="bob", user_name="Bob", content_type="text",
+                           content="id: target\n目标群正在商量正事"))
+        await db.commit()
+    reviewer = SimpleNamespace(ainvoke=AsyncMock(return_value=SimpleNamespace(content=model_response)))
+    tool = create_coordination_tool(
+        config=SimpleNamespace(cross_group_spaces={"friends": [source, target]}), platform="qq", bot_id=bot,
+        scene_id=source, user_id="alice", user_name="Alice", message_id="source", request_id=None,
+        request_text="帮我去隔壁说句话", source_history=[prior], review_model=reviewer,
+        reachable_groups=AsyncMock(return_value={source, target}),
+    )
+    try:
+        result = json.loads(await tool.ainvoke({"reason": "传话", "operation": "send", "target_group_id": target, "message": "你好"}))
+        assert result["reason_code"] == expected
+        payload = json.loads(reviewer.ainvoke.await_args.args[0][-1].content)
+        assert payload["来源群近期聊天"][0]["text"] == "源群正在聊比赛"
+        assert payload["目标群近期聊天"][0]["text"] == "目标群正在商量正事"
+        assert payload["待转达原文"] == "你好"
+        async with get_session() as db:
+            assert await db.scalar(select(BrainTask).where(BrainTask.source_scene == source)) is None
+    finally:
+        async with get_session() as db:
+            await db.execute(delete(HistoryMessageIndex).where(HistoryMessageIndex.session_id == target))
+            await db.execute(delete(ChatHistory).where(ChatHistory.session_id == target))
+            await db.commit()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("failed_call", [1, 2])
 async def test_direct_send_with_unknown_delivery_does_not_repeat(failed_call, cleanup_direct_tasks):
     from nonebot_plugin_ai_groupmate.brain.poll import poll
@@ -83,7 +139,7 @@ async def test_direct_send_with_unknown_delivery_does_not_repeat(failed_call, cl
     spaces = {"friends": [source, target]}
     tool = create_coordination_tool(config=SimpleNamespace(cross_group_spaces=spaces), platform="qq", bot_id=bot,
         scene_id=source, user_id="alice", message_id="source", request_id=None, request_text="发个消息",
-        reachable_groups=AsyncMock(return_value={source, target}))
+        reachable_groups=AsyncMock(return_value={source, target}), review_model=_allow_relay_model())
     result = json.loads(await tool.ainvoke({"reason": "打招呼", "operation": "send", "target_group_id": target, "message": "你好"}))
     assert result["ok"]
     sent = []
@@ -117,7 +173,7 @@ async def test_direct_send_recovers_confirmation_without_resending(monkeypatch, 
     spaces = {"friends": [source, target]}
     tool = create_coordination_tool(config=SimpleNamespace(cross_group_spaces=spaces), platform="qq", bot_id=bot,
         scene_id=source, user_id="alice", message_id="source", request_id=None, request_text="发个消息",
-        reachable_groups=AsyncMock(return_value={source, target}))
+        reachable_groups=AsyncMock(return_value={source, target}), review_model=_allow_relay_model())
     result = json.loads(await tool.ainvoke({"reason": "打招呼", "operation": "send", "target_group_id": target, "message": "你好"}))
     task_id = result["data"]["task_id"]
     sender = AsyncMock(side_effect=["target-receipt", "source-receipt"])
@@ -135,7 +191,8 @@ async def test_direct_send_recovers_confirmation_without_resending(monkeypatch, 
 
 
 @pytest.mark.asyncio
-async def test_tool_and_poll_complete_cross_group_question():
+@pytest.mark.parametrize(("answer_text", "private"), [("八点出发", False), ("我的电话是13800138000", True)])
+async def test_tool_and_poll_complete_cross_group_question(answer_text, private):
     from nonebot_plugin_orm import get_session
 
     from nonebot_plugin_ai_groupmate.brain.poll import poll
@@ -180,14 +237,15 @@ async def test_tool_and_poll_complete_cross_group_question():
     assert await poll(**kwargs) == "idle"
     async with get_session() as db:
         assert await record_message(db, platform="qq", bot_id=bot, scene_id=group_b, message_id="reply",
-                                    user_id="bob", text="八点出发", reply_to="receipt-1",
+                                    user_id="bob", text=answer_text, reply_to="receipt-1",
                                     now=datetime.now(timezone.utc).replace(tzinfo=None))
         await db.commit()
     model.ainvoke.return_value.content = '{"result":"answer"}'
     assert await poll(**kwargs) == "answer"
     assert await poll(**kwargs) == "completed"
-    assert sent[0] == ("qq", bot, group_b, "几点出发？", None)
-    assert sent[1] == ("qq", bot, group_a, f"{group_b} 群回复：八点出发", "source")
+    assert sent[0] == ("qq", bot, group_b, "来自另一群的跨群提问；引用这条消息回复会转告：几点出发？", None)
+    expected = "对方群的答复涉及个人敏感信息，我没有跨群转述。" if private else "对方群回复：八点出发"
+    assert sent[1] == ("qq", bot, group_a, expected, "source")
     assert await poll(**kwargs) == "idle"
 
 
