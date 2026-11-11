@@ -2490,10 +2490,6 @@ async def _process_media_vectorization(media_id: int) -> str:
 
     if already_vectorized and not needs_reindex and not needs_animation_upgrade:
         return "skipped"
-    if needs_animation_upgrade and existing_description.startswith(ANIMATED_MARK) and not needs_reindex:
-        await _mark_animation_checked(media_id)
-        return "skipped"
-
     try:
         file_path = pic_dir / media_file_path
         try:
@@ -2527,7 +2523,9 @@ async def _process_media_vectorization(media_id: int) -> str:
             return "skipped"
         img_data_uri = prepared.data_uri
 
-        needs_animation_tagging = prepared.animated and not existing_description.startswith(ANIMATED_MARK)
+        needs_animation_tagging = prepared.animated and (
+            needs_animation_upgrade or not existing_description.startswith(ANIMATED_MARK)
+        )
         known_animated_meme = prepared.animated and already_vectorized and existing_description != "[图片]"
         if needs_reindex and not needs_animation_tagging:
             try:

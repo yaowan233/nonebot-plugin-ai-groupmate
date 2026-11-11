@@ -8,7 +8,7 @@ from typing import Any, cast
 from unittest.mock import AsyncMock
 
 import pytest
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
 
 def animation(colors=("red", "blue", "red", "lime"), *, format="GIF", **kwargs):
@@ -72,6 +72,44 @@ def test_still_looking_animation_keeps_its_animation_metadata():
     prepared = prepare_image(animation(["red", (254, 0, 0)]))
     assert prepared.animated
     assert prepared.selected_frames == 1
+
+
+@pytest.mark.parametrize("frame_count", [2, 12])
+def test_small_text_changes_survive_animation_preview(frame_count):
+    from nonebot_plugin_ai_groupmate.image_preparation import prepare_image
+
+    font = ImageFont.load_default(size=40)
+    frames = []
+    for index in range(frame_count):
+        image = Image.new("RGB", (512, 512), "white")
+        ImageDraw.Draw(image).text((220, 230), f"{index:02d}", font=font, fill="black")
+        frames.append(image)
+    data = io.BytesIO()
+    frames[0].save(data, format="GIF", save_all=True, append_images=frames[1:], duration=100, loop=0)
+
+    prepared = prepare_image(data.getvalue())
+
+    assert prepared.source_frames == frame_count
+    assert prepared.selected_frames == min(frame_count, 9)
+
+
+def test_long_held_frame_is_sampled_even_among_many_short_frames():
+    from PIL import ImageChops
+
+    from nonebot_plugin_ai_groupmate.image_preparation import prepare_image
+
+    frames = [Image.new("RGB", (64, 64), "white" if i % 2 else "#eeeeee") for i in range(310)]
+    frames[30] = Image.new("RGB", (64, 64), "red")
+    durations = [20] * len(frames)
+    durations[30] = 10_000
+    data = io.BytesIO()
+    frames[0].save(data, format="GIF", save_all=True, append_images=frames[1:], duration=durations, loop=0)
+
+    prepared = prepare_image(data.getvalue())
+
+    assert prepared.source_frames == 310
+    red, green, _ = decode_uri(prepared.data_uri).split()
+    assert ImageChops.subtract(red, green).getextrema()[1] > 100
 
 
 def test_static_transparency_orientation_and_size_limits():
@@ -343,6 +381,33 @@ async def test_background_automatically_repairs_only_historical_memes_once(tmp_p
     assert model.ainvoke.await_count == insert.await_count == 3
 
 
+async def test_existing_animation_label_does_not_skip_old_vector_upgrade(tmp_path, monkeypatch, animation_database):
+    import nonebot_plugin_ai_groupmate as plugin
+    from nonebot_plugin_ai_groupmate.model import MediaStorage
+    from nonebot_plugin_ai_groupmate.image_preparation import ANIMATION_ANNOTATION_VERSION
+
+    (tmp_path / "old.gif").write_bytes(animation())
+    async with animation_database() as db:
+        row = MediaStorage(file_hash="prefixed-old", file_path="old.gif", description="动图：旧描述",
+                           references=3, vectorized=True, embedding_version=3, animation_version=0)
+        db.add(row)
+        await db.commit()
+    model = SimpleNamespace(ainvoke=AsyncMock(return_value=SimpleNamespace(content='{"is_meme":true,"description":"新的动作描述"}')))
+    insert = AsyncMock(return_value=True)
+    monkeypatch.setattr(plugin, "get_tagging_model", lambda: model)
+    monkeypatch.setattr(plugin.DB, "insert_media", insert)
+
+    assert await plugin._process_media_vectorization(row.media_id) == "indexed"
+    assert model.ainvoke.await_count == insert.await_count == 1
+    async with animation_database() as db:
+        updated = await db.get(MediaStorage, row.media_id)
+        assert updated is not None
+        assert updated.description == "动图：新的动作描述"
+        assert updated.animation_version == ANIMATION_ANNOTATION_VERSION
+    assert await plugin._process_media_vectorization(row.media_id) == "skipped"
+    assert insert.await_count == 1
+
+
 async def test_background_retries_failures_after_unattempted_records(tmp_path, monkeypatch, animation_database):
     import nonebot_plugin_ai_groupmate as plugin
     from nonebot_plugin_ai_groupmate.model import MediaStorage
@@ -444,7 +509,9 @@ async def test_embedding_upgrade_retags_old_animations_and_reuses_new_descriptio
     path.write_bytes(animation(format="WEBP"))
     description = "动图：猫挥手" if already_annotated else "猫"
     async with get_session() as db:
-        row = MediaStorage(file_hash=f"upgrade-animation-{active_version}-{already_annotated}", file_path=path.name, description=description, references=3, vectorized=True, embedding_version=0)
+        row = MediaStorage(file_hash=f"upgrade-animation-{active_version}-{already_annotated}", file_path=path.name,
+                           description=description, references=3, vectorized=True, embedding_version=0,
+                           animation_version=plugin.ANIMATION_ANNOTATION_VERSION if already_annotated else 0)
         db.add(row)
         await db.flush()
         media_id = row.media_id

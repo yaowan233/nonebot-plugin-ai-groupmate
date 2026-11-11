@@ -3,6 +3,7 @@
 import io
 import math
 import base64
+from bisect import bisect_right
 from dataclasses import dataclass
 
 from PIL import Image, ImageOps, ImageDraw, ImageFont, ImageStat, ImageChops
@@ -67,27 +68,42 @@ def _on_white(image: Image.Image) -> Image.Image:
 
 
 def _difference(a: Image.Image, b: Image.Image) -> float:
-    return sum(ImageStat.Stat(ImageChops.difference(a, b)).mean) / (3 * 255)
+    # RMS retains localized text or facial changes that a full-image mean
+    # would wash out, while still ignoring nearly identical frames.
+    return sum(ImageStat.Stat(ImageChops.difference(a, b)).rms) / (3 * 255)
 
 
 def _key_frames(image: Image.Image, count: int, max_frames: int) -> list[Image.Image]:
     # APNG may contain a separate default image that is not part of playback.
     first = int(bool(image.info.get("default_image")))
-    samples = min(count - first, MAX_SIGNATURES)
-    indices = [first] if samples == 1 else [first + (count - first - 1) * j // (samples - 1) for j in range(samples)]
-    starts: list[float] = []
-    signatures: list[Image.Image] = []
+    playback_frames = count - first
+    all_starts: list[float] = []
     elapsed = 0.0
-    sampled = set(indices)
-    # Seek sequentially so disposal/compositing and variable frame durations
-    # remain correct. Only tiny signatures survive this pass.
+    # Seek in playback order to collect durations. A long-held frame must not
+    # disappear merely because many short frames surround it.
     for index in range(first, count):
         image.seek(index)
-        if index in sampled:
-            starts.append(elapsed)
-            signatures.append(_on_white(image.resize((64, 64), Image.Resampling.BILINEAR)))
+        all_starts.append(elapsed)
         duration = image.info.get("duration") or 100
         elapsed += 100 if float(duration) <= 10 else float(duration)
+
+    if playback_frames <= MAX_SIGNATURES:
+        indices = list(range(first, count))
+    else:
+        # Share the bounded signature budget between frame-order coverage and
+        # playback-time coverage, including both endpoints.
+        per_axis = MAX_SIGNATURES // 2
+        by_index = {first + (playback_frames - 1) * j // (per_axis - 1) for j in range(per_axis)}
+        by_time = {
+            first + max(0, bisect_right(all_starts, elapsed * j / (per_axis - 1)) - 1)
+            for j in range(per_axis)
+        }
+        indices = sorted(by_index | by_time)
+    starts = [all_starts[index - first] for index in indices]
+    signatures: list[Image.Image] = []
+    for index in indices:
+        image.seek(index)
+        signatures.append(_on_white(image.resize((64, 64), Image.Resampling.BILINEAR)))
 
     def differs(index: int, others: list[int], threshold: float) -> bool:
         return all(_difference(signatures[index], signatures[other]) >= threshold for other in others)
