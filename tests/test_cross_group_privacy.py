@@ -147,13 +147,21 @@ async def test_user_facing_queries_do_not_list_another_groups_members():
 
 
 @pytest.mark.asyncio
-async def test_cross_group_relay_blocks_other_peoples_private_data_but_allows_explicit_self_share():
+async def test_cross_group_relay_blocks_other_peoples_private_data_but_allows_explicit_self_share(tmp_path, monkeypatch):
     from sqlalchemy import delete, select
-    from nonebot_plugin_orm import get_session
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-    from nonebot_plugin_ai_groupmate.model import BrainTask, BrainAction
+    from nonebot_plugin_ai_groupmate.model import BrainTask, BrainAction, ChatHistory
+    from nonebot_plugin_ai_groupmate.brain import tools as brain_tools
     from nonebot_plugin_ai_groupmate.brain.tools import create_coordination_tool
 
+    engine = create_async_engine(f"sqlite+aiosqlite:///{(tmp_path / 'privacy.sqlite3').as_posix()}")
+    async with engine.begin() as connection:
+        await connection.run_sync(lambda sync: ChatHistory.metadata.create_all(
+            sync, tables=[ChatHistory.__table__, BrainTask.__table__, BrainAction.__table__],
+        ))
+    get_session = async_sessionmaker(engine, expire_on_commit=False)
+    monkeypatch.setattr(brain_tools, "get_session", get_session)
     source, target, bot = (uuid4().hex for _ in range(3))
     model = SimpleNamespace(ainvoke=AsyncMock(return_value=SimpleNamespace(content='{"send":true,"reason":""}')))
 
@@ -178,6 +186,7 @@ async def test_cross_group_relay_blocks_other_peoples_private_data_but_allows_ex
         await db.execute(delete(BrainAction).where(BrainAction.task_id.in_(ids)))
         await db.execute(delete(BrainTask).where(BrainTask.source_scene == source))
         await db.commit()
+    await engine.dispose()
 
 
 @pytest.mark.asyncio
