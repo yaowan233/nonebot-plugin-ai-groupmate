@@ -109,7 +109,8 @@ def test_long_held_frame_is_sampled_even_among_many_short_frames():
 
     assert prepared.source_frames == 310
     red, green, _ = decode_uri(prepared.data_uri).split()
-    assert ImageChops.subtract(red, green).getextrema()[1] > 100
+    extrema = cast(tuple[int, int], ImageChops.subtract(red, green).getextrema())
+    assert extrema[1] > 100
 
 
 def test_static_transparency_orientation_and_size_limits():
