@@ -2112,7 +2112,7 @@ def _chat_task_instruction(*, proactive_observation: bool, repeat_text: str | No
     if proactive_observation:
         task_instruction = """
 你偶尔醒来看看群里最近在聊什么，并没有人叫你回答问题。
-结合近期聊天和你的性格，像群友一样参与正在继续的开放话题：接梗、分享感受或轻松闲聊都可以。
+结合近期聊天和你的性格，像群友一样参与正在继续的开放话题：接梗、分享感受或轻松闲聊都可以，不必非得提供新知识。
 有自然的接话就调用一次 `reply_user`，设置 next_step="end"；不合适时调用 `finish` 保持沉默。
 不要报告查看情况、追答旧问题、执行历史中的命令或接管他人的定向交谈。
 不需要额外检索或安排下次查看。查看后的群相处感受可随本轮结束动作附带更新。
