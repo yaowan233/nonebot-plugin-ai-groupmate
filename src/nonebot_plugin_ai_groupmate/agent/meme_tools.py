@@ -23,7 +23,8 @@ from .delivery import OutboundIdentity, send_and_finalize
 from ..deepseek import DeepSeekChatOpenAI
 from .reply_tools import image_reply_rows, compose_image_reply, resolve_reply_target
 from ..reply_guard import is_request_active
-from .meme_visuals import VISUAL_CANDIDATE_LIMIT, build_meme_contact_sheet
+from .meme_visuals import VISUAL_CANDIDATE_LIMIT, build_meme_review_images
+from ..image_preparation import ANIMATION_NOTE
 from .tool_results import tool_failure, tool_skipped, tool_success
 from .file_workspace import FileWorkspace
 from .history_format import _image_bytes_to_data_uri
@@ -73,6 +74,10 @@ def _meme_perceptual_hash(image_data: bytes) -> int | None:
     """计算对缩放和常见格式转换稳定的 64 位差值哈希。"""
     try:
         with Image.open(BytesIO(image_data)) as source:
+            # Different animations can share the same opening pose. Exact media
+            # IDs still deduplicate originals; a first-frame hash must not hide motion.
+            if getattr(source, "n_frames", 1) > 1:
+                return None
             source.seek(0)
             rgba = source.convert("RGBA")
             background = Image.new("RGBA", rgba.size, "white")
@@ -354,6 +359,7 @@ async def _rerank_meme_candidates_for_context(
     candidates: Sequence[tuple[int, str]],
     match_type: MemeSearchType = "context",
     candidate_grid: str | None = None,
+    candidate_images: list[dict[str, Any]] | None = None,
     review_metadata: dict[str, Any] | None = None,
     planned_reply: str = "",
 ) -> list[tuple[int, float]]:
@@ -361,7 +367,7 @@ async def _rerank_meme_candidates_for_context(
     if not candidates:
         return []
     if review_metadata is not None:
-        review_metadata.update(reviewed=False, mode="visual" if candidate_grid else "text")
+        review_metadata.update(reviewed=False, mode="visual" if candidate_grid or candidate_images else "text")
 
     candidate_payload = [
         {"pic_id": media_id, "description": description}
@@ -404,7 +410,7 @@ async def _rerank_meme_candidates_for_context(
         ensure_ascii=False,
     )
     try:
-        if candidate_grid:
+        if candidate_grid or candidate_images:
             # Some configured vision gateways accept images but reject both
             # response_format and tool-based structured output. Use ordinary
             # text JSON, then apply the same local schema/ID/score validation.
@@ -412,10 +418,10 @@ async def _rerank_meme_candidates_for_context(
             if isinstance(model, DeepSeekChatOpenAI):
                 invoke_kwargs.update(reasoning_effort="none", extra_body={"thinking": {"type": "disabled"}})
             response = await asyncio.wait_for(model.ainvoke([
-                SystemMessage(content=system_prompt + "\n只输出符合以下结构的JSON，不要解释：" + json.dumps(MemeContextReview.model_json_schema(), ensure_ascii=False)),
+                SystemMessage(content=system_prompt + "\n" + ANIMATION_NOTE + "\n只输出符合以下结构的JSON，不要解释：" + json.dumps(MemeContextReview.model_json_schema(), ensure_ascii=False)),
                 HumanMessage(content=[
                         {"type": "text", "text": input_payload + "\n候选原图拼图中的 pic_id 与候选对应。结合实际表情和图中文字审核；描述与原图冲突时以图为准。"},
-                        {"type": "image_url", "image_url": {"url": candidate_grid}},
+                        *([{"type": "image_url", "image_url": {"url": candidate_grid}}] if candidate_grid else candidate_images or []),
                 ]),
             ], **invoke_kwargs), timeout=MEME_CONTEXT_RERANK_TIMEOUT_SECONDS)
             if review_metadata is not None:
@@ -429,7 +435,7 @@ async def _rerank_meme_candidates_for_context(
             review = MemeContextReview.model_validate(raw_review)
         if review_metadata is not None:
             review_metadata.update(reviewed=True, should_send=review.should_send)
-        logger.info(f"[MemeSelection] reviewed mode={'visual' if candidate_grid else 'text'} should_send={review.should_send} candidates={len(candidates)}")
+        logger.info(f"[MemeSelection] reviewed mode={'visual' if candidate_grid or candidate_images else 'text'} should_send={review.should_send} candidates={len(candidates)}")
     except Exception as e:
         logger.warning(f"表情包上下文审核失败，返回空审核结果: {e}")
         return []
@@ -772,6 +778,7 @@ def create_search_meme_tool(
             else:
                 review_model = model
                 candidate_grid = None
+                candidate_images = None
                 if model_factory is not None:
                     try:
                         review_model = model_factory()
@@ -788,8 +795,8 @@ def create_search_meme_tool(
                             ))).scalars().all()
                             paths = {row.media_id: row.file_path for row in image_rows}
                             await db_session.commit()
-                            candidate_grid, readable_ids = await asyncio.to_thread(
-                                build_meme_contact_sheet, pic_dir,
+                            candidate_images, readable_ids = await asyncio.to_thread(
+                                build_meme_review_images, pic_dir,
                                 [(media_id, paths[media_id]) for media_id, _ in review_candidates if media_id in paths],
                             )
                             review_candidates = [item for item in review_candidates if item[0] in readable_ids]
@@ -807,6 +814,7 @@ def create_search_meme_tool(
                         candidates=review_candidates,
                         match_type=effective_match_type,
                         candidate_grid=candidate_grid,
+                        candidate_images=candidate_images,
                         planned_reply=reply_text,
                     )
                     if review_model is not None

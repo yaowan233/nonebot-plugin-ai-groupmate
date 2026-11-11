@@ -1,8 +1,17 @@
 import json
+import asyncio
 from typing import Any, cast
+from unittest.mock import AsyncMock
 
 import pytest
 from nonebot.adapters import Bot
+
+
+@pytest.fixture(autouse=True)
+def forward_image_download(monkeypatch):
+    from nonebot_plugin_ai_groupmate.agent import image_search_tools
+
+    monkeypatch.setattr(image_search_tools, "_download_preview", AsyncMock(side_effect=lambda url: url))
 
 
 class _FakeBot:
@@ -15,6 +24,59 @@ class _FakeBot:
         forward_id = str(data["id"])
         self.calls.append(forward_id)
         return self.responses[forward_id]
+
+
+@pytest.mark.asyncio
+async def test_forward_images_download_concurrently_without_losing_text(monkeypatch):
+    from nonebot_plugin_ai_groupmate.agent import image_search_tools
+    from nonebot_plugin_ai_groupmate.agent.forward_tools import create_read_forward_message_tool
+
+    all_started = asyncio.Event()
+    started = []
+
+    async def download(url):
+        started.append(url)
+        if len(started) == 3:
+            all_started.set()
+        await asyncio.wait_for(all_started.wait(), timeout=0.5)
+        return url
+
+    monkeypatch.setattr(image_search_tools, "_download_preview", download)
+    bot = _FakeBot({"mixed": {"messages": [{"message": [
+        *[{"type": "image", "data": {"url": f"https://example.com/{i}.png"}} for i in range(3)],
+        {"type": "text", "data": {"text": "重要的转发文字"}},
+    ]}]}})
+    result = await asyncio.wait_for(create_read_forward_message_tool(cast(Bot, bot), {"mixed"}).ainvoke(
+        {"forward_id": "mixed"}
+    ), timeout=0.3)
+    assert len(started) == 3
+    assert "重要的转发文字" in str(result)
+    assert len([item for item in result if item.get("type") == "image_url"]) == 3
+
+
+@pytest.mark.asyncio
+async def test_slow_forward_image_preserves_other_images_and_text(monkeypatch):
+    from nonebot_plugin_ai_groupmate.agent import forward_tools, image_search_tools
+
+    monkeypatch.setattr(forward_tools, "FORWARD_IMAGE_TIMEOUT_SECONDS", 0.02, raising=False)
+
+    async def download(url):
+        if "slow" in url:
+            await asyncio.sleep(10)
+        return url
+
+    monkeypatch.setattr(image_search_tools, "_download_preview", download)
+    bot = _FakeBot({"mixed": {"messages": [{"message": [
+        {"type": "image", "data": {"url": "https://example.com/slow.png"}},
+        {"type": "image", "data": {"url": "https://example.com/good.png"}},
+        {"type": "text", "data": {"text": "重要的转发文字"}},
+    ]}]}})
+    result = await asyncio.wait_for(forward_tools.create_read_forward_message_tool(cast(Bot, bot), {"mixed"}).ainvoke(
+        {"forward_id": "mixed"}
+    ), timeout=0.5)
+    assert "重要的转发文字" in str(result)
+    assert "转发图片 1，无法读取" in str(result)
+    assert "https://example.com/good.png" in str(result)
 
 
 @pytest.mark.asyncio

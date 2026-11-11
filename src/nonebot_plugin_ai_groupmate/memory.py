@@ -4,11 +4,9 @@ import json
 import math
 import time
 import uuid
-import base64
 import random
 import asyncio
 import hashlib
-import mimetypes
 import unicodedata
 from typing import Any, NoReturn
 from datetime import datetime, timedelta
@@ -22,6 +20,7 @@ from qdrant_client import AsyncQdrantClient, models
 from qdrant_client.http.exceptions import UnexpectedResponse, ResponseHandlingException
 
 from .runtime_config import get_runtime_config
+from .image_preparation import prepare_image
 
 plugin_config = get_runtime_config()
 
@@ -937,11 +936,8 @@ class VectorDBOperator:
 
         if image_source:
             if os.path.isfile(image_source):
-                mime_type, _ = mimetypes.guess_type(image_source)
-                mime_type = mime_type or "image/jpeg"
                 with open(image_source, "rb") as f:
-                    base64_data = base64.b64encode(f.read()).decode("utf-8")
-                    image_value = f"data:{mime_type};base64,{base64_data}"
+                    image_value = prepare_image(f.read()).data_uri
             elif image_source.startswith("data:image"):
                 image_value = image_source
             elif image_source.startswith("http://") or image_source.startswith("https://"):
@@ -1066,7 +1062,11 @@ class VectorDBOperator:
         instruct: str = "",
     ) -> list[float] | None:
         """获取单模态向量，或在同时传入图文时获取旧版融合向量。"""
-        contents = self._build_qwen_vl_contents(text, image_source)
+        try:
+            contents = await asyncio.to_thread(self._build_qwen_vl_contents, text, image_source)
+        except (OSError, ValueError) as error:
+            logger.warning(f"Embedding 图片无法预处理: {type(error).__name__}")
+            return None
         vectors = await self._request_qwen_vl_embeddings(
             contents,
             enable_fusion=bool(text and image_source),
@@ -1084,7 +1084,11 @@ class VectorDBOperator:
         """在一次请求中分别生成描述文本向量与图片向量。"""
         if not text or not image_source:
             return None
-        contents = self._build_qwen_vl_contents(text, image_source)
+        try:
+            contents = await asyncio.to_thread(self._build_qwen_vl_contents, text, image_source)
+        except (OSError, ValueError) as error:
+            logger.warning(f"Embedding 图片无法预处理: {type(error).__name__}")
+            return None
         vectors = await self._request_qwen_vl_embeddings(contents)
         if not vectors or len(vectors) != 2:
             return None

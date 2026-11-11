@@ -31,7 +31,7 @@ def generate_file_hash(file_data: bytes) -> str:
 
 
 def check_and_compress_image_bytes(
-        image_bytes, max_size_mb=2, quality_start=95, image_format="JPEG"
+        image_bytes, max_size_mb: float = 2, quality_start=95, image_format="JPEG"
 ):
     """
     检查bytes格式的图片大小，如果大于指定大小则压缩
@@ -60,6 +60,11 @@ def check_and_compress_image_bytes(
 
     try:
         img = Image.open(io.BytesIO(image_bytes))
+        # Model previews are prepared separately. Re-saving an animation here
+        # without save_all would permanently discard every frame after the first.
+        if getattr(img, "n_frames", 1) > 1:
+            img.close()
+            return image_bytes
         # 自动检测真实格式,覆盖传入的 image_format
         if img.format:
             image_format = img.format

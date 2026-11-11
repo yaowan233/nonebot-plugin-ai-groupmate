@@ -1,13 +1,12 @@
 import re
 import json
 import time
-import base64
 import random
 import asyncio
 import datetime
 import traceback
 from io import BytesIO
-from typing import Any
+from typing import Any, Literal
 from pathlib import Path
 from urllib.parse import urlsplit
 from functools import lru_cache
@@ -36,7 +35,6 @@ from nonebot_plugin_alconna import (
     File,
     Image,
     Target,
-    UniMessage,
     image_fetch,
     get_message_id,
 )
@@ -126,6 +124,16 @@ from .group_reply_scheduler import GroupReplyScheduler
 from .agent.command_delivery import send_command_image
 from .agent.web_image_search import is_explicit_web_image_search_request
 from .history_index_backfill import backfill_one, has_pending_backfill
+from .image_preparation import (
+    ANIMATED_MARK,
+    ANIMATION_NOTE,
+    ANIMATION_ANNOTATION_VERSION,
+    PreparedImage,
+    is_animated,
+    image_suffix,
+    prepare_image,
+    mark_animation_description,
+)
 
 
 async def _safe_rollback(db_session) -> None:
@@ -1401,13 +1409,9 @@ async def process_image_message(
             return
 
         pic = await asyncio.to_thread(check_and_compress_image_bytes, pic, image_format=image_format.upper())
+        image_format = await asyncio.to_thread(image_suffix, pic, image_format)
         file_hash = generate_file_hash(pic)
-        file_name = f"{file_hash}.{image_format}"
-        file_path = pic_dir / file_name
-
-        # 2. 保存文件到本地
-        if not file_path.exists():
-            file_path.write_bytes(pic)
+        preferred_file_name = f"{file_hash}.{image_format}"
 
         # Match text ingestion: acquire the group lock BEFORE the first SQL
         # operation. Holding a pooled connection/write transaction while waiting
@@ -1423,7 +1427,7 @@ async def process_image_message(
             else:
                 new_media = MediaStorage(
                     file_hash=file_hash,
-                    file_path=file_name,
+                    file_path=preferred_file_name,
                     references=1,
                     description="[图片]",
                 )
@@ -1443,6 +1447,19 @@ async def process_image_message(
 
             # 4. 添加聊天历史 (ChatHistory)
             if media_obj:
+                # Keep the existing filename even when its extension is wrong.
+                # Resolve concurrent inserts before writing, so receiving an old
+                # hash.jpg GIF does not also create an unreferenced hash.gif.
+                file_name = getattr(media_obj, "file_path", preferred_file_name)
+                if not (pic_dir / file_name).is_file():
+                    file_name = preferred_file_name
+                    file_path = pic_dir / file_name
+                    if not file_path.is_file():
+                        await asyncio.to_thread(file_path.write_bytes, pic)
+                    media_obj.file_path = file_name
+                    media_obj.animation_version = 0
+                    media_obj.animation_attempted_at = None
+                    db_session.add(media_obj)
                 # 确保 flush 拿到 media_id (如果是新插入的对象)
                 await db_session.flush()
 
@@ -2373,16 +2390,14 @@ async def _run_rag_backfill() -> None:
             logger.info(f"会话向量化任务结束，耗时 {elapsed:.2f}s")
 
 
-def _read_image_data_uri(file_path: Path, media_file_path: str) -> str | None:
-    if not file_path.is_file():
+def _read_prepared_image(file_path: Path, *, animation_only: bool = False) -> PreparedImage | Literal["static"] | None:
+    try:
+        data = file_path.read_bytes()
+    except FileNotFoundError:
         return None
-    file_data = file_path.read_bytes()
-    encoded_string = base64.b64encode(file_data).decode("utf-8")
-    ext = media_file_path.rsplit(".", 1)[-1].lower()
-    mime = "image/png" if ext == "png" else "image/jpeg"
-    if ext == "gif":
-        mime = "image/gif"
-    return f"data:{mime};base64,{encoded_string}"
+    if animation_only and not is_animated(data):
+        return "static"
+    return prepare_image(data)
 
 
 async def _mark_media_vectorized(
@@ -2400,10 +2415,21 @@ async def _mark_media_vectorized(
             media.description = description
         if embedding_version is not None:
             media.embedding_version = embedding_version
+        media.animation_version = ANIMATION_ANNOTATION_VERSION
         media.vectorized = True
         db_session.add(media)
         await db_session.commit()
         return True
+
+
+async def _mark_animation_checked(media_id: int) -> None:
+    """Finish the local check without changing the existing annotation or vectors."""
+    async with get_session() as db_session:
+        media = await db_session.get(MediaStorage, media_id)
+        if media is not None:
+            media.animation_version = ANIMATION_ANNOTATION_VERSION
+            db_session.add(media)
+        await db_session.commit()
 
 
 MEDIA_TAGGING_PROMPT = """
@@ -2428,6 +2454,17 @@ MEDIA_TAGGING_PROMPT = """
 }
 """
 
+ANIMATED_TAGGING_PROMPT = """你在给 QQ 群聊里的一张动图做后台标注，描述用于以后替代原图和检索表情包。
+""" + ANIMATION_NOTE + """
+先连起来理解整段动作，再判断它是否适合作为表情包或聊天贴纸：卡通小动物、卖萌动图、二次元反应表情、梗图都算；普通风景、长文字截图等不算。
+description 用一到三句自然中文连续描述，不要分栏、列清单或添加小标题：
+- 写清可见主体、整段动作和表情的变化、结尾或循环，以及适合表达的情绪或态度；
+- 有文字就保留原文，逐渐出现的文字写最后完整的那句；
+- 无法确认角色或作品时只描述外观，不凭发色、服饰猜名字，不补写没有证据的出处、年代或梗史；
+- 只描述原动图本身，不提帧、编号、格子、拼图、系统截取方式。只有一个关键帧时不编造运动。
+只返回合法 JSON，不要 Markdown 代码块：{"is_meme": true, "description": "……"}
+"""
+
 
 async def _process_media_vectorization(media_id: int) -> str:
     """处理单张图片；网络请求期间不占用 SQL 连接。"""
@@ -2441,21 +2478,37 @@ async def _process_media_vectorization(media_id: int) -> str:
             return "skipped"
         media_file_path = media.file_path
         existing_description = media.description
+        already_vectorized = media.vectorized
         needs_reindex = media.vectorized and media.embedding_version != active_embedding_version and existing_description != "[图片]"
+        needs_animation_upgrade = media.vectorized and existing_description != "[图片]" and getattr(media, "animation_version", 0) < ANIMATION_ANNOTATION_VERSION
+        if needs_animation_upgrade:
+            # Failed attempts stay pending. Oldest/unattempted records are picked
+            # first, so a broken early batch cannot starve the rest of the library.
+            media.animation_attempted_at = datetime.datetime.now()
+            db_session.add(media)
         await db_session.commit()
 
+    if already_vectorized and not needs_reindex and not needs_animation_upgrade:
+        return "skipped"
     try:
         file_path = pic_dir / media_file_path
         try:
-            img_data_uri = await asyncio.to_thread(_read_image_data_uri, file_path, media_file_path)
+            prepared = await asyncio.to_thread(
+                _read_prepared_image, file_path,
+                animation_only=needs_animation_upgrade and not needs_reindex,
+            )
+        except ValueError as e:
+            logger.warning(f"图片内容无效或超过预处理限制，跳过向量化 {media_id}: {e}")
+            await _mark_media_vectorized(media_id, embedding_version=active_embedding_version)
+            return "skipped"
         except Exception as e:
             logger.error(f"读取图片失败 {media_id}: {e}")
             return "failed"
 
-        if img_data_uri is None:
-            if needs_reindex:
-                # 旧集合已不再参与检索，原图缺失时也无法生成当前格式的向量。
-                # 将版本推进到当前值，避免每轮重复扫描并逐条刷 Warning。
+        if prepared is None:
+            if needs_reindex or needs_animation_upgrade:
+                # Missing originals cannot be checked or re-embedded. Finish
+                # this pass; receiving the original again reopens its progress.
                 await _mark_media_vectorized(
                     media_id,
                     embedding_version=active_embedding_version,
@@ -2465,7 +2518,16 @@ async def _process_media_vectorization(media_id: int) -> str:
             await _mark_media_vectorized(media_id)
             return "skipped"
 
-        if needs_reindex:
+        if prepared == "static":
+            await _mark_animation_checked(media_id)
+            return "skipped"
+        img_data_uri = prepared.data_uri
+
+        needs_animation_tagging = prepared.animated and (
+            needs_animation_upgrade or not existing_description.startswith(ANIMATED_MARK)
+        )
+        known_animated_meme = prepared.animated and already_vectorized and existing_description != "[图片]"
+        if needs_reindex and not needs_animation_tagging:
             try:
                 inserted = await DB.insert_media(
                     media_id,
@@ -2490,7 +2552,11 @@ async def _process_media_vectorization(media_id: int) -> str:
                 [
                     HumanMessage(
                         content=[
-                            {"type": "text", "text": MEDIA_TAGGING_PROMPT},
+                            {"type": "text", "text": (
+                                ANIMATED_TAGGING_PROMPT + f"\n原文件 {prepared.source_frames} 帧，当前展示 {prepared.selected_frames} 个关键帧。"
+                                + ("\n这张动图已经作为表情包入库，本次只更新内容描述，保持 is_meme=true。" if known_animated_meme else "")
+                                if prepared.animated else MEDIA_TAGGING_PROMPT
+                            )},
                             {
                                 "type": "image_url",
                                 "image_url": {"url": img_data_uri},
@@ -2508,8 +2574,12 @@ async def _process_media_vectorization(media_id: int) -> str:
                 content = content.replace("```json", "").replace("```", "")
 
             res_json = json.loads(content)
-            is_meme = res_json.get("is_meme", False)
+            # Backfill enriches known stickers; a fresh classification must not
+            # remove a historical sticker from the searchable library.
+            is_meme = known_animated_meme or res_json.get("is_meme", False)
             description = str(res_json.get("description", "")).strip()
+            if prepared.animated:
+                description = mark_animation_description(description)
 
         except Exception as e:
             err_str = str(e)
@@ -2519,14 +2589,14 @@ async def _process_media_vectorization(media_id: int) -> str:
                     logger.warning(f"图片 {media_id} 内容违规，跳过向量化")
                 else:
                     logger.warning(f"图片 {media_id} 请求非法（400），跳过向量化: {e}")
-                await _mark_media_vectorized(media_id)
+                await _mark_media_vectorized(media_id, embedding_version=active_embedding_version)
                 return "skipped"
             logger.error(f"模型识别图片失败 {media_id}: {e}")
             return "failed"
 
         if not is_meme:
             logger.info(f"图片 {media_id} 被判定为非表情包(杂图)，跳过入库")
-            await _mark_media_vectorized(media_id)
+            await _mark_media_vectorized(media_id, "[图片]" if needs_animation_tagging else None)
             return "skipped"
         if not description:
             logger.warning(f"图片 {media_id} 缺少描述，等待下轮重试")
@@ -2557,7 +2627,7 @@ async def _process_media_vectorization(media_id: int) -> str:
 
 async def _vectorize_media_impl():
     """
-    并发处理新图片与旧向量。每个 worker 使用独立 SQL 会话，且网络请求
+    并发处理新图片、旧向量和历史动图。每个 worker 使用独立 SQL 会话，且网络请求
     期间不持有数据库连接。
     """
     if not DB.enabled:
@@ -2569,7 +2639,7 @@ async def _vectorize_media_impl():
     active_embedding_version = DB.media_embedding_version
 
     async with get_session() as db_session:
-        # 新图片和旧向量分别取一批，避免大量新图导致历史重建一直饥饿。
+        # Each queue gets a batch so new images cannot starve historical work.
         pending_res = await db_session.execute(
             Select(MediaStorage.media_id)
             .where(
@@ -2593,10 +2663,23 @@ async def _vectorize_media_impl():
             .limit(batch_size)
         )
         outdated_ids = list(outdated_res.scalars().all())
+
+        animation_res = await db_session.execute(
+            Select(MediaStorage.media_id)
+            .where(
+                MediaStorage.references >= min_references,
+                MediaStorage.vectorized.is_(True),
+                MediaStorage.description != "[图片]",
+                MediaStorage.animation_version < ANIMATION_ANNOTATION_VERSION,
+            )
+            .order_by(MediaStorage.animation_attempted_at.is_not(None), MediaStorage.animation_attempted_at, MediaStorage.media_id)
+            .limit(batch_size)
+        )
+        animation_ids = list(animation_res.scalars().all())
         await db_session.commit()
 
-    media_ids = list(dict.fromkeys(pending_ids + outdated_ids))
-    logger.info(f"本轮待处理新图片: {len(pending_ids)}，待重建旧表情包: {len(outdated_ids)}，并发数: {concurrency}")
+    media_ids = list(dict.fromkeys(pending_ids + outdated_ids + animation_ids))
+    logger.info(f"本轮待处理新图片: {len(pending_ids)}，待重建旧表情包: {len(outdated_ids)}，待检查历史动图: {len(animation_ids)}，并发数: {concurrency}")
     if not media_ids:
         return
 

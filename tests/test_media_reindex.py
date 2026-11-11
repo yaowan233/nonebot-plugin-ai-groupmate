@@ -6,6 +6,7 @@ from typing import Any
 from contextlib import asynccontextmanager
 
 import pytest
+from PIL import Image
 
 
 class FakeScalars:
@@ -73,7 +74,7 @@ async def test_vectorize_media_reindexes_mismatched_version_without_retagging(
         embedding_version=stored_version,
     )
     session = FakeSession(media)
-    (tmp_path / media.file_path).write_bytes(b"legacy-image")
+    Image.new("RGBA", (8, 8), (255, 0, 0, 100)).save(tmp_path / media.file_path)
 
     @asynccontextmanager
     async def fake_get_session():

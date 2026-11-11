@@ -18,6 +18,8 @@ class MediaStorage(NulSafeModel):
     description: Mapped[str]
     vectorized: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     embedding_version: Mapped[int] = mapped_column(default=0, index=True)
+    animation_version: Mapped[int] = mapped_column(default=0, server_default="0", index=True)
+    animation_attempted_at: Mapped[datetime | None] = mapped_column(default=None)
 
 
 class MediaStorageSchema(BaseModel):
@@ -29,6 +31,8 @@ class MediaStorageSchema(BaseModel):
     description: str
     vectorized: bool
     embedding_version: int = 0
+    animation_version: int = 0
+    animation_attempted_at: datetime | None = None
 
 
 class StructuredMessage(NulSafeModel):
