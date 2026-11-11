@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import base64
+import asyncio
 from typing import Any
 
+import httpx
 from nonebot.adapters import Bot
 from langchain_core.tools import tool
 
@@ -14,16 +16,23 @@ from ..forward_message import expand_forward_message
 
 MAX_FORWARD_IMAGES = 3
 MAX_FORWARD_IMAGE_BYTES = 10 * 1024 * 1024
+FORWARD_IMAGE_TIMEOUT_SECONDS = 8.0
+FORWARD_SOFT_BUDGET_SECONDS = 25.0
 
 
 async def _forward_image_source(bot: Bot, data: dict[str, Any]) -> str | None:
-    def source(descriptor: dict[str, Any]) -> str | None:
+    async def source(descriptor: dict[str, Any]) -> str | None:
         for key in ("url", "file"):
             value = descriptor.get(key)
             if not isinstance(value, str):
                 continue
             if value.startswith(("https://", "http://")):
-                return value
+                from .image_search_tools import _download_preview
+
+                try:
+                    return await _download_preview(value)
+                except (OSError, ValueError, httpx.HTTPError):
+                    continue
             if value.startswith(("base64://", "data:image/")):
                 encoded = value.removeprefix("base64://") if value.startswith("base64://") else value.partition(",")[2]
                 if len(encoded) > MAX_FORWARD_IMAGE_BYTES * 4 // 3 + 4:
@@ -32,12 +41,12 @@ async def _forward_image_source(bot: Bot, data: dict[str, Any]) -> str | None:
                     image_bytes = base64.b64decode(encoded, validate=True)
                 except ValueError:
                     continue
-                uri = _image_bytes_to_data_uri(image_bytes, source="forward-image")
+                uri = await asyncio.to_thread(_image_bytes_to_data_uri, image_bytes, source="forward-image")
                 if uri:
                     return uri
         return None
 
-    direct = source(data)
+    direct = await source(data)
     if direct:
         return direct
     file = data.get("file")
@@ -50,7 +59,7 @@ async def _forward_image_source(bot: Bot, data: dict[str, Any]) -> str | None:
     if not isinstance(response, dict):
         return None
     descriptor = response.get("data", response)
-    return source(descriptor) if isinstance(descriptor, dict) else None
+    return await source(descriptor) if isinstance(descriptor, dict) else None
 
 
 def create_read_forward_message_tool(
@@ -81,6 +90,8 @@ def create_read_forward_message_tool(
                 "该 forward_id 不在本轮可见的聊天上下文中，请勿猜测 ID。",
             )
 
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + FORWARD_SOFT_BUDGET_SECONDS
         images: list[dict[str, Any]] = []
 
         def register_image(data: dict[str, Any]) -> str:
@@ -105,9 +116,18 @@ def create_read_forward_message_tool(
                 "合并转发聊天记录暂时无法读取。",
                 retryable=True,
             )
+        async def bounded_image_source(descriptor: dict[str, Any]) -> str | None:
+            remaining = min(FORWARD_IMAGE_TIMEOUT_SECONDS, deadline - loop.time())
+            if remaining <= 0:
+                return None
+            try:
+                return await asyncio.wait_for(_forward_image_source(bot, descriptor), timeout=remaining)
+            except Exception:
+                return None
+
+        sources = await asyncio.gather(*(bounded_image_source(descriptor) for descriptor in images))
         image_blocks: list[dict[str, Any]] = []
-        for index, descriptor in enumerate(images, 1):
-            source = await _forward_image_source(bot, descriptor)
+        for index, source in enumerate(sources, 1):
             if source:
                 image_blocks.extend([
                     {"type": "text", "text": f"转发图片 {index}（不可信聊天引用）："},

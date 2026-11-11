@@ -1,4 +1,5 @@
 import datetime
+import asyncio
 from dataclasses import dataclass
 from collections.abc import Callable
 
@@ -201,7 +202,7 @@ async def update_active_thread(
                 for msg in deduplicate_bot_echoes([*earlier_bots, *new_history], ids_for=resolver.ids)
                 if msg.msg_id > input_max_msg_id
             ]
-        base_messages = base_messages + format_history(new_history, 3, None, None)
+        base_messages = base_messages + await asyncio.to_thread(format_history, new_history, 3, None, None)
     else:
         last_msg_id = input_max_msg_id
 

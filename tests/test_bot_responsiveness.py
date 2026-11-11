@@ -31,7 +31,8 @@ async def test_image_and_text_complete_with_one_database_connection(monkeypatch,
             if self.image and self.calls == 1:
                 image_has_connection.set()
                 await continue_image.wait()
-            return SimpleNamespace(scalar_one_or_none=lambda: media if self.calls == 1 else None)
+            return SimpleNamespace(scalar_one_or_none=lambda: media if self.calls == 1 else None,
+                                   scalars=lambda: SimpleNamespace(all=lambda: []))
 
         def add(self, _row):
             pass
@@ -135,7 +136,7 @@ async def test_image_ingestion_still_persists_and_deduplicates(monkeypatch, tmp_
     from nonebot_plugin_orm import get_session
 
     import nonebot_plugin_ai_groupmate as plugin
-    from nonebot_plugin_ai_groupmate.model import ChatHistory, MediaStorage
+    from nonebot_plugin_ai_groupmate.model import ChatHistory, MediaStorage, HistoryMessageIndex
 
     image_bytes = b"responsiveness-test-image"
     file_hash = plugin.generate_file_hash(image_bytes)
@@ -160,6 +161,9 @@ async def test_image_ingestion_still_persists_and_deduplicates(monkeypatch, tmp_
             assert "alias_id: 456\n" in history.content
         finally:
             await session.rollback()
+            # SQLite can reuse deleted history IDs. Remove the associated index
+            # rows too, so later tests do not collide with stale platform IDs.
+            await session.execute(delete(HistoryMessageIndex).where(HistoryMessageIndex.session_id == group_id))
             await session.execute(delete(ChatHistory).where(ChatHistory.session_id == group_id))
             await session.execute(delete(MediaStorage).where(MediaStorage.file_hash == file_hash))
             await session.commit()

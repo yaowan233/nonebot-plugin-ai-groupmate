@@ -1,10 +1,7 @@
-import io
 import json
-import base64
 from typing import Any
 from pathlib import Path
 
-from PIL import Image, ImageOps
 from nonebot.log import logger
 from nonebot_plugin_uninfo import SceneType, QryItrface
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -20,41 +17,18 @@ from ..message_mentions import format_member_mention
 from ..message_metadata import platform_message_ids, deduplicate_bot_echoes, parse_message_metadata, is_reliable_platform_id
 from .structured_context import StructuredSnapshot, visible_quote_text
 from ..message_repository import find_by_platform_id
+from ..image_preparation import prepare_image
 
 BOT_IMAGE_DESCRIPTION_MAX_CHARS = 500
-MODEL_IMAGE_MAX_EDGE = 4096
 
 
 def _image_bytes_to_data_uri(image_bytes: bytes, *, source: str) -> str | None:
     """Decode and normalize an image before sending it to an OpenAI-compatible API."""
     try:
-        with Image.open(io.BytesIO(image_bytes)) as image:
-            image.seek(0)
-            image.load()
-            has_transparency = image.mode in {"RGBA", "LA"} or (
-                image.mode == "P" and "transparency" in image.info
-            )
-            normalized = ImageOps.exif_transpose(image)
-            normalized.thumbnail((MODEL_IMAGE_MAX_EDGE, MODEL_IMAGE_MAX_EDGE), Image.Resampling.LANCZOS)
-            output = io.BytesIO()
-            if has_transparency:
-                normalized.convert("RGBA").save(output, format="PNG", optimize=True)
-                mime_type = "image/png"
-            else:
-                normalized.convert("RGB").save(
-                    output,
-                    format="JPEG",
-                    quality=90,
-                    optimize=True,
-                )
-                mime_type = "image/jpeg"
+        return prepare_image(image_bytes).data_uri
     except Exception as e:
         logger.warning(f"图片无法解码，跳过模型图片输入 source={source}: {e}")
         return None
-
-    encoded_string = base64.b64encode(output.getvalue()).decode("ascii")
-    return f"data:{mime_type};base64,{encoded_string}"
-
 
 def get_image_data_uri(file_name: str, *, pic_dir: Path) -> str | None:
     try:

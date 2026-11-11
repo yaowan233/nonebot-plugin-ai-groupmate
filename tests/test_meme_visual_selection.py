@@ -78,7 +78,8 @@ async def test_search_pipeline_selects_only_visible_candidates(tmp_path, monkeyp
                 content = messages[1].content
                 payload = json.loads(content[0]["text"].split("\n候选原图", 1)[0])
                 assert [item["pic_id"] for item in payload["candidates"]] == [ids[0]]
-                assert content[1]["image_url"]["url"].startswith("data:image/png;base64,")
+                image_parts = [part for part in content if part["type"] == "image_url"]
+                assert image_parts[0]["image_url"]["url"].startswith("data:image/png;base64,")
                 # A hallucinated/missing candidate may not receive approval.
                 return SimpleNamespace(content=json.dumps({"should_send": True, "candidates": [{"pic_id": mid, "relevance": 0.9} for mid in ids]}))
 
