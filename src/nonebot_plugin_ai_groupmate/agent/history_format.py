@@ -1,6 +1,6 @@
 import io
-import base64
 import json
+import base64
 from typing import Any
 from pathlib import Path
 
@@ -11,17 +11,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 
 from ..model import ChatHistorySchema
+from .turn_context import TurnHistoryResolver
+from ..media_message import format_media_markers
 from .file_workspace import FileWorkspace
 from .image_resources import ImageResources, ImageResourceError, is_image_history as is_image_history, published_image_file_id as published_image_file_id, image_file_name_from_history as image_file_name_from_history
+from ..forward_message import format_forward_marker
 from ..message_mentions import format_member_mention
 from ..message_metadata import platform_message_ids, deduplicate_bot_echoes, parse_message_metadata, is_reliable_platform_id
 from .structured_context import StructuredSnapshot, visible_quote_text
-from .turn_context import TurnHistoryResolver
 from ..message_repository import find_by_platform_id
-from ..media_message import format_media_markers
-from ..forward_message import format_forward_marker
 
 BOT_IMAGE_DESCRIPTION_MAX_CHARS = 500
+MODEL_IMAGE_MAX_EDGE = 4096
 
 
 def _image_bytes_to_data_uri(image_bytes: bytes, *, source: str) -> str | None:
@@ -34,6 +35,7 @@ def _image_bytes_to_data_uri(image_bytes: bytes, *, source: str) -> str | None:
                 image.mode == "P" and "transparency" in image.info
             )
             normalized = ImageOps.exif_transpose(image)
+            normalized.thumbnail((MODEL_IMAGE_MAX_EDGE, MODEL_IMAGE_MAX_EDGE), Image.Resampling.LANCZOS)
             output = io.BytesIO()
             if has_transparency:
                 normalized.convert("RGBA").save(output, format="PNG", optimize=True)

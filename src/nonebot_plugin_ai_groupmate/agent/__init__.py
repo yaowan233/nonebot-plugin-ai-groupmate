@@ -75,11 +75,9 @@ from .common_tools import (
     create_scoped_history_search_tool,
 )
 from .conversation import (
-    ACTIVE_THREAD_MAX_IMAGES,
     get_active_thread,
     limit_history_images,
     update_active_thread,
-    history_image_context,
     build_append_only_history,
 )
 from .custom_tools import (
@@ -2176,7 +2174,7 @@ async def _build_multimodal_prompt(
     structured_reply_images: list[bytes] | None, structured_reply_failed: bool,
     structured_current_images: list[bytes] | None, structured_current_failed: bool,
     structured_quote: tuple[str, str] | None, quote_lookup_failed: bool, reply_to_id: str | None,
-    structured_messages: dict[tuple[str, str], StructuredSnapshot],
+    structured_messages: dict[tuple[str, str], StructuredSnapshot], include_legacy_current_images: bool,
 ) -> str | list[Any]:
     """Assemble current and quoted media into the final user prompt."""
     final_prompt_content: str | list[Any] = prompt_text
@@ -2198,10 +2196,18 @@ async def _build_multimodal_prompt(
         else:
             structured_current_failed = True
 
+    if _chat_supports_images(chat_config) and structured_current_images is None and include_legacy_current_images:
+        for image in current_message_images(history)[-3:]:
+            uri = get_history_image_data_uri(image, pic_dir=pic_dir, workspace=image_workspace)
+            if uri:
+                structured_current_uris.append(uri)
+            else:
+                structured_current_failed = True
+
     if not _chat_supports_images(chat_config):
         summary_images: list[Any] = list(replied_images)
         seen_ids = {m.msg_id for m in summary_images}
-        for img in current_message_images(history) if structured_current_images is None else []:
+        for img in current_message_images(history) if structured_current_images is None and include_legacy_current_images else []:
             if img.msg_id not in seen_ids:
                 summary_images.append(img)
                 seen_ids.add(img.msg_id)
@@ -2400,8 +2406,8 @@ async def choice_response_strategy(
         quoted_sender: tuple[str, str, str] | None = None
         quote_lookup_failed = False
         needs_legacy_quote = True
-        (current_message_ids, structured_current_images, structured_current_text,
-         structured_batch_text, structured_current_failed, current_lookup_failed) = await _load_current_input_context(
+        (_current_message_ids, structured_current_images, structured_current_text,
+         structured_batch_text, structured_current_failed, _current_lookup_failed) = await _load_current_input_context(
             db_session, history, session_id=session_id, user_id=str(user_id), history_variant=history_variant,
             proactive_observation=proactive_observation, event=event, reply_to_id=reply_to_id, bot=bot,
             is_private=is_private, image_workspace=image_workspace,
@@ -2447,13 +2453,8 @@ async def choice_response_strategy(
                 history_variant = "legacy"
             else:
                 merge_snapshots(structured_messages, additional)
-        image_format_history = partial(format_chat_history, config=chat_config, workspace=image_workspace,
-                                       structured_messages=structured_messages,
-                                       suppress_history_images=bool(structured_reply_images or structured_reply_failed),
-                                       exclude_inline_message_ids=frozenset(current_message_ids)
-                                       if structured_current_images or structured_current_failed or current_lookup_failed else frozenset(),
-                                       reserved_inline_images=len(structured_current_images or []))
-        scoped_format_history = partial(image_format_history, suppress_history_images=True)
+        scoped_format_history = partial(format_chat_history, config=chat_config, workspace=image_workspace,
+                                        structured_messages=structured_messages, suppress_history_images=True)
         # Everything below may perform adapter I/O or wait for the LLM.  The
         # history rows are already materialized, so release the connection.
         await _finish_db_operation(db_session.commit())
@@ -2473,18 +2474,9 @@ async def choice_response_strategy(
                 history_variant=history_variant,
                 structured_messages=structured_messages if history_variant == "structured" else None,
             )
-        # Current and quoted pictures take priority over older cached images.
-        reserved_images = len(structured_current_images or []) + len(structured_reply_images or [])
-        if structured_reply_images is None:
-            reserved_images += sum(_is_image_history(row) for row in replied_extra)
-        image_budget = max(0, ACTIVE_THREAD_MAX_IMAGES - reserved_images)
-        if structured_reply_failed or structured_current_failed:
-            image_budget = 0
-        chat_history_messages = limit_history_images(chat_history_messages, image_budget)
-        visual_context_messages = []
-        if not proactive_observation and image_budget and _chat_supports_images(chat_config):
-            visual_history = image_format_history(history, 3, role_map, replied_extra)
-            visual_context_messages = history_image_context(limit_history_images(visual_history, image_budget))
+        # Historical image bytes are loaded on demand; current and quoted
+        # pictures are bound separately to the final request below.
+        chat_history_messages = limit_history_images(chat_history_messages, 0)
         input_max_msg_id = max((msg.msg_id for msg in history), default=0)
         active_thread = get_active_thread(session_id)
         if reused_thread and active_thread:
@@ -2554,7 +2546,7 @@ async def choice_response_strategy(
             structured_reply_images=structured_reply_images, structured_reply_failed=structured_reply_failed,
             structured_current_images=structured_current_images, structured_current_failed=structured_current_failed,
             structured_quote=structured_quote, quote_lookup_failed=quote_lookup_failed, reply_to_id=reply_to_id,
-            structured_messages=structured_messages,
+            structured_messages=structured_messages, include_legacy_current_images=not proactive_observation,
         )
 
         avatar_context_messages: list[BaseMessage] = []
@@ -2577,7 +2569,6 @@ async def choice_response_strategy(
 
         final_messages = (
             chat_history_messages
-            + visual_context_messages
             + avatar_context_messages
             + [HumanMessage(content=final_prompt_content)]
         )

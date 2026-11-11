@@ -619,6 +619,8 @@ def _is_image_input_error(error: Exception) -> bool:
         "image format is illegal",
         "cannot be opened",
         "invalid image",
+        "unsupported image",
+        "patches after processing",
         "failed to process image",
     )
     return is_multimodal_unsupported_error(error) or (
@@ -641,7 +643,7 @@ def _remove_image_blocks(
         sanitized_content: list[Any] = []
         removed_from_message = 0
         for item in content:
-            if isinstance(item, dict) and item.get("type") == "image_url":
+            if isinstance(item, dict) and item.get("type") in {"image_url", "image", "input_image"}:
                 removed_count += 1
                 removed_from_message += 1
                 continue

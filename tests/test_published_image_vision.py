@@ -6,6 +6,91 @@ import pytest
 from langchain_core.messages import AIMessage
 
 
+async def test_unrelated_question_does_not_send_historical_image(monkeypatch, tmp_path):
+    from uuid import uuid4
+    from datetime import datetime
+    from unittest.mock import AsyncMock
+
+    from nonebot_plugin_orm import get_session
+    from test_image_generation import png, image_config
+
+    from nonebot_plugin_ai_groupmate import agent
+    from nonebot_plugin_ai_groupmate.model import ChatHistorySchema
+
+    group = f"unrelated-history-image-{uuid4()}"
+    (tmp_path / "old.png").write_bytes(png("red"))
+    monkeypatch.setattr(agent, "pic_dir", tmp_path)
+    monkeypatch.setattr(agent, "plugin_data_dir", tmp_path)
+    monkeypatch.setattr(agent, "resolve_session_chat_config", lambda **kw: image_config())
+    monkeypatch.setattr(agent, "record_token_usage", AsyncMock())
+    monkeypatch.setattr(agent, "update_active_thread", AsyncMock())
+    captured = {}
+
+    class Graph:
+        async def ainvoke(self, state, **kwargs):
+            captured["messages"] = state["messages"]
+            return {**state, "called_finish": 1, "llm_call_count": 1}
+
+    monkeypatch.setattr(agent, "create_chat_graph", AsyncMock(return_value=(Graph(), None, "")))
+    history = [
+        ChatHistorySchema(msg_id=1, session_id=group, user_id="alice", user_name="Alice", content_type="image",
+                          content="id: old-image\nold.png", created_at=datetime.now()),
+        ChatHistorySchema(msg_id=2, session_id=group, user_id="alice", user_name="Alice", content_type="text",
+                          content="id: question\n你都加了什么群", created_at=datetime.now()),
+    ]
+    async with get_session() as db:
+        await agent.choice_response_strategy(db, group, None, history, "alice", "Alice", bot_id="bot", group_members=[])
+
+    assert all("image_url" not in str(message.content) for message in captured["messages"])
+    assert any("old-image" in str(message.content) for message in captured["messages"])
+
+
+async def test_current_legacy_message_keeps_all_its_images(monkeypatch, tmp_path):
+    from uuid import uuid4
+    from datetime import datetime
+    from unittest.mock import AsyncMock
+
+    from nonebot_plugin_orm import get_session
+    from test_image_generation import png, image_config
+
+    from nonebot_plugin_ai_groupmate import agent
+    from nonebot_plugin_ai_groupmate.model import ChatHistorySchema
+
+    group = f"current-images-{uuid4()}"
+    for name, color in (("old.png", "blue"), ("a.png", "red"), ("b.png", "green")):
+        (tmp_path / name).write_bytes(png(color))
+    monkeypatch.setattr(agent, "pic_dir", tmp_path)
+    monkeypatch.setattr(agent, "plugin_data_dir", tmp_path)
+    monkeypatch.setattr(agent, "resolve_session_chat_config", lambda **kw: image_config())
+    monkeypatch.setattr(agent, "record_token_usage", AsyncMock())
+    monkeypatch.setattr(agent, "update_active_thread", AsyncMock())
+    captured = {}
+
+    class Graph:
+        async def ainvoke(self, state, **kwargs):
+            captured["messages"] = state["messages"]
+            return {**state, "called_finish": 1, "llm_call_count": 1}
+
+    monkeypatch.setattr(agent, "create_chat_graph", AsyncMock(return_value=(Graph(), None, "")))
+    history = [
+        ChatHistorySchema(msg_id=1, session_id=group, user_id="alice", user_name="Alice", content_type="image",
+                          content="id: old\nold.png", created_at=datetime.now()),
+        ChatHistorySchema(msg_id=2, session_id=group, user_id="alice", user_name="Alice", content_type="image",
+                          content="id: current\na.png", created_at=datetime.now()),
+        ChatHistorySchema(msg_id=3, session_id=group, user_id="alice", user_name="Alice", content_type="image",
+                          content="id: current\nb.png", created_at=datetime.now()),
+        ChatHistorySchema(msg_id=4, session_id=group, user_id="alice", user_name="Alice", content_type="text",
+                          content="id: current\n这两张图有什么区别", created_at=datetime.now()),
+    ]
+    async with get_session() as db:
+        await agent.choice_response_strategy(db, group, None, history, "alice", "Alice", bot_id="bot", group_members=[])
+
+    image_parts = [part for message in captured["messages"] if isinstance(message.content, list)
+                   for part in message.content if isinstance(part, dict) and part.get("type") == "image_url"]
+    assert len(image_parts) == 2
+    assert any("old" in str(message.content) for message in captured["messages"])
+
+
 async def test_history_image_does_not_rewrite_cached_history_on_next_turn(monkeypatch, tmp_path):
     from uuid import uuid4
     from typing import cast
@@ -55,7 +140,8 @@ async def test_history_image_does_not_rewrite_cached_history_on_next_turn(monkey
             await agent.choice_response_strategy(db, group, None, history, "alice", "Alice", bot_id="bot",
                                                  bot=bot, group_members=[])
             assert [m.model_dump() for m in captures[1][:len(cached)]] == [m.model_dump() for m in cached]
-            assert any("image_url" in str(m.content) for m in captures[1])
+            assert all("image_url" not in str(m.content) for m in captures[1])
+            assert any("first-image" in str(m.content) for m in captures[1])
             cached = active_conversation_threads[group].messages
             for index in range(3):
                 name = f"later-{index}.png"
@@ -70,7 +156,8 @@ async def test_history_image_does_not_rewrite_cached_history_on_next_turn(monkey
             assert [m.model_dump() for m in captures[2][:len(cached)]] == [m.model_dump() for m in cached]
             images = [part for message in captures[2] if isinstance(message.content, list)
                       for part in message.content if isinstance(part, dict) and part.get("type") == "image_url"]
-            assert len(images) == 3
+            assert len(images) == 1
+            assert any("later-0" in str(m.content) for m in captures[2])
     finally:
         active_conversation_threads.pop(group, None)
 
