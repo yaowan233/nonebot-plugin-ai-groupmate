@@ -20,6 +20,7 @@ def isolated_affinity(monkeypatch):
     monkeypatch.setattr(affinity, "_feelings", {})
     monkeypatch.setattr(affinity, "_activity", OrderedDict())
     monkeypatch.setattr(affinity, "_review_due", {})
+    monkeypatch.setattr(affinity, "resolve_group_reply_probability", lambda *_: 0.01)
     return affinity
 
 
