@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import base64
+import asyncio
 from typing import Any
 
+import httpx
 from nonebot.adapters import Bot
 from langchain_core.tools import tool
 
@@ -17,13 +19,18 @@ MAX_FORWARD_IMAGE_BYTES = 10 * 1024 * 1024
 
 
 async def _forward_image_source(bot: Bot, data: dict[str, Any]) -> str | None:
-    def source(descriptor: dict[str, Any]) -> str | None:
+    async def source(descriptor: dict[str, Any]) -> str | None:
         for key in ("url", "file"):
             value = descriptor.get(key)
             if not isinstance(value, str):
                 continue
             if value.startswith(("https://", "http://")):
-                return value
+                from .image_search_tools import _download_preview
+
+                try:
+                    return await _download_preview(value)
+                except (OSError, ValueError, httpx.HTTPError):
+                    continue
             if value.startswith(("base64://", "data:image/")):
                 encoded = value.removeprefix("base64://") if value.startswith("base64://") else value.partition(",")[2]
                 if len(encoded) > MAX_FORWARD_IMAGE_BYTES * 4 // 3 + 4:
@@ -32,12 +39,12 @@ async def _forward_image_source(bot: Bot, data: dict[str, Any]) -> str | None:
                     image_bytes = base64.b64decode(encoded, validate=True)
                 except ValueError:
                     continue
-                uri = _image_bytes_to_data_uri(image_bytes, source="forward-image")
+                uri = await asyncio.to_thread(_image_bytes_to_data_uri, image_bytes, source="forward-image")
                 if uri:
                     return uri
         return None
 
-    direct = source(data)
+    direct = await source(data)
     if direct:
         return direct
     file = data.get("file")
@@ -50,7 +57,7 @@ async def _forward_image_source(bot: Bot, data: dict[str, Any]) -> str | None:
     if not isinstance(response, dict):
         return None
     descriptor = response.get("data", response)
-    return source(descriptor) if isinstance(descriptor, dict) else None
+    return await source(descriptor) if isinstance(descriptor, dict) else None
 
 
 def create_read_forward_message_tool(

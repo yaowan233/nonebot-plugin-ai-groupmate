@@ -1,8 +1,16 @@
 import json
 from typing import Any, cast
+from unittest.mock import AsyncMock
 
 import pytest
 from nonebot.adapters import Bot
+
+
+@pytest.fixture(autouse=True)
+def forward_image_download(monkeypatch):
+    from nonebot_plugin_ai_groupmate.agent import image_search_tools
+
+    monkeypatch.setattr(image_search_tools, "_download_preview", AsyncMock(side_effect=lambda url: url))
 
 
 class _FakeBot:
