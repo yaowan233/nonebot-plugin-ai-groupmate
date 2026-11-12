@@ -650,7 +650,7 @@ def create_reverse_image_search_tool(
         ):
             return tool_skipped(
                 "request_expired",
-                "请求已过期，已取消反向搜图。",
+                "这轮请求已结束或取消，没有继续反向搜图。",
             )
         if not (config.serpapi_api_key.strip() or config.google_web_detection_enabled):
             return tool_failure(

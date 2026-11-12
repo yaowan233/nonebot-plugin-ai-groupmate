@@ -43,14 +43,10 @@ PARALLEL_SAFE_TOOL_NAMES = frozenset({
     "search_web",
 })
 EMPTY_RESPONSE_RETRY_PROMPT = (
-    "你刚才返回了空响应，这是无效输出。请重新选择下一步：需要回应时调用对应工具；"
-    "确实不需要回应时必须调用 finish。不要再次返回空内容。"
+    """你刚才返回了空内容。重新选一下：需要回应就调对应工具；确定不用回话就调 finish 收尾，别再返回空内容。"""
 )
 BUDGET_FINALIZATION_PROMPT = (
-    "本轮 Agent 已达到处理预算上限。现在停止搜索、计算和其他工具操作，"
-    "仅根据当前对话及已经取得的工具结果，整理一条尽可能完整、准确的最终回复。"
-    "只输出要发送给用户的正文，不要调用任何工具；若资料仍不完整，请明确说明限制，"
-    "不要编造。"
+    """这轮处理预算已经用完了。先停下搜索、计算和其他工具操作，只用当前对话和已有工具结果，整理一条尽可能完整准确的最终回复。只输出要发给对方的正文，别再调用工具；资料不全就说明限制，别编造。"""
 )
 BUDGET_FINALIZATION_FALLBACK = (
     "我已经取得了一些资料，但本轮处理达到了 Token 上限，暂时没能完成整理。"
@@ -124,11 +120,7 @@ class _ToolInvocationOutcome:
 
 
 COMPLETION_RULE = (
-    "任务必须在本轮实际处理并交付结果；若无法完成，明确说明已知结论、卡点或缺少的条件。"
-    "不要只回复‘还在推/正在查/等下再回你’，也不要声称结束后仍会在后台工作。"
-    "只有定时任务工具已明确返回成功，才能承诺稍后自动回复。"
-    "next_step=end 表示整个任务本轮已结束，不是这一句话写完；"
-    "需要继续处理时先处理再回复，不要用进度闲聊替代结果。"
+    """手头的事要在这轮实际处理并交付；做不完就说清目前的结论、卡点或缺少的条件。别只说“还在推/正在查/等下再回你”，也别声称结束后还在后台工作；只有定时任务工具明确返回成功，才能答应稍后自动回复。next_step=end 表示整件事这轮已经结束，不是这一句话写完；还要处理就先处理，别拿进度闲聊代替结果。"""
 )
 INCOMPLETE_REPLY_FALLBACK = "这次没能给出可靠结果，目前无法完成这项任务。刚才没有完成的部分不会在后台继续运行。"
 
@@ -1036,10 +1028,10 @@ def _make_budget_finalizer_node(
             prompt += "\n" + delivery_context
         if pending_files:
             prompt = (
-                "本轮处理预算已用尽。停止生成、修改和预览；仅可用 send_file 交付已生成的成品，最多 3 个。"
-                "从以下 file_id 中选择最终需要交付的文件，不发送草稿、不猜 ID："
+                "这轮处理预算用完了，别再生成、修改或预览；只可用 send_file 交付已经生成的成品，最多 3 个。"
+                "从下面的 file_id 里挑最终成品，别发草稿，也别猜 ID："
                 + json.dumps(sorted(pending_files))
-                + "。发送必须使用结构化工具调用，不输出工具标记。无法交付则用正文如实说明，未发送不得声称已发送。"
+                + "。发文件要走结构化工具调用，别输出工具标记。没法交付就用正文说明，没发出去别说已经发了。"
             )
         call_messages = [
             *full,
@@ -1369,7 +1361,7 @@ def _make_tool_node(
                 results.append(ToolMessage(
                     content=tool_skipped(
                         "request_expired",
-                        "请求已过期，已取消执行。",
+                        "这轮请求已结束或取消，没有继续执行。",
                     ),
                     tool_call_id=tool_call_id,
                 ))
@@ -1380,8 +1372,7 @@ def _make_tool_node(
                     results.append(ToolMessage(
                         content=tool_skipped(
                             "pending_tool_work",
-                            "本轮还有工具工作未完成，未发送这条提前确认。"
-                            "请先完成操作并检查结果，再在下一轮回复用户。",
+                            "手头还有工具没跑完，这条提前确认没有发出；等操作完成、检查结果后再回复。",
                             delivery_state="not_attempted",
                         ),
                         tool_call_id=tool_call_id,
@@ -1458,7 +1449,7 @@ def _make_tool_node(
                     results.append(ToolMessage(
                         content=tool_skipped(
                             "duplicate_side_effect",
-                            "相同的副作用请求已经执行过，已跳过重复执行。",
+                            "相同的操作刚才已经执行过，这次跳过，不再重复。",
                             delivery_state="not_attempted",
                         ),
                         tool_call_id=tool_call_id,
@@ -1581,8 +1572,7 @@ def _make_tool_node(
                         content=tool_failure(
                             "tool_timeout",
                             (
-                                "副作用工具执行超时，投递结果未知；为避免重复操作，"
-                                "本轮必须停止且不得重试。"
+                                "操作超时了，结果不确定，可能已经执行；为避免重复，本轮先停止，不要重试。"
                                 if delivery_unknown
                                 else "工具执行超时，请根据已有信息决定是否重试或换一种方式。"
                             ),

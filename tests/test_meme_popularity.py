@@ -550,7 +550,7 @@ async def test_send_meme_rejects_an_id_outside_current_approval(tmp_path):
 
     result = await send_tool.ainvoke({"pic_id": "42"})
 
-    assert "未通过本轮搜索审核" in result
+    assert json.loads(result)["reason_code"] == "candidate_not_approved"
 
 
 @pytest.mark.asyncio
@@ -680,7 +680,7 @@ async def test_send_meme_rechecks_images_recently_sent_by_group_members(
     result = json.loads(await send_tool.ainvoke({"pic_id": "42"}))
 
     assert result["status"] == "skipped"
-    assert "刚刚在群里出现过" in result["message"]
+    assert result["reason_code"] == "recently_used"
     assert approved == set()
 
 

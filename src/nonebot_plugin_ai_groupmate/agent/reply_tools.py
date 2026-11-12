@@ -107,25 +107,18 @@ def create_reply_tool(
         next_step: Literal["end", "continue"],
         reply_to: str | None = None,
     ) -> str:
-        """
-        向当前会话单独发送文字回复，不要直接返回正文。
-        文字要和图片在同一条消息中时，使用发图工具的 text 参数，不要拆成两次发送。
+        """往当前聊天里单独发一条文字消息，别不调工具直接输出正文。
+        要把文字和图片放在同一条消息时，用发图工具的 text 参数，别拆成两条。
         Args:
-            content: 你想发送的内容。提及本轮发言者用 @current；群内其他成员用@用户ID，ID后用空白或标点分隔；
-                会生成平台原生@。未知ID或重名时先用query_platform的list_members查询，也支持唯一昵称。
-            reply_to: 可选引用回复。填 current 引用用户现在发出的这条消息；
-                引用其他消息则传当前会话的已知平台消息ID。省略则普通发送，不要编造ID。
-            next_step: 当前请求已处理并交付结果或明确说明阻塞后填 end；
-                只有下一条会提供新信息时填 continue，最后一条必须填 end。
-                end 表示本轮任务结束。不要发送“还在推/等下再回你”等空承诺；
-                应先完成处理，给出结果，或明确说明无法完成及具体卡点。
-        """
+            content: 要说的话。@ 当前发言者写 @current；群里 @ 别人写 @用户ID，ID 后用空白或标点分隔，会生成平台原生 @。未知 ID 或重名时先用 query_platform 的 list_members 查询，也支持唯一昵称。
+            reply_to: 可选引用。填 current 引用当前消息；引用其他消息传当前聊天中已知的真实平台消息 ID。留空为普通发送，别编 ID。
+            next_step: 这轮事办完、结果交付或卡点说清后填 end；只有下一条会提供新信息时才填 continue，最后一条必须填 end。别发句“正在查/等会儿回你”的空承诺就结束；先完成处理、交付结果或说明具体卡点。"""
         if request_id is not None and not await is_request_active(
             session_id, request_id
         ):
             return tool_skipped(
                 "request_expired",
-                "请求已过期，已取消发送。",
+                "这轮请求已结束或取消，没有继续发送。",
                 delivery_state="not_attempted",
             )
 
@@ -238,7 +231,7 @@ def create_reply_tool(
             ):
                 return tool_skipped(
                     "request_expired",
-                    "请求已过期，已取消发送。",
+                    "这轮请求已结束或取消，没有继续发送。",
                     delivery_state="not_attempted",
                 )
 

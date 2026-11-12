@@ -25,7 +25,7 @@ def create_history_image_tool(
     async def view_history_image(message_id: str = "", history_row_id: int | None = None, image_index: int | None = None):
         """查看当前会话的一条历史图片。message_id 用近期消息引用中的真实消息 ID；旧记录可用历史查询返回的数据库 msg_id 作 history_row_id。多图可用从 1 开始的 image_index。只在需要看具体图片时调用。"""
         if request_id is not None and not await is_request_active(session_id, request_id):
-            return tool_skipped("request_expired", "请求已过期，已取消图片读取。")
+            return tool_skipped("request_expired", "这轮请求已结束或取消，没有继续图片读取。")
         if bool(message_id.strip()) == (history_row_id is not None) or (image_index is not None and image_index < 1):
             return tool_failure("invalid_image_target", "请指定一个消息 ID 或历史记录 msg_id；图片序号从 1 开始。")
 

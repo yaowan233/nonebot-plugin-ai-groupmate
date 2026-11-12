@@ -201,7 +201,7 @@ def create_reaction_tool(
         ):
             return tool_skipped(
                 "request_expired",
-                "请求已过期，已取消表情回复。",
+                "这轮请求已结束或取消，没有继续表情回复。",
                 delivery_state="not_attempted",
             )
 
@@ -301,7 +301,7 @@ def create_reaction_tool(
         ):
             return tool_skipped(
                 "request_expired",
-                "请求已过期，已取消表情回复。",
+                "这轮请求已结束或取消，没有继续表情回复。",
                 delivery_state="not_attempted",
             )
 

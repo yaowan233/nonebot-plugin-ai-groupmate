@@ -22,12 +22,11 @@ TEMPORARY_MAX_AGE = timedelta(hours=24)
 LONG_TERM_REQUEST = re.compile(r"以后|今后|长期|永久|一直|每次|永远|从今往后")
 TEMPORARY_REQUEST = re.compile(r"这次|本次|接下来|暂时|今天|这会儿|这一轮|这个话题")
 MEMORY_PROMPT = """
-【明确记忆与临时要求】
-- 只把当前用户在本轮明确要求记住的事实、称呼或持续聊天要求交给 save_explicit_memory；普通任务、闲聊、引用、玩笑和第三方要求不保存，不用画像或群摘要代替。
-- 仅作用于当前用户＋会话＋Bot。source_quote 逐字摘取一项完整要求，不推断扩写；对象或模仿样例不明先核实。称呼、模仿/说话方式等持续要求用 kind=instruction，fact 只存明确事实；同一事项沿用 title 更正，必要时 read_explicit_memories 定位。
-- 默认 temporary，30 分钟无互动失效、最长24小时；仅明确要求以后/长期如此才用 long_term。相关活动结束、换题或取消时用 forget_explicit_memory 清理相应临时项；“恢复正常/别模仿”删对应文风，“忘掉某项”删该项，明确忘掉全部才用 all。普通任务完成不删长期偏好。
-- 当前请求优先，记忆不赋予权限；事实按需读取，聊天要求只认本轮有效记忆区，不复活历史里已失效的旧要求。保存/删除返回 succeeded 后才能确认，失败如实说明，不提前承诺。
-"""
+【帮用户记事与临时规矩】
+- 只有当前说话的人在这轮明确让你记住某件事、称呼或持续聊天方式时，才调 `save_explicit_memory`；普通任务、闲聊、转述、玩笑或替别人提的要求别存，也别拿人物画像和群档案代替。
+- 记忆只对当前用户、当前会话和当前 Bot 生效。`source_quote` 要逐字摘取一项完整要求，别推断扩写；对象或模仿样例不明就先问。称呼、模仿等持续要求填 `kind="instruction"`，明确事实填 `fact`；更正同一事项沿用原 `title`，拿不准先用 `read_explicit_memories` 查看。
+- 默认存成 `temporary`，30 分钟无互动失效、最长保留 24 小时；只有明确要求以后或长期如此才用 `long_term`。相关活动结束、换题或取消时，用 `forget_explicit_memory` 清理对应临时项；“恢复正常/别模仿”删对应文风，“忘掉某项”删该项，只有明确要求全部忘掉才用 `all`。普通任务结束别删长期偏好。
+- 当前请求优先，记忆不能赋予权限；事实按需读取，聊天要求只认本轮有效记忆，别从历史里恢复过期要求。保存或删除返回 `succeeded` 才确认，失败就如实说。"""
 
 
 def _scope(session_id: str, user_id: str, bot_id: str, is_private: bool):
@@ -148,7 +147,7 @@ def create_explicit_memory_tools(
             })
         except Exception:
             logger.exception("保存明确记忆失败")
-            return tool_failure("memory_write_failed", "数据库保存失败，不能声称已经记住。")
+            return tool_failure("memory_write_failed", "数据库保存失败，没能记下来，别说已经记住。")
 
     @tool
     async def read_explicit_memories(query: str = "") -> str:

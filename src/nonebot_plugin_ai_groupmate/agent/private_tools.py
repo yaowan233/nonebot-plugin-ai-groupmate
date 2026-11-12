@@ -97,7 +97,7 @@ def create_private_message_tool(
         ):
             return tool_skipped(
                 "request_expired",
-                "请求已过期，已取消主动私聊。",
+                "这轮请求已结束或取消，没有继续主动私聊。",
                 delivery_state="not_attempted",
             )
 

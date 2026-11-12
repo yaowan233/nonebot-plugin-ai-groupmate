@@ -554,7 +554,7 @@ def create_similar_meme_tool(
         if request_id is not None and not await is_request_active(
             session_id, request_id
         ):
-            return tool_skipped("request_expired", "请求已过期，已取消相似图片搜索。")
+            return tool_skipped("request_expired", "这轮请求已结束或取消，没有继续相似图片搜索。")
 
         logger.info("正在搜索相似图片...")
 
@@ -723,7 +723,7 @@ def create_search_meme_tool(
         if request_id is not None and not await is_request_active(
             session_id, request_id
         ):
-            return tool_skipped("request_expired", "请求已过期，已取消表情包搜索。")
+            return tool_skipped("request_expired", "这轮请求已结束或取消，没有继续表情包搜索。")
 
         try:
             effective_match_type = match_type or default_match_type
@@ -841,7 +841,7 @@ def create_search_meme_tool(
             ):
                 return tool_skipped(
                     "request_expired",
-                    "请求已过期，已取消表情包搜索。",
+                    "这轮请求已结束或取消，没有继续表情包搜索。",
                 )
 
             if not pic_ids:
@@ -956,17 +956,11 @@ def create_send_meme_tool(
 
     @tool("send_meme_image")
     async def send_meme_image(pic_id: str, reply_to: str | None = None, text: str = "", next_step: Literal["end", "continue"] = "end") -> str:
-        """
-        发送表情包图片到聊天中。
-
-        你需要先使用当前可用的表情包搜索工具获取候选图片，
-        然后从本轮审核通过的候选中决定是否发送。工具每次发送一张；只有用户明确
-        要求多张时才可用不同 pic_id 多次调用，且必须服从本轮发送上限。
-        reply_to 可选：填 current 引用用户现在发出的这条消息；
-        引用其他消息则传当前会话的已知平台消息ID；省略则普通发送，不要编造ID。
-        text 可选，填写后文字与图片在同一条消息中发送，不要再单独重复发文字。
-        图文已完成本轮请求时 next_step=end；仍需交付其他内容时填 continue。
-        """
+        """往聊天里发一张表情包。
+        先用当前可用的表情包搜索工具找候选，再从本轮通过审核的 pic_id 里挑。每次发一张；只有用户明确要求多张时才可多次调用，使用不同 pic_id，别超过本轮上限。
+        reply_to 填 current 引用当前消息，或填已知的平台消息 ID；不引用就留空，别编 ID。
+        text 可以让文字和图片同条发送，配了字就别再单独重复发。
+        图文已经完成本轮请求时 next_step 填 end；还要交付其他内容时填 continue。"""
         nonlocal sent_count
         if sent_count >= max_sends:
             return tool_skipped(
@@ -980,7 +974,7 @@ def create_send_meme_tool(
         ):
             return tool_skipped(
                 "request_expired",
-                "请求已过期，已取消发送。",
+                "这轮请求已结束或取消，没有继续发送。",
                 delivery_state="not_attempted",
             )
 
@@ -1014,7 +1008,7 @@ def create_send_meme_tool(
             ):
                 return tool_failure(
                     "candidate_not_approved",
-                    "该图片未通过本轮搜索审核，请先重新搜索。",
+                    "这张图不在本轮审核通过的候选里，想发图先重新搜索。",
                     retryable=True,
                     delivery_state="not_attempted",
                 )
@@ -1030,7 +1024,7 @@ def create_send_meme_tool(
                     approved_meme_ids.discard(selected_pic_id)
                 return tool_skipped(
                     "recently_used",
-                    "这张表情包刚刚在群里出现过，请选择不同的 pic_id。",
+                    "这张表情包刚在群里出现过，换个 pic_id 吧。",
                     data={"sent_count": sent_count, "max_sends": max_sends},
                     delivery_state="not_attempted",
                 )
@@ -1086,7 +1080,7 @@ def create_send_meme_tool(
             ):
                 return tool_skipped(
                     "request_expired",
-                    "请求已过期，已取消发送。",
+                    "这轮请求已结束或取消，没有继续发送。",
                     delivery_state="not_attempted",
                 )
 
