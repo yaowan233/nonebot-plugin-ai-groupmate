@@ -271,11 +271,12 @@ async def test_expired_request_does_not_read_database(monkeypatch):
         assert (await invoke(tool))["status"] == "skipped"
 
 
-@pytest.mark.parametrize("mode", ["group", "private", "repeat", "reaction", "meme", "observation"])
+@pytest.mark.parametrize("mode", ["group", "private", "repeat", "reaction", "meme", "observation", "observation-linked"])
 def test_history_tools_visible_on_first_group_turn_without_loading_a_skill(mode):
     """Exercise the production registration and first-turn tool selection."""
     from nonebot_plugin_ai_groupmate.agent import interaction_tools
     from nonebot_plugin_ai_groupmate.agent.graph import _active_tools
+    from nonebot_plugin_ai_groupmate.brain.observations import configured_space
 
     source = Path(interaction_tools.__file__).with_name("__init__.py")
     tree = ast.parse(source.read_text(encoding="utf-8"))
@@ -288,13 +289,14 @@ def test_history_tools_visible_on_first_group_turn_without_loading_a_skill(mode)
             nodes.append(node)
     env: dict[str, Any] = {node.id: SimpleNamespace(name=node.id) for statement in nodes for node in ast.walk(statement) if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)}
     env.update(
-        is_private=mode == "private", proactive_meme_only=mode == "meme", proactive_reaction_only=mode == "reaction", proactive_observation=mode == "observation",
+        is_private=mode == "private", proactive_meme_only=mode == "meme", proactive_reaction_only=mode == "reaction", proactive_observation=mode in {"observation", "observation-linked"},
         repeat_text="跟读" if mode == "repeat" else None, meme_similar_enabled=False, reaction_enabled=True,
         web_image_tools=[], ordered_reply_tools=[], file_tools=[], file_delivery_tools=[], image_generation_tools=[], drawing_management_tools=[], custom_agent_tools=[], lazy_attachment_tools=[],
         create_explicit_memory_tools=lambda *_, **__: [], create_interaction_history_tools=interaction_tools.create_interaction_history_tools,
         create_platform_query_tool=lambda *_, **__: SimpleNamespace(name="query_platform"), member_snapshot=[], interface=None,
         create_scoped_history_search_tool=lambda *_, **__: SimpleNamespace(name="search_history_context"),
-        session_id="group-1", request_id=None, bot_id="bot-id", plugin_config=SimpleNamespace(bot_name="miyuki"),
+        session_id="group-1", request_id=None, bot_id="bot-id", configured_space=configured_space,
+        plugin_config=SimpleNamespace(bot_name="miyuki", cross_group_spaces={"linked": ["group-1", "group-2"]} if mode == "observation-linked" else {}),
         get_bots=lambda: {"bot-id": object()}, str=str, tuple=tuple, set=set, max=max,
         user_id="1", history=[],
         plugin_data_dir=Path("unused-card-cache"), create_shared_card_tools=lambda *_, **__: [],
@@ -305,6 +307,8 @@ def test_history_tools_visible_on_first_group_turn_without_loading_a_skill(mode)
     history_names = {"search_history_context", "search_group_interactions", "read_member_history", "read_recent_history"}
     assert names & history_names == (history_names if mode == "group" else set())
     assert ("query_platform" in names) == (mode == "group")
+    if mode == "observation-linked":
+        assert names == {"reply_tool", "finish", "search_meme_tool", "send_meme_tool"}
 
 
 def test_group_skill_exposes_interaction_guidance():

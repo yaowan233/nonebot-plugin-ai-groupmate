@@ -1981,8 +1981,9 @@ async def create_chat_graph(
 
     run_limits = _agent_run_limits()
     if proactive_observation:
+        max_observation_calls = 3 if configured_space(plugin_config.cross_group_spaces, session_id) else 2
         run_limits = replace(
-            run_limits, max_llm_calls=min(3, run_limits.max_llm_calls),
+            run_limits, max_llm_calls=min(max_observation_calls, run_limits.max_llm_calls),
             max_total_tokens=min(16000, run_limits.max_total_tokens),
             max_replies=1, finalize_on_budget_exhaustion=False,
         )
