@@ -68,7 +68,7 @@ def _meme_hint(item: dict, originals: list[str], users: list[str]) -> dict | Non
     pattern = r".{0,50}?".join(re.escape(part) for part in literals)
     if not all(re.search(pattern, text, flags=re.DOTALL) for text in originals):
         return None
-    return {"meme": meme, "usage": usage}
+    return {"meme": _MEME_SLOT.sub("{内容}", meme), "usage": usage}
 
 
 def configured_space(spaces: dict[str, list[str]], scene_id: str) -> str | None:
