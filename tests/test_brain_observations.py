@@ -252,3 +252,5 @@ def test_meme_template_preserves_fixed_text_and_replaces_variable_content():
                              "今天是疯狂星期四，我在肯德基看菜单，电话13812345678，谁请我吃炸鸡"], ["a", "b"]) is None
     assert _meme_hint(item, ["今天是疯狂星期四，我在肯德基饿得走不动，谁请我吃炸鸡",
                              "完全不相关的内容"], ["a", "b"]) is None
+    short = {"meme": "我嘞个豆，{事件}", "usage": "表达惊讶"}
+    assert _meme_hint(short, ["我嘞个豆，太离谱了", "我嘞个豆，居然这样"], ["a", "b"]) == short

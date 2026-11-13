@@ -59,7 +59,7 @@ def _meme_hint(item: dict, originals: list[str], users: list[str]) -> dict | Non
     literals = _MEME_SLOT.split(meme)
     slots = _MEME_SLOT.findall(meme)
     if (not 2 <= len(meme) <= 400 or not 2 <= len(usage) <= 40 or "\n" in usage or "\r" in usage
-            or len(slots) > 4 or (slots and sum(len(part.strip()) for part in literals) < 6)
+            or len(slots) > 4 or (slots and sum(len(part.strip()) for part in literals) < 4)
             or "{" in "".join(literals) or "}" in "".join(literals)
             or len(set(users)) < 2
             or any(_MEME_PRIVATE_CLUE.search(text) or contains_personal_data(text) for text in [meme, usage, *originals])
