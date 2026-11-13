@@ -8,15 +8,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 
 from ..model import ChatHistorySchema
+from .turn_context import TurnHistoryResolver
+from ..media_message import format_media_markers
 from .file_workspace import FileWorkspace
 from .image_resources import ImageResources, ImageResourceError, is_image_history as is_image_history, published_image_file_id as published_image_file_id, image_file_name_from_history as image_file_name_from_history
+from ..forward_message import format_forward_marker
 from ..message_mentions import format_member_mention
 from ..message_metadata import platform_message_ids, deduplicate_bot_echoes, parse_message_metadata, is_reliable_platform_id
 from .structured_context import StructuredSnapshot, visible_quote_text
-from .turn_context import TurnHistoryResolver
 from ..message_repository import find_by_platform_id
-from ..media_message import format_media_markers
-from ..forward_message import format_forward_marker
 from ..image_preparation import prepare_image
 
 BOT_IMAGE_DESCRIPTION_MAX_CHARS = 500

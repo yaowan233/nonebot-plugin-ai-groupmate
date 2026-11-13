@@ -1,3 +1,4 @@
+from typing import Any, cast
 from datetime import datetime
 
 import pytest
@@ -12,6 +13,54 @@ def test_active_thread_retains_latest_thousand_model_messages():
     assert len(retained) == 1000
     assert retained[0].content == "1"
     assert retained[-1].content == "1000"
+
+
+def test_active_thread_limits_images_across_turns_without_losing_text():
+    from nonebot_plugin_ai_groupmate.agent.conversation import limit_history_images
+
+    def turn(index):
+        return HumanMessage(content=[
+            {"type": "text", "text": f"消息 {index}"},
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{index}"}},
+        ])
+
+    original: list[BaseMessage] = [turn(index) for index in range(5)]
+    limited = limit_history_images(original)
+    limited_parts = [cast(list[dict[str, Any]], message.content) for message in limited]
+    assert [part["image_url"]["url"] for parts in limited_parts for part in parts
+            if part.get("type") == "image_url"] == [
+        "data:image/png;base64,2", "data:image/png;base64,3", "data:image/png;base64,4",
+    ]
+    assert [parts[0]["text"] for parts in limited_parts] == [f"消息 {index}" for index in range(5)]
+    assert limited_parts[0][1] == {"type": "text", "text": "[图片]"}
+    assert cast(list[dict[str, Any]], original[0].content)[1]["type"] == "image_url"
+
+
+def test_reused_thread_applies_image_limit_to_cached_and_new_messages():
+    from nonebot_plugin_ai_groupmate.agent.conversation import (
+        ActiveConversationThread,
+        build_append_only_history,
+        active_conversation_threads,
+    )
+
+    def image(index):
+        return HumanMessage(content=[{"type": "image_url", "image_url": {"url": str(index)}}])
+
+    active_conversation_threads["image-limit"] = ActiveConversationThread(
+        messages=[image(1), image(2), image(3)], last_msg_id=1, updated_at=datetime.now()
+    )
+    try:
+        messages, appended, reused = build_append_only_history(
+            "image-limit", [_history(2, "text", "id: 2\n新消息")],
+            format_history=lambda *_args: [image(4), image(5)],
+        )
+    finally:
+        active_conversation_threads.pop("image-limit", None)
+
+    assert reused
+    assert len(appended) == 1
+    assert [part["image_url"]["url"] for message in messages for part in cast(list[dict[str, Any]], message.content)
+            if part.get("type") == "image_url"] == ["4", "5"]
 
 
 @pytest.mark.asyncio
@@ -145,7 +194,7 @@ def test_sent_meme_original_is_attached_once_in_provider_compatible_role(tmp_pat
 
 
 @pytest.mark.asyncio
-async def test_sent_meme_original_survives_active_thread_update(tmp_path):
+async def test_sent_meme_does_not_keep_pixels_in_active_thread(tmp_path):
     from uuid import uuid4
 
     from PIL import Image
@@ -172,7 +221,7 @@ async def test_sent_meme_original_survives_active_thread_update(tmp_path):
             await update_active_thread(db, session_id, [HumanMessage("发个表情包")], boundary, format_history=format_history)
 
         thread = active_conversation_threads[session_id]
-        assert any(isinstance(m.content, list) and any(p.get("type") == "image_url" for p in m.content if isinstance(p, dict)) for m in thread.messages)
+        assert not any(isinstance(m.content, list) and any(p.get("type") == "image_url" for p in m.content if isinstance(p, dict)) for m in thread.messages)
         assert any(isinstance(m, AIMessage) for m in thread.messages)
     finally:
         active_conversation_threads.pop(session_id, None)

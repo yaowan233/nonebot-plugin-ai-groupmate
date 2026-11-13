@@ -36,6 +36,24 @@ def test_get_image_data_uri_normalizes_image_content(tmp_path):
         assert normalized.format == "JPEG"
 
 
+@pytest.mark.parametrize("mode", ["RGB", "RGBA"])
+def test_large_image_is_resized_for_model_without_modifying_original(tmp_path, mode):
+    from nonebot_plugin_ai_groupmate.agent.history_format import get_image_data_uri
+
+    source = tmp_path / "large.png"
+    Image.new(mode, (5000, 1000)).save(source)
+    original = source.read_bytes()
+
+    uri = get_image_data_uri(source.name, pic_dir=tmp_path)
+
+    assert uri is not None
+    with Image.open(io.BytesIO(base64.b64decode(uri.split(",", 1)[1]))) as image:
+        assert image.width <= 4096
+        assert image.height == round(1000 * image.width / 5000)
+        assert image.mode == mode
+    assert source.read_bytes() == original
+
+
 def _image_msg(
     msg_id: int,
     content: str,

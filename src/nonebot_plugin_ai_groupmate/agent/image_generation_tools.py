@@ -66,7 +66,7 @@ def create_image_generation_tool(db_session, session_id: str, request_id: str | 
 
         prompt 保留用户的内容和风格要求；改图须传参考图。reference_message_ids 是本会话图片的真实消息ID，
         current=当前消息，replied=当前用户引用的消息；reference_file_ids 可传已生成或下载的图片 file_id。
-        reference_user_ids 取当前群已知成员头像作为真实参考图，current=当前用户；不确定 ID 先 get_group_members，不猜昵称或ID。
+        reference_user_ids 取当前群已知成员头像作为真实参考图，current=当前用户；不确定 ID 先用 query_platform 的 list_members 查询，不猜昵称或ID。
         合计最多4张参考图。size 支持 1024x1024、1536x1024、1024x1536、auto。可用透明背景。
         图文穿插需要等多张绘图一起发送时设置 defer_delivery=true，返回待组合的 job_id，不会单独发送。
         需要引用消息中的某一张图时，传单个 reference_message_ids 和从 1 开始的 reference_image_index。
@@ -74,7 +74,7 @@ def create_image_generation_tool(db_session, session_id: str, request_id: str | 
         标注引导修改需原图及单独的透明 PNG 标注层，传 markup_file_id，标注层须与原图尺寸一致。
         """
         if not await active():
-            return tool_skipped("request_expired", "请求已过期，已取消绘图。")
+            return tool_skipped("request_expired", "这轮请求已结束或取消，没有继续绘图。")
         if not config.image_generation_enabled:
             return tool_failure("image_generation_disabled", "GPT 绘图尚未启用。")
         if defer_delivery and not background:
@@ -211,7 +211,7 @@ def create_image_generation_tool(db_session, session_id: str, request_id: str | 
                                                            content_type=mime, source_key=source_key)
                         reference_ids.append(artifact.file_id)
                     if not await active():
-                        return tool_skipped("request_expired", "请求已过期，已取消绘图。")
+                        return tool_skipped("request_expired", "这轮请求已结束或取消，没有继续绘图。")
                     attempted.add(fingerprint)
                     queued = await enqueue_drawing(db_session, DrawingRequest(
                         platform=platform, session_id=session_id, is_private=is_private, bot_id=bot_id,
@@ -233,7 +233,7 @@ def create_image_generation_tool(db_session, session_id: str, request_id: str | 
                     return result
                 async with _generation_gate:
                     if not await active():
-                        return tool_skipped("request_expired", "请求已过期，已取消绘图。")
+                        return tool_skipped("request_expired", "这轮请求已结束或取消，没有继续绘图。")
                     attempted.add(fingerprint)
                     request_options = {k: v for k, v in options.items() if k != "markup_file_id"}
                     if markup is not None:
@@ -243,7 +243,7 @@ def create_image_generation_tool(db_session, session_id: str, request_id: str | 
                         timeout=config.image_generation_timeout_seconds,
                     )
             artifact = await asyncio.to_thread(workspace.save, generated.data, f"gpt-image.{generated.output_format}", content_type=f"image/{generated.output_format}")
-            result = tool_success("image_generated", "图片已生成并保存，尚未发送；用 send_file(as_image=true) 交付，无需重新生成。", data={**artifact.public(), "model": config.image_generation_model, "usage": generated.usage})
+            result = tool_success("image_generated", "图已经生成并保存，还没发出去；用 send_file(as_image=true) 发给对方，不用重新生成。", data={**artifact.public(), "model": config.image_generation_model, "usage": generated.usage})
             results[fingerprint] = result
             return result
         except ImageResourceError as error:

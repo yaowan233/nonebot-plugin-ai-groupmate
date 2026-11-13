@@ -1,5 +1,6 @@
 import json
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 from langchain.tools import ToolRuntime
@@ -518,3 +519,22 @@ async def test_search_history_context_returns_shared_protocol(monkeypatch):
     assert result["reason_code"] == "history_found"
     assert "北极星" in result["data"]["context"]
     assert "不可信引用" in result["data"]["safety_notice"]
+
+
+@pytest.mark.asyncio
+async def test_cross_group_rag_uses_authorized_target(monkeypatch):
+    from nonebot_plugin_ai_groupmate.agent import common_tools
+
+    search = AsyncMock(return_value='[user_id="572473053"] 讨论了计划')
+    monkeypatch.setattr(common_tools.DB, "search_chat", search)
+    reachable = AsyncMock(return_value={"group-1", "group-2"})
+    tool = common_tools.create_scoped_history_search_tool(
+        "group-1", None, platform="OneBot V11", configured_spaces=lambda: {"friends": ["group-1", "group-2"]},
+        reachable_groups=reachable, allow_cross_group_history=True,
+    )
+    result = json.loads(await tool.ainvoke({"query": "572473053 计划", "target_group_id": "group-2"}))
+    assert result["status"] == "succeeded"
+    search.assert_awaited_once_with("572473053 计划", "group-2", platform="OneBot V11", require_group_scope=True)
+    blocked = json.loads(await tool.ainvoke({"query": "计划", "target_group_id": "outside"}))
+    assert blocked["reason_code"] == "group_not_allowed"
+    assert search.await_count == 1

@@ -1,4 +1,6 @@
 import json
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -63,5 +65,58 @@ async def test_registered_agent_skill_can_be_loaded_on_demand():
         result = json.loads(await loader.ainvoke({"skill_name": "score_report"}))
         assert result["status"] == "succeeded"
         assert result["data"]["instructions"] == "full prompt for group-1"
+    finally:
+        clear_registered_agent_tools()
+
+
+@pytest.mark.asyncio
+async def test_registered_skill_tools_are_hidden_until_skill_is_loaded(monkeypatch):
+    from langchain.tools import tool
+
+    from nonebot_plugin_ai_groupmate import agent
+    from nonebot_plugin_ai_groupmate.agent.custom_tools import AgentSkill
+
+    @tool("plugin_example")
+    async def plugin_example() -> str:
+        """Example plugin tool."""
+        return "ok"
+
+    skill = AgentSkill(name="plugin_skill", description="Example", prompt="Use plugin_example.", tools=[plugin_example])
+    monkeypatch.setattr(agent.plugin_config, "agent_file_tools_enabled", False)
+    for name in ("get_user_relation_context", "get_group_context", "get_recent_relations_context", "relevant_context"):
+        monkeypatch.setattr(agent, name, AsyncMock(return_value=""))
+    monkeypatch.setattr(agent, "get_chat_model", lambda: object())
+    monkeypatch.setattr(agent, "load_group_style_context", AsyncMock(return_value=""))
+    monkeypatch.setattr(agent, "build_registered_agent_extensions", AsyncMock(return_value=([plugin_example], [], [skill])))
+    captured = {}
+
+    def build(_model, tools, _prompt, **kwargs):
+        captured.update(tools=tools, **kwargs)
+        return object()
+
+    monkeypatch.setattr(agent, "build_chat_graph", build)
+    await agent.create_chat_graph(SimpleNamespace(commit=AsyncMock()), "group", None, "user", "User", history=[],
+                                  group_members=[])  # pyright: ignore[reportArgumentType]
+    assert "plugin_example" not in {item.name for item in captured["base_tools"]}
+    assert "plugin_example" in {item.name for item in captured["tools"]}
+    assert [item.name for item in captured["tools_by_skill"]["plugin_skill"]] == ["plugin_example"]
+
+
+@pytest.mark.asyncio
+async def test_legacy_bundle_instructions_remain_visible_unless_explicitly_deferred():
+    from nonebot_plugin_ai_groupmate.agent.custom_tools import (
+        AgentToolBundle,
+        AgentToolContext,
+        register_agent_tool,
+        clear_registered_agent_tools,
+        build_registered_agent_extensions,
+    )
+
+    clear_registered_agent_tools()
+    try:
+        register_agent_tool(lambda _: AgentToolBundle(instructions=["legacy instruction"]))
+        register_agent_tool(lambda _: AgentToolBundle(instructions=["deferred instruction"], defer_instructions=True))
+        _, instructions, _ = await build_registered_agent_extensions(_context(AgentToolContext))
+        assert instructions == ["legacy instruction"]
     finally:
         clear_registered_agent_tools()

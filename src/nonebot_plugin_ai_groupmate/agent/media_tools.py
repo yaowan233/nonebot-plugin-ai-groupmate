@@ -331,32 +331,19 @@ def create_read_media_tools(
             data={"content": result},
         )
 
-    @tool("read_audio_message")
-    async def read_audio_message(
+    @tool("read_media_message")
+    async def read_media_message(
+        kind: MediaKind,
         message_id: str = "",
         media_ref: str = "",
         index: int = 0,
     ) -> str:
-        """按需读取语音。普通消息传 attachment_message_id；合并转发内语音传 media_ref，二者只传一个。"""
+        """按需读取语音或视频，kind 填 audio 或 video。普通消息传 attachment_message_id；合并转发内媒体传 media_ref，二者只传一个。"""
         return await read_media(
-            "audio",
+            kind,
             message_id=message_id,
             media_ref=media_ref,
             index=index,
         )
 
-    @tool("read_video_message")
-    async def read_video_message(
-        message_id: str = "",
-        media_ref: str = "",
-        index: int = 0,
-    ) -> str:
-        """按需读取视频。普通消息传 attachment_message_id；合并转发内视频传 media_ref，二者只传一个。"""
-        return await read_media(
-            "video",
-            message_id=message_id,
-            media_ref=media_ref,
-            index=index,
-        )
-
-    return [read_audio_message, read_video_message]
+    return [read_media_message]

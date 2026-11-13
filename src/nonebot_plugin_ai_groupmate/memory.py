@@ -1302,10 +1302,11 @@ class VectorDBOperator:
     # ================= 聊天记录功能 (RAG) =================
 
     @staticmethod
-    async def _read_chat_sources(session_id: str, msg_ids: list[int], *, platform: str = "") -> list[Any]:
+    async def _read_chat_sources(session_id: str, msg_ids: list[int], *, platform: str = "", require_group_scope: bool = False) -> list[Any]:
+        from types import SimpleNamespace
+
         from sqlalchemy import select
         from nonebot_plugin_orm import get_session
-        from types import SimpleNamespace
 
         from .model import ChatHistory, ChatHistorySchema
 
@@ -1316,17 +1317,24 @@ class VectorDBOperator:
                 ChatHistory.content_type.in_(("text", "bot")),
             ))).all()
             records = [ChatHistorySchema.model_validate(row) for row in rows]
+            if require_group_scope and not platform:
+                return []
             if not platform or not records:
                 return records
-            from .agent.structured_context import load_structured_context_safely
             from .agent.turn_context import TurnHistoryResolver
+            from .agent.structured_context import load_structured_context_safely
 
             snapshots = await load_structured_context_safely(
                 session, records, session_id=session_id, scope="group", platform=platform, include_media=False,
             )
             if not snapshots:
-                return records
+                return [] if require_group_scope else records
             resolver = TurnHistoryResolver(snapshots)
+            if require_group_scope:
+                verified = {history_id: snapshot.platform_id for snapshot in snapshots.values() for history_id in snapshot.history_ids}
+                records = [row for row in records if row.msg_id in verified]
+                return [SimpleNamespace(**row.model_dump(), resolved_body=resolver.metadata(row)[2],
+                                        source_platform_id=verified[row.msg_id]) for row in records]
             return [SimpleNamespace(**row.model_dump(), resolved_body=resolver.metadata(row)[2]) for row in records]
 
     @staticmethod
@@ -1346,10 +1354,13 @@ class VectorDBOperator:
         excerpt = ("…" if start else "") + body[start:start + 500]
         if start + 500 < len(body):
             excerpt += "…"
+        platform_id = getattr(message, "source_platform_id", None)
+        platform_suffix = f"[platform_message_id={json.dumps(platform_id, ensure_ascii=False)}] " if platform_id else ""
         identity = (
             f"[{message.created_at:%Y-%m-%d %H:%M:%S}] "
             f"[user_id={json.dumps(str(message.user_id), ensure_ascii=False)} "
             f"msg_id={message.msg_id} role={'bot' if message.content_type == 'bot' else 'user'}] "
+            f"{platform_suffix}"
             f"{json.dumps(message.user_name[:80], ensure_ascii=False)}: "
         )
         return (identity + json.dumps(excerpt, ensure_ascii=False)).translate({
@@ -1358,7 +1369,7 @@ class VectorDBOperator:
 
     async def _hydrate_chat_sources(
         self, query: str, session_id: str, texts: list[str], points: Sequence[Any],
-        *, platform: str = "",
+        *, platform: str = "", require_group_scope: bool = False,
     ) -> list[tuple[str, str]]:
         """Resolve retained hits through SQL IDs, including existing v2 indexes.
 
@@ -1381,18 +1392,26 @@ class VectorDBOperator:
         needed = sorted({msg_id for text in texts for msg_id in source_ids.get(text, [])})
         unverified = "来源未核实：稳定用户ID、消息ID及角色不可用；不得按昵称合并或认定人物。"
         if not needed:
+            if require_group_scope:
+                return []
             return [(text, unverified) for text in texts]
         try:
-            rows = await self._read_chat_sources(session_id, needed, **({"platform": platform} if platform else {}))
+            kwargs: dict[str, Any] = {"platform": platform} if platform else {}
+            if require_group_scope:
+                kwargs["require_group_scope"] = True
+            rows = await self._read_chat_sources(session_id, needed, **kwargs)
         except Exception as error:
             logger.warning(f"RAG 来源回查失败，返回未核实片段: {type(error).__name__}")
+            if require_group_scope:
+                return []
             return [(text, unverified) for text in texts]
         by_id = {row.msg_id: row for row in rows}
         hydrated = []
         for text in texts:
             ids = source_ids.get(text, [])
             if not ids:
-                hydrated.append((text, unverified))
+                if not require_group_scope:
+                    hydrated.append((text, unverified))
                 continue
             found = [by_id[msg_id] for msg_id in ids if msg_id in by_id]
             # Deleted or cross-session sources must not reappear from vector text.
@@ -1469,7 +1488,7 @@ class VectorDBOperator:
             ]
         )
 
-    async def search_chat(self, query: str, session_id: str, *, platform: str = "") -> str:
+    async def search_chat(self, query: str, session_id: str, *, platform: str = "", require_group_scope: bool = False) -> str:
         """在当前会话中召回并融合排序相关历史片段。"""
         if not self.enabled:
             return "未找到相关历史记录"
@@ -1521,9 +1540,43 @@ class VectorDBOperator:
         if not search_result or not search_result.points:
             return "未找到相关历史记录"
 
+        points = search_result.points
+        if require_group_scope:
+            if not platform or platform == "unknown":
+                return "无法连接记忆库"
+            from types import SimpleNamespace
+
+            point_ids = []
+            for point in points:
+                payload = getattr(point, "payload", None)
+                values = payload.get("msg_ids", []) if isinstance(payload, dict) else []
+                point_ids.append(list(dict.fromkeys(
+                    int(value) for value in values[:100]
+                    if (type(value) is int or isinstance(value, str) and value.isascii() and value.isdigit() and len(value) <= 10)
+                    and 0 < int(value) <= 2**31 - 1
+                )) if isinstance(values, list) else [])
+            needed = sorted({msg_id for ids in point_ids for msg_id in ids})
+            try:
+                rows = await self._read_chat_sources(session_id, needed, platform=platform, require_group_scope=True) if needed else []
+            except Exception as error:
+                logger.warning(f"跨群 RAG 来源核验失败: {type(error).__name__}")
+                return "无法连接记忆库"
+            verified = {row.msg_id: row for row in rows}
+            sanitized = []
+            for point, ids in zip(points, point_ids, strict=True):
+                selected = [verified[msg_id] for msg_id in ids if msg_id in verified]
+                if selected:
+                    payload = getattr(point, "payload", {})
+                    sanitized.append(SimpleNamespace(payload={"text": "\n".join(self._format_chat_source(normalized_query, row) for row in selected),
+                                                               "msg_ids": [row.msg_id for row in selected],
+                                                               "created_at": payload.get("created_at", 0)}))
+            points = sanitized
+            if not points:
+                return "未找到相关历史记录"
+
         candidates = self._rank_chat_candidates(
             expanded_query,
-            search_result.points,
+            points,
         )
         best_texts = await self._rerank(
             expanded_query,
@@ -1534,8 +1587,10 @@ class VectorDBOperator:
             return "未找到相关历史记录"
         fragments: list[str] = []
         total_chars = 0
-        sources = await self._hydrate_chat_sources(normalized_query, session_id, best_texts, search_result.points,
-                                                    **({"platform": platform} if platform else {}))
+        source_kwargs: dict[str, Any] = {"platform": platform} if platform else {}
+        if require_group_scope:
+            source_kwargs["require_group_scope"] = True
+        sources = await self._hydrate_chat_sources(normalized_query, session_id, best_texts, points, **source_kwargs)
         for text, source_notice in sources:
             fragment = self._trim_chat_fragment(normalized_query, text)
             if not fragment:

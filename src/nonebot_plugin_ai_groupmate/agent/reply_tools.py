@@ -9,12 +9,14 @@ from nonebot_plugin_alconna import Target, UniMessage
 
 from ..model import ChatHistory
 from .delivery import OutboundIdentity, send_and_finalize
+from .chat_text import plain_chat_text, wants_original_format
 from ..reply_guard import is_request_active
 from .member_tools import member_aliases
 from .tool_results import tool_failure, tool_skipped, tool_success
 from .outbound_plan import compose_segments
 from ..message_metadata import is_reliable_platform_id
 from ..message_repository import find_by_platform_id, structured_id_in_scope
+from ..cross_group_privacy import hide_other_group_ids
 
 
 async def resolve_reply_target(db_session, session_id: str, reply_to: str | None, *, current_message_id: str | None = None, replied_message_id: str | None = None, outbound_identity: OutboundIdentity | None = None) -> str | None:
@@ -72,10 +74,12 @@ def create_reply_tool(
     group_members: list[Any] | None = None,
     current_user_id: str | None = None,
     repeat_text: str | None = None,
+    request_text: str = "",
     current_message_id: str | None = None,
     replied_message_id: str | None = None,
     recovery_enabled: bool = True,
     outbound_identity: OutboundIdentity | None = None,
+    cross_group_spaces: dict[str, list[str]] | None = None,
 ):
     """
     核心工具：用于发送消息。
@@ -103,25 +107,18 @@ def create_reply_tool(
         next_step: Literal["end", "continue"],
         reply_to: str | None = None,
     ) -> str:
-        """
-        向当前会话单独发送文字回复，不要直接返回正文。
-        文字要和图片在同一条消息中时，使用发图工具的 text 参数，不要拆成两次发送。
+        """往当前聊天里单独发一条文字消息，别不调工具直接输出正文。
+        要把文字和图片放在同一条消息时，用发图工具的 text 参数，别拆成两条。
         Args:
-            content: 你想发送的内容。提及本轮发言者用 @current；群内其他成员用@用户ID，ID后用空白或标点分隔；
-                会生成平台原生@。未知ID或重名时先用get_group_members查询，也支持唯一昵称。
-            reply_to: 可选引用回复。填 current 引用用户现在发出的这条消息；
-                引用其他消息则传当前会话的已知平台消息ID。省略则普通发送，不要编造ID。
-            next_step: 当前请求已处理并交付结果或明确说明阻塞后填 end；
-                只有下一条会提供新信息时填 continue，最后一条必须填 end。
-                end 表示本轮任务结束。不要发送“还在推/等下再回你”等空承诺；
-                应先完成处理，给出结果，或明确说明无法完成及具体卡点。
-        """
+            content: 要说的话。@ 当前发言者写 @current；群里 @ 别人写 @用户ID，ID 后用空白或标点分隔，会生成平台原生 @。未知 ID 或重名时先用 query_platform 的 list_members 查询，也支持唯一昵称。
+            reply_to: 可选引用。填 current 引用当前消息；引用其他消息传当前聊天中已知的真实平台消息 ID。留空为普通发送，别编 ID。
+            next_step: 这轮事办完、结果交付或卡点说清后填 end；只有下一条会提供新信息时才填 continue，最后一条必须填 end。别发句“正在查/等会儿回你”的空承诺就结束；先完成处理、交付结果或说明具体卡点。"""
         if request_id is not None and not await is_request_active(
             session_id, request_id
         ):
             return tool_skipped(
                 "request_expired",
-                "请求已过期，已取消发送。",
+                "这轮请求已结束或取消，没有继续发送。",
                 delivery_state="not_attempted",
             )
 
@@ -150,7 +147,11 @@ def create_reply_tool(
                 quoted_id = await resolve_reply_target(db_session, session_id, reply_to, current_message_id=current_message_id, replied_message_id=replied_message_id, outbound_identity=outbound_identity)
             except ValueError as error:
                 return tool_failure("invalid_reply_target", str(error), delivery_state="not_attempted")
-            content = _dedupe_consecutive_lines(content.strip())
+            if repeat_text is None:
+                content = plain_chat_text(content.strip(), request_text=request_text)
+                if not wants_original_format(request_text) and "```" not in content and "~~~" not in content:
+                    content = _dedupe_consecutive_lines(content)
+            content = hide_other_group_ids(content, session_id, cross_group_spaces or {})
             current_pattern = r"(?<![\w@])@current(?=$|[\s，。,.!！?？:：;；、)）\]\"'”’])"
             if re.search(current_pattern, content, re.IGNORECASE):
                 if not current_user_id:
@@ -215,7 +216,7 @@ def create_reply_tool(
                 target_id = name_to_id.get(mention_name)
                 if not target_id:
                     if mention_name.isdigit():
-                        return tool_failure("invalid_mention_target", "当前群成员名单中无法确认该用户ID，未发送；请先用get_group_members核对。", delivery_state="not_attempted")
+                        return tool_failure("invalid_mention_target", "当前群成员名单中无法确认该用户ID，未发送；请先用query_platform的list_members核对。", delivery_state="not_attempted")
                     continue
 
                 append_text(content[cursor:start])
@@ -230,7 +231,7 @@ def create_reply_tool(
             ):
                 return tool_skipped(
                     "request_expired",
-                    "请求已过期，已取消发送。",
+                    "这轮请求已结束或取消，没有继续发送。",
                     delivery_state="not_attempted",
                 )
 

@@ -296,7 +296,7 @@ async def test_only_new_group_text_feeds_affinity_with_public_api(deliver_messag
 @pytest.mark.asyncio
 async def test_ordinary_chat_is_counted_locally_and_only_due_looks_are_queued(deliver_message, monkeypatch):
     import nonebot_plugin_ai_groupmate as plugin
-    from nonebot_plugin_ai_groupmate.observation import ObservationSchedule
+    from nonebot_plugin_ai_groupmate.observation import MIN_NEW_MESSAGES, ObservationSchedule
 
     deliver, queued, _ = deliver_message
     now = [1000.0]
@@ -313,7 +313,7 @@ async def test_ordinary_chat_is_counted_locally_and_only_due_looks_are_queued(de
     await deliver("observation-inbound", "command", "/查看群API")
     await deliver("observation-private", "private", "私聊不观察", is_private=True)
     queued.reset_mock()  # Private delivery is an addressed request.
-    assert observer.watches[("bot-1", "observation-inbound")].messages == 12
+    assert observer.watches[("bot-1", "observation-inbound")].messages == MIN_NEW_MESSAGES
     assert len(observer.watches) == 1
     await plugin._occasionally_observe_groups()
     queued.assert_not_awaited()
@@ -761,3 +761,30 @@ async def test_old_bot_id_outside_echo_window_does_not_hide_new_input(deliver_me
         rows = (await db.execute(Select(ChatHistory).where(ChatHistory.session_id == "old-platform-id"))).scalars().all()
         assert len(rows) == 2
         assert rows[-1].content_type == "text"
+
+
+@pytest.mark.asyncio
+async def test_inbound_handler_only_records_opted_in_human_message(deliver_message, monkeypatch):
+    from uuid import uuid4
+
+    from sqlalchemy import select
+    from nonebot_plugin_orm import get_session
+
+    import nonebot_plugin_ai_groupmate as plugin
+    from nonebot_plugin_ai_groupmate.model import BrainObservationMessage
+
+    group, peer, other = uuid4().hex, uuid4().hex, uuid4().hex
+    monkeypatch.setattr(plugin.plugin_config, "cross_group_spaces", {"test": [group, peer]})
+    monkeypatch.setattr(plugin, "adapter_name", lambda _bot: "test-platform")
+    deliver, _, _ = deliver_message
+    await deliver(group, "source-1", "周末有活动", user_id="alice")
+    await deliver(group, "source-1", "周末有活动", user_id="alice")
+    await deliver(other, "source-2", "普通群消息", user_id="bob")
+    async with get_session() as db:
+        rows = list((await db.scalars(select(BrainObservationMessage).where(
+            BrainObservationMessage.platform == "test-platform",
+            BrainObservationMessage.scene_id.in_([group, other]),
+        ))).all())
+        assert len(rows) == 1
+        assert rows[0].scene_id == group
+        assert rows[0].text == "周末有活动"

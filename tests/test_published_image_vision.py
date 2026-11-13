@@ -6,6 +6,203 @@ import pytest
 from langchain_core.messages import AIMessage
 
 
+async def test_unrelated_question_does_not_send_historical_image(monkeypatch, tmp_path):
+    from uuid import uuid4
+    from datetime import datetime
+    from unittest.mock import AsyncMock
+
+    from nonebot_plugin_orm import get_session
+    from test_image_generation import png, image_config
+
+    from nonebot_plugin_ai_groupmate import agent
+    from nonebot_plugin_ai_groupmate.model import ChatHistorySchema
+
+    group = f"unrelated-history-image-{uuid4()}"
+    (tmp_path / "old.png").write_bytes(png("red"))
+    monkeypatch.setattr(agent, "pic_dir", tmp_path)
+    monkeypatch.setattr(agent, "plugin_data_dir", tmp_path)
+    monkeypatch.setattr(agent, "resolve_session_chat_config", lambda **kw: image_config())
+    monkeypatch.setattr(agent, "record_token_usage", AsyncMock())
+    monkeypatch.setattr(agent, "update_active_thread", AsyncMock())
+    captured = {}
+
+    class Graph:
+        async def ainvoke(self, state, **kwargs):
+            captured["messages"] = state["messages"]
+            return {**state, "called_finish": 1, "llm_call_count": 1}
+
+    monkeypatch.setattr(agent, "create_chat_graph", AsyncMock(return_value=(Graph(), None, "")))
+    history = [
+        ChatHistorySchema(msg_id=1, session_id=group, user_id="alice", user_name="Alice", content_type="image",
+                          content="id: old-image\nold.png", created_at=datetime.now()),
+        ChatHistorySchema(msg_id=2, session_id=group, user_id="alice", user_name="Alice", content_type="text",
+                          content="id: question\n你都加了什么群", created_at=datetime.now()),
+    ]
+    async with get_session() as db:
+        await agent.choice_response_strategy(db, group, None, history, "alice", "Alice", bot_id="bot", group_members=[])
+
+    assert all("image_url" not in str(message.content) for message in captured["messages"])
+    assert any("old-image" in str(message.content) for message in captured["messages"])
+
+
+async def test_current_legacy_message_keeps_all_its_images(monkeypatch, tmp_path):
+    from uuid import uuid4
+    from datetime import datetime
+    from unittest.mock import AsyncMock
+
+    from nonebot_plugin_orm import get_session
+    from test_image_generation import png, image_config
+
+    from nonebot_plugin_ai_groupmate import agent
+    from nonebot_plugin_ai_groupmate.model import ChatHistorySchema
+
+    group = f"current-images-{uuid4()}"
+    for name, color in (("old.png", "blue"), ("a.png", "red"), ("b.png", "green")):
+        (tmp_path / name).write_bytes(png(color))
+    monkeypatch.setattr(agent, "pic_dir", tmp_path)
+    monkeypatch.setattr(agent, "plugin_data_dir", tmp_path)
+    monkeypatch.setattr(agent, "resolve_session_chat_config", lambda **kw: image_config())
+    monkeypatch.setattr(agent, "record_token_usage", AsyncMock())
+    monkeypatch.setattr(agent, "update_active_thread", AsyncMock())
+    captured = {}
+
+    class Graph:
+        async def ainvoke(self, state, **kwargs):
+            captured["messages"] = state["messages"]
+            return {**state, "called_finish": 1, "llm_call_count": 1}
+
+    monkeypatch.setattr(agent, "create_chat_graph", AsyncMock(return_value=(Graph(), None, "")))
+    history = [
+        ChatHistorySchema(msg_id=1, session_id=group, user_id="alice", user_name="Alice", content_type="image",
+                          content="id: old\nold.png", created_at=datetime.now()),
+        ChatHistorySchema(msg_id=2, session_id=group, user_id="alice", user_name="Alice", content_type="image",
+                          content="id: current\na.png", created_at=datetime.now()),
+        ChatHistorySchema(msg_id=3, session_id=group, user_id="alice", user_name="Alice", content_type="image",
+                          content="id: current\nb.png", created_at=datetime.now()),
+        ChatHistorySchema(msg_id=4, session_id=group, user_id="alice", user_name="Alice", content_type="text",
+                          content="id: current\n这两张图有什么区别", created_at=datetime.now()),
+    ]
+    async with get_session() as db:
+        await agent.choice_response_strategy(db, group, None, history, "alice", "Alice", bot_id="bot", group_members=[])
+
+    image_parts = [part for message in captured["messages"] if isinstance(message.content, list)
+                   for part in message.content if isinstance(part, dict) and part.get("type") == "image_url"]
+    assert len(image_parts) == 2
+    assert any("old" in str(message.content) for message in captured["messages"])
+
+
+async def test_history_image_does_not_rewrite_cached_history_on_next_turn(monkeypatch, tmp_path):
+    from uuid import uuid4
+    from typing import cast
+    from unittest.mock import AsyncMock
+
+    from sqlalchemy import select
+    from nonebot.adapters import Bot
+    from nonebot_plugin_orm import get_session
+    from test_image_generation import png, image_config
+
+    from nonebot_plugin_ai_groupmate import agent
+    from nonebot_plugin_ai_groupmate.model import ChatHistory, ChatHistorySchema
+    from nonebot_plugin_ai_groupmate.agent.conversation import active_conversation_threads
+
+    group = f"stable-image-{uuid4()}"
+    (tmp_path / "first.png").write_bytes(png("red"))
+    monkeypatch.setattr(agent, "pic_dir", tmp_path)
+    monkeypatch.setattr(agent, "plugin_data_dir", tmp_path)
+    monkeypatch.setattr(agent, "resolve_session_chat_config", lambda **kw: image_config())
+    monkeypatch.setattr(agent, "record_token_usage", AsyncMock())
+    captures = []
+
+    class Graph:
+        async def ainvoke(self, state, **kwargs):
+            captures.append(state["messages"])
+            return {**state, "called_finish": 1, "llm_call_count": 1}
+
+    monkeypatch.setattr(agent, "create_chat_graph", AsyncMock(return_value=(Graph(), None, "")))
+    bot = cast(Bot, SimpleNamespace(adapter=SimpleNamespace(get_name=lambda: "qq")))
+    try:
+        async with get_session() as db:
+            db.add(ChatHistory(session_id=group, user_id="alice", user_name="Alice", content_type="image",
+                               content="id: first-image\nfirst.png"))
+            await db.commit()
+            rows = (await db.scalars(select(ChatHistory).where(ChatHistory.session_id == group))).all()
+            history = [ChatHistorySchema.model_validate(row) for row in rows]
+            await agent.choice_response_strategy(db, group, None, history, "alice", "Alice", bot_id="bot",
+                                                 bot=bot, group_members=[])
+            cached = active_conversation_threads[group].messages
+            assert [m.model_dump() for m in captures[0][:len(cached)]] == [m.model_dump() for m in cached]
+            assert any("image_url" in str(m.content) for m in captures[0])
+            db.add(ChatHistory(session_id=group, user_id="alice", user_name="Alice", content_type="text",
+                               content="id: second\n这张图怎么样"))
+            await db.commit()
+            rows = (await db.scalars(select(ChatHistory).where(ChatHistory.session_id == group).order_by(ChatHistory.msg_id))).all()
+            history = [ChatHistorySchema.model_validate(row) for row in rows]
+            await agent.choice_response_strategy(db, group, None, history, "alice", "Alice", bot_id="bot",
+                                                 bot=bot, group_members=[])
+            assert [m.model_dump() for m in captures[1][:len(cached)]] == [m.model_dump() for m in cached]
+            assert all("image_url" not in str(m.content) for m in captures[1])
+            assert any("first-image" in str(m.content) for m in captures[1])
+            cached = active_conversation_threads[group].messages
+            for index in range(3):
+                name = f"later-{index}.png"
+                (tmp_path / name).write_bytes(png("blue"))
+                db.add(ChatHistory(session_id=group, user_id="alice", user_name="Alice", content_type="image",
+                                   content=f"id: later-{index}\n{name}"))
+            await db.commit()
+            rows = (await db.scalars(select(ChatHistory).where(ChatHistory.session_id == group).order_by(ChatHistory.msg_id))).all()
+            history = [ChatHistorySchema.model_validate(row) for row in rows]
+            await agent.choice_response_strategy(db, group, None, history, "alice", "Alice", bot_id="bot",
+                                                 bot=bot, group_members=[])
+            assert [m.model_dump() for m in captures[2][:len(cached)]] == [m.model_dump() for m in cached]
+            images = [part for message in captures[2] if isinstance(message.content, list)
+                      for part in message.content if isinstance(part, dict) and part.get("type") == "image_url"]
+            assert len(images) == 1
+            assert any("later-0" in str(m.content) for m in captures[2])
+    finally:
+        active_conversation_threads.pop(group, None)
+
+
+async def test_history_image_tool_reads_exact_scoped_images(tmp_path):
+    from uuid import uuid4
+
+    from nonebot_plugin_orm import get_session
+    from test_image_generation import png
+
+    from nonebot_plugin_ai_groupmate.model import ChatHistory
+    from nonebot_plugin_ai_groupmate.config import ScopedConfig
+    from nonebot_plugin_ai_groupmate.agent.reply_tools import record_image_reply
+    from nonebot_plugin_ai_groupmate.agent.file_workspace import FileWorkspace
+    from nonebot_plugin_ai_groupmate.agent.history_image_tools import create_history_image_tool
+
+    group = f"history-image-{uuid4()}"
+    pics = tmp_path / "pics"
+    pics.mkdir()
+    (pics / "upload.png").write_bytes(png("red"))
+    owner = FileWorkspace(tmp_path / "files", session_id=group, user_id="alice", bot_id="bot", is_private=False)
+    artifact = owner.save(png("blue"), "draw.png")
+    owner.publish_image(artifact.file_id, "bot-image")
+    viewer = FileWorkspace(tmp_path / "files", session_id=group, user_id="bob", bot_id="bot", is_private=False)
+    async with get_session() as db:
+        row = ChatHistory(session_id=group, user_id="alice", user_name="Alice", content_type="image",
+                          content="id: upload-id\nupload.png")
+        db.add(row)
+        record_image_reply(db, session_id=group, bot_name="miyuki", message_id="bot-image",
+                           image_content=f"[图片文件] draw.png file_id={artifact.file_id}")
+        await db.commit()
+        await db.refresh(row)
+        kwargs = {"pic_dir": pics, "workspace": viewer, "config": ScopedConfig(), "platform": "qq", "is_private": False}
+        image_tool = create_history_image_tool(db, group, None, **kwargs)
+        for target in ({"message_id": "upload-id"}, {"history_row_id": row.msg_id}, {"message_id": "bot-image"}):
+            result = await image_tool.ainvoke(target)
+            assert isinstance(result, list)
+            assert result[1]["image_url"]["url"].startswith("data:image/")
+
+        foreign = FileWorkspace(tmp_path / "files", session_id="another-group", user_id="bob", bot_id="bot", is_private=False)
+        other_tool = create_history_image_tool(db, "another-group", None, **{**kwargs, "workspace": foreign})
+        assert json.loads(await other_tool.ainvoke({"history_row_id": row.msg_id}))["status"] == "failed"
+        assert json.loads(await other_tool.ainvoke({"message_id": "bot-image"}))["status"] == "failed"
+
+
 def test_recent_image_reference_list_is_bounded_and_uses_transport_ids():
     from test_history_metadata import _history
 
@@ -36,13 +233,13 @@ def test_recent_image_reference_list_is_bounded_and_uses_transport_ids():
 
 async def test_unquoted_followup_can_reference_published_bot_image(monkeypatch, tmp_path):
     from uuid import uuid4
-    from datetime import datetime
     from typing import cast
+    from datetime import datetime
     from unittest.mock import AsyncMock
 
     from sqlalchemy import select
-    from nonebot_plugin_orm import get_session
     from nonebot.adapters import Bot
+    from nonebot_plugin_orm import get_session
     from test_image_generation import png, image_config
 
     from nonebot_plugin_ai_groupmate import agent

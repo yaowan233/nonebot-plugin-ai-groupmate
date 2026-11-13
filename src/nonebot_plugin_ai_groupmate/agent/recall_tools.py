@@ -134,7 +134,7 @@ def create_recall_message_tool(
         ):
             return tool_skipped(
                 "request_expired",
-                "请求已过期，已取消撤回。",
+                "这轮请求已结束或取消，没有继续撤回。",
                 delivery_state="not_attempted",
             )
 
@@ -187,7 +187,7 @@ def create_recall_message_tool(
         if history is None:
             return tool_failure(
                 "message_not_found",
-                "撤回失败：没有在当前会话历史中找到这条消息。",
+                "没撤成：在当前聊天记录里没找到这条消息。",
                 retryable=True,
                 delivery_state="not_attempted",
             )
@@ -203,7 +203,7 @@ def create_recall_message_tool(
             if datetime.datetime.now() - history.created_at > SELF_RECALL_WINDOW:
                 return tool_failure(
                     "recall_window_expired",
-                    "当前会话权限只允许撤回 bot 自己 5 分钟内发送的消息。",
+                    "当前权限只能撤回 Bot 自己 5 分钟内发的消息。",
                     delivery_state="not_attempted",
                 )
 

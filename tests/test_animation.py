@@ -207,6 +207,7 @@ async def test_current_and_quoted_previews_are_built_off_the_event_loop(tmp_path
         quote_lookup_failed=False,
         reply_to_id="quoted",
         structured_messages={},
+        include_legacy_current_images=True,
     )
     assert isinstance(result, list)
     images = [part["image_url"]["url"] for part in result if part["type"] == "image_url"]
@@ -754,7 +755,8 @@ async def test_file_embedding_queries_use_the_same_bounded_preview_as_indexing(t
     assert len(base64.b64decode(queried_image.split(",", 1)[1])) <= MAX_MODEL_BYTES
 
 
-def test_animation_migration_upgrades_both_existing_heads():
+@pytest.mark.parametrize("groupmate_head", ["f3a7b9c2d614", "a8b9c0d1e2f3"])
+def test_animation_migration_upgrades_both_existing_heads(groupmate_head):
     from pathlib import Path
     from importlib import import_module
 
@@ -772,12 +774,12 @@ def test_animation_migration_upgrades_both_existing_heads():
         connection.execute(text("CREATE TABLE nonebot_plugin_ai_groupmate_mediastorage (media_id INTEGER PRIMARY KEY, description TEXT NOT NULL)"))
         connection.execute(text("INSERT INTO nonebot_plugin_ai_groupmate_mediastorage VALUES (1, '旧描述')"))
         connection.execute(text("CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL PRIMARY KEY)"))
-        connection.execute(text("INSERT INTO alembic_version VALUES ('f3a7b9c2d614'),('d6b9a3e2c710')"))
+        connection.execute(text("INSERT INTO alembic_version VALUES (:head),('d6b9a3e2c710')"), {"head": groupmate_head})
         context = MigrationContext.configure(connection, opts={"fn": lambda heads, ctx: script._upgrade_revs("heads", heads)})
         with Operations.context(context):
             context.run_migrations()
             context.run_migrations()
-        assert set(connection.execute(text("SELECT version_num FROM alembic_version")).scalars()) == {"a9d4e7c2b615", "d6b9a3e2c710"}
+        assert set(connection.execute(text("SELECT version_num FROM alembic_version")).scalars()) == {"b1e2a3c4d5f6", "d6b9a3e2c710"}
         assert connection.execute(text("SELECT description, animation_version FROM nonebot_plugin_ai_groupmate_mediastorage")).one() == ("旧描述", 0)
     engine.dispose()
 

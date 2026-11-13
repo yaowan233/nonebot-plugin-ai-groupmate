@@ -35,6 +35,10 @@ class AgentSkill:
     name: str
     description: str
     prompt: AgentSkillPrompt
+    tools: Iterable[Any] = field(default_factory=tuple)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "tools", tuple(self.tools))
 
 
 @dataclass(frozen=True)
@@ -42,6 +46,7 @@ class AgentToolBundle:
     tools: Iterable[Any] = field(default_factory=tuple)
     instructions: Iterable[str] = field(default_factory=tuple)
     skills: Iterable[AgentSkill] = field(default_factory=tuple)
+    defer_instructions: bool = False
 
 
 AgentToolFactory = Callable[
@@ -113,11 +118,12 @@ async def build_registered_agent_extensions(
             result = await result
         bundle = _normalize_tool_result(result)
         tools.extend([tool for tool in bundle.tools if tool is not None])
-        instructions.extend(
-            instruction.strip()
-            for instruction in bundle.instructions
-            if instruction and instruction.strip()
-        )
+        if not bundle.defer_instructions:
+            instructions.extend(
+                instruction.strip()
+                for instruction in bundle.instructions
+                if instruction and instruction.strip()
+            )
         skills.extend(
             skill
             for skill in bundle.skills

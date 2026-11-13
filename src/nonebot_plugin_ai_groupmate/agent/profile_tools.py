@@ -52,7 +52,7 @@ def create_report_tool(
         if request_id is not None and not await is_request_active(
             session_id, request_id
         ):
-            return tool_skipped("request_expired", "请求已过期，已取消生成报告素材。")
+            return tool_skipped("request_expired", "这轮请求已结束或取消，没有继续生成报告素材。")
 
         try:
             logger.info(f"开始生成用户 {user_name} 在群 {session_id} 的年度报告...")
@@ -255,7 +255,7 @@ def create_relation_tool(
         ):
             return tool_skipped(
                 "request_expired",
-                "请求已过期，已取消更新。",
+                "这轮请求已结束或取消，没有继续更新。",
                 delivery_state="not_attempted",
             )
 
@@ -336,7 +336,7 @@ def create_relation_tool(
                     await session.rollback()
                     return tool_skipped(
                         "request_expired",
-                        "请求已过期，已取消更新。",
+                        "这轮请求已结束或取消，没有继续更新。",
                         delivery_state="not_attempted",
                     )
 

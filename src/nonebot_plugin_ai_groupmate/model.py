@@ -7,6 +7,162 @@ from sqlalchemy.orm import Mapped, validates, mapped_column
 from .db_types import NulSafeModel
 
 
+class GroupReplyJob(NulSafeModel):
+    """Persist an addressed group request before batching and execution."""
+
+    job_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    platform: Mapped[str] = mapped_column(String(64))
+    bot_id: Mapped[str] = mapped_column(String(255))
+    scene_id: Mapped[str] = mapped_column(String(255))
+    user_id: Mapped[str] = mapped_column(String(255))
+    message_id: Mapped[str] = mapped_column(String(255))
+    payload: Mapped[dict] = mapped_column(JSON)
+    status: Mapped[str] = mapped_column(String(32), index=True)
+    created_at: Mapped[datetime] = mapped_column()
+    updated_at: Mapped[datetime] = mapped_column()
+
+    __table_args__ = (UniqueConstraint("platform", "bot_id", "scene_id", "message_id", name="uq_group_reply_job_message"),)
+
+
+class BrainTask(NulSafeModel):
+    """Durable cross-group coordination; platform objects never enter this record."""
+
+    task_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    brain_id: Mapped[str] = mapped_column(String(255))
+    bot_id: Mapped[str] = mapped_column(String(255))
+    platform: Mapped[str] = mapped_column(String(64))
+    source_scene: Mapped[str] = mapped_column(String(255))
+    source_message: Mapped[str] = mapped_column(String(255))
+    source_user: Mapped[str] = mapped_column(String(255))
+    request: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(32), index=True)
+    failure_reason: Mapped[str | None] = mapped_column(String(64))
+    revision: Mapped[int] = mapped_column(Integer, default=0)
+    claim_token: Mapped[str | None] = mapped_column(String(32))
+    lease_until: Mapped[datetime | None] = mapped_column()
+    deadline: Mapped[datetime] = mapped_column()
+    created_at: Mapped[datetime] = mapped_column()
+    updated_at: Mapped[datetime] = mapped_column()
+
+    __table_args__ = (UniqueConstraint("brain_id", "platform", "source_scene", "source_message", name="uq_brain_task_source"),)
+
+
+class BrainWait(NulSafeModel):
+    task_id: Mapped[str] = mapped_column(String(32), ForeignKey("nonebot_plugin_ai_groupmate_braintask.task_id"), primary_key=True)
+    platform: Mapped[str] = mapped_column(String(64))
+    target_scene: Mapped[str] = mapped_column(String(255))
+    question_message: Mapped[str] = mapped_column(String(255))
+    unquoted_from: Mapped[datetime] = mapped_column()
+    unquoted_until: Mapped[datetime] = mapped_column()
+    answer_message: Mapped[str | None] = mapped_column(String(255))
+    answer_user: Mapped[str | None] = mapped_column(String(255))
+    answer_text: Mapped[str | None] = mapped_column(Text)
+    deadline: Mapped[datetime] = mapped_column()
+    status: Mapped[str] = mapped_column(String(32))
+
+    __table_args__ = (Index("ix_brain_wait_lookup", "platform", "target_scene", "question_message", "status"),)
+
+
+class BrainAction(NulSafeModel):
+    """Persist one logical platform side effect before it is attempted."""
+
+    action_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    task_id: Mapped[str] = mapped_column(String(32), ForeignKey("nonebot_plugin_ai_groupmate_braintask.task_id"))
+    logical_step: Mapped[str] = mapped_column(String(128))
+    effect_slot: Mapped[str] = mapped_column(String(128))
+    platform: Mapped[str] = mapped_column(String(64))
+    target_scene: Mapped[str] = mapped_column(String(255))
+    content: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(32), index=True)
+    claim_token: Mapped[str | None] = mapped_column(String(32))
+    lease_until: Mapped[datetime | None] = mapped_column()
+    receipt_message_id: Mapped[str | None] = mapped_column(String(255))
+    created_at: Mapped[datetime] = mapped_column()
+    updated_at: Mapped[datetime] = mapped_column()
+
+    __table_args__ = (UniqueConstraint("task_id", "logical_step", "effect_slot", "platform", "target_scene", name="uq_brain_action_effect"),)
+
+
+class BrainInteraction(NulSafeModel):
+    """Confirmed human-to-Bot turn used to determine observation eligibility."""
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    platform: Mapped[str] = mapped_column(String(64))
+    bot_id: Mapped[str] = mapped_column(String(255))
+    scene_id: Mapped[str] = mapped_column(String(255))
+    turn_id: Mapped[str] = mapped_column(String(255))
+    explicitly_addressed: Mapped[bool] = mapped_column(Boolean)
+    created_at: Mapped[datetime] = mapped_column()
+
+    __table_args__ = (
+        UniqueConstraint("platform", "bot_id", "scene_id", "turn_id", name="uq_brain_interaction_turn"),
+        Index("ix_brain_interaction_scene_time", "platform", "bot_id", "scene_id", "created_at"),
+    )
+
+
+class BrainObservationMessage(NulSafeModel):
+    """Scoped inbound text eligible for selective observation."""
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    platform: Mapped[str] = mapped_column(String(64))
+    bot_id: Mapped[str] = mapped_column(String(255))
+    scene_id: Mapped[str] = mapped_column(String(255))
+    message_id: Mapped[str] = mapped_column(String(255))
+    reply_to: Mapped[str | None] = mapped_column(String(255))
+    addressed_other: Mapped[bool] = mapped_column(Boolean, default=False)
+    user_id: Mapped[str] = mapped_column(String(255))
+    text: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column()
+
+    __table_args__ = (
+        UniqueConstraint("platform", "bot_id", "scene_id", "message_id", name="uq_brain_observation_message"),
+        Index("ix_brain_observation_scene_time", "platform", "bot_id", "scene_id", "created_at"),
+    )
+
+
+class BrainSceneObservation(NulSafeModel):
+    platform: Mapped[str] = mapped_column(String(64), primary_key=True)
+    bot_id: Mapped[str] = mapped_column(String(255), primary_key=True)
+    scene_id: Mapped[str] = mapped_column(String(255), primary_key=True)
+    last_message_id: Mapped[int] = mapped_column(Integer, default=0)
+    next_due: Mapped[datetime] = mapped_column()
+    active: Mapped[bool] = mapped_column(Boolean, default=False)
+    digest: Mapped[str] = mapped_column(Text, default="")
+    source_ids: Mapped[list[int]] = mapped_column(JSON, default=list)
+    updated_at: Mapped[datetime] = mapped_column()
+
+
+class BrainCandidateDecision(NulSafeModel):
+    task_id: Mapped[str] = mapped_column(String(32), ForeignKey("nonebot_plugin_ai_groupmate_braintask.task_id"), primary_key=True)
+    observation_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    decision: Mapped[str] = mapped_column(String(32))
+    created_at: Mapped[datetime] = mapped_column()
+
+
+class BrainObservationRun(NulSafeModel):
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    platform: Mapped[str] = mapped_column(String(64))
+    bot_id: Mapped[str] = mapped_column(String(255))
+    scene_id: Mapped[str] = mapped_column(String(255))
+    started_at: Mapped[datetime] = mapped_column(index=True)
+    status: Mapped[str] = mapped_column(String(32))
+
+
+class BrainProactive(NulSafeModel):
+    """Journal one autonomous fact-to-group decision and any resulting send."""
+
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    platform: Mapped[str] = mapped_column(String(64))
+    bot_id: Mapped[str] = mapped_column(String(255))
+    source_scene: Mapped[str] = mapped_column(String(255))
+    target_scene: Mapped[str] = mapped_column(String(255))
+    status: Mapped[str] = mapped_column(String(32), index=True)
+    content: Mapped[str | None] = mapped_column(Text)
+    receipt_message_id: Mapped[str | None] = mapped_column(String(255))
+    created_at: Mapped[datetime] = mapped_column()
+    updated_at: Mapped[datetime] = mapped_column()
+
+
 class MediaStorage(NulSafeModel):
     """媒体资源中心化存储"""
 

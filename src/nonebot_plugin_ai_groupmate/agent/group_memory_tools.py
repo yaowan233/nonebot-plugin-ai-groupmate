@@ -104,7 +104,7 @@ def create_group_memory_tool(
         ):
             return tool_skipped(
                 "request_expired",
-                "请求已过期，已取消群档案更新。",
+                "这轮请求已结束或取消，没有继续群档案更新。",
                 delivery_state="not_attempted",
             )
 

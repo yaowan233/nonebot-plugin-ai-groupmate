@@ -122,7 +122,9 @@ async def test_media_tools_read_normal_messages_only_on_demand(
         )
     }
 
-    raw_result = await tools[f"read_{kind}_message"].ainvoke({
+    assert list(tools) == ["read_media_message"]
+    raw_result = await tools["read_media_message"].ainvoke({
+        "kind": kind,
         "message_id": "123",
         "media_ref": "",
         "index": 0,
@@ -155,6 +157,7 @@ async def test_media_tool_can_read_source_registered_by_forward_tool():
     )[0]
 
     payload = json.loads(await audio_tool.ainvoke({
+        "kind": "audio",
         "message_id": "",
         "media_ref": media_ref,
         "index": 0,
@@ -163,6 +166,22 @@ async def test_media_tool_can_read_source_registered_by_forward_tool():
     assert payload["status"] == "succeeded"
     assert payload["data"]["content"] == "转发语音内容"
     assert bot.calls == []
+
+
+@pytest.mark.asyncio
+async def test_unified_media_tool_rejects_wrong_kind_and_unseen_message():
+    from nonebot_plugin_ai_groupmate.media_message import LazyMediaRegistry
+    from nonebot_plugin_ai_groupmate.agent.media_tools import create_read_media_tools
+
+    bot = _FakeBot({"123": {"message": [{"type": "record", "data": {"url": "https://example.com/a.mp3"}}]}})
+    model = _FakeModel("不应读取")
+    tool = create_read_media_tools(bot, model, LazyMediaRegistry({"123": {"audio"}}))[0]  # type: ignore[arg-type]
+    wrong_kind = json.loads(await tool.ainvoke({"kind": "video", "message_id": "123"}))
+    unseen = json.loads(await tool.ainvoke({"kind": "audio", "message_id": "999"}))
+    assert not wrong_kind["ok"]
+    assert not unseen["ok"]
+    assert bot.calls == []
+    assert model.calls == []
 
 
 @pytest.mark.asyncio
@@ -196,9 +215,10 @@ async def test_video_tool_materializes_onebot_file_when_reported_url_is_unusable
         bot,  # type: ignore[arg-type]
         model,
         registry,
-    )[1]
+    )[0]
 
     payload = json.loads(await video_tool.ainvoke({
+        "kind": "video",
         "message_id": "123",
         "media_ref": "",
         "index": 0,
@@ -252,6 +272,7 @@ async def test_audio_tool_converts_onebot_record_when_reported_url_is_unusable(
     )[0]
 
     payload = json.loads(await audio_tool.ainvoke({
+        "kind": "audio",
         "message_id": "123",
         "media_ref": "",
         "index": 0,

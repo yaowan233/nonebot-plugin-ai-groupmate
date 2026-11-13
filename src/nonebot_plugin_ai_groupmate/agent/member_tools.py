@@ -50,7 +50,7 @@ def create_group_member_tool(
         """
         nonlocal members
         if request_id is not None and not await is_request_active(session_id, request_id):
-            return tool_skipped("request_expired", "请求已过期，已取消查询。")
+            return tool_skipped("request_expired", "这轮请求已结束或取消，没有继续查询。")
         if members is None:
             if interface is None:
                 return tool_failure("members_unavailable", "当前无法获取群成员名单。")

@@ -8,9 +8,9 @@ from dataclasses import field, replace, dataclass
 
 from nonebot.adapters import Bot, Event
 from nonebot_plugin_uninfo import Uninfo, QryItrface
+
 from .message_batching import current_input_batch
 from .message_metadata import is_reliable_platform_id
-
 
 current_transport_message_id: ContextVar[str | None] = ContextVar("current_transport_message_id", default=None)
 
@@ -52,6 +52,7 @@ class ReplyRequest:
     created_monotonic: float = field(default_factory=time.monotonic)
     message_id: str | None = None
     normalized_parts: tuple[dict[str, str], ...] | None = None
+    durable_job_id: str | None = None
 
 
 @dataclass

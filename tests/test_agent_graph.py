@@ -869,6 +869,8 @@ class _InvalidImageThenResponseModel:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("error_message", [
     "Error code: 400 - The image format is illegal and cannot be opened",
+    "Error code: 400 - .messages[19].image[0]: You have uploaded an unsupported image. Please make sure your image is valid and has one of the following formats: webp, png, jpeg, and gif.",
+    "Error code: 400 - The image you provided requires 31707 patches after processing, exceeding the limit of 30000. Please resize the image and try again.",
     (
         "Error code: 403 - Free accounts do not support multimodal "
         "functionality (image analysis)"

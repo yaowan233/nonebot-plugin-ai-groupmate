@@ -329,7 +329,7 @@ async def test_expired_request_cannot_download_or_send(tmp_path, monkeypatch):
 async def test_file_tools_are_wired_into_group_and_private_agents(monkeypatch, enabled, private):
     from nonebot_plugin_ai_groupmate import agent
 
-    captured = []
+    captured = {}
     monkeypatch.setattr(agent.plugin_config, "agent_file_tools_enabled", enabled)
     for name in ("get_user_relation_context", "get_group_context", "get_recent_relations_context"):
         monkeypatch.setattr(agent, name, AsyncMock(return_value=""))
@@ -337,13 +337,16 @@ async def test_file_tools_are_wired_into_group_and_private_agents(monkeypatch, e
     monkeypatch.setattr(agent, "get_chat_model", lambda: object())
 
     def build(model, tools, system_prompt, **kwargs):
-        captured.extend(item.name for item in kwargs["base_tools"])
+        captured.update(base={item.name for item in kwargs["base_tools"]}, by_skill=kwargs["tools_by_skill"])
         return object()
 
     monkeypatch.setattr(agent, "build_chat_graph", build)
     await agent.create_chat_graph(SimpleNamespace(commit=AsyncMock()), "file-integration-group", None, "file-user", "User", history=[], is_private=private)
-    assert ("fetch_url" in captured) is enabled
-    assert ("send_file" in captured) is enabled
+    assert "fetch_url" not in captured["base"]
+    assert ("send_file" in captured["base"]) is enabled
+    assert ("file_tools" in captured["by_skill"]) is enabled
+    if enabled:
+        assert "fetch_url" in {item.name for item in captured["by_skill"]["file_tools"]}
 
 
 @pytest.mark.asyncio
@@ -354,7 +357,9 @@ async def test_full_agent_fetch_download_summarize_and_send(tmp_path, monkeypatc
 
     from nonebot_plugin_ai_groupmate.agent import web_fetch
     from nonebot_plugin_ai_groupmate.agent.graph import build_chat_graph
+    from nonebot_plugin_ai_groupmate.agent.file_tools import FILE_TOOLS_PROMPT
     from nonebot_plugin_ai_groupmate.agent.common_tools import finish
+    from nonebot_plugin_ai_groupmate.agent.custom_tools import AgentSkill, AgentToolContext, create_agent_skill_loader_tool
 
     spreadsheet = xlsx_bytes([["Category", "Amount"], ["A", 10], ["B", 5], ["A", 20]])
 
@@ -387,19 +392,21 @@ async def test_full_agent_fetch_download_summarize_and_send(tmp_path, monkeypatc
             if results:
                 assert results[-1]["status"] == "succeeded"
             if self.step == 0:
-                name, args = "fetch_url", {"url": "https://example.org/page"}
+                name, args = "load_agent_skill", {"skill_name": "file_tools"}
             elif self.step == 1:
-                name, args = "download_file", {"url": results[-1]["data"]["links"][0]["url"]}
+                name, args = "fetch_url", {"url": "https://example.org/page"}
             elif self.step == 2:
+                name, args = "fetch_url", {"url": results[-1]["data"]["links"][0]["url"], "read_preview": False}
+            elif self.step == 3:
                 self.input_id = results[-1]["data"]["file_id"]
                 name, args = "read_file", {"file_id": self.input_id}
-            elif self.step == 3:
+            elif self.step == 4:
                 assert results[-1]["data"]["columns"] == ["Category", "Amount"]
                 name, args = "summarize_table", {"file_id": self.input_id, "group_by": ["Category"], "value_columns": ["Amount"]}
-            elif self.step == 4:
+            elif self.step == 5:
                 self.output_id = results[-1]["data"]["file_id"]
                 name, args = "read_file", {"file_id": self.output_id}
-            elif self.step == 5:
+            elif self.step == 6:
                 assert "A,30" in results[-1]["data"]["text"]
                 name, args = "send_file", {"file_id": self.output_id}
             else:
@@ -408,12 +415,23 @@ async def test_full_agent_fetch_download_summarize_and_send(tmp_path, monkeypatc
             return AIMessage(content="", tool_calls=[{"id": f"call-{self.step}", "name": name, "args": args}])
 
     model = Model()
-    tools = [*toolset(tmp_path).values(), finish]
-    graph = build_chat_graph(model, tools, "Read the web page, download Excel, summarize and deliver.")
+    from nonebot_plugin_alconna import Target
+
+    ctx = AgentToolContext(db_session=None, session_id="group", request_id=None, user_id="user", user_name="User",
+                           interface=None, send_target=Target("group"), is_private=False)
+    loader = create_agent_skill_loader_tool([AgentSkill("file_tools", "处理网页与文件", FILE_TOOLS_PROMPT)], ctx)
+    assert loader is not None
+    file_tools = list(toolset(tmp_path).values())
+    send_file = next(item for item in file_tools if item.name == "send_file")
+    deferred = [item for item in file_tools if item.name != "send_file"]
+    tools = [*file_tools, loader, finish]
+    assert "download_file" not in {tool.name for tool in tools}
+    graph = build_chat_graph(model, tools, "Read the web page, download Excel, summarize and deliver.",
+                             base_tools=[loader, send_file, finish], tools_by_skill={"file_tools": deferred})
     result = await graph.ainvoke({"messages": [HumanMessage(content="Summarize the Excel on this web page and send me the file.")], "session_id": "group", "request_id": None})
     # Successful terminal file delivery ends the run without a separate finish call.
     assert result["reply_count"] == 1
-    assert model.step == 6
+    assert model.step == 7
     assert len(sent) == 1
     assert sent[0][1]["fallback"] is False
     assert sent[0][1]["target"].id == "group"
@@ -426,8 +444,9 @@ async def test_full_agent_fetch_download_summarize_and_send(tmp_path, monkeypatc
 
 @pytest.mark.asyncio
 async def test_connected_group_bots_can_deliver_existing_files_without_crossing_users(tmp_path, monkeypatch):
-    from nonebot_plugin_ai_groupmate.agent import file_workspace as module
     import nonebot
+
+    from nonebot_plugin_ai_groupmate.agent import file_workspace as module
 
     monkeypatch.setattr(nonebot, "get_bots", lambda: {"bot": object(), "peer": object()})
     old = workspace(tmp_path).save(b"picture", "desert_boss.png")

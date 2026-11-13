@@ -65,7 +65,9 @@ async def test_unknown_file_delivery_notifies_once_without_retry(tmp_path, monke
             return AIMessage(content="", tool_calls=[{"id": "file-send", "name": "send_file", "args": {"file_id": file_id}}])
 
     model = Model()
-    graph = build_chat_graph(model, [*tools.values(), reply_user], "Send the saved file.", db_session=db, limits=AgentRunLimits(max_llm_calls=1, tool_timeout_seconds=0.05))
+    # Allow dispatch and local file preparation to start under parallel CI load;
+    # the deliberately stalled adapter still exceeds this timeout by far.
+    graph = build_chat_graph(model, [*tools.values(), reply_user], "Send the saved file.", db_session=db, limits=AgentRunLimits(max_llm_calls=1, tool_timeout_seconds=1.0))
     result = await graph.ainvoke({"messages": [HumanMessage(content="把结果文件发给我")], "session_id": "notice-group", "request_id": None})
 
     assert len(file_attempts) == 1
