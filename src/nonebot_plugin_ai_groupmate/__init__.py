@@ -435,33 +435,6 @@ async def _send_cross_group_message(platform: str, bot_id: str, scene_id: str, t
     return receipt.message_id
 
 
-@scheduler.scheduled_job("interval", minutes=1, max_instances=1, coalesce=True, id="ai_groupmate_cross_group_proactive")
-async def _poll_cross_group_proactive() -> None:
-    if not plugin_config.cross_group_spaces or not plugin_config.cross_group_proactive_enabled:
-        return
-    from .group_memory import get_summary_model
-    from .brain.proactive import poll_proactive
-
-    try:
-        async with maintenance_gate.slot():
-            await poll_proactive(spaces=lambda: plugin_config.cross_group_spaces,
-                                 connected={str(bot_id): adapter_name(bot) for bot_id, bot in get_bots().items()},
-                                 allowed=lambda bot_id, scene: (
-                                     plugin_config.cross_group_proactive_enabled
-                                     and resolve_group_reply_probability(scene) > 0
-                                     and participation.can_reply((bot_id, scene))
-                                     and time.monotonic() >= participation.state((bot_id, scene)).quiet_until
-                                 ), model_factory=get_summary_model, sender=_send_cross_group_message,
-                                 source_allowed=lambda bot_id, scene: (
-                                     resolve_group_reply_probability(scene) > 0
-                                     and time.monotonic() >= participation.state((bot_id, scene)).quiet_until
-                                 ), on_sent=lambda bot_id, scene: participation.sent((bot_id, scene), proactive=True),
-                                 name_resolver=_resolve_cross_group_names,
-                                 now=datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None))
-    except Exception:
-        logger.exception("主动跨群联动调度失败")
-
-
 @scheduler.scheduled_job("interval", hours=1, max_instances=1, coalesce=True, id="ai_groupmate_prune_cross_group_observations")
 async def _prune_cross_group_observations() -> None:
     try:

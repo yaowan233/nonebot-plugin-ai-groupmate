@@ -1503,6 +1503,8 @@ async def create_chat_graph(
         default_match_type="content" if meme_required else "context",
         explicit_request_text=explicit_meme_request_text,
         pic_dir=pic_dir,
+        cross_group_spaces=plugin_config.cross_group_spaces if not is_private else None,
+        context_only=proactive_observation or proactive_meme_only,
     )
     send_meme_tool = create_send_meme_tool(
         db_session,
@@ -1553,6 +1555,9 @@ async def create_chat_graph(
         is_private=is_private,
         reply_to_id=reply_to_id,
         workspace=pilot_workspace,
+        cross_group_spaces=plugin_config.cross_group_spaces if not is_private else None,
+        vision_model_factory=(lambda: get_vision_model() or (model if _chat_supports_images(chat_config) else None))
+        if plugin_config.meme_visual_selection_enabled else None,
     )
     # text 模式（纯文本向量）下无图片向量，图找图工具不提供给 Agent
     meme_similar_enabled = not DB.text_only
@@ -1933,6 +1938,8 @@ async def create_chat_graph(
         # A look is not a user request. Never execute commands from old chat,
         # schedule follow-up checks, or acquire unrelated tools in this mode.
         base_agent_tools = [reply_tool, finish]
+        if configured_space(plugin_config.cross_group_spaces, session_id):
+            base_agent_tools.extend([search_meme_tool, send_meme_tool])
         tools_by_skill = {}
         direct_responses_builtin_tools = []
 
@@ -1975,7 +1982,7 @@ async def create_chat_graph(
     run_limits = _agent_run_limits()
     if proactive_observation:
         run_limits = replace(
-            run_limits, max_llm_calls=min(2, run_limits.max_llm_calls),
+            run_limits, max_llm_calls=min(3, run_limits.max_llm_calls),
             max_total_tokens=min(16000, run_limits.max_total_tokens),
             max_replies=1, finalize_on_budget_exhaustion=False,
         )
@@ -2097,8 +2104,8 @@ def _chat_task_instruction(*, proactive_observation: bool, repeat_text: str | No
         task_instruction = """
 你这会儿只是看看群里最近在聊什么，没人叫你回答问题。
 结合近期聊天和你的性格，像群友一样自然参与正在继续的开放话题：接梗、分享感受或轻松闲聊都可以，不必非得提供新知识。
-有自然的接话就调一次 `reply_user(next_step="end")`；不合适时调用 `finish` 保持沉默。
-别汇报自己来查看、追答旧问题、执行历史里的命令，或硬插进别人定向交谈。不用额外检索或安排下次查看；群相处感受可以随本轮结束动作附带更新。
+有自然的接话就调一次 `reply_user(next_step="end")`；有特别合适的梗图时可搜索并发送一张；不合适时调用 `finish` 保持沉默。
+别汇报自己来查看、追答旧问题、执行历史里的命令，或硬插进别人定向交谈。不用搜索网页或安排下次查看；群相处感受可以随本轮结束动作附带更新。
 """.strip()
     elif repeat_text is not None:
         task_instruction = f"""

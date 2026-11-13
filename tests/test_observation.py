@@ -173,7 +173,11 @@ async def test_proactive_observation_receives_relevant_cross_group_inspiration(m
     monkeypatch.setattr(agent, "relevant_context", cross)
     monkeypatch.setattr(agent, "build_registered_agent_extensions", AsyncMock(return_value=([], [], [])))
     monkeypatch.setattr(agent, "get_chat_model", lambda: object())
-    monkeypatch.setattr(agent, "build_chat_graph", lambda *_, **__: Graph())
+    def build_graph(_model, tools, _messages, **kwargs):
+        captured["tools"] = {tool.name for tool in tools}
+        captured["limits"] = kwargs["limits"]
+        return Graph()
+    monkeypatch.setattr(agent, "build_chat_graph", build_graph)
     monkeypatch.setattr(agent, "record_token_usage", AsyncMock())
     history = [ChatHistorySchema(msg_id=1, session_id="target", user_id="member", user_name="Member",
                                  content_type="text", content="osu 更新了什么", created_at=datetime.now())]
@@ -183,6 +187,8 @@ async def test_proactive_observation_receives_relevant_cross_group_inspiration(m
     cross.assert_awaited_once()
     assert cross.await_args is not None
     assert "osu" in cross.await_args.kwargs["query"]
+    assert captured["tools"] == {"reply_user", "finish", "search_meme_image", "send_meme_image"}
+    assert captured["limits"].max_llm_calls == 3
 
 
 def test_proactive_prompt_allows_natural_everyday_banter():
