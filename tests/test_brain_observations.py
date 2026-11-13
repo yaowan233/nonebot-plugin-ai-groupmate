@@ -196,3 +196,59 @@ async def test_confirmed_reply_handler_records_one_interaction(monkeypatch):
         assert len(rows) == 1
         assert rows[0].turn_id == "request-1"
         assert rows[0].explicitly_addressed
+
+async def test_repeated_text_meme_can_inspire_without_matching_keywords():
+    from nonebot_plugin_orm import get_session
+
+    from nonebot_plugin_ai_groupmate.brain.observations import record_message, relevant_context, poll_observations
+
+    now = datetime(2026, 11, 12, 12)
+    source, target, other, bot = [uuid4().hex for _ in range(4)]
+    spaces = {"friends": [source, target]}
+    async with get_session() as db:
+        for index in range(10):
+            await record_message(db, platform="qq", bot_id=bot, scene_id=source,
+                                 message_id=f"meme-{index}", user_id=f"user-{index % 2}",
+                                 text="我嘞个豆", now=now)
+        await db.commit()
+    async def observe(messages):
+        if "审查线索" in messages[0].content:
+            return SimpleNamespace(content='{"approved":[0]}')
+        rows = json.loads(messages[1].content)
+        return SimpleNamespace(content=json.dumps([{"topic":"生活", "meme":"我嘞个豆", "usage":"惊讶时感叹",
+                                                    "source_ids":[rows[0]["id"], rows[1]["id"]]}], ensure_ascii=False))
+    model = SimpleNamespace(ainvoke=AsyncMock(side_effect=observe))
+    assert await poll_observations(spaces=spaces, connected={bot: "qq"}, paused=lambda *_: False,
+                                   model_factory=lambda: model, now=now)
+    async with get_session() as db:
+        context = await relevant_context(db, spaces=spaces, platform="qq", bot_id=bot, scene_id=target,
+                                         query="居然考了满分", now=now)
+        assert "我嘞个豆" in context
+        assert "惊讶时感叹" in context
+        assert "自然使用" in context
+        assert source not in context
+        assert "user-" not in context
+        assert not await relevant_context(db, spaces=spaces, platform="qq", bot_id=bot, scene_id=other,
+                                          query="居然考了满分", now=now)
+
+
+def test_meme_requires_multiple_users_and_cannot_include_private_details():
+    from nonebot_plugin_ai_groupmate.brain.observations import _meme_hint
+
+    item = {"meme": "我嘞个豆", "usage": "惊讶时感叹"}
+    assert _meme_hint(item, ["我嘞个豆", "我嘞个豆"], ["a", "b"]) == item
+    assert _meme_hint(item, ["我嘞个豆", "我嘞个豆"], ["a", "a"]) is None
+    assert _meme_hint(item, ["我嘞个豆 群友住院", "我嘞个豆"], ["a", "b"]) is None
+    assert _meme_hint({"meme": "张三的工资", "usage": "惊讶"}, ["张三的工资", "张三的工资"], ["a", "b"]) is None
+
+
+def test_meme_template_preserves_fixed_text_and_replaces_variable_content():
+    from nonebot_plugin_ai_groupmate.brain.observations import _meme_hint
+
+    item = {"meme": "今天是疯狂星期四，我在肯德基{内容}，谁请我吃炸鸡", "usage": "开玩笑地邀人吃饭"}
+    assert _meme_hint(item, ["今天是疯狂星期四，我在肯德基饿得走不动，谁请我吃炸鸡",
+                             "今天是疯狂星期四，我在肯德基看菜单，谁请我吃炸鸡"], ["a", "b"]) == item
+    assert _meme_hint(item, ["今天是疯狂星期四，我在肯德基饿得走不动，谁请我吃炸鸡",
+                             "今天是疯狂星期四，我在肯德基看菜单，电话13812345678，谁请我吃炸鸡"], ["a", "b"]) is None
+    assert _meme_hint(item, ["今天是疯狂星期四，我在肯德基饿得走不动，谁请我吃炸鸡",
+                             "完全不相关的内容"], ["a", "b"]) is None
