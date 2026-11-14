@@ -87,6 +87,7 @@ async def test_voice_tool_sends_native_voice_once_and_records_spoken_text(monkey
     assert result["delivery_state"] == "completed"
     assert len(sent) == 1
     assert sent[0][0].type == "voice"
+    assert synthesis.await_args is not None
     assert synthesis.await_args.args[2] == "stella"
     again = json.loads(await voice.ainvoke({"text":"你好呀"}))
     assert again["status"] == "skipped"
