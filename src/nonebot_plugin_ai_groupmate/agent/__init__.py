@@ -58,6 +58,7 @@ from .reaction import is_onebot_context, create_reaction_tool
 from .decisions import classify as classify_decisions, close_client as close_decisions_client
 from .chat_style import load_group_style_context, build_group_style_context
 from .file_tools import FILE_TOOLS_PROMPT, create_file_tools
+from .tts_tools import wants_voice, create_voice_tool
 from .meme_tools import (
     MAX_MEME_SEND_COUNT,
     create_send_meme_tool,
@@ -1724,6 +1725,15 @@ async def create_chat_graph(
         outbound_identity=outbound_identity,
         cross_group_spaces=plugin_config.cross_group_spaces if not is_private else {},
     )
+    voice_tool = None
+    if (plugin_config.deepseek_tts_enabled and wants_voice(current_request_text) and not proactive_observation
+            and not proactive_meme_only and not proactive_reaction_only and repeat_text is None):
+        voice_tool = create_voice_tool(
+            db_session, session_id, request_id, config=plugin_config, chat_config=chat_config,
+            send_target=send_target, bot_name=plugin_config.bot_name, outbound_identity=outbound_identity,
+            recovery_enabled=message_pilot, cross_group_spaces=plugin_config.cross_group_spaces if not is_private else {},
+        )
+        system_prompt += "\n用户要求语音时可用 send_voice_message 发送实际语音；语音失败就如实说明。"
     async def summarize_web_image(content_blocks):
         return await _summarize_image_content(content_blocks, vision_metrics)
 
@@ -1837,6 +1847,7 @@ async def create_chat_graph(
             else []
         ),
         *([reaction_tool] if reaction_enabled else []),
+        *([voice_tool] if voice_tool is not None else []),
         *(
             (
                 [search_meme_tool, similar_meme_tool, send_meme_tool]

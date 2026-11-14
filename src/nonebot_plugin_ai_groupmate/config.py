@@ -94,6 +94,9 @@ class ScopedConfig(BaseModel):
     tavily_api_key: str = ""
     web_search_provider: Literal["tavily", "deepseek"] = "tavily"
     deepseek_search_api_key: str = ""
+    deepseek_tts_enabled: bool = True
+    deepseek_tts_api_key: str = ""
+    deepseek_tts_voice: Literal["stella", "tide"] = "stella"
 
     # === LLM 通用配置（作为各角色的默认值） ===
     llm_api_key: str = ""

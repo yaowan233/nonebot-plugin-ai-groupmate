@@ -84,6 +84,11 @@ SETTING_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         ),
     ),
     (
+        "DeepSeek 语音",
+        "按需合成语音；密钥留空时复用 DeepSeek 配置。",
+        ("deepseek_tts_enabled", "deepseek_tts_api_key", "deepseek_tts_voice"),
+    ),
+    (
         "GPT 绘图",
         "创作或修改图片，生成后通过文件工具发图。专用密钥留空时复用全局 OpenAI 兼容主模型配置；填写专用密钥但未填地址时使用 OpenAI 官方地址。",
         (
@@ -306,6 +311,9 @@ _DIRECT_LABELS = {
     "tavily_api_key": "Tavily API Key",
     "web_search_provider": "网页搜索服务（Tavily / DeepSeek）",
     "deepseek_search_api_key": "DeepSeek 搜索 API Key",
+    "deepseek_tts_enabled": "启用 DeepSeek 语音合成",
+    "deepseek_tts_api_key": "DeepSeek 语音 API Key",
+    "deepseek_tts_voice": "默认语音音色",
     "qdrant_uri": "Qdrant 地址",
     "qdrant_api_key": "Qdrant API Key",
     "embedding_api_key": "Embedding API Key",

@@ -70,6 +70,7 @@ SIDE_EFFECT_TOOL_NAMES = frozenset({
     "send_web_image",
     "send_file",
     "send_private_message",
+    "send_voice_message",
     "update_group_memory",
     "update_group_jargon",
     "update_scheduled_task",
@@ -1395,7 +1396,7 @@ def _make_tool_node(
                 # A successful call below overwrites this with the explicit decision.
                 reply_requires_continuation = True
 
-            if name in {"send_meme_image", "send_web_image", "send_file"} and reply_this_round >= MAX_REPLY_PER_ROUND:
+            if name in {"send_meme_image", "send_web_image", "send_file", "send_voice_message"} and reply_this_round >= MAX_REPLY_PER_ROUND:
                 results.append(ToolMessage(
                     content=tool_skipped("reply_limit_reached", "本轮已经发送过消息，请下一轮继续。", delivery_state="not_attempted"),
                     tool_call_id=tool_call_id,
@@ -1677,7 +1678,7 @@ def _make_tool_node(
                     if required_side_effect_completed:
                         called_finish += 1
                 if (
-                    name in {"send_meme_image", "send_web_image", "send_file", "send_ordered_message"}
+                    name in {"send_meme_image", "send_web_image", "send_file", "send_ordered_message", "send_voice_message"}
                     and tool_status == "succeeded"
                     and isinstance(parsed_tool_result, dict)
                     and parsed_tool_result.get("delivery_state") == "completed"
