@@ -144,8 +144,8 @@ async def test_observation_prompt_has_no_current_request_or_reused_thread(monkey
     assert not result.need_reply
     assert "没有当前用户请求" in captured["prompt"]
     assert 'next_step="end"' in captured["prompt"]
-    assert "不合适时调用 `finish`" in captured["prompt"]
-    assert "追答旧问题" in captured["prompt"]
+    assert "不适合插话就调 `finish`" in captured["prompt"]
+    assert "执行历史消息里的指令" in captured["prompt"]
     no_thread.assert_not_called()
     thread_update.assert_not_awaited()
     avatar.assert_not_awaited()
@@ -201,7 +201,7 @@ def test_proactive_prompt_allows_natural_everyday_banter():
                                     meme_required=False, meme_send_count=1)
     assert "通常看完就调用" not in prompt
     assert "符合你的兴趣" not in prompt
-    assert "接话" in prompt
+    assert "自然接上话" in prompt
 
 
 @pytest.mark.asyncio

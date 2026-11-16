@@ -54,12 +54,12 @@ def test_group_prompt_encourages_proactive_memes_with_serious_topic_boundary():
         reaction_tool_instruction="",
     )
 
-    assert "主动参与群聊" in result.system_prompt
+    assert "主动搭话" in result.system_prompt
     assert "`meme_intent`" in result.system_prompt
     assert "`meme_only=true`" in result.system_prompt
     assert "敏感或者沉重的话题，必须认真对待" in result.system_prompt
-    assert "没有合适的图就正常发文字" in result.system_prompt
-    assert "正经问题、敏感话题和真实冲突用文字回答" in result.system_prompt
+    assert "没配到则正常发文字" in result.system_prompt
+    assert "正经提问、敏感话题或真实的争执，只用文字回复" in result.system_prompt
 
 
 @pytest.mark.parametrize("is_private", [False, True])
