@@ -438,6 +438,7 @@ async def _rerank_meme_candidates_for_context(
         task_rules = """
 当前任务是根据对话选择自然反应。
 - 重点判断语用是否匹配：情绪、态度、对象、台词和笑点是否与当前对话及检索意图一致。
+- 拟发文字中的具体动作和画面必须与原图符合；捏脸不等于被压扁。图中文字和态度不符合的候选低于 0.70，不得臆造图像细节。
 - 表情包允许带一点随机性：明显自然为 0.70～1.00，大致合拍、略有偏差但仍能接话为 0.40～0.69；只有明显冲突或完全无关才低于 0.40。
 - 不要求候选完美复述当前语境。只要至少一张不明显冲突，should_send=true；所有候选都明显不合适时才返回 false。
 """.strip()
@@ -762,6 +763,7 @@ def create_search_meme_tool(
     pic_dir: Path | None = None,
     cross_group_spaces: dict[str, list[str]] | None = None,
     context_only: bool = False,
+    casual_reply: bool = False,
 ):
     """
     创建一个带数据库会话的表情包搜索工具
@@ -827,16 +829,27 @@ def create_search_meme_tool(
             candidates = [
                 item for item in candidates if item[0] not in recent_ids
             ]
-            review_candidates, usage_counts, favorite_ids = (
-                await _prepare_meme_context_review(
-                    db_session,
-                    session_id,
-                    candidates,
-                    recent_ids,
-                    include_favorites=effective_match_type != "content",
+            if casual_reply:
+                # Only reuse images already visible in this group, before truncation.
+                candidate_ids = [mid for mid, _ in candidates]
+                local_rows = await db_session.execute(Select(ChatHistory.media_id).where(
+                    ChatHistory.session_id == session_id, ChatHistory.content_type.in_(("image", "bot")),
+                    ChatHistory.media_id.in_(candidate_ids),
+                ).distinct())
+                local_ids = set(local_rows.scalars().all())
+                review_ids = [mid for mid, _ in candidates if mid in local_ids][:MEME_CONTEXT_SEMANTIC_POOL_SIZE]
+                rows = await db_session.execute(Select(MediaStorage.media_id, MediaStorage.description).where(MediaStorage.media_id.in_(review_ids)))
+                descriptions = {int(mid): description for mid, description in rows.all() if mid is not None and description and description != "[图片]"}
+                review_candidates = [(mid, descriptions[mid]) for mid in review_ids if mid in descriptions]
+                usage_counts, favorite_ids = {}, set()
+            else:
+                review_candidates, usage_counts, favorite_ids = (
+                    await _prepare_meme_context_review(
+                        db_session, session_id, candidates, recent_ids,
+                        include_favorites=effective_match_type != "content",
+                    )
                 )
-            )
-            if cross_group_spaces is not None:
+            if cross_group_spaces is not None and not casual_reply:
                 review_candidates = await _scope_group_meme_candidates(
                     db_session, session_id, review_candidates, cross_group_spaces, pic_dir, vision_model_factory,
                 )
@@ -892,11 +905,11 @@ def create_search_meme_tool(
                     if review_model is not None
                     else []
                 )
-            if context_only:
+            if context_only or casual_reply:
                 context_candidates = [(mid, score) for mid, score in context_candidates if score >= 0.7]
             # Empty/failed review is intentional: never approve an unreviewed
             # image merely because the request explicitly asked for a meme.
-            if effective_match_type == "content":
+            if casual_reply or effective_match_type == "content":
                 pic_ids = _select_content_meme_ids(
                     context_candidates,
                     recent_ids,

@@ -175,6 +175,7 @@ async def test_proactive_observation_receives_relevant_cross_group_inspiration(m
     monkeypatch.setattr(agent, "get_chat_model", lambda: object())
     def build_graph(_model, tools, _messages, **kwargs):
         captured["tools"] = {tool.name for tool in tools}
+        captured["reply_fields"] = set(next(tool for tool in tools if tool.name == "reply_user").args_schema.model_fields)
         captured["limits"] = kwargs["limits"]
         return Graph()
     monkeypatch.setattr(agent, "build_chat_graph", build_graph)
@@ -187,8 +188,9 @@ async def test_proactive_observation_receives_relevant_cross_group_inspiration(m
     cross.assert_awaited_once()
     assert cross.await_args is not None
     assert "osu" in cross.await_args.kwargs["query"]
-    assert captured["tools"] == {"reply_user", "finish", "search_meme_image", "send_meme_image"}
-    assert captured["limits"].max_llm_calls == 3
+    assert captured["tools"] == {"reply_user", "finish"}
+    assert {"meme_intent", "meme_only"} <= captured["reply_fields"]
+    assert captured["limits"].max_llm_calls == 2
 
 
 def test_proactive_prompt_allows_natural_everyday_banter():

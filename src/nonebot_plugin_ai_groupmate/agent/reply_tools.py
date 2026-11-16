@@ -1,6 +1,6 @@
 import re
 from typing import Any, Literal
-from collections.abc import Callable
+from collections.abc import Callable, Awaitable
 
 from nonebot.log import logger
 from langchain.tools import tool
@@ -80,6 +80,7 @@ def create_reply_tool(
     recovery_enabled: bool = True,
     outbound_identity: OutboundIdentity | None = None,
     cross_group_spaces: dict[str, list[str]] | None = None,
+    casual_meme_sender: Callable[..., Awaitable[str | None]] | None = None,
 ):
     """
     核心工具：用于发送消息。
@@ -106,10 +107,14 @@ def create_reply_tool(
         content: str,
         next_step: Literal["end", "continue"],
         reply_to: str | None = None,
+        meme_intent: str = "",
+        meme_only: bool = False,
     ) -> str:
         """往当前聊天里单独发一条文字消息，别不调工具直接输出正文。
         要把文字和图片放在同一条消息时，用发图工具的 text 参数，别拆成两条。
         Args:
+            meme_intent: 轻松闲聊可填写想表达的态度、情绪和回应对象；空字符串只发文字。
+            meme_only: 为 true 时只发图，content 仍填写找不到图时的后备文字。
             content: 要说的话。@ 当前发言者写 @current；群里 @ 别人写 @用户ID，ID 后用空白或标点分隔，会生成平台原生 @。未知 ID 或重名时先用 query_platform 的 list_members 查询，也支持唯一昵称。
             reply_to: 可选引用。填 current 引用当前消息；引用其他消息传当前聊天中已知的真实平台消息 ID。留空为普通发送，别编 ID。
             next_step: 这轮事办完、结果交付或卡点说清后填 end；只有下一条会提供新信息时才填 continue，最后一条必须填 end。别发句“正在查/等会儿回你”的空承诺就结束；先完成处理、交付结果或说明具体卡点。"""
@@ -160,6 +165,16 @@ def create_reply_tool(
             normalized_content = _normalize_text(content)
             if (normalized_content, quoted_id) in attempted_sends:
                 return tool_skipped("duplicate_reply", "本轮已尝试发送该消息，请勿重复发送。", delivery_state="not_attempted")
+
+            if casual_meme_sender is not None and meme_intent.strip() and next_step == "end" and repeat_text is None and "@" not in content:
+                try:
+                    result = await casual_meme_sender(intent=meme_intent.strip()[:500], text=content, image_only=meme_only, reply_to=reply_to)
+                except Exception as error:
+                    logger.warning(f"[CasualMeme] outcome=unavailable error_type={type(error).__name__}")
+                    await db_session.rollback()
+                    result = None
+                if result is not None:
+                    return result
 
             # Sending can block; release the pooled connection first.
             await db_session.commit()
