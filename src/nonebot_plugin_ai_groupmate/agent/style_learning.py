@@ -89,6 +89,8 @@ async def _style_output(model: Any, schema: type[BaseModel], messages: list, *, 
     instruction = "\n只输出符合以下 JSON Schema 的 JSON 对象，不要输出 Markdown 或其他文字：" + json.dumps(schema.model_json_schema(), ensure_ascii=False)
     prompt = [SystemMessage(content=str(messages[0].content) + instruction), *messages[1:]]
     response = await model.ainvoke(prompt, max_tokens=max_tokens)
+    if not isinstance(response.content, str):
+        raise ValueError("Expected a JSON text response")
     return schema.model_validate_json(response.content)
 
 

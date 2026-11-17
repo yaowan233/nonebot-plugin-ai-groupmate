@@ -2,7 +2,7 @@ import json
 from datetime import datetime, timedelta
 
 import pytest
-from pydantic import ValidationError
+from pydantic import SecretStr, ValidationError
 
 
 def message(number, user, body, *, quote=None, platform_id=None, seconds=None, **overrides):
@@ -48,7 +48,7 @@ async def test_deepseek_paired_selection_does_not_require_response_format(tmp_pa
             "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": json.dumps({"expression_ids": [], "pair_ids": [pair.id]})}}]})
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
-        model = DeepSeekChatOpenAI(model="deepseek-chat", api_key="test", base_url="https://api.deepseek.com", http_async_client=client, max_retries=0)
+        model = DeepSeekChatOpenAI(model="deepseek-chat", api_key=SecretStr("test"), base_url="https://api.deepseek.com", http_async_client=client, max_retries=0)
         result = await learning.contextual_style(root=tmp_path, session_id="group", sources=[], recent_chat="我总算修好了", model_factory=lambda: model)
     assert result
     assert "真人接话案例" in result
@@ -74,7 +74,7 @@ async def test_deepseek_learning_and_review_validate_pair_decisions(tmp_path):
             "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": json.dumps(answer)}}]})
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
-        model = DeepSeekChatOpenAI(model="deepseek-chat", api_key="test", base_url="https://api.deepseek.com", http_async_client=client, max_retries=0)
+        model = DeepSeekChatOpenAI(model="deepseek-chat", api_key=SecretStr("test"), base_url="https://api.deepseek.com", http_async_client=client, max_retries=0)
         path = learning.bank_path(tmp_path, "group")
         await learning._learn(path, "group", _human_expressions(rows, "group"), lambda: model, rows)
     bank = learning._read_bank(path, "group")
@@ -96,7 +96,7 @@ async def test_deepseek_invalid_paired_selection_fails_closed(tmp_path, content)
         return httpx.Response(200, json={"id": "test", "object": "chat.completion", "created": 0, "model": "deepseek-chat",
             "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": content}}]})
     async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
-        model = DeepSeekChatOpenAI(model="deepseek-chat", api_key="test", base_url="https://api.deepseek.com", http_async_client=client, max_retries=0)
+        model = DeepSeekChatOpenAI(model="deepseek-chat", api_key=SecretStr("test"), base_url="https://api.deepseek.com", http_async_client=client, max_retries=0)
         result = await learning.contextual_style(root=tmp_path, session_id="group", sources=[], recent_chat="我总算修好了", model_factory=lambda: model)
     assert result == ""
 
