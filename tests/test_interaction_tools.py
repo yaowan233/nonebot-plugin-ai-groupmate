@@ -307,8 +307,8 @@ def test_history_tools_visible_on_first_group_turn_without_loading_a_skill(mode)
     history_names = {"search_history_context", "search_group_interactions", "read_member_history", "read_recent_history"}
     assert names & history_names == (history_names if mode == "group" else set())
     assert ("query_platform" in names) == (mode == "group")
-    if mode == "observation-linked":
-        assert names == {"reply_tool", "finish", "search_meme_tool", "send_meme_tool"}
+    if mode in {"observation", "observation-linked"}:
+        assert names == {"reply_tool", "finish"}
 
 
 def test_group_skill_exposes_interaction_guidance():

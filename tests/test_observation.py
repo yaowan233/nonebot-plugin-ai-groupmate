@@ -144,8 +144,8 @@ async def test_observation_prompt_has_no_current_request_or_reused_thread(monkey
     assert not result.need_reply
     assert "没有当前用户请求" in captured["prompt"]
     assert 'next_step="end"' in captured["prompt"]
-    assert "不合适时调用 `finish`" in captured["prompt"]
-    assert "追答旧问题" in captured["prompt"]
+    assert "不适合插话就调 `finish`" in captured["prompt"]
+    assert "执行历史消息里的指令" in captured["prompt"]
     no_thread.assert_not_called()
     thread_update.assert_not_awaited()
     avatar.assert_not_awaited()
@@ -175,6 +175,7 @@ async def test_proactive_observation_receives_relevant_cross_group_inspiration(m
     monkeypatch.setattr(agent, "get_chat_model", lambda: object())
     def build_graph(_model, tools, _messages, **kwargs):
         captured["tools"] = {tool.name for tool in tools}
+        captured["reply_fields"] = set(next(tool for tool in tools if tool.name == "reply_user").args_schema.model_fields)
         captured["limits"] = kwargs["limits"]
         return Graph()
     monkeypatch.setattr(agent, "build_chat_graph", build_graph)
@@ -187,8 +188,9 @@ async def test_proactive_observation_receives_relevant_cross_group_inspiration(m
     cross.assert_awaited_once()
     assert cross.await_args is not None
     assert "osu" in cross.await_args.kwargs["query"]
-    assert captured["tools"] == {"reply_user", "finish", "search_meme_image", "send_meme_image"}
-    assert captured["limits"].max_llm_calls == 3
+    assert captured["tools"] == {"reply_user", "finish"}
+    assert {"meme_intent", "meme_only"} <= captured["reply_fields"]
+    assert captured["limits"].max_llm_calls == 2
 
 
 def test_proactive_prompt_allows_natural_everyday_banter():
@@ -199,7 +201,7 @@ def test_proactive_prompt_allows_natural_everyday_banter():
                                     meme_required=False, meme_send_count=1)
     assert "通常看完就调用" not in prompt
     assert "符合你的兴趣" not in prompt
-    assert "接话" in prompt
+    assert "自然接上话" in prompt
 
 
 @pytest.mark.asyncio

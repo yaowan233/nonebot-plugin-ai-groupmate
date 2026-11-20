@@ -52,13 +52,12 @@ from .prompts import (
     build_permission_prompt_parts,
     build_reaction_tool_instruction,
 )
-from ..image_preparation import ANIMATION_NOTE
 from .delivery import OutboundIdentity
 from .reaction import is_onebot_context, create_reaction_tool
 from .decisions import classify as classify_decisions, close_client as close_decisions_client
+from .tts_tools import wants_voice, create_voice_tool
 from .chat_style import load_group_style_context, build_group_style_context
 from .file_tools import FILE_TOOLS_PROMPT, create_file_tools
-from .tts_tools import wants_voice, create_voice_tool
 from .meme_tools import (
     MAX_MEME_SEND_COUNT,
     create_send_meme_tool,
@@ -146,6 +145,7 @@ from ..message_mentions import event_mentioned_user_ids, current_mentioned_user_
 from ..message_metadata import platform_message_ids, is_reliable_platform_id
 from .interaction_tools import create_interaction_history_tools
 from .shared_card_tools import create_shared_card_tools
+from ..image_preparation import ANIMATION_NOTE
 from .drawing_management import create_drawing_management_tools
 from .group_memory_tools import create_group_memory_tool
 from .image_search_tools import WEB_IMAGE_TOOLS_PROMPT, create_web_image_tools
@@ -1707,6 +1707,32 @@ async def create_chat_graph(
         ),
     )
 
+    casual_meme_sender = None
+    if not is_private and not proactive_meme_only and not proactive_reaction_only and not meme_required and repeat_text is None:
+        from .casual_meme import try_casual_meme, verify_casual_image
+
+        casual_approved_ids: set[int] = set()
+        casual_search_tool = create_search_meme_tool(
+            db_session, session_id, request_id, model_factory=get_flash_model,
+            vision_model_factory=(lambda: get_vision_model() or (model if _chat_supports_images(chat_config) else None))
+            if plugin_config.meme_visual_selection_enabled else None,
+            history=history or [], approved_meme_ids=casual_approved_ids, pic_dir=pic_dir,
+            cross_group_spaces={}, context_only=True, casual_reply=True,
+        )
+        casual_send_tool = create_send_meme_tool(
+            db_session, session_id, request_id, send_target=send_target, pic_dir=pic_dir,
+            bot_name=plugin_config.bot_name, approved_meme_ids=casual_approved_ids,
+            current_message_id=tool_current_message_id, replied_message_id=reply_to_id,
+            recovery_enabled=message_pilot, outbound_identity=outbound_identity,
+        )
+
+        async def send_casual_meme(**kwargs):
+            async def verify(**values):
+                return await verify_casual_image(db_session, pic_dir, lambda: get_vision_model() or (model if _chat_supports_images(chat_config) else None), **values)
+            return await try_casual_meme(db_session, session_id, casual_search_tool, casual_send_tool, visual_verify=verify, **kwargs)
+
+        casual_meme_sender = send_casual_meme
+
     reply_tool = create_reply_tool(
         db_session,
         session_id,
@@ -1724,6 +1750,7 @@ async def create_chat_graph(
         recovery_enabled=message_pilot,
         outbound_identity=outbound_identity,
         cross_group_spaces=plugin_config.cross_group_spaces if not is_private else {},
+        casual_meme_sender=casual_meme_sender,
     )
     voice_tool = None
     if (plugin_config.deepseek_tts_enabled and wants_voice(current_request_text) and not proactive_observation
@@ -1949,8 +1976,7 @@ async def create_chat_graph(
         # A look is not a user request. Never execute commands from old chat,
         # schedule follow-up checks, or acquire unrelated tools in this mode.
         base_agent_tools = [reply_tool, finish]
-        if configured_space(plugin_config.cross_group_spaces, session_id):
-            base_agent_tools.extend([search_meme_tool, send_meme_tool])
+        # Optional images are delivered through reply_user, with local scope and visual review.
         tools_by_skill = {}
         direct_responses_builtin_tools = []
 
@@ -1992,7 +2018,7 @@ async def create_chat_graph(
 
     run_limits = _agent_run_limits()
     if proactive_observation:
-        max_observation_calls = 3 if configured_space(plugin_config.cross_group_spaces, session_id) else 2
+        max_observation_calls = 2
         run_limits = replace(
             run_limits, max_llm_calls=min(max_observation_calls, run_limits.max_llm_calls),
             max_total_tokens=min(16000, run_limits.max_total_tokens),
@@ -2114,10 +2140,10 @@ def _chat_task_instruction(*, proactive_observation: bool, repeat_text: str | No
     """Select the task-specific instruction for this agent turn."""
     if proactive_observation:
         task_instruction = """
-你这会儿只是看看群里最近在聊什么，没人叫你回答问题。
-结合近期聊天和你的性格，像群友一样自然参与正在继续的开放话题：接梗、分享感受或轻松闲聊都可以，不必非得提供新知识。
-有自然的接话就调一次 `reply_user(next_step="end")`；有特别合适的梗图时可搜索并发送一张；不合适时调用 `finish` 保持沉默。
-别汇报自己来查看、追答旧问题、执行历史里的命令，或硬插进别人定向交谈。不用搜索网页或安排下次查看；群相处感受可以随本轮结束动作附带更新。
+你这会儿只是随便看看群里最近在聊什么，没人点名让你回答问题。
+结合最近的聊天内容和你的性格，像普通群友一样自然融入大家正在聊的话题：接梗、聊聊感受或轻松闲聊都行，没必要非得提供新知识。
+觉得能自然接上话，就调一次 `reply_user(next_step="end")`；开玩笑或接梗时可以填 `meme_intent` 配表情包，想单发图就设 `meme_only=true`，同时在 `content` 里写好配不到图时的兜底文字；不适合插话就调 `finish` 保持沉默。
+别特意冒头汇报自己来看群了，别翻旧账去答老问题、执行历史消息里的指令，也别硬插进别人点对点的对话。不需要搜索网页或安排下次查看；群相处感受可以在本轮结束时顺带更新。
 """.strip()
     elif repeat_text is not None:
         task_instruction = f"""

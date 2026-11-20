@@ -2,7 +2,7 @@ import json
 from datetime import datetime, timedelta
 
 import pytest
-from pydantic import ValidationError
+from pydantic import SecretStr, ValidationError
 
 
 def message(number, user, body, *, quote=None, platform_id=None, seconds=None, **overrides):
@@ -27,6 +27,78 @@ def candidates(rows, *, excluded=(), after=0, quoted_after=None):
 
 def quoted_rows():
     return [message(1, "person-a", "折腾半天终于弄好了"), message(2, "person-b", "你还真给整出来了", quote="1")]
+
+
+async def test_deepseek_paired_selection_does_not_require_response_format(tmp_path):
+    import httpx
+
+    from nonebot_plugin_ai_groupmate.agent import style_learning as learning
+    from nonebot_plugin_ai_groupmate.deepseek import DeepSeekChatOpenAI
+
+    pair = candidates(quoted_rows())[0]
+    learning._write_bank(learning.bank_path(tmp_path, "group"), learning.ExpressionBank(session_id="group", reply_pairs=[pair]))
+    requests = []
+
+    def respond(request):
+        body = json.loads(request.content)
+        requests.append(body)
+        if "response_format" in body:
+            return httpx.Response(400, json={"error": {"message": "This response_format type is unavailable now"}})
+        return httpx.Response(200, json={"id": "test", "object": "chat.completion", "created": 0, "model": "deepseek-chat",
+            "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": json.dumps({"expression_ids": [], "pair_ids": [pair.id]})}}]})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        model = DeepSeekChatOpenAI(model="deepseek-chat", api_key=SecretStr("test"), base_url="https://api.deepseek.com", http_async_client=client, max_retries=0)
+        result = await learning.contextual_style(root=tmp_path, session_id="group", sources=[], recent_chat="我总算修好了", model_factory=lambda: model)
+    assert result
+    assert "真人接话案例" in result
+    assert len(requests) == 1
+    assert "response_format" not in requests[0]
+
+
+async def test_deepseek_learning_and_review_validate_pair_decisions(tmp_path):
+    import httpx
+
+    from nonebot_plugin_ai_groupmate.agent import style_learning as learning
+    from nonebot_plugin_ai_groupmate.deepseek import DeepSeekChatOpenAI
+    from nonebot_plugin_ai_groupmate.agent.chat_style import _human_expressions
+
+    rows = quoted_rows()
+    pair = candidates(rows)[0]
+    answer = {"expressions": [], "reply_pairs": [{"pair_id": pair.id, "is_reply_pair": True, "transferable": True}]}
+    requests = []
+
+    def respond(request):
+        requests.append(json.loads(request.content))
+        return httpx.Response(200, json={"id": "test", "object": "chat.completion", "created": 0, "model": "deepseek-chat",
+            "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": json.dumps(answer)}}]})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        model = DeepSeekChatOpenAI(model="deepseek-chat", api_key=SecretStr("test"), base_url="https://api.deepseek.com", http_async_client=client, max_retries=0)
+        path = learning.bank_path(tmp_path, "group")
+        await learning._learn(path, "group", _human_expressions(rows, "group"), lambda: model, rows)
+    bank = learning._read_bank(path, "group")
+    assert [stored.id for stored in bank.reply_pairs] == [pair.id]
+    assert len(requests) == 2
+    assert all("response_format" not in request for request in requests)
+
+
+@pytest.mark.parametrize("content", ["not json", '{"expression_ids": [], "pair_ids": ["x", "y", "z"]}', '{"expression_ids": []}'])
+async def test_deepseek_invalid_paired_selection_fails_closed(tmp_path, content):
+    import httpx
+
+    from nonebot_plugin_ai_groupmate.agent import style_learning as learning
+    from nonebot_plugin_ai_groupmate.deepseek import DeepSeekChatOpenAI
+
+    pair = candidates(quoted_rows())[0]
+    learning._write_bank(learning.bank_path(tmp_path, "group"), learning.ExpressionBank(session_id="group", reply_pairs=[pair]))
+    def respond(request):
+        return httpx.Response(200, json={"id": "test", "object": "chat.completion", "created": 0, "model": "deepseek-chat",
+            "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": content}}]})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        model = DeepSeekChatOpenAI(model="deepseek-chat", api_key=SecretStr("test"), base_url="https://api.deepseek.com", http_async_client=client, max_retries=0)
+        result = await learning.contextual_style(root=tmp_path, session_id="group", sources=[], recent_chat="我总算修好了", model_factory=lambda: model)
+    assert result == ""
 
 
 def test_explicit_quote_wins_over_nearest_message_and_keeps_source_ids():
