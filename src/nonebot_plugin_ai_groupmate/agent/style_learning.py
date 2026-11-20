@@ -11,9 +11,10 @@ from collections.abc import Callable, Sequence
 
 from pydantic import Field, BaseModel, ConfigDict
 from nonebot.log import logger
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 
 from ..model import ChatHistorySchema
+from ..deepseek import DeepSeekChatOpenAI
 from .reply_pair_learning import (
     MAX_REPLY_PAIRS,
     ReplyPair,
@@ -78,6 +79,20 @@ class ExpressionBank(BaseModel):
     pair_cursor: int = 0
     quoted_pair_cursor: int = 0
     prefer_pair_learning: bool = True
+
+
+async def _style_output(model: Any, schema: type[BaseModel], messages: Sequence[BaseMessage], *, max_tokens: int) -> Any:
+    if not isinstance(model, DeepSeekChatOpenAI):
+        return await model.with_structured_output(schema).ainvoke(messages, max_tokens=max_tokens)
+    # DeepSeek can reject response_format=json_schema. Ask for JSON in the
+    # prompt and enforce the same schema locally, without a second request.
+    schema_json = json.dumps(schema.model_json_schema(), ensure_ascii=False)
+    system = SystemMessage(content=f"{messages[0].content}\n只输出符合以下 JSON Schema 的 JSON 对象，不要输出 Markdown 或其他文字：{schema_json}")
+    prompt = [system, *messages[1:]]
+    response = await model.ainvoke(prompt, max_tokens=max_tokens)
+    if not isinstance(response.content, str):
+        raise ValueError("Expected a JSON text response")
+    return schema.model_validate_json(response.content)
 
 
 def bank_path(root: Path, session_id: str) -> Path:
@@ -214,7 +229,7 @@ async def _learn(
             input_payload = {"single_messages": payload, "reply_pairs": pair_payload} if pairs else payload
             model = model_factory()
             schema = PairedExpressionLearning if pairs else ExpressionLearning
-            raw = await asyncio.wait_for(model.with_structured_output(schema).ainvoke([
+            raw = await asyncio.wait_for(_style_output(model, schema, [
                 SystemMessage(content=(
                     ("本轮必须先逐项审核全部reply_pairs，原样返回每个pair_id及两个布尔判断，再归纳少量表达。不要省略配对判断。" if pairs else "")
                     + "expressions字段从真人材料归纳少量可复用的表达方法，返回适用情境、表达方法、支持它的来源ID；可以返回空集。"
@@ -238,7 +253,7 @@ async def _learn(
                 review_payload = {"candidates": learned.model_dump()["expressions"], "evidence": payload}
                 if pairs:
                     review_payload.update(reply_pairs=pair_payload)
-                reviewed = await asyncio.wait_for(model.with_structured_output(schema).ainvoke([
+                reviewed = await asyncio.wait_for(_style_output(model, schema, [
                     SystemMessage(content=(
                         "两类输出分开：expressions是抽象表达方法，reply_pairs是原始接话案例的独立判断。"
                         "审核候选是否真正描述可跨话题复用的表达形式，不能把原话内容当成说话风格。"
@@ -308,7 +323,7 @@ async def contextual_style(
     try:
         selection_schema = PairedExpressionSelection if cases else ExpressionSelection
         selected = selection_schema.model_validate(await asyncio.wait_for(
-            model_factory().with_structured_output(selection_schema).ainvoke([
+            _style_output(model_factory(), selection_schema, [
                 SystemMessage(content=(
                     "为本轮回复选择两类独立参考：candidates是抽象表达方法，选0到3项expression_ids；"
                     "reply_pairs是真人接话案例，选0到2项pair_ids。一类为空不妨碍另一类被选。"
